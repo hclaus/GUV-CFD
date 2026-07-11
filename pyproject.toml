@@ -1,0 +1,20 @@
+[project]
+name = "guv-cfd"
+version = "0.1.0"
+description = "Couple guv-calcs UV fluence-rate physics to OpenFOAM CFD, given a .guv project file."
+requires-python = ">=3.11"
+dependencies = [
+    "guv-calcs @ git+https://github.com/hclaus/guv-calcHC.git@85e2957",
+    "numpy>=1.26.4,<3.0.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0,<9.0.0",
+]
+
+[tool.uv]
+package = false
+
+[tool.uv.sources]
+guv-calcs = { path = "../guv-calcHC", editable = true }
