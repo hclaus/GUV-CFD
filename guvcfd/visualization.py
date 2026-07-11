@@ -31,6 +31,15 @@ _WALL_LABEL_POSITIONS = {
 _WALL_FLOW_DIRECTION = {"xMin": (1, 0, 0), "xMax": (1, 0, 0)}
 
 
+def _remove_zone_traces(fig):
+    """Strip the calc-zone traces RoomPlotter adds automatically (Whole Room
+    Fluence, Eye Dose, etc.) - not relevant to a CFD case-setup preview.
+    Zone traces are tagged customdata=["zone_<id>"] by RoomPlotter itself.
+    """
+    fig.data = [t for t in fig.data if not (t.customdata and str(t.customdata[0]).startswith("zone_"))]
+    return fig
+
+
 def _add_wall_labels(fig, Lx, Ly, Lz):
     xs, ys, zs, texts = [], [], [], []
     for name, fn in _WALL_LABEL_POSITIONS.items():
@@ -80,32 +89,77 @@ def _add_opening(fig, label, wall, center_frac, size, Lx, Ly, Lz, color):
     return fig
 
 
-def _add_fan(fig, center, radius, direction, n_points=32):
-    cx, cy, cz = center
+def _orthonormal_basis(direction):
+    dx, dy, dz = direction
+    mag = (dx ** 2 + dy ** 2 + dz ** 2) ** 0.5
+    d = np.array([dx, dy, dz]) / mag
+    arbitrary = (1, 0, 0) if abs(d[2]) > 0.9 else (0, 0, 1)
+    u = np.cross(d, arbitrary)
+    u = u / np.linalg.norm(u)
+    v = np.cross(d, u)
+    return d, u, v
+
+
+def _cylinder_mesh(center, radius, thickness, direction, n_theta=32):
+    """Vertex/face arrays (Mesh3d i/j/k triangle format) for a solid
+    cylinder - the fan's actual swept volume (radius x thickness), not
+    just a flat disk, so the preview matches the real cylinderToCell
+    geometry (p1/p2 base/top centers + radius) used to carve its cellZone.
+    """
+    c = np.array(center, dtype=float)
+    d, u, v = _orthonormal_basis(direction)
+
+    theta = np.linspace(0, 2 * np.pi, n_theta, endpoint=False)
+    ring = np.outer(np.cos(theta), u) + np.outer(np.sin(theta), v)  # (n_theta, 3)
+
+    bottom_center = c - d * thickness / 2
+    top_center = c + d * thickness / 2
+    bottom_rim = bottom_center + radius * ring
+    top_rim = top_center + radius * ring
+
+    verts = np.vstack([bottom_center, top_center, bottom_rim, top_rim])
+    BC, TC = 0, 1
+    BR0, TR0 = 2, 2 + n_theta
+
+    i_idx, j_idx, k_idx = [], [], []
+    for a in range(n_theta):
+        b = (a + 1) % n_theta
+        i_idx += [BC, TC, BR0 + a, BR0 + b]
+        j_idx += [BR0 + a, TR0 + b, BR0 + b, TR0 + b]
+        k_idx += [BR0 + b, TR0 + a, TR0 + a, TR0 + a]
+
+    return verts, np.array(i_idx), np.array(j_idx), np.array(k_idx), bottom_rim, top_rim
+
+
+def _add_fan(fig, center, radius, direction, thickness=0.2, n_points=32, color="#e8a13a"):
     dx, dy, dz = direction
     mag = (dx ** 2 + dy ** 2 + dz ** 2) ** 0.5
     dx, dy, dz = dx / mag, dy / mag, dz / mag
 
-    # Build an orthonormal basis (u, v) perpendicular to the fan's own axis,
-    # so the disk outline is drawn in the plane normal to `direction`.
-    arbitrary = (1, 0, 0) if abs(dz) > 0.9 else (0, 0, 1)
-    u = np.cross(direction, arbitrary)
-    u = u / np.linalg.norm(u)
-    v = np.cross(direction, u)
-
-    theta = np.linspace(0, 2 * np.pi, n_points)
-    circle = np.array([cx, cy, cz]) + radius * (np.outer(np.cos(theta), u) + np.outer(np.sin(theta), v))
-    fig.add_trace(go.Scatter3d(
-        x=circle[:, 0], y=circle[:, 1], z=circle[:, 2], mode="lines",
-        line=dict(color="#e8a13a", width=5),
-        name="Fan", customdata=["fan_outline"], showlegend=True,
+    verts, i_idx, j_idx, k_idx, bottom_rim, top_rim = _cylinder_mesh(
+        center, radius, thickness, direction, n_points,
+    )
+    fig.add_trace(go.Mesh3d(
+        x=verts[:, 0], y=verts[:, 1], z=verts[:, 2],
+        i=i_idx, j=j_idx, k=k_idx,
+        color=color, opacity=0.3, flatshading=True,
+        name="Fan", customdata=["fan_volume"], showlegend=True,
     ))
+    # Crisp rim outlines at both faces, for definition against the transparent fill.
+    for rim in (bottom_rim, top_rim):
+        loop = np.vstack([rim, rim[:1]])
+        fig.add_trace(go.Scatter3d(
+            x=loop[:, 0], y=loop[:, 1], z=loop[:, 2], mode="lines",
+            line=dict(color=color, width=4),
+            name="Fan", customdata=["fan_rim"], showlegend=False,
+        ))
+    cx, cy, cz = center
     arrow_len = radius * 1.2
     tip = (cx + dx * arrow_len, cy + dy * arrow_len, cz + dz * arrow_len)
     fig.add_trace(go.Scatter3d(
         x=[cx, tip[0]], y=[cy, tip[1]], z=[cz, tip[2]],
-        mode="lines+markers", line=dict(color="#e8a13a", width=5),
-        marker=dict(size=[0, 6], color="#e8a13a", symbol="diamond"),
+        mode="lines+markers", line=dict(color=color, width=5),
+        marker=dict(size=[0, 6], color=color, symbol="diamond"),
         name="Fan direction", customdata=["fan_arrow"], showlegend=False,
     ))
     return fig
@@ -113,13 +167,18 @@ def _add_fan(fig, center, radius, direction, n_points=32):
 
 def plot_case(room, inlet_wall="xMin", inlet_center=(0.5, 0.85), inlet_size=(0.3, 0.3),
               outlet_wall="xMax", outlet_center=(0.5, 0.15), outlet_size=(0.3, 0.3),
-              fan_center=None, fan_disk_radius=None, fan_direction=(0, 0, -1), fan_speed=None,
+              fan_center=None, fan_disk_radius=None, fan_disk_thickness=0.2,
+              fan_direction=(0, 0, -1), fan_speed=None,
               title=""):
     """Build the full preview figure: room + lamps (RoomPlotter) + inlet/
     outlet + optional fan + wall labels. Returns a plotly Figure - render
     with fig.show() or fig.write_html(path).
+
+    Calc-zone traces RoomPlotter adds automatically (Whole Room Fluence
+    etc.) are stripped - not relevant to a CFD case-setup preview.
     """
     fig = RoomPlotter(room).plotly(title=title)
+    fig = _remove_zone_traces(fig)
     fig = _add_wall_labels(fig, room.x, room.y, room.z)
     fig = _add_opening(fig, "inlet", inlet_wall, inlet_center, inlet_size,
                         room.x, room.y, room.z, color="#2ecc71")
@@ -128,5 +187,5 @@ def plot_case(room, inlet_wall="xMin", inlet_center=(0.5, 0.85), inlet_size=(0.3
     if fan_speed is not None:
         center = fan_center or (room.x / 2, room.y / 2, room.z - 0.3)
         radius = fan_disk_radius or 0.6
-        fig = _add_fan(fig, center, radius, fan_direction)
+        fig = _add_fan(fig, center, radius, fan_direction, thickness=fan_disk_thickness)
     return fig
