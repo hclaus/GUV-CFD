@@ -118,6 +118,8 @@ def run_steady_state_scenario(case_dir, room_x, room_y, room_z, ach, Z, nbins=25
         source_center = (room_x / 2, room_y / 2, 1.6)
     summary = {"room_volume": room_volume, "source_center": source_center, "target_T_ss": target_T_ss}
 
+    run_wsl_or_raise("touch case.foam", case_dir_wsl, "touching case.foam")
+
     log_fn("Ensuring SIMPLE fvSolution and outlet-average monitoring are set up...")
     ensure_simple_fvsolution(case_dir)
     write_vol_average_dict(case_dir, field="T", patches=patches_to_monitor)

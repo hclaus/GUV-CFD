@@ -118,7 +118,7 @@ def setup_case(guv_path, case_dir, template_case_dir=None, cell_size=0.1, Z=2.0,
                converge_flow=True, simple_foam_iterations=500,
                pimple_end_time=120, pimple_write_interval=10, pimple_delta_t=0.5,
                fan_speed=None, fan_center=None, fan_direction=(0, 0, -1),
-               fan_disk_radius=0.4, fan_disk_thickness=0.2, fan_height=None,
+               fan_disk_radius=0.6, fan_disk_thickness=0.2, fan_height=None,
                log_fn=print):
     """Set up an OpenFOAM case end-to-end from a .guv project. Returns a dict
     summarizing the run (room dims, lamp count, fluence/k ranges, zone count).
@@ -138,16 +138,22 @@ def setup_case(guv_path, case_dir, template_case_dir=None, cell_size=0.1, Z=2.0,
     hardcoded so that wiring is a small change, not a rework.
 
     fan_speed: if given (m/s, see fan.SPEED_RANGE), adds an optional mixing
-    fan (see fan.py) - a small cylindrical cellZone near the ceiling with a
-    meanVelocityForce driving that zone's mean velocity to fan_speed in
-    fan_direction. Stays active through flow convergence *and* the
-    pimpleFoam phase (a real fan affects the whole scenario, not just part
-    of it) - unlike the UV/source entries, which only apply once scalar
-    transport starts. fan_center defaults to room center at 85% of room
-    height if not given.
+    fan (see fan.py) - a cylindrical cellZone (default radius 0.6m, a 1.2m
+    diameter fan) with a meanVelocityForce driving that zone's mean velocity
+    to fan_speed in fan_direction (default straight down, like a ceiling
+    fan). Stays active through flow convergence *and* the pimpleFoam phase
+    (a real fan affects the whole scenario, not just part of it) - unlike
+    the UV/source entries, which only apply once scalar transport starts.
+    fan_center defaults to room center in x/y, 30cm below the ceiling, if
+    not given.
     """
     case_dir_wsl = _wsl_path(case_dir)
     summary = {}
+
+    Path(case_dir).mkdir(parents=True, exist_ok=True)
+    Path(f"{case_dir}/case.foam").touch()
+    log_fn("Touched case.foam (ParaView marker file) - present from the start so it's "
+           "there regardless of whether this run finishes, fails, or gets interrupted.")
 
     if template_case_dir is not None:
         log_fn(f"Copying static config from {template_case_dir} ...")
@@ -191,7 +197,7 @@ def setup_case(guv_path, case_dir, template_case_dir=None, cell_size=0.1, Z=2.0,
 
     fan_entry = None
     if fan_speed is not None:
-        center = fan_center or (room.x / 2, room.y / 2, (fan_height if fan_height is not None else 0.85 * room.z))
+        center = fan_center or (room.x / 2, room.y / 2, (fan_height if fan_height is not None else room.z - 0.3))
         p1 = (center[0], center[1], center[2] - fan_disk_thickness / 2)
         p2 = (center[0], center[1], center[2] + fan_disk_thickness / 2)
         log_fn(f"Carving fan cellZone at {center}, radius={fan_disk_radius}, speed={fan_speed} m/s...")
