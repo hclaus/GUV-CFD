@@ -6,6 +6,8 @@ requires-python = ">=3.11"
 dependencies = [
     "guv-calcs @ git+https://github.com/hclaus/guv-calcHC.git@85e2957",
     "numpy>=1.26.4,<3.0.0",
+    "dash>=2.17.0,<3.0.0",
+    "dash-bootstrap-components>=1.6.0,<2.0.0",
 ]
 
 [dependency-groups]

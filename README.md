@@ -31,7 +31,9 @@ Standalone tool, connected to [Illuminate](https://github.com/hclaus/Illuminate_
 - `guvcfd/decay_analysis.py` — decay-curve fitting, convergence/plateau detection, results summary.
 - `guvcfd/run_pipeline.py` — `setup_case()`, the one-call orchestrator for mesh → flow convergence → fluence/UV-zones → splice.
 - `guvcfd/steady_state_pipeline.py` — `run_steady_state_scenario()`, the two-phase (no-UV steady state → UV-on steady state) orchestrator.
+- `guvcfd/visualization.py` — 3D case preview (room, lamps, inlet/outlet, fan) built on `guv_calcs`' `RoomPlotter`.
+- `guvcfd/app.py` — Dash GUI: load a `.guv` file, configure inlet/outlet/fan and simulation type, preview the case live. Run with `uv run python -m guvcfd.app`.
 
 ## Status
 
-Early — CLI/API surface for driving this from outside a Python REPL is still minimal (`guvcfd/cli.py`). No GUI yet.
+Early — case setup/preview GUI exists (`guvcfd/app.py`); running a simulation and viewing results is still only wired up via a Python REPL / `guvcfd/cli.py`, not yet from the GUI.
