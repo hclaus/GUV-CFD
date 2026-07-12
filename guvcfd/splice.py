@@ -133,6 +133,28 @@ def set_control_dict_time(case_dir, end_time=None, write_interval=None, delta_t=
     return cd_path
 
 
+def set_control_dict_start_from(case_dir, mode):
+    """Set controlDict's startFrom to "latestTime" (resume the solver from
+    whatever time directory is already on disk) or "startTime" (the normal
+    fresh-run default) - used to extend an already-run decay simulation to a
+    longer duration without redoing mesh generation or flow convergence.
+
+    Both the solver *and* `postProcess -dict ...` honor this setting for
+    their own time range (verified directly - left on latestTime,
+    `postProcess` only recomputes the single newest time step instead of the
+    full history). So a resume needs latestTime for the solver step, then
+    startTime again (with endTime left at its new, higher value) before
+    postProcess runs, to get one continuous merged decay curve back.
+    """
+    cd_path = f"{case_dir}/system/controlDict"
+    with open(cd_path) as f:
+        content = f.read()
+    content = re.sub(r'(\n[ \t]*)startFrom(\s+)\w+;', rf'\g<1>startFrom\g<2>{mode};', content, count=1)
+    with open(cd_path, "w") as f:
+        f.write(content)
+    return cd_path
+
+
 _SIMPLE_BLOCK = """
 SIMPLE
 {

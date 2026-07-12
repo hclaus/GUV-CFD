@@ -130,6 +130,8 @@ def converge_flow_field(case_dir, n_iterations=500, fan_entry=None, log_fn=print
     case_dir_wsl = _wsl_path(case_dir)
     solver = "pimpleFoam" if method == "lts" else "simpleFoam"
 
+    log_fn(f"Flow-convergence budget: {max_iterations} iterations max, in chunks of {n_iterations}...")
+
     log_fn("Disabling scalarTransport1 for flow development...")
     set_function_object_enabled(case_dir, "scalarTransport1", False)
 

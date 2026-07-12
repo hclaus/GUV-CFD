@@ -22,6 +22,7 @@ from .decay_analysis import write_results_summary
 from .fan import fan_fvoptions_entry
 from .initial_fields import compute_inlet_velocity
 from .run_pipeline import setup_case
+from .splice import set_control_dict_start_from, set_control_dict_time
 from .steady_state_pipeline import run_steady_state_scenario
 from .visualization import plot_case
 from .wsl_utils import run_wsl, run_wsl_or_raise, run_wsl_streaming, wsl_path, StoppedByUser
@@ -159,6 +160,15 @@ _STEADY_STATE_MARKERS = [
     ("Phase 2: source + UV", "Phase 2: source + UV"),
 ]
 
+# "Continue" reuses the existing mesh/flow field/UV zones untouched (see
+# _continue_decay) - only pimpleFoam and the post-processing/results steps
+# rerun, so it gets its own short checklist rather than DECAY_STEPS' full one.
+CONTINUE_STEPS = ["Run pimpleFoam (decay)", "Post-process & write results"]
+_CONTINUE_MARKERS = [
+    ("Running pimpleFoam", "Run pimpleFoam (decay)"),
+    ("Running postProcess volAverage", "Post-process & write results"),
+]
+
 _TIME_RE = re.compile(r"^Time\s*=\s*([\d.eE+-]+)\s*$")
 
 # Each pattern's single capture group is the target Time value for the
@@ -168,19 +178,36 @@ _TIME_RE = re.compile(r"^Time\s*=\s*([\d.eE+-]+)\s*$")
 # so an ETA can be computed from (current Time / target) without threading
 # a separate progress callback through run_pipeline.py/steady_state_pipeline.py.
 _PHASE_TARGET_PATTERNS = [
-    re.compile(r"Running simpleFoam iterations \d+-(\d+) \(chunk size"),  # flow-convergence chunk
     re.compile(r"Running simpleFoam \((\d+) iterations, writing every"),  # steady-state phase
     re.compile(r"Running pimpleFoam to ([\d.]+)s"),  # decay transient run
 ]
 
+# Flow convergence is special-cased rather than folded into
+# _PHASE_TARGET_PATTERNS above: each simpleFoam chunk always logs its own
+# "Time" starting back at (near) 0 - see converge_flow_field's docstring, the
+# chunk's fields carry over but its solver-internal Time counter doesn't - so
+# naively treating each chunk as its own phase (old behavior) made the
+# progress fraction *shrink* every chunk (500/500, then 500/1000, 500/1500,
+# ...) instead of climbing. Fixed by anchoring target_time once to the whole
+# budget (_FLOW_BUDGET_RE, logged once at the start of converge_flow_field)
+# and tracking a running chunk_base offset (_FLOW_CHUNK_RE, logged at the
+# start of every chunk) added to each chunk's local Time to get a true
+# cumulative iteration count.
+_FLOW_BUDGET_RE = re.compile(r"Flow-convergence budget: (\d+) iterations max")
+_FLOW_CHUNK_RE = re.compile(r"Running simpleFoam iterations (\d+)-\d+ \(chunk size")
+
 
 def _reset_run_progress(sim_type):
-    steps = DECAY_STEPS if sim_type == "decay" else STEADY_STATE_STEPS
-    markers = _DECAY_MARKERS if sim_type == "decay" else _STEADY_STATE_MARKERS
+    if sim_type == "decay":
+        steps, markers = DECAY_STEPS, _DECAY_MARKERS
+    elif sim_type == "continue":
+        steps, markers = CONTINUE_STEPS, _CONTINUE_MARKERS
+    else:
+        steps, markers = STEADY_STATE_STEPS, _STEADY_STATE_MARKERS
     _run_state.update(
         sim_type=sim_type, steps=steps, markers=markers,
         step_status={s: "pending" for s in steps}, log=[],
-        current_time=None, target_time=None, phase_start_time=None,
+        current_time=None, target_time=None, phase_start_time=None, chunk_base=None,
         start_time=time.time(), stop_requested=False,
     )
 
@@ -207,18 +234,31 @@ def _run_log(msg):
         # memory growth while keeping plenty of scrollback.
         del log[: len(log) - _MAX_LOG_LINES]
 
-    for pattern in _PHASE_TARGET_PATTERNS:
-        m = pattern.search(msg)
+    m = _FLOW_BUDGET_RE.search(msg)
+    if m:
+        _run_state["target_time"] = float(m.group(1))
+        _run_state["phase_start_time"] = time.time()
+        _run_state["current_time"] = None
+        _run_state["chunk_base"] = 0
+    else:
+        m = _FLOW_CHUNK_RE.search(msg)
         if m:
-            _run_state["target_time"] = float(m.group(1))
-            _run_state["phase_start_time"] = time.time()
-            _run_state["current_time"] = None
-            break
+            _run_state["chunk_base"] = float(m.group(1)) - 1
+        else:
+            for pattern in _PHASE_TARGET_PATTERNS:
+                m = pattern.search(msg)
+                if m:
+                    _run_state["target_time"] = float(m.group(1))
+                    _run_state["phase_start_time"] = time.time()
+                    _run_state["current_time"] = None
+                    _run_state["chunk_base"] = None
+                    break
 
     for line in msg.splitlines():
         m = _TIME_RE.match(line.strip())
         if m:
-            _run_state["current_time"] = m.group(1)
+            base = _run_state.get("chunk_base")
+            _run_state["current_time"] = str(float(m.group(1)) + base) if base is not None else m.group(1)
 
     steps = _run_state.get("steps", [])
     for substr, step_name in _run_state.get("markers", []):
@@ -243,6 +283,43 @@ def _fan_kwargs(settings):
     )
 
 
+# Settings that determine the mesh/flow field/UV zones a full Run builds -
+# everything Continue reuses as-is without regenerating. If any of these
+# differ between what's on disk and what the GUI currently shows, Continue
+# would silently apply the OLD values (not what the user now sees in the
+# form) since it only touches pimpleFoam. pimple-end-time/write-interval are
+# deliberately excluded - changing those is the whole point of Continue.
+_MESH_AFFECTING_FIELDS = [
+    "ach", "z-value",
+    "inlet-wall", "inlet-y-input", "inlet-z-input", "inlet-size-w", "inlet-size-h",
+    "outlet-wall", "outlet-y-input", "outlet-z-input", "outlet-size-w", "outlet-size-h",
+    "fan-enable", "fan-speed", "fan-direction", "fan-radius", "fan-thickness",
+    "fan-x-input", "fan-y-input", "fan-z-input",
+]
+
+
+def _save_run_settings(case_dir, settings):
+    with open(f"{case_dir}/run_settings.json", "w") as f:
+        json.dump({k: settings.get(k) for k in _MESH_AFFECTING_FIELDS}, f, indent=2)
+
+
+def _settings_mismatch(case_dir, current_settings):
+    """Compare current GUI settings against what the case directory's mesh/
+    flow field were actually last built with (see _save_run_settings).
+    Returns a list of (field, prior_value, current_value) tuples for
+    anything that differs; [] if nothing differs or there's no prior record
+    to compare against (an older case dir predating this check, say).
+    """
+    path = f"{case_dir}/run_settings.json"
+    if not Path(path).exists():
+        return []
+    with open(path) as f:
+        prior = json.load(f)
+    return [(field, prior[field], current_settings.get(field))
+            for field in _MESH_AFFECTING_FIELDS
+            if field in prior and prior[field] != current_settings.get(field)]
+
+
 def _run_decay(guv_path, case_dir, room, settings):
     summary = setup_case(
         guv_path, case_dir, template_case_dir=TEMPLATE_CASE_DIR,
@@ -260,6 +337,11 @@ def _run_decay(guv_path, case_dir, room, settings):
     )
     if _should_stop():
         raise StoppedByUser("Stopped after case setup.")
+
+    # Record what the mesh/flow field were actually built with, regardless
+    # of whether pimpleFoam below succeeds - Continue compares against this,
+    # not against whatever the GUI happens to show later.
+    _save_run_settings(case_dir, settings)
 
     case_dir_wsl = wsl_path(case_dir)
     _run_log(f"Running pimpleFoam to {settings['pimple-end-time']}s (this can take a while)...")
@@ -280,6 +362,65 @@ def _run_decay(guv_path, case_dir, room, settings):
     results = write_results_summary(
         case_dir, f"{case_dir}/results.json", settings["ach"],
         summary["eACH_uv_well_mixed_mean"], extra={"n_lamps": summary["n_lamps"]},
+    )
+    _complete_all_steps()
+    _run_log(f"Done. eACH_uv effective={results['eACH_uv_effective']:.4g} /hr "
+             f"(well-mixed={results['eACH_uv_well_mixed']:.4g} /hr)")
+
+
+def _continue_decay(case_dir, end_time, write_interval):
+    """Extend an already-completed decay run to a longer duration, reusing
+    the existing mesh/converged flow field/UV zones as-is - only pimpleFoam
+    (and the postProcess/results steps after it) reruns.
+
+    Two controlDict states are needed, not one: startFrom=latestTime makes
+    the *solver* resume from whatever time directory is already on disk
+    (verified: it genuinely continues the physics, not just relabeling t=0).
+    But postProcess -dict system/volAverageDict honors that same setting for
+    its own processing range too - left on latestTime, it only recomputes
+    the single newest time step rather than the whole curve (verified
+    directly: postProcessing/volAverage1/90/ instead of the expected .../0/,
+    containing just one row). So startFrom is switched back to startTime
+    (endTime stays at the new, higher value) before postProcess runs, so it
+    walks the full 0..end_time history and produces one continuous merged
+    decay curve - not something that needs manual stitching in Python.
+    """
+    results_path = f"{case_dir}/results.json"
+    if not Path(results_path).exists():
+        raise RuntimeError(
+            f"No existing results.json in {case_dir} - run a full simulation "
+            f"here first before continuing it."
+        )
+    with open(results_path) as f:
+        prior = json.load(f)
+
+    case_dir_wsl = wsl_path(case_dir)
+    _run_log(f"Resuming from the latest existing time directory, extending to {end_time}s "
+             f"(mesh, flow field, and UV zones are untouched)...")
+    set_control_dict_start_from(case_dir, "latestTime")
+    set_control_dict_time(case_dir, end_time=end_time, write_interval=write_interval)
+
+    _run_log(f"Running pimpleFoam to {end_time}s...")
+    r = run_wsl_streaming(
+        "pimpleFoam 2>&1 | tee -a log.pimpleFoam", case_dir_wsl,
+        on_line=_run_log, should_stop=_should_stop, kill_pattern="pimpleFoam",
+    )
+    if _should_stop():
+        raise StoppedByUser("Stopped during pimpleFoam.")
+    if r.returncode != 0 or "FOAM FATAL" in r.stdout or "Floating Point Exception" in r.stdout:
+        tail = "\n".join(r.stdout.splitlines()[-25:]) or "(no output captured)"
+        raise RuntimeError(f"pimpleFoam failed (exit {r.returncode}):\n{tail}")
+
+    _run_log("Running postProcess volAverage (recomputing the full merged decay curve)...")
+    set_control_dict_start_from(case_dir, "startTime")
+    run_wsl_or_raise("rm -rf postProcessing", case_dir_wsl, "clearing stale postProcessing")
+    run_wsl_or_raise("postProcess -dict system/volAverageDict", case_dir_wsl, "postProcess volAverage")
+
+    _run_log("Writing results summary...")
+    extra = {k: prior[k] for k in ("n_lamps",) if k in prior}
+    results = write_results_summary(
+        case_dir, results_path, prior["ventilation_ach"], prior["eACH_uv_well_mixed"],
+        extra=extra or None,
     )
     _complete_all_steps()
     _run_log(f"Done. eACH_uv effective={results['eACH_uv_effective']:.4g} /hr "
@@ -362,6 +503,18 @@ def _run_pipeline_thread(sim_type, guv_path, case_dir, room, settings):
             _run_decay(guv_path, case_dir, room, settings)
         else:
             _run_steady_state(guv_path, case_dir, room, settings)
+        _run_state["status"] = "done"
+    except StoppedByUser as e:
+        _run_log(f"Stopped: {e}")
+        _run_state["status"] = "stopped"
+    except Exception as e:
+        _run_log(f"ERROR: {e}")
+        _run_state["status"] = "error"
+
+
+def _continue_pipeline_thread(case_dir, end_time, write_interval):
+    try:
+        _continue_decay(case_dir, end_time, write_interval)
         _run_state["status"] = "done"
     except StoppedByUser as e:
         _run_log(f"Stopped: {e}")
@@ -578,6 +731,8 @@ project_setup_tab = dbc.Row([
         ]),
 
         dbc.Button("Run simulation", id="run-btn", color="success", className="w-100 mb-2"),
+        dbc.Button("Continue to longer duration", id="continue-btn", color="secondary",
+                   outline=True, className="w-100 mb-2"),
         html.Div(id="run-validation-msg", className="small text-danger text-center mb-4"),
     ], width=4, style={"maxHeight": "88vh", "overflowY": "auto"}),
 
@@ -675,12 +830,36 @@ def _steady_state_summary(result):
 
 
 def _decay_figure(result):
+    """Actual CFD decay curve plus two idealized well-mixed reference curves
+    (pure ventilation, and ventilation+UV at the well-mixed eACH estimate)
+    computed from the same T[0] starting value - so the gap between the real
+    (CFD) curve and each reference visually shows how much imperfect mixing
+    slows disinfection versus the idealized box-model assumption. Log y-axis
+    since decay is exponential - a straight line here is a pure exponential,
+    and curvature/kinks reveal where the real mixing deviates from one.
+    """
     curve = result["decay_curve"]
+    t, T = curve["t_seconds"], curve["volAverage_T"]
+    T0 = T[0] if T else 1.0
+
+    lambda_vent = result["ventilation_ach"] / 3600.0
+    lambda_well_mixed = lambda_vent + result["eACH_uv_well_mixed"] / 3600.0
+    ach_curve = [T0 * math.exp(-lambda_vent * ti) for ti in t]
+    well_mixed_curve = [T0 * math.exp(-lambda_well_mixed * ti) for ti in t]
+
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=curve["t_seconds"], y=curve["volAverage_T"], mode="lines+markers",
-                              name="volAverage(T)", line=dict(color="#3498db", width=2)))
+    fig.add_trace(go.Scatter(x=t, y=T, mode="lines+markers", name="volAverage(T) - actual (CFD)",
+                              line=dict(color="#3498db", width=2)))
+    fig.add_trace(go.Scatter(x=t, y=ach_curve, mode="lines",
+                              name=f"Ventilation ACH only ({result['ventilation_ach']:.3g}/hr)",
+                              line=dict(color="#95a5a6", width=2, dash="dash")))
+    fig.add_trace(go.Scatter(x=t, y=well_mixed_curve, mode="lines",
+                              name=f"Well-mixed, ACH+eACH_uv "
+                                   f"({result['ventilation_ach'] + result['eACH_uv_well_mixed']:.3g}/hr)",
+                              line=dict(color="#e67e22", width=2, dash="dash")))
     fig.update_layout(
-        xaxis_title="Time (s)", yaxis_title="volAverage(T)",
+        xaxis_title="Time (s)", yaxis_title="volAverage(T)", yaxis_type="log",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
         margin=dict(l=50, r=20, t=30, b=45),
     )
     return fig
@@ -715,6 +894,7 @@ app.layout = dbc.Container([
     dcc.Store(id="fresh-room-load"),
     dcc.Store(id="results-data"),
     dcc.Interval(id="run-poll", interval=2000, n_intervals=0, disabled=True),
+    dcc.ConfirmDialog(id="overwrite-confirm"),
     dbc.Row([
         dbc.Col(html.H4("GUV-CFD", className="mt-3 mb-1"), width="auto"),
         dbc.Col(dbc.DropdownMenu(
@@ -972,42 +1152,149 @@ def _open_project(n_clicks):
     return tuple([proj_name, status] + field_values + max_values)
 
 
-@app.callback(
-    Output("run-btn", "disabled"),
-    Output("run-poll", "disabled", allow_duplicate=True),
-    Output("run-validation-msg", "children"),
-    Output("main-tabs", "active_tab"),
-    Input("run-btn", "n_clicks"),
-    [State(fid, "value") for fid in SETTINGS_FIELDS],
-    prevent_initial_call=True,
-)
-def _start_run(n_clicks, *values):
-    if _run_state["status"] == "running":
-        return True, False, dash.no_update, "processing"
+def _case_dir_has_data(case_dir):
+    """True if case_dir already looks like it holds a completed or
+    in-progress run (a results.json, or any real solver time directory
+    beyond 0/) - used to warn before a fresh Run regenerates the mesh and
+    silently overwrites/orphans it. Not a guarantee of what a fresh run
+    would actually delete (see _continue_decay's docstring - simpleFoam's
+    own chunk cleanup deletes non-0/ time directories, but only if it gets
+    far enough to run), just a "there's something here" heuristic.
+    """
+    p = Path(case_dir)
+    if (p / "results.json").exists():
+        return True
+    if not p.exists():
+        return False
+    return any(c.is_dir() and c.name != "0" and re.fullmatch(r"\d+(\.\d+)?", c.name)
+               for c in p.iterdir())
 
-    room = _loaded["room"]
-    guv_path = _loaded["path"]
-    if room is None or guv_path is None:
-        return (False, True, "No .guv project loaded - use File > Open Project or "
-                "Load .guv file first.", dash.no_update)
 
-    settings = dict(zip(SETTINGS_FIELDS, values))
-    case_dir = settings["case-dir"]
-    if not case_dir:
-        return False, True, "Set an OpenFOAM project directory first.", dash.no_update
+# Holds a Run click's settings between the overwrite-confirmation prompt and
+# the user's confirm click (two separate callbacks/requests) - single-user
+# local tool, so plain module state is fine here (same pattern as _run_state).
+_pending_run = {"sim_type": None, "guv_path": None, "case_dir": None, "room": None, "settings": None}
 
-    sim_type = settings["sim-type"]
+
+def _launch_run(sim_type, guv_path, case_dir, room, settings):
     _reset_run_progress(sim_type)
     _run_state["status"] = "running"
     _run_state["case_dir"] = case_dir
-
     thread = threading.Thread(
         target=_run_pipeline_thread,
         args=(sim_type, guv_path, case_dir, room, settings),
         daemon=True,
     )
     thread.start()
-    return True, False, "", "processing"
+
+
+@app.callback(
+    Output("run-btn", "disabled"),
+    Output("continue-btn", "disabled", allow_duplicate=True),
+    Output("run-poll", "disabled", allow_duplicate=True),
+    Output("run-validation-msg", "children"),
+    Output("main-tabs", "active_tab"),
+    Output("overwrite-confirm", "displayed"),
+    Output("overwrite-confirm", "message"),
+    Input("run-btn", "n_clicks"),
+    [State(fid, "value") for fid in SETTINGS_FIELDS],
+    prevent_initial_call=True,
+)
+def _start_run(n_clicks, *values):
+    if _run_state["status"] == "running":
+        return True, True, False, dash.no_update, "processing", False, dash.no_update
+
+    room = _loaded["room"]
+    guv_path = _loaded["path"]
+    if room is None or guv_path is None:
+        return (False, False, True, "No .guv project loaded - use File > Open Project or "
+                "Load .guv file first.", dash.no_update, False, dash.no_update)
+
+    settings = dict(zip(SETTINGS_FIELDS, values))
+    case_dir = settings["case-dir"]
+    if not case_dir:
+        return (False, False, True, "Set an OpenFOAM project directory first.",
+                dash.no_update, False, dash.no_update)
+
+    sim_type = settings["sim-type"]
+
+    if _case_dir_has_data(case_dir):
+        _pending_run.update(sim_type=sim_type, guv_path=guv_path, case_dir=case_dir,
+                             room=room, settings=settings)
+        return (False, False, True, "", dash.no_update, True,
+                f"{case_dir} already has simulation data (results.json and/or solver "
+                f"output). Running will regenerate the mesh and overwrite the case "
+                f"directory in place - existing results may be lost. Continue anyway?")
+
+    _launch_run(sim_type, guv_path, case_dir, room, settings)
+    return True, True, False, "", "processing", False, dash.no_update
+
+
+@app.callback(
+    Output("run-btn", "disabled", allow_duplicate=True),
+    Output("continue-btn", "disabled", allow_duplicate=True),
+    Output("run-poll", "disabled", allow_duplicate=True),
+    Output("main-tabs", "active_tab", allow_duplicate=True),
+    Input("overwrite-confirm", "submit_n_clicks"),
+    prevent_initial_call=True,
+)
+def _confirm_overwrite_run(submit_n_clicks):
+    if not _pending_run.get("case_dir"):
+        return dash.no_update, dash.no_update, dash.no_update, dash.no_update
+    _launch_run(_pending_run["sim_type"], _pending_run["guv_path"], _pending_run["case_dir"],
+                _pending_run["room"], _pending_run["settings"])
+    _pending_run.update(sim_type=None, guv_path=None, case_dir=None, room=None, settings=None)
+    return True, True, False, "processing"
+
+
+@app.callback(
+    Output("continue-btn", "disabled"),
+    Output("run-btn", "disabled", allow_duplicate=True),
+    Output("run-poll", "disabled", allow_duplicate=True),
+    Output("run-validation-msg", "children", allow_duplicate=True),
+    Output("main-tabs", "active_tab", allow_duplicate=True),
+    Input("continue-btn", "n_clicks"),
+    State("case-dir", "value"),
+    State("sim-type", "value"),
+    State("pimple-end-time", "value"),
+    State("pimple-write-interval", "value"),
+    [State(fid, "value") for fid in _MESH_AFFECTING_FIELDS],
+    prevent_initial_call=True,
+)
+def _start_continue(n_clicks, case_dir, sim_type, end_time, write_interval, *mesh_values):
+    if _run_state["status"] == "running":
+        return True, True, False, dash.no_update, "processing"
+
+    if sim_type != "decay":
+        return (False, False, True, "Continuing to a longer duration is only supported "
+                "for Decay Curve runs.", dash.no_update)
+    if not case_dir:
+        return False, False, True, "Set an OpenFOAM project directory first.", dash.no_update
+    if not Path(f"{case_dir}/results.json").exists():
+        return (False, False, True, "No completed run found in this directory yet - run a "
+                "full simulation first, then use Continue to extend it.", dash.no_update)
+
+    mismatches = _settings_mismatch(case_dir, dict(zip(_MESH_AFFECTING_FIELDS, mesh_values)))
+    if mismatches:
+        changed = "; ".join(f"{field} was {prior}, now {current}"
+                             for field, prior, current in mismatches)
+        return (False, False, True,
+                f"These settings differ from the run currently on disk, and Continue won't "
+                f"apply them (it only reruns pimpleFoam - mesh/flow field/UV zones are reused "
+                f"as-is): {changed}. Run a full simulation instead if you want these changes "
+                f"to take effect.", dash.no_update)
+
+    _reset_run_progress("continue")
+    _run_state["status"] = "running"
+    _run_state["case_dir"] = case_dir
+
+    thread = threading.Thread(
+        target=_continue_pipeline_thread,
+        args=(case_dir, end_time, write_interval),
+        daemon=True,
+    )
+    thread.start()
+    return True, True, False, "", "processing"
 
 
 @app.callback(
@@ -1067,8 +1354,9 @@ def _solver_progress_text():
 
     pct = min(100, round(100 * cur_val / target))
     text = f"Solver time: {cur_val:.4g} / {target:.4g} ({pct}%)"
-    if cur_val > 0:
-        rate = cur_val / (time.time() - phase_start)
+    elapsed = time.time() - phase_start
+    if cur_val > 0 and elapsed > 0:
+        rate = cur_val / elapsed
         if rate > 0:
             text += f" — ETA ~{_format_duration((target - cur_val) / rate)}"
     return text
@@ -1078,6 +1366,7 @@ def _solver_progress_text():
     Output("run-log", "children"),
     Output("run-status-text", "children"),
     Output("run-btn", "disabled", allow_duplicate=True),
+    Output("continue-btn", "disabled", allow_duplicate=True),
     Output("run-poll", "disabled"),
     Output("stop-btn", "disabled"),
     Output("run-checklist", "children"),
@@ -1121,7 +1410,7 @@ def _poll_run(n_intervals):
         except Exception:
             results_data = dash.no_update
 
-    return (log_text, status_text, still_running, not still_running, not still_running,
+    return (log_text, status_text, still_running, still_running, not still_running, not still_running,
             _render_checklist(), pct, f"{pct}%", elapsed, cur_time_text, results_data)
 
 
