@@ -4,7 +4,10 @@ pipeline. Local single-user tool - run `python -m guvcfd.app` and open
 the printed localhost URL.
 """
 import json
+import math
+import re
 import threading
+import time
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog
@@ -21,7 +24,7 @@ from .initial_fields import compute_inlet_velocity
 from .run_pipeline import setup_case
 from .steady_state_pipeline import run_steady_state_scenario
 from .visualization import plot_case
-from .wsl_utils import run_wsl, run_wsl_or_raise, wsl_path
+from .wsl_utils import run_wsl, run_wsl_or_raise, run_wsl_streaming, wsl_path, StoppedByUser
 
 # Reference case setup_case() copies its static config (controlDict,
 # fvSchemes, fvSolution, transportProperties, turbulenceProperties,
@@ -91,14 +94,140 @@ def _compute_default_run_dir():
 
 _DEFAULT_RUN_DIR = _compute_default_run_dir()
 
+_UNSAFE_FOLDER_CHARS_RE = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+def _sanitize_folder_name(name):
+    name = _UNSAFE_FOLDER_CHARS_RE.sub("_", name).strip("_")
+    return name or "case"
+
+
+def _fresh_case_dir(guv_path):
+    """A new, never-colliding project-directory default under $FOAM_RUN,
+    named after the loaded .guv file. Always points at a subfolder (never
+    $FOAM_RUN itself, which every project would otherwise dump straight
+    into) and always a folder that doesn't exist yet - loading the same
+    project twice gets "name", "name-2", "name-3", ... rather than one run
+    silently overwriting another's.
+    """
+    if not _DEFAULT_RUN_DIR:
+        return _DEFAULT_RUN_DIR
+    base_name = _sanitize_folder_name(Path(guv_path).stem if guv_path else "case")
+    candidate = f"{_DEFAULT_RUN_DIR}\\{base_name}"
+    n = 2
+    while Path(candidate).exists():
+        candidate = f"{_DEFAULT_RUN_DIR}\\{base_name}-{n}"
+        n += 1
+    return candidate
+
 # Background-thread run state - a real pipeline run takes minutes, far too
 # long for a single Dash callback/HTTP request, so it runs in a daemon
 # thread while a dcc.Interval polls this dict for the GUI to display.
-_run_state = {"status": "idle", "log": [], "case_dir": None}
+_run_state = {
+    "status": "idle", "log": [], "case_dir": None, "sim_type": None,
+    "steps": [], "step_status": {}, "markers": [],
+    "current_time": None, "start_time": None, "stop_requested": False,
+}
+
+# Checklist shown on the Processing tab, and the log-line substrings that
+# advance it - reuses the log_fn messages the pipeline already emits rather
+# than threading a separate step-tracking callback through run_pipeline.py/
+# steady_state_pipeline.py. Order matters: a later marker also retroactively
+# marks every earlier step "done" (see _run_log), so this only needs each
+# step's *first* recognizable log line, not an explicit "finished" one.
+DECAY_STEPS = [
+    "Generate mesh", "Write initial fields", "Converge flow field",
+    "Compute fluence & UV zones", "Run pimpleFoam (decay)", "Post-process & write results",
+]
+_DECAY_MARKERS = [
+    ("Running blockMesh", "Generate mesh"),
+    ("Writing initial fields", "Write initial fields"),
+    ("Converging flow field", "Converge flow field"),
+    ("Computing fluence rate", "Compute fluence & UV zones"),
+    ("Running pimpleFoam", "Run pimpleFoam (decay)"),
+    ("Running postProcess volAverage", "Post-process & write results"),
+]
+
+STEADY_STATE_STEPS = [
+    "Set up mesh, flow field, and UV zones", "Carve contaminant source zone",
+    "Phase 1: source only (no UV)", "Phase 2: source + UV", "Write results",
+]
+_STEADY_STATE_MARKERS = [
+    ("Setting up mesh, flow field", "Set up mesh, flow field, and UV zones"),
+    ("Carving source cellZone", "Carve contaminant source zone"),
+    ("Phase 1: source only", "Phase 1: source only (no UV)"),
+    ("Phase 2: source + UV", "Phase 2: source + UV"),
+]
+
+_TIME_RE = re.compile(r"^Time\s*=\s*([\d.eE+-]+)\s*$")
+
+# Each pattern's single capture group is the target Time value for the
+# phase/chunk that log line announces the start of - matched against the
+# exact log_fn messages the pipeline already emits (see converge_flow_field,
+# steady_state_pipeline._run_phase, and _run_decay's pimpleFoam line below),
+# so an ETA can be computed from (current Time / target) without threading
+# a separate progress callback through run_pipeline.py/steady_state_pipeline.py.
+_PHASE_TARGET_PATTERNS = [
+    re.compile(r"Running simpleFoam iterations \d+-(\d+) \(chunk size"),  # flow-convergence chunk
+    re.compile(r"Running simpleFoam \((\d+) iterations, writing every"),  # steady-state phase
+    re.compile(r"Running pimpleFoam to ([\d.]+)s"),  # decay transient run
+]
+
+
+def _reset_run_progress(sim_type):
+    steps = DECAY_STEPS if sim_type == "decay" else STEADY_STATE_STEPS
+    markers = _DECAY_MARKERS if sim_type == "decay" else _STEADY_STATE_MARKERS
+    _run_state.update(
+        sim_type=sim_type, steps=steps, markers=markers,
+        step_status={s: "pending" for s in steps}, log=[],
+        current_time=None, target_time=None, phase_start_time=None,
+        start_time=time.time(), stop_requested=False,
+    )
+
+
+def _complete_all_steps():
+    for s in _run_state.get("steps", []):
+        _run_state["step_status"][s] = "done"
+
+
+def _should_stop():
+    return _run_state.get("stop_requested", False)
+
+
+_MAX_LOG_LINES = 5000
 
 
 def _run_log(msg):
-    _run_state["log"].append(str(msg))
+    msg = str(msg)
+    log = _run_state["log"]
+    log.append(msg)
+    if len(log) > _MAX_LOG_LINES:
+        # Streaming solver output line-by-line (vs. the old tail-20 dump)
+        # means a long run can produce tens of thousands of lines - cap
+        # memory growth while keeping plenty of scrollback.
+        del log[: len(log) - _MAX_LOG_LINES]
+
+    for pattern in _PHASE_TARGET_PATTERNS:
+        m = pattern.search(msg)
+        if m:
+            _run_state["target_time"] = float(m.group(1))
+            _run_state["phase_start_time"] = time.time()
+            _run_state["current_time"] = None
+            break
+
+    for line in msg.splitlines():
+        m = _TIME_RE.match(line.strip())
+        if m:
+            _run_state["current_time"] = m.group(1)
+
+    steps = _run_state.get("steps", [])
+    for substr, step_name in _run_state.get("markers", []):
+        if substr in msg and step_name in steps:
+            idx = steps.index(step_name)
+            for i, s in enumerate(steps):
+                _run_state["step_status"][s] = "done" if i < idx else "running" if i == idx else \
+                    _run_state["step_status"].get(s, "pending")
+            break
 
 
 def _fan_kwargs(settings):
@@ -126,17 +255,23 @@ def _run_decay(guv_path, case_dir, room, settings):
         outlet_size=(settings["outlet-size-w"], settings["outlet-size-h"]),
         pimple_end_time=settings["pimple-end-time"],
         pimple_write_interval=settings["pimple-write-interval"],
-        log_fn=_run_log,
+        log_fn=_run_log, should_stop=_should_stop,
         **_fan_kwargs(settings),
     )
+    if _should_stop():
+        raise StoppedByUser("Stopped after case setup.")
 
     case_dir_wsl = wsl_path(case_dir)
-    _run_log("Running pimpleFoam (this can take a while)...")
-    r = run_wsl("rm -f log.pimpleFoam; pimpleFoam > log.pimpleFoam 2>&1", case_dir_wsl)
-    tail = run_wsl("tail -30 log.pimpleFoam", case_dir_wsl).stdout
-    _run_log(tail)
-    if r.returncode != 0 or "FOAM FATAL" in tail or "Floating Point Exception" in tail:
-        raise RuntimeError(f"pimpleFoam failed (exit {r.returncode}), see log above")
+    _run_log(f"Running pimpleFoam to {settings['pimple-end-time']}s (this can take a while)...")
+    r = run_wsl_streaming(
+        "pimpleFoam 2>&1 | tee log.pimpleFoam", case_dir_wsl,
+        on_line=_run_log, should_stop=_should_stop, kill_pattern="pimpleFoam",
+    )
+    if _should_stop():
+        raise StoppedByUser("Stopped during pimpleFoam.")
+    if r.returncode != 0 or "FOAM FATAL" in r.stdout or "Floating Point Exception" in r.stdout:
+        tail = "\n".join(r.stdout.splitlines()[-25:]) or "(no output captured)"
+        raise RuntimeError(f"pimpleFoam failed (exit {r.returncode}):\n{tail}")
 
     _run_log("Running postProcess volAverage...")
     run_wsl_or_raise("postProcess -dict system/volAverageDict", case_dir_wsl, "postProcess volAverage")
@@ -146,15 +281,31 @@ def _run_decay(guv_path, case_dir, room, settings):
         case_dir, f"{case_dir}/results.json", settings["ach"],
         summary["eACH_uv_well_mixed_mean"], extra={"n_lamps": summary["n_lamps"]},
     )
+    _complete_all_steps()
     _run_log(f"Done. eACH_uv effective={results['eACH_uv_effective']:.4g} /hr "
              f"(well-mixed={results['eACH_uv_well_mixed']:.4g} /hr)")
+
+
+def _settling_iterations(lambda_per_hr, target_fraction=0.995, min_iterations=500, max_iterations=50000):
+    """Iterations to settle to target_fraction of steady state for a
+    first-order well-mixed system (dT/dt = G/V - lambda*T): t = ln(1/(1-f))/lambda.
+    _run_phase() uses deltaT=1s per iteration, so this iteration count IS
+    the settling time in seconds directly - no separate unit conversion.
+    lambda_per_hr is the total removal rate (ventilation ACH, plus UV's
+    eACH for phase 2) in 1/hr.
+    """
+    if lambda_per_hr <= 0:
+        return max_iterations
+    lambda_per_s = lambda_per_hr / 3600.0
+    t = math.log(1.0 / (1.0 - target_fraction)) / lambda_per_s
+    return int(min(max_iterations, max(min_iterations, round(t))))
 
 
 def _run_steady_state(guv_path, case_dir, room, settings):
     fan_kwargs = _fan_kwargs(settings)
 
     _run_log("=== Setting up mesh, flow field, and UV zones ===")
-    setup_case(
+    summary = setup_case(
         guv_path, case_dir, template_case_dir=TEMPLATE_CASE_DIR,
         Z=settings["z-value"], ach=settings["ach"],
         inlet_wall=settings["inlet-wall"],
@@ -163,9 +314,11 @@ def _run_steady_state(guv_path, case_dir, room, settings):
         outlet_wall=settings["outlet-wall"],
         outlet_center=(settings["outlet-y-input"] / room.y, settings["outlet-z-input"] / room.z),
         outlet_size=(settings["outlet-size-w"], settings["outlet-size-h"]),
-        log_fn=_run_log,
+        log_fn=_run_log, should_stop=_should_stop,
         **fan_kwargs,
     )
+    if _should_stop():
+        raise StoppedByUser("Stopped after case setup.")
 
     fan_entry = None
     if settings["fan-enable"]:
@@ -177,19 +330,28 @@ def _run_steady_state(guv_path, case_dir, room, settings):
     v_mag = compute_inlet_velocity(settings["ach"], room_volume, inlet_area)
     inlet_velocity = tuple(v_mag * d for d in inflow_dir)
 
-    _run_log("=== Running steady-state two-phase scenario ===")
+    ach = settings["ach"]
+    eACH_uv = summary.get("eACH_uv_well_mixed_mean", 0.0)
+    phase1_iterations = max(settings["phase1-iterations"], _settling_iterations(ach))
+    phase2_iterations = max(settings["phase2-iterations"], _settling_iterations(ach + eACH_uv))
+    _run_log(f"99.5% settling estimate: phase1={_settling_iterations(ach)} iterations "
+             f"(ACH={ach:.3g}/hr alone), phase2={_settling_iterations(ach + eACH_uv)} iterations "
+             f"(ACH+eACH_uv={ach + eACH_uv:.3g}/hr) - using the larger of this and the configured "
+             f"value for each phase ({phase1_iterations}, {phase2_iterations}).")
+
     result = run_steady_state_scenario(
         case_dir, room.x, room.y, room.z, settings["ach"], settings["z-value"],
         source_center=(settings["inject-x-input"], settings["inject-y-input"], settings["inject-z-input"]),
         target_T_ss=settings["target-t-ss"],
         inlet_velocity=inlet_velocity,
-        phase1_iterations=settings["phase1-iterations"],
-        phase2_iterations=settings["phase2-iterations"],
+        phase1_iterations=phase1_iterations,
+        phase2_iterations=phase2_iterations,
         fan_entry=fan_entry,
-        log_fn=_run_log,
+        log_fn=_run_log, should_stop=_should_stop,
     )
     with open(f"{case_dir}/results.json", "w") as f:
         json.dump(result, f, indent=2)
+    _complete_all_steps()
     _run_log(f"Done. Reduction={result['reduction_pct']:.1f}%, "
              f"eACH_uv={result['eACH_uv_steady_state']:.4g} /hr")
 
@@ -201,6 +363,9 @@ def _run_pipeline_thread(sim_type, guv_path, case_dir, room, settings):
         else:
             _run_steady_state(guv_path, case_dir, room, settings)
         _run_state["status"] = "done"
+    except StoppedByUser as e:
+        _run_log(f"Stopped: {e}")
+        _run_state["status"] = "stopped"
     except Exception as e:
         _run_log(f"ERROR: {e}")
         _run_state["status"] = "error"
@@ -210,11 +375,14 @@ app = dash.Dash(__name__, external_stylesheets=[dbc.themes.FLATLY])
 app.title = "GUV-CFD"
 
 
-def _native_open_file(filetypes, title):
+def _native_open_file(filetypes, title, initialdir=None):
     root = tk.Tk()
     root.withdraw()
     root.attributes("-topmost", True)
-    path = filedialog.askopenfilename(title=title, filetypes=filetypes)
+    kwargs = {"title": title, "filetypes": filetypes}
+    if initialdir:
+        kwargs["initialdir"] = initialdir
+    path = filedialog.askopenfilename(**kwargs)
     root.destroy()
     # Tk returns forward-slash paths on Windows even for UNC (\\wsl.localhost\...)
     # paths - normalize so downstream code doesn't have to handle both forms.
@@ -410,13 +578,7 @@ project_setup_tab = dbc.Row([
         ]),
 
         dbc.Button("Run simulation", id="run-btn", color="success", className="w-100 mb-2"),
-        html.Div(id="run-status-text", className="small fw-semibold text-center mb-1"),
-        html.Pre(id="run-log", className="small mb-4", style={
-            "maxHeight": "220px", "overflowY": "auto", "fontSize": "11px",
-            "background": "rgba(127,127,127,0.08)", "padding": "8px",
-            "border": "1px solid rgba(127,127,127,0.3)", "whiteSpace": "pre-wrap",
-        }),
-        dcc.Interval(id="run-poll", interval=2000, n_intervals=0, disabled=True),
+        html.Div(id="run-validation-msg", className="small text-danger text-center mb-4"),
     ], width=4, style={"maxHeight": "88vh", "overflowY": "auto"}),
 
     # --- right column: 3D preview ---
@@ -425,13 +587,134 @@ project_setup_tab = dbc.Row([
     ], width=8),
 ])
 
-analysis_tab = html.Div(
-    "Results will appear here once a simulation has been run.",
-    className="text-muted p-5 text-center",
-)
+
+def _checklist_item(step):
+    return html.Li("☐ " + step, className="text-muted")
+
+
+processing_tab = dbc.Row([
+    dbc.Col([
+        html.Div(id="run-status-text", className="fs-5 fw-semibold mb-2"),
+        dbc.Progress(id="run-progress-bar", value=0, striped=True, animated=True, className="mb-2"),
+        html.Div(id="run-elapsed", className="small text-muted"),
+        html.Div(id="run-current-time", className="small text-muted mb-3"),
+        dbc.Button("Stop", id="stop-btn", color="danger", size="sm", className="mb-4", disabled=True),
+        html.Div("Steps", className="small fw-semibold text-uppercase mb-1"),
+        html.Ul([_checklist_item(s) for s in DECAY_STEPS], id="run-checklist", className="list-unstyled small"),
+    ], width=4),
+    dbc.Col([
+        html.Div("Log", className="small fw-semibold text-uppercase mb-1"),
+        html.Pre(id="run-log", className="small", style={
+            "height": "72vh", "overflowY": "auto", "fontSize": "11px",
+            "background": "rgba(127,127,127,0.08)", "padding": "8px",
+            "border": "1px solid rgba(127,127,127,0.3)", "whiteSpace": "pre-wrap",
+        }),
+    ], width=8),
+], className="mt-3")
+
+def _empty_analysis_figure():
+    return go.Figure(layout=dict(
+        annotations=[dict(text="Load a results.json to see analysis (or finish a run - it loads automatically)",
+                           showarrow=False, font=dict(size=16, color="#888"))],
+    ))
+
+
+def _steady_state_figure(result):
+    """T over time as a percentage of phase 1's steady state (100%), phase
+    1 and phase 2 plotted on one continuous linear timeline (phase 2
+    shifted to start where phase 1 ends) so the UV-on transition and its
+    reduction read directly off the curve. Time axis is linear - the
+    underlying OpenFOAM write schedule is what's log-spaced (see
+    _settling_write_schedule()), not this plot.
+    """
+    p1, p2 = result["phase1"], result["phase2"]
+    T_ss1 = p1["T_ss"] or 1.0
+    t1 = p1["decay_curve"]["t"]
+    T1 = p1["decay_curve"]["T"]
+    t1_end = t1[-1] if t1 else 0.0
+
+    t2 = p2["decay_curve"]["t"]
+    T2 = p2["decay_curve"]["T"]
+    t2_shifted = [t1_end + v for v in t2]
+
+    pct1 = [100 * v / T_ss1 for v in T1]
+    pct2 = [100 * v / T_ss1 for v in T2]
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=t1, y=pct1, mode="lines+markers", name="Phase 1 (no UV)",
+                              line=dict(color="#e67e22", width=2)))
+    fig.add_trace(go.Scatter(x=t2_shifted, y=pct2, mode="lines+markers", name="Phase 2 (UV on)",
+                              line=dict(color="#2ecc71", width=2)))
+    fig.add_hline(y=100, line_dash="dot", line_color="gray",
+                  annotation_text="Phase 1 steady state (100%)", annotation_position="top left")
+    pct2_ss = 100 * p2["T_ss"] / T_ss1
+    fig.add_hline(y=pct2_ss, line_dash="dot", line_color="#2ecc71",
+                  annotation_text=f"Phase 2 steady state ({pct2_ss:.1f}%)", annotation_position="bottom left")
+    fig.add_vline(x=t1_end, line_dash="dash", line_color="gray", annotation_text="UV on")
+    fig.update_layout(
+        xaxis_title="Time (s)", yaxis_title="T (% of phase 1 steady state)",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+        margin=dict(l=50, r=20, t=30, b=45),
+    )
+    return fig
+
+
+def _steady_state_summary(result):
+    p1, p2 = result["phase1"], result["phase2"]
+    rows = [
+        ("Target T_ss (design)", f"{result.get('target_T_ss', '?')}"),
+        ("Phase 1 T_ss", f"{p1['T_ss']:.4g}  ({'plateaued' if p1['converged'] else 'NOT fully plateaued'}, "
+                          f"{p1['iterations']} iterations)"),
+        ("Phase 2 T_ss", f"{p2['T_ss']:.4g}  ({'plateaued' if p2['converged'] else 'NOT fully plateaued'}, "
+                          f"{p2['iterations']} iterations)"),
+        ("Reduction", f"{result['reduction_pct']:.1f}%"),
+        ("eACH_uv (steady-state method)", f"{result['eACH_uv_steady_state']:.4g} /hr"),
+    ]
+    return [html.Div([html.Span(k + ": ", className="text-muted"), html.Span(v)], className="mb-1")
+            for k, v in rows]
+
+
+def _decay_figure(result):
+    curve = result["decay_curve"]
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=curve["t_seconds"], y=curve["volAverage_T"], mode="lines+markers",
+                              name="volAverage(T)", line=dict(color="#3498db", width=2)))
+    fig.update_layout(
+        xaxis_title="Time (s)", yaxis_title="volAverage(T)",
+        margin=dict(l=50, r=20, t=30, b=45),
+    )
+    return fig
+
+
+def _decay_summary(result):
+    rows = [
+        ("Ventilation ACH", f"{result['ventilation_ach']:.3g} /hr"),
+        ("eACH_uv well-mixed", f"{result['eACH_uv_well_mixed']:.4g} /hr"),
+        ("eACH_uv effective (CFD-fit)", f"{result['eACH_uv_effective']:.4g} /hr"),
+        ("Total ACH, effective", f"{result.get('total_ach_effective', 0):.3g} /hr"),
+    ]
+    if result.get("mixing_efficiency") is not None:
+        rows.append(("Mixing efficiency", f"{result['mixing_efficiency'] * 100:.1f}%"))
+    return [html.Div([html.Span(k + ": ", className="text-muted"), html.Span(v)], className="mb-1")
+            for k, v in rows]
+
+
+analysis_tab = dbc.Row([
+    dbc.Col([
+        dbc.Button("Load results.json...", id="load-results-btn", color="primary",
+                   size="sm", className="w-100 mb-2"),
+        html.Div(id="analysis-status", className="small text-muted mb-3"),
+        html.Div(id="analysis-summary", className="small"),
+    ], width=4),
+    dbc.Col([
+        dcc.Graph(id="analysis-graph", style={"height": "80vh"}, figure=_empty_analysis_figure()),
+    ], width=8),
+], className="mt-3")
 
 app.layout = dbc.Container([
     dcc.Store(id="fresh-room-load"),
+    dcc.Store(id="results-data"),
+    dcc.Interval(id="run-poll", interval=2000, n_intervals=0, disabled=True),
     dbc.Row([
         dbc.Col(html.H4("GUV-CFD", className="mt-3 mb-1"), width="auto"),
         dbc.Col(dbc.DropdownMenu(
@@ -451,8 +734,9 @@ app.layout = dbc.Container([
     ))),
     dbc.Tabs([
         dbc.Tab(project_setup_tab, label="Project Setup", tab_id="project-setup"),
+        dbc.Tab(processing_tab, label="Processing", tab_id="processing"),
         dbc.Tab(analysis_tab, label="Analysis of Results", tab_id="analysis"),
-    ], active_tab="project-setup", className="mb-3"),
+    ], active_tab="project-setup", className="mb-3", id="main-tabs"),
 ], fluid=True)
 
 
@@ -515,6 +799,7 @@ def _toggle_fan_controls(enabled):
     Output("project-status", "children"),
     Output("project-description", "value"),
     Output("fresh-room-load", "data"),
+    Output("case-dir", "value", allow_duplicate=True),
     Input("load-btn", "n_clicks"),
     prevent_initial_call=True,
 )
@@ -524,19 +809,19 @@ def _load_project(n_clicks):
         "Select a .guv project file",
     )
     if not path:
-        return dash.no_update, dash.no_update, dash.no_update
+        return dash.no_update, dash.no_update, dash.no_update, dash.no_update
     try:
         project = Project.load(path)
         room = next(iter(project.rooms.values()))
     except Exception as e:
-        return f"Failed to load: {e}", dash.no_update, dash.no_update
+        return f"Failed to load: {e}", dash.no_update, dash.no_update, dash.no_update
     _loaded["project"] = project
     _loaded["room"] = room
     _loaded["path"] = path
     name = path.replace("\\", "/").rsplit("/", 1)[-1]
     status = f"Loaded {name}: {room.x:.2f} x {room.y:.2f} x {room.z:.2f} {room.units}, {len(room.lamps)} lamp(s)"
     description = f"{room.x:.2f} x {room.y:.2f} x {room.z:.2f} {room.units} room"
-    return status, description, n_clicks
+    return status, description, n_clicks, _fresh_case_dir(path)
 
 
 @app.callback(
@@ -551,6 +836,47 @@ def _browse_case_dir(n_clicks, current_dir):
     if not path:
         return dash.no_update
     return path
+
+
+@app.callback(
+    Output("results-data", "data", allow_duplicate=True),
+    Output("analysis-status", "children"),
+    Input("load-results-btn", "n_clicks"),
+    State("case-dir", "value"),
+    prevent_initial_call=True,
+)
+def _load_results(n_clicks, case_dir_field):
+    # Prefer the directory of the run that actually just happened (this
+    # session), falling back to whatever's in the project-directory field -
+    # either way, start in the WSL-mapped project folder, not Tk's default.
+    initialdir = _run_state.get("case_dir") or case_dir_field or None
+    path = _native_open_file(
+        [("Results JSON", "*.json"), ("All files", "*.*")],
+        "Select a results.json file",
+        initialdir=initialdir,
+    )
+    if not path:
+        return dash.no_update, dash.no_update
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except Exception as e:
+        return dash.no_update, f"Failed to load: {e}"
+    name = path.replace("\\", "/").rsplit("/", 1)[-1]
+    return data, f"Loaded {name}"
+
+
+@app.callback(
+    Output("analysis-graph", "figure"),
+    Output("analysis-summary", "children"),
+    Input("results-data", "data"),
+)
+def _render_analysis(data):
+    if not data:
+        return _empty_analysis_figure(), []
+    if "phase1" in data:
+        return _steady_state_figure(data), _steady_state_summary(data)
+    return _decay_figure(data), _decay_summary(data)
 
 
 @app.callback(
@@ -649,36 +975,103 @@ def _open_project(n_clicks):
 @app.callback(
     Output("run-btn", "disabled"),
     Output("run-poll", "disabled", allow_duplicate=True),
-    Output("run-log", "children", allow_duplicate=True),
+    Output("run-validation-msg", "children"),
+    Output("main-tabs", "active_tab"),
     Input("run-btn", "n_clicks"),
     [State(fid, "value") for fid in SETTINGS_FIELDS],
     prevent_initial_call=True,
 )
 def _start_run(n_clicks, *values):
     if _run_state["status"] == "running":
-        return True, False, dash.no_update
+        return True, False, dash.no_update, "processing"
 
     room = _loaded["room"]
     guv_path = _loaded["path"]
     if room is None or guv_path is None:
-        return False, True, "No .guv project loaded - use File > Open Project or Load .guv file first."
+        return (False, True, "No .guv project loaded - use File > Open Project or "
+                "Load .guv file first.", dash.no_update)
 
     settings = dict(zip(SETTINGS_FIELDS, values))
     case_dir = settings["case-dir"]
     if not case_dir:
-        return False, True, "Set an OpenFOAM project directory first."
+        return False, True, "Set an OpenFOAM project directory first.", dash.no_update
 
+    sim_type = settings["sim-type"]
+    _reset_run_progress(sim_type)
     _run_state["status"] = "running"
-    _run_state["log"] = []
     _run_state["case_dir"] = case_dir
 
     thread = threading.Thread(
         target=_run_pipeline_thread,
-        args=(settings["sim-type"], guv_path, case_dir, room, settings),
+        args=(sim_type, guv_path, case_dir, room, settings),
         daemon=True,
     )
     thread.start()
-    return True, False, "Starting..."
+    return True, False, "", "processing"
+
+
+@app.callback(
+    Output("run-log", "children", allow_duplicate=True),
+    Input("stop-btn", "n_clicks"),
+    prevent_initial_call=True,
+)
+def _stop_run(n_clicks):
+    if _run_state["status"] == "running":
+        _run_state["stop_requested"] = True
+        _run_log("Stop requested - waiting for the current step to exit...")
+    return (dash.no_update,)
+
+
+def _render_checklist():
+    icons = {"pending": "☐", "running": "▶", "done": "☑"}
+    colors = {"pending": "text-muted", "running": "text-primary fw-semibold", "done": "text-success"}
+    steps = _run_state.get("steps") or DECAY_STEPS
+    status = _run_state.get("step_status", {})
+    return [
+        html.Li(f"{icons[status.get(s, 'pending')]} {s}", className=colors[status.get(s, "pending")])
+        for s in steps
+    ]
+
+
+def _format_duration(seconds):
+    seconds = max(0, int(seconds))
+    m, s = divmod(seconds, 60)
+    h, m = divmod(m, 60)
+    if h:
+        return f"{h}h {m}m {s}s"
+    if m:
+        return f"{m}m {s}s"
+    return f"{s}s"
+
+
+def _solver_progress_text():
+    """'Solver time' line for the Processing tab: current/target within
+    the phase currently running (a flow-convergence chunk, a steady-state
+    phase, or the pimpleFoam decay run - see _PHASE_TARGET_PATTERNS) plus
+    an ETA extrapolated from how fast Time has advanced since that phase
+    started, not the whole run's elapsed time (an earlier phase's pace
+    would otherwise skew the estimate).
+    """
+    cur = _run_state.get("current_time")
+    if not cur:
+        return ""
+    try:
+        cur_val = float(cur)
+    except (TypeError, ValueError):
+        return f"Solver time: {cur}"
+
+    target = _run_state.get("target_time")
+    phase_start = _run_state.get("phase_start_time")
+    if not target or not phase_start:
+        return f"Solver time: {cur_val:.4g}"
+
+    pct = min(100, round(100 * cur_val / target))
+    text = f"Solver time: {cur_val:.4g} / {target:.4g} ({pct}%)"
+    if cur_val > 0:
+        rate = cur_val / (time.time() - phase_start)
+        if rate > 0:
+            text += f" — ETA ~{_format_duration((target - cur_val) / rate)}"
+    return text
 
 
 @app.callback(
@@ -686,6 +1079,13 @@ def _start_run(n_clicks, *values):
     Output("run-status-text", "children"),
     Output("run-btn", "disabled", allow_duplicate=True),
     Output("run-poll", "disabled"),
+    Output("stop-btn", "disabled"),
+    Output("run-checklist", "children"),
+    Output("run-progress-bar", "value"),
+    Output("run-progress-bar", "label"),
+    Output("run-elapsed", "children"),
+    Output("run-current-time", "children"),
+    Output("results-data", "data", allow_duplicate=True),
     Input("run-poll", "n_intervals"),
     prevent_initial_call=True,
 )
@@ -696,9 +1096,33 @@ def _poll_run(n_intervals):
         "running": "Running...",
         "done": "Finished.",
         "error": "Failed - see log below.",
+        "stopped": "Stopped.",
     }.get(status, "")
     still_running = status == "running"
-    return log_text, status_text, still_running, not still_running
+
+    steps = _run_state.get("steps") or []
+    step_status = _run_state.get("step_status", {})
+    n_done = sum(1 for s in steps if step_status.get(s) == "done")
+    pct = round(100 * n_done / len(steps)) if steps else 0
+
+    start = _run_state.get("start_time")
+    elapsed = f"Elapsed: {int(time.time() - start)}s" if start else ""
+    cur_time_text = _solver_progress_text()
+
+    # Auto-load this run's own results once it finishes, so the Analysis
+    # tab has something to show without a separate manual step - polling
+    # stops right after this (run-poll.disabled becomes True), so this
+    # only fires once, exactly when status first becomes "done".
+    results_data = dash.no_update
+    if status == "done" and _run_state.get("case_dir"):
+        try:
+            with open(f"{_run_state['case_dir']}/results.json") as f:
+                results_data = json.load(f)
+        except Exception:
+            results_data = dash.no_update
+
+    return (log_text, status_text, still_running, not still_running, not still_running,
+            _render_checklist(), pct, f"{pct}%", elapsed, cur_time_text, results_data)
 
 
 @app.callback(

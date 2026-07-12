@@ -23,7 +23,7 @@ from .decay_analysis import read_vol_average_dat, check_plateau
 from .initial_fields import restore_boundary_conditions
 from .monitoring import write_vol_average_dict
 from .splice import splice_fv_options_into_control_dict, set_control_dict_time, ensure_simple_fvsolution
-from .wsl_utils import wsl_path, run_wsl_or_raise
+from .wsl_utils import wsl_path, run_wsl_or_raise, run_wsl_streaming, StoppedByUser
 
 
 def _uv_fvoptions_entries(k_values, nbins):
@@ -66,15 +66,21 @@ def _copy_latest_to_zero(case_dir_wsl, latest, include_T, log_fn):
     run_wsl_or_raise(f"cp -f {cp_targets} 0/", case_dir_wsl, "copying converged fields")
 
 
-def _run_phase(case_dir, case_dir_wsl, n_iterations, write_interval, plateau_window, plateau_rel_tol, log_fn):
+def _run_phase(case_dir, case_dir_wsl, n_iterations, write_interval, plateau_window, plateau_rel_tol,
+                log_fn, should_stop=None):
     set_control_dict_time(case_dir, end_time=n_iterations, write_interval=write_interval, delta_t=1)
     _clean_time_dirs(case_dir_wsl)
 
     log_fn(f"Running simpleFoam ({n_iterations} iterations, writing every {write_interval})...")
-    run_wsl_or_raise("rm -f log.simpleFoam; simpleFoam > log.simpleFoam 2>&1", case_dir_wsl, "simpleFoam")
-    tail = run_wsl_or_raise("tail -20 log.simpleFoam", case_dir_wsl, "reading log tail").stdout
-    if "FOAM FATAL" in tail or "Floating Point Exception" in tail:
-        raise RuntimeError(f"simpleFoam failed:\n{tail}")
+    r = run_wsl_streaming(
+        "simpleFoam 2>&1 | tee log.simpleFoam", case_dir_wsl,
+        on_line=log_fn, should_stop=should_stop, kill_pattern="simpleFoam",
+    )
+    if should_stop is not None and should_stop():
+        raise StoppedByUser("Stopped during simpleFoam phase.")
+    if r.returncode != 0 or "FOAM FATAL" in r.stdout or "Floating Point Exception" in r.stdout:
+        tail = "\n".join(r.stdout.splitlines()[-25:]) or "(no output captured)"
+        raise RuntimeError(f"simpleFoam failed (exit {r.returncode}):\n{tail}")
 
     r = run_wsl_or_raise(
         "ls -d [0-9]*/ 2>/dev/null | sed 's#/##' | sort -n | tail -1",
@@ -100,7 +106,7 @@ def run_steady_state_scenario(case_dir, room_x, room_y, room_z, ach, Z, nbins=25
                                phase2_iterations=3000, phase2_write_interval=100,
                                plateau_window=5, plateau_rel_tol=0.01,
                                fan_entry=None,
-                               patches_to_monitor=("outlet",), log_fn=print):
+                               patches_to_monitor=("outlet",), log_fn=print, should_stop=None):
     """Run both phases of a continuous-source steady-state scenario against
     an already-converged case (mesh + flow + fluenceRate/kUV must already
     exist - see run_pipeline.setup_case()). Returns a summary dict.
@@ -151,7 +157,7 @@ def run_steady_state_scenario(case_dir, room_x, room_y, room_z, ach, Z, nbins=25
 
     latest1, t1, T1, converged1 = _run_phase(
         case_dir, case_dir_wsl, phase1_iterations, phase1_write_interval,
-        plateau_window, plateau_rel_tol, log_fn,
+        plateau_window, plateau_rel_tol, log_fn, should_stop=should_stop,
     )
     summary["phase1"] = {"T_ss": float(T1[-1]), "converged": converged1, "iterations": latest1,
                           "decay_curve": {"t": t1.tolist(), "T": T1.tolist()}}
@@ -168,7 +174,7 @@ def run_steady_state_scenario(case_dir, room_x, room_y, room_z, ach, Z, nbins=25
 
     latest2, t2, T2, converged2 = _run_phase(
         case_dir, case_dir_wsl, phase2_iterations, phase2_write_interval,
-        plateau_window, plateau_rel_tol, log_fn,
+        plateau_window, plateau_rel_tol, log_fn, should_stop=should_stop,
     )
     summary["phase2"] = {"T_ss": float(T2[-1]), "converged": converged2, "iterations": latest2,
                           "decay_curve": {"t": t2.tolist(), "T": T2.tolist()}}

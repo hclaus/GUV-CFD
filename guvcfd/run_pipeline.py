@@ -25,11 +25,17 @@ from .splice import (
     set_control_dict_time,
     ensure_simple_fvsolution,
 )
-from .wsl_utils import wsl_path as _wsl_path, run_wsl as _run_wsl, run_wsl_or_raise as _run_wsl_or_raise
+from .wsl_utils import (
+    wsl_path as _wsl_path,
+    run_wsl as _run_wsl,
+    run_wsl_or_raise as _run_wsl_or_raise,
+    run_wsl_streaming as _run_wsl_streaming,
+    StoppedByUser,
+)
 
 
 def converge_flow_field(case_dir, n_iterations=500, fan_entry=None, log_fn=print,
-                         max_iterations=5000, check_field="p", rel_tol=0.005):
+                         max_iterations=5000, check_field="p", rel_tol=0.005, should_stop=None):
     """Run simpleFoam to actually converge the flow field on this mesh,
     starting from whatever is in 0/ (e.g. a mapFields warm start), then copy
     the result back into 0/ so it becomes pimpleFoam's starting point.
@@ -102,10 +108,14 @@ def converge_flow_field(case_dir, n_iterations=500, fan_entry=None, log_fn=print
                f"(chunk size {n_iterations})...")
         set_control_dict_time(case_dir, end_time=n_iterations, write_interval=n_iterations, delta_t=1)
 
-        r = _run_wsl("rm -f log.simpleFoam; simpleFoam > log.simpleFoam 2>&1", case_dir_wsl)
-        tail = _run_wsl("tail -20 log.simpleFoam", case_dir_wsl).stdout
-        log_fn(tail)
-        if r.returncode != 0 or "FOAM FATAL" in tail or "Floating Point Exception" in tail:
+        r = _run_wsl_streaming(
+            "simpleFoam 2>&1 | tee log.simpleFoam", case_dir_wsl,
+            on_line=log_fn, should_stop=should_stop, kill_pattern="simpleFoam",
+        )
+        if should_stop is not None and should_stop():
+            raise StoppedByUser("Stopped during flow convergence.")
+        if r.returncode != 0 or "FOAM FATAL" in r.stdout or "Floating Point Exception" in r.stdout:
+            tail = "\n".join(r.stdout.splitlines()[-25:]) or "(no output captured)"
             raise RuntimeError(f"simpleFoam failed (exit {r.returncode}):\n{tail}")
 
         r = _run_wsl_or_raise(
@@ -184,7 +194,7 @@ def setup_case(guv_path, case_dir, template_case_dir=None, cell_size=0.1, Z=2.0,
                pimple_end_time=120, pimple_write_interval=10, pimple_delta_t=0.5,
                fan_speed=None, fan_center=None, fan_direction=(0, 0, -1),
                fan_disk_radius=0.6, fan_disk_thickness=0.2, fan_height=None,
-               log_fn=print):
+               log_fn=print, should_stop=None):
     """Set up an OpenFOAM case end-to-end from a .guv project. Returns a dict
     summarizing the run (room dims, lamp count, fluence/k ranges, zone count).
 
@@ -302,7 +312,10 @@ def setup_case(guv_path, case_dir, template_case_dir=None, cell_size=0.1, Z=2.0,
 
     if converge_flow:
         log_fn(f"Converging flow field (simpleFoam, budget={simple_foam_iterations} iterations)...")
-        converge_flow_field(case_dir, n_iterations=simple_foam_iterations, fan_entry=fan_entry, log_fn=log_fn)
+        converge_flow_field(case_dir, n_iterations=simple_foam_iterations, fan_entry=fan_entry,
+                             log_fn=log_fn, should_stop=should_stop)
+        if should_stop is not None and should_stop():
+            raise StoppedByUser("Stopped after flow convergence.")
         log_fn("  restoring our own boundary conditions again (simpleFoam's mesh-derived "
                "boundary values aren't necessarily our fixedValue settings either)...")
         restore_boundary_conditions(case_dir, inlet_velocity=inlet_velocity)
