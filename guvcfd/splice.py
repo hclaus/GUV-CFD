@@ -182,3 +182,39 @@ def ensure_simple_fvsolution(case_dir):
     with open(fvs_path, "w") as f:
         f.write(content.rstrip("\n") + "\n" + _SIMPLE_BLOCK)
     return fvs_path
+
+
+_LTS_DDT_DEFAULT = (
+    "    default         localEuler;\n"
+    "    rDeltaTSmoothingCoeff 0.1;\n"
+    "    rDeltaTDampingCoeff 1;\n"
+    "    maxDeltaT       1;"
+)
+
+
+def set_lts_ddt_scheme(case_dir, enabled):
+    """Toggle ddtSchemes.default between localEuler (Local Time Stepping -
+    each cell gets its own pseudo-timestep sized to its local Courant
+    number, converging pseudo-transient flow problems faster than a single
+    uniform step for flows with very different length/time scales in
+    different regions) and Euler (real time-accurate transient, needed by
+    the later pimpleFoam decay run - LTS must NOT still be active then).
+
+    rDeltaTSmoothingCoeff/rDeltaTDampingCoeff/maxDeltaT are the standard
+    OpenFOAM LTS controls (limit how fast the local timestep field can grow/
+    shrink between neighbouring cells and cap its absolute size) - same
+    values used in OpenFOAM's own LTS tutorials (e.g. simpleFoam cases
+    converted to pimpleFoam+LTS) as a reasonable starting point.
+    """
+    path = f"{case_dir}/system/fvSchemes"
+    with open(path) as f:
+        content = f.read()
+    m = re.search(r'ddtSchemes\s*\{.*?\n\}', content, re.DOTALL)
+    if not m:
+        raise RuntimeError(f"Could not find ddtSchemes{{}} block in {path}")
+    replacement = ("ddtSchemes\n{\n" + _LTS_DDT_DEFAULT + "\n}") if enabled else \
+        "ddtSchemes\n{\n    default         Euler;\n}"
+    content = content[:m.start()] + replacement + content[m.end():]
+    with open(path, "w") as f:
+        f.write(content)
+    return path
