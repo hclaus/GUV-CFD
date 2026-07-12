@@ -8,13 +8,16 @@ OPENFOAM_BASHRC = "/usr/lib/openfoam/openfoam2412/etc/bashrc"
 
 
 def wsl_path(unc_or_wsl_path):
-    """Convert a \\\\wsl.localhost\\Distro\\... Windows UNC path to a native
-    WSL /path. Passes through paths that are already native (start with /).
+    """Convert a \\\\wsl.localhost\\Distro\\... (or //wsl.localhost/Distro/...
+    - Tk file dialogs return UNC paths with forward slashes on Windows)
+    Windows UNC path to a native WSL /path. Passes through paths that are
+    already native (no wsl.localhost marker) unchanged.
     """
-    if unc_or_wsl_path.startswith("/"):
+    normalized = unc_or_wsl_path.replace("\\", "/")
+    if "wsl.localhost" not in normalized.lower():
         return unc_or_wsl_path
-    parts = unc_or_wsl_path.replace("\\", "/").split("/")
-    idx = parts.index("wsl.localhost")
+    parts = normalized.split("/")
+    idx = next(i for i, p in enumerate(parts) if p.lower() == "wsl.localhost")
     return "/" + "/".join(parts[idx + 2:])
 
 

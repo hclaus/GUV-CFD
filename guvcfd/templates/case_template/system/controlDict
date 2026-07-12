@@ -1,0 +1,80 @@
+FoamFile
+{
+    version     2.0;
+    format      ascii;
+    class       dictionary;
+    object      controlDict;
+}
+
+application     pimpleFoam;
+startFrom        startTime;
+startTime        0;
+stopAt           endTime;
+endTime          8000;
+deltaT           1;
+writeControl     adjustableRunTime;
+writeInterval    200;
+purgeWrite       0;
+writeFormat      ascii;
+writePrecision   6;
+writeCompression off;
+timeFormat       general;
+timePrecision    6;
+runTimeModifiable true;
+
+adjustTimeStep   yes;
+maxCo            0.5;
+maxDeltaT        5;
+
+functions
+{
+    scalarTransport1
+    {
+        enabled         true;
+        type            scalarTransport;
+        libs            ("libsolverFunctionObjects.so");
+        field           T;
+        phi             phi;
+        nut             nut;
+        alphaD          1;
+        alphaDt         1;
+        fvOptions
+        {
+        contaminantSource
+        {
+            type            scalarSemiImplicitSource;
+            active          true;
+
+            scalarSemiImplicitSourceCoeffs
+            {
+                selectionMode   cellZone;
+                cellZone        sourceZone;
+                volumeMode      specific;
+
+                injectionRateSuSp
+                {
+                    T           (2.343750e-01 0);
+                }
+            }
+        }
+
+        fanSource
+        {
+            type            meanVelocityForce;
+            active          true;
+
+            meanVelocityForceCoeffs
+            {
+                selectionMode   cellZone;
+                cellZone        fanZone;
+                fields          (U);
+                Ubar            (0 0 -0.3);
+            }
+        }
+        }
+        executeControl  timeStep;
+        executeInterval 1;
+        writeControl    adjustableRunTime;
+        writeInterval   200;
+    }
+}

@@ -72,7 +72,7 @@ def check_plateau(T, window=5, rel_tol=0.01):
     spread = tail.max() - tail.min()
     mean = tail.mean()
     rel_spread = spread / mean if mean else float("inf")
-    return rel_spread <= rel_tol, rel_spread
+    return bool(rel_spread <= rel_tol), float(rel_spread)
 
 
 def write_results_summary(case_dir, out_path, ventilation_ach, well_mixed_eACH_mean,

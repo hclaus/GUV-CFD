@@ -13,10 +13,12 @@ from guv_calcs import Project
 from .case_io import read_cell_centers, read_boundary_patch_names, write_scalar_field
 from .cellzones import bin_decay_rates, write_cellzones, write_fvoptions
 from .contaminant_source import write_fvoptions_file
+from .decay_analysis import read_vol_average_dat
 from .fan import write_fan_topo_set_dict, fan_fvoptions_entry
 from .fluence import compute_fluence_at_points, compute_inactivation_rate, compute_well_mixed_eACH
 from .initial_fields import write_initial_fields, compute_inlet_velocity, restore_boundary_conditions
 from .mesh_gen import write_mesh_dicts, write_map_fields_dict
+from .monitoring import write_vol_average_dict
 from .splice import (
     splice_fv_options_into_control_dict,
     set_function_object_enabled,
@@ -26,7 +28,8 @@ from .splice import (
 from .wsl_utils import wsl_path as _wsl_path, run_wsl as _run_wsl, run_wsl_or_raise as _run_wsl_or_raise
 
 
-def converge_flow_field(case_dir, n_iterations=500, fan_entry=None, log_fn=print):
+def converge_flow_field(case_dir, n_iterations=500, fan_entry=None, log_fn=print,
+                         max_iterations=5000, check_field="p", rel_tol=0.005):
     """Run simpleFoam to actually converge the flow field on this mesh,
     starting from whatever is in 0/ (e.g. a mapFields warm start), then copy
     the result back into 0/ so it becomes pimpleFoam's starting point.
@@ -54,6 +57,19 @@ def converge_flow_field(case_dir, n_iterations=500, fan_entry=None, log_fn=print
     entry), which acts on U directly and so is relevant during flow
     convergence too: a real fan affects the converged flow field itself,
     not just the later scalar-transport phases.
+
+    Convergence is checked directly rather than trusted from fvSolution's
+    own SIMPLE{residualControl{}} (p/U/k/omega at 1e-4): empirically, on
+    these room-ventilation meshes, residuals plateau around 1e-2/1e-3 - well
+    above that threshold - and never trigger simpleFoam's own early stop,
+    even once the flow field itself has stopped changing physically. So
+    instead this runs in n_iterations-sized chunks, and after each chunk
+    compares the room's volume-averaged `check_field` (a representative
+    scalar flow quantity - p by default) against the previous chunk's value;
+    once the relative change is <= rel_tol, the flow field is accepted as
+    converged. Capped at max_iterations total to avoid a runaway on a case
+    that never plateaus - raises rather than silently returning an
+    unconverged field in that case.
     """
     case_dir_wsl = _wsl_path(case_dir)
 
@@ -73,39 +89,88 @@ def converge_flow_field(case_dir, n_iterations=500, fan_entry=None, log_fn=print
            "(the reference case's fvSolution was only ever set up for PIMPLE)...")
     ensure_simple_fvsolution(case_dir)
 
-    log_fn(f"Setting simpleFoam iteration budget: {n_iterations} iterations "
-           f"(writing only the final state)...")
-    set_control_dict_time(case_dir, end_time=n_iterations, write_interval=n_iterations, delta_t=1)
+    log_fn(f"Writing flow-convergence monitor (room volume-average {check_field})...")
+    write_vol_average_dict(case_dir, field=check_field, patches=())
 
-    log_fn("Running simpleFoam (this can take a while)...")
-    r = _run_wsl("rm -f log.simpleFoam; simpleFoam > log.simpleFoam 2>&1", case_dir_wsl)
-    tail = _run_wsl("tail -20 log.simpleFoam", case_dir_wsl).stdout
-    log_fn(tail)
-    if r.returncode != 0 or "FOAM FATAL" in tail or "Floating Point Exception" in tail:
-        raise RuntimeError(f"simpleFoam failed (exit {r.returncode}):\n{tail}")
+    prev_avg = None
+    total_run = 0
+    converged = False
 
-    r = _run_wsl_or_raise(
-        "ls -d [0-9]*/ 2>/dev/null | sed 's#/##' | sort -n | tail -1",
-        case_dir_wsl, "listing time directories",
-    )
-    latest = r.stdout.strip()
-    if not latest or latest == "0":
-        raise RuntimeError(f"simpleFoam did not write any new time directory (found: {latest!r})")
-    log_fn(f"  simpleFoam stopped at time {latest}. Copying converged fields back into 0/ "
-           f"(excluding T - that's our fresh UV-decay starting condition, not a flow quantity)...")
+    while total_run < max_iterations:
+        chunk_end = total_run + n_iterations
+        log_fn(f"Running simpleFoam iterations {total_run + 1}-{chunk_end} "
+               f"(chunk size {n_iterations})...")
+        set_control_dict_time(case_dir, end_time=n_iterations, write_interval=n_iterations, delta_t=1)
 
-    r = _run_wsl_or_raise(f"ls {latest}/ | grep -v '^uniform$' | grep -v '^T$'",
-                           case_dir_wsl, "listing converged field files")
-    field_files = r.stdout.split()
-    log_fn(f"  Fields: {field_files}")
-    cp_targets = " ".join(f"{latest}/{f}" for f in field_files)
-    _run_wsl_or_raise(f"cp -f {cp_targets} 0/", case_dir_wsl, "copying converged fields")
-    _run_wsl_or_raise(f"rm -rf {latest}", case_dir_wsl, "cleaning up iteration directory")
+        r = _run_wsl("rm -f log.simpleFoam; simpleFoam > log.simpleFoam 2>&1", case_dir_wsl)
+        tail = _run_wsl("tail -20 log.simpleFoam", case_dir_wsl).stdout
+        log_fn(tail)
+        if r.returncode != 0 or "FOAM FATAL" in tail or "Floating Point Exception" in tail:
+            raise RuntimeError(f"simpleFoam failed (exit {r.returncode}):\n{tail}")
+
+        r = _run_wsl_or_raise(
+            "ls -d [0-9]*/ 2>/dev/null | sed 's#/##' | sort -n | tail -1",
+            case_dir_wsl, "listing time directories",
+        )
+        latest = r.stdout.strip()
+        if not latest or latest == "0":
+            raise RuntimeError(f"simpleFoam did not write any new time directory (found: {latest!r})")
+        total_run = chunk_end
+
+        _run_wsl_or_raise("rm -rf postProcessing", case_dir_wsl, "clearing stale postProcessing")
+        _run_wsl_or_raise("postProcess -dict system/volAverageDict", case_dir_wsl, "postProcess flow monitor")
+        _, vals = read_vol_average_dat(f"{case_dir}/postProcessing/volAverage1/0/volFieldValue.dat")
+        cur_avg = vals[-1]
+
+        if prev_avg is not None and prev_avg != 0:
+            rel_change = abs(cur_avg - prev_avg) / abs(prev_avg)
+            log_fn(f"  [{total_run} iterations total] volAverage({check_field}) = {cur_avg:.6g} "
+                   f"(change since last chunk: {rel_change * 100:.3f}%, target <={rel_tol * 100:.2g}%)")
+            if rel_change <= rel_tol:
+                converged = True
+        else:
+            log_fn(f"  [{total_run} iterations total] volAverage({check_field}) = {cur_avg:.6g} (first chunk)")
+        prev_avg = cur_avg
+
+        log_fn(f"  Copying fields from {latest}/ to 0/ (excluding T - that's our fresh UV-decay "
+               f"starting condition, not a flow quantity) so the next chunk continues from here...")
+        r = _run_wsl_or_raise(f"ls {latest}/ | grep -v '^uniform$' | grep -v '^T$'",
+                               case_dir_wsl, "listing converged field files")
+        field_files = r.stdout.split()
+        cp_targets = " ".join(f"{latest}/{f}" for f in field_files)
+        _run_wsl_or_raise(f"cp -f {cp_targets} 0/", case_dir_wsl, "copying converged fields")
+        _run_wsl_or_raise(
+            "for d in [0-9]*/; do [ \"$d\" = \"0/\" ] || rm -rf \"$d\"; done",
+            case_dir_wsl, "cleaning time directories",
+        )
+
+        if converged:
+            break
+
+    if not converged:
+        raise RuntimeError(
+            f"Flow field did not converge within {max_iterations} iterations "
+            f"(volAverage({check_field}) still changing more than {rel_tol * 100:.2g}% "
+            f"per {n_iterations}-iteration chunk) - the mesh/BCs may need attention, "
+            f"or max_iterations needs raising for this case."
+        )
+
+    log_fn(f"Flow field converged after {total_run} iterations total "
+           f"(volAverage({check_field}) changed <={rel_tol * 100:.2g}% in the last chunk).")
 
     log_fn("Re-enabling scalarTransport1 for the transient UV-decay run...")
     set_function_object_enabled(case_dir, "scalarTransport1", True)
 
-    return latest
+    log_fn(f"Restoring system/volAverageDict to track T (was tracking {check_field} "
+           f"for flow convergence) - the decay-analysis step downstream needs it.")
+    write_vol_average_dict(case_dir)
+    log_fn("  Clearing postProcessing/ from the p-tracking runs above - otherwise OpenFOAM "
+           "detects the changed field name and versions the T output into volFieldValue_0.dat "
+           "instead of the plain volFieldValue.dat that decay_analysis reads, silently leaving "
+           "the stale p data in place under the expected filename.")
+    _run_wsl("rm -rf postProcessing", case_dir_wsl)
+
+    return str(total_run)
 
 
 _WALL_INFLOW_DIRECTION = {"xMin": (1, 0, 0), "xMax": (-1, 0, 0)}

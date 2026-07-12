@@ -1,0 +1,48 @@
+FoamFile
+{
+    version     2.0;
+    format      ascii;
+    class       dictionary;
+    object      volAverageDict;
+}
+
+functions
+{
+    readT
+    {
+        type            readFields;
+        libs            ("libfieldFunctionObjects.so");
+        fields          (T);
+        executeControl  timeStep;
+        executeInterval 1;
+    }
+
+    volAverage1
+    {
+        type            volFieldValue;
+        libs            ("libfieldFunctionObjects.so");
+        fields          (T);
+        operation       volAverage;
+        regionType      all;
+        executeControl  timeStep;
+        executeInterval 1;
+        writeControl    timeStep;
+        writeInterval   1;
+        writeFields     false;
+    }
+
+    outletAverage
+    {
+        type            surfaceFieldValue;
+        libs            ("libfieldFunctionObjects.so");
+        fields          (T);
+        operation       areaAverage;
+        regionType      patch;
+        name            outlet;
+        executeControl  timeStep;
+        executeInterval 1;
+        writeControl    timeStep;
+        writeInterval   1;
+        writeFields     false;
+    }
+}

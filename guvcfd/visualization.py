@@ -69,6 +69,16 @@ def _rect_outline(center, wall, size):
     return x, y, z
 
 
+def _add_label(fig, position, text, color, name, customdata, size=10):
+    x, y, z = position
+    fig.add_trace(go.Scatter3d(
+        x=[x], y=[y], z=[z], mode="text", text=[text],
+        textfont=dict(size=size, color=color),
+        name=name, customdata=[customdata], showlegend=False,
+    ))
+    return fig
+
+
 def _add_opening(fig, label, wall, center_frac, size, Lx, Ly, Lz, color):
     lo, hi = _opening_box(wall, Lx, Ly, Lz, center_frac, size, eps=0.0)
     center = tuple((a + b) / 2 for a, b in zip(lo, hi))
@@ -86,6 +96,8 @@ def _add_opening(fig, label, wall, center_frac, size, Lx, Ly, Lz, color):
         marker=dict(size=[0, 5], color=color, symbol="diamond"),
         name=label + " flow", customdata=[f"{label}_arrow"], showlegend=False,
     ))
+    label_pos = (center[0], center[1], center[2] + size[1] / 2 + 0.1)
+    fig = _add_label(fig, label_pos, label, color, label, f"{label}_label")
     return fig
 
 
@@ -162,6 +174,18 @@ def _add_fan(fig, center, radius, direction, thickness=0.2, n_points=32, color="
         marker=dict(size=[0, 6], color=color, symbol="diamond"),
         name="Fan direction", customdata=["fan_arrow"], showlegend=False,
     ))
+    fig = _add_label(fig, (cx, cy, cz + radius + 0.15), "fan", color, "Fan", "fan_label")
+    return fig
+
+
+def _add_injection(fig, center, color="#9b59b6"):
+    cx, cy, cz = center
+    fig.add_trace(go.Scatter3d(
+        x=[cx], y=[cy], z=[cz], mode="markers",
+        marker=dict(size=8, color=color, symbol="circle"),
+        name="Injection", customdata=["injection_marker"], showlegend=True,
+    ))
+    fig = _add_label(fig, (cx, cy, cz + 0.15), "injection", color, "Injection", "injection_label")
     return fig
 
 
@@ -169,10 +193,11 @@ def plot_case(room, inlet_wall="xMin", inlet_center=(0.5, 0.85), inlet_size=(0.3
               outlet_wall="xMax", outlet_center=(0.5, 0.15), outlet_size=(0.3, 0.3),
               fan_center=None, fan_disk_radius=None, fan_disk_thickness=0.2,
               fan_direction=(0, 0, -1), fan_speed=None,
+              injection_center=None,
               title=""):
     """Build the full preview figure: room + lamps (RoomPlotter) + inlet/
-    outlet + optional fan + wall labels. Returns a plotly Figure - render
-    with fig.show() or fig.write_html(path).
+    outlet + optional fan + optional injection point + wall labels. Returns
+    a plotly Figure - render with fig.show() or fig.write_html(path).
 
     Calc-zone traces RoomPlotter adds automatically (Whole Room Fluence
     etc.) are stripped - not relevant to a CFD case-setup preview.
@@ -188,4 +213,6 @@ def plot_case(room, inlet_wall="xMin", inlet_center=(0.5, 0.85), inlet_size=(0.3
         center = fan_center or (room.x / 2, room.y / 2, room.z - 0.3)
         radius = fan_disk_radius or 0.6
         fig = _add_fan(fig, center, radius, fan_direction, thickness=fan_disk_thickness)
+    if injection_center is not None:
+        fig = _add_injection(fig, injection_center)
     return fig
