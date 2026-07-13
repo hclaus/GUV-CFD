@@ -71,9 +71,25 @@ try:
     disp1 = Show(reader, view1)
     disp1.SetRepresentationType('Volume')
     ColorBy(disp1, ('POINTS', 'T'))
-    disp1.RescaleTransferFunctionToDataRange(True)
+    # RescaleTransferFunctionToDataRange(True) only looks at whichever single
+    # timestep happens to be current - verified directly (a full-window
+    # screenshot at t=370 showed a flat, featureless blue blob, because the
+    # color range was fixed from t=10's data and T had long since decayed
+    # below it). *OverTime() scans every timestep once and fixes the range to
+    # the true min/max across the whole run instead, so "red" means the same
+    # absolute concentration throughout and the room visibly fades toward the
+    # low end as T decays - the actual point of animating this field.
+    disp1.RescaleTransferFunctionToDataRangeOverTime()
+    # RescaleTransferFunctionToDataRangeOverTime() steps through every
+    # timestep internally and leaves the scene sitting at whatever time it
+    # finished on - verified directly (Time was left at 0, which isn't one
+    # of the reader's actual timesteps since the first real one is 10) -
+    # showing a blank volume view, since there's no data at an invalid time.
+    # Explicitly return to the first real timestep afterward.
+    scene.GoToFirst()
     ResetCamera(view1)
-    _log_step("view1 (volume T) shown")
+    _log_step(f"view1 (volume T) shown, color range fixed across all timesteps, "
+              f"scene time reset to {{scene.AnimationTime}}")
 
     streamTracer = StreamTracer(Input=reader, SeedType='Point Cloud')
     streamTracer.Vectors = ['POINTS', 'U']
