@@ -93,14 +93,14 @@ def _copy_latest_to_zero(case_dir_wsl, latest, include_T, log_fn):
 
 
 def _run_phase(case_dir, case_dir_wsl, n_iterations, write_interval, plateau_window, plateau_rel_tol,
-                log_fn, should_stop=None):
+                log_fn, should_stop=None, solver_log_fn=None):
     set_control_dict_time(case_dir, end_time=n_iterations, write_interval=write_interval, delta_t=1)
     _clean_time_dirs(case_dir_wsl)
 
     log_fn(f"Running simpleFoam ({n_iterations} iterations, writing every {write_interval})...")
     r = run_wsl_streaming(
         "simpleFoam 2>&1 | tee log.simpleFoam", case_dir_wsl,
-        on_line=log_fn, should_stop=should_stop, kill_pattern="simpleFoam",
+        on_line=solver_log_fn or log_fn, should_stop=should_stop, kill_pattern="simpleFoam",
     )
     if should_stop is not None and should_stop():
         raise StoppedByUser("Stopped during simpleFoam phase.")
@@ -132,7 +132,8 @@ def run_steady_state_scenario(case_dir, room_x, room_y, room_z, ach, Z, nbins=25
                                phase2_iterations=3000, phase2_write_interval=100,
                                plateau_window=5, plateau_rel_tol=0.01,
                                fan_entry=None, monitoring_points=None,
-                               patches_to_monitor=("outlet",), log_fn=print, should_stop=None):
+                               patches_to_monitor=("outlet",), log_fn=print, should_stop=None,
+                               solver_log_fn=None):
     """Run both phases of a continuous-source steady-state scenario against
     an already-converged case (mesh + flow + fluenceRate/kUV must already
     exist - see run_pipeline.setup_case()). Returns a summary dict.
@@ -179,6 +180,10 @@ def run_steady_state_scenario(case_dir, room_x, room_y, room_z, ach, Z, nbins=25
     G = compute_source_strength(room_volume, ach, target_T_ss)
     Su = source_Su(G, source_volume)
     summary["source_Su"] = Su
+    summary["source_volume"] = source_volume
+    # G is the total room-wide generation rate: T[amount]/m^3 * m^3/s = T[amount]/s
+    # (e.g. CFU/s if T represents CFU/m^3 - see the T-field note in the report).
+    summary["injection_rate_total"] = G
     log_fn(f"  G={G:.4g}, Su={Su:.4g}")
 
     source_entry = source_fvoptions_entry(Su)
@@ -194,6 +199,7 @@ def run_steady_state_scenario(case_dir, room_x, room_y, room_z, ach, Z, nbins=25
     latest1, t1, T1, converged1 = _run_phase(
         case_dir, case_dir_wsl, phase1_iterations, phase1_write_interval,
         plateau_window, plateau_rel_tol, log_fn, should_stop=should_stop,
+        solver_log_fn=solver_log_fn,
     )
     summary["phase1"] = {"T_ss": float(T1[-1]), "converged": converged1, "iterations": latest1,
                           "decay_curve": {"t": t1.tolist(), "T": T1.tolist()}}
@@ -215,6 +221,7 @@ def run_steady_state_scenario(case_dir, room_x, room_y, room_z, ach, Z, nbins=25
     latest2, t2, T2, converged2 = _run_phase(
         case_dir, case_dir_wsl, phase2_iterations, phase2_write_interval,
         plateau_window, plateau_rel_tol, log_fn, should_stop=should_stop,
+        solver_log_fn=solver_log_fn,
     )
     summary["phase2"] = {"T_ss": float(T2[-1]), "converged": converged2, "iterations": latest2,
                           "decay_curve": {"t": t2.tolist(), "T": T2.tolist()}}

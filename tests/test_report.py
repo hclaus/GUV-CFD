@@ -113,3 +113,39 @@ def test_steady_state_report_shows_corrected_fields_when_present(tmp_path):
             all_text += "\n" + "\t".join(c.text for c in row.cells)
     assert "2.55" in all_text
     assert "18.1" in all_text
+
+
+def test_report_always_includes_t_field_note(tmp_path):
+    case_dir = str(tmp_path)
+    (tmp_path / "run_settings.json").write_text(json.dumps(_REAL_SETTINGS))
+    (tmp_path / "results.json").write_text(json.dumps(_STEADY_STATE_RESULTS))
+    out_path = str(tmp_path / "out.docx")
+
+    generate_report_docx(case_dir, out_path)
+
+    from docx import Document
+    doc = Document(out_path)
+    all_text = "\n".join(p.text for p in doc.paragraphs)
+    assert "T is the OpenFOAM field name" in all_text
+
+
+def test_report_flags_non_uniform_mixing_when_monitoring_points_diverge(tmp_path):
+    case_dir = str(tmp_path)
+    (tmp_path / "run_settings.json").write_text(json.dumps(_REAL_SETTINGS))
+    results = dict(_STEADY_STATE_RESULTS)
+    results["monitoring"] = {
+        "Patient": {
+            "phase1": {"volAverage_T": [0.0, 0.1957]},
+            "phase2": {"volAverage_T": [0.1957, 0.0122]},
+        },
+    }
+    (tmp_path / "results.json").write_text(json.dumps(results))
+    out_path = str(tmp_path / "out.docx")
+
+    generate_report_docx(case_dir, out_path)
+
+    from docx import Document
+    doc = Document(out_path)
+    all_text = "\n".join(p.text for p in doc.paragraphs)
+    assert "NOT well mixed" in all_text
+    assert "Patient" in all_text

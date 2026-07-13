@@ -9,7 +9,20 @@ from docx import Document
 from docx.shared import Inches
 from guv_calcs import Project
 
+from .monitoring_points import mixing_uniformity_note
 from .visualization import plot_case
+
+# What "T" actually is - shown once under the Results heading in both the
+# .docx report and the Analysis tab (imported from here by app.py) since
+# neither this pipeline nor OpenFOAM itself assigns it a physical unit.
+T_FIELD_NOTE = (
+    "Note: T is the OpenFOAM field name for the transported scalar this "
+    "whole pipeline tracks - the substance being reduced, per unit volume. "
+    "In a GUV disinfection context this is typically a pathogen "
+    "concentration, e.g. CFU/m³ (colony-forming units per cubic meter) or "
+    "an equivalent airborne-contaminant unit; the pipeline itself is "
+    "unit-agnostic and just tracks relative concentration."
+)
 
 _ROW_LABELS_ROOM = [
     ("Room dimensions", lambda r, s: f"{r.x:.3g} x {r.y:.3g} x {r.z:.3g} {r.units}"),
@@ -34,8 +47,8 @@ _ROW_LABELS_RESULTS_DECAY = [
     ("Average fluence rate", lambda res: f"{res['fluence_mean']:.4g} µW/cm²"
                                           if res.get("fluence_mean") is not None else "n/a"),
     ("Ventilation ACH (nominal)", lambda res: f"{res['ventilation_ach']:.3g} /hr"),
-    ("eACH_uv, well-mixed (idealized)", lambda res: f"{res['eACH_uv_well_mixed']:.4g} /hr"),
-    ("eACH_uv, effective (CFD-fit)", lambda res: f"{res['eACH_uv_effective']:.4g} /hr"),
+    ("eACH_uv, well-mixed (idealized: Z x E_avg)", lambda res: f"{res['eACH_uv_well_mixed']:.4g} /hr"),
+    ("eACH_uv, CFD-fit (nominal ventilation ACH)", lambda res: f"{res['eACH_uv_effective']:.4g} /hr"),
     ("Mixing efficiency", lambda res: f"{res['mixing_efficiency'] * 100:.1f}%"
                                         if res.get("mixing_efficiency") is not None else "n/a"),
     ("Total ACH, effective", lambda res: f"{res.get('total_ach_effective', 0):.3g} /hr"),
@@ -43,20 +56,28 @@ _ROW_LABELS_RESULTS_DECAY = [
                                          if res.get("decay_curve", {}).get("t_seconds") else "n/a"),
 ]
 
-# Corrected (UV-off control) numbers - only present when that option was used.
+# Ventilation ACH is *measured* here (from a UV-off control run) instead of
+# assumed at its nominal design value, so the eACH_uv/mixing-efficiency
+# numbers below isolate UV's own contribution more accurately - see
+# decay_analysis.compute_effective_eACH's docstring. Only present when that
+# control run was used.
 _ROW_LABELS_RESULTS_DECAY_CORRECTED = [
     ("Ventilation ACH (measured, UV-off control)",
      lambda res: f"{res['ventilation_ach_measured']:.4g} /hr"),
-    ("eACH_uv, effective (corrected)", lambda res: f"{res['eACH_uv_effective_corrected']:.4g} /hr"),
-    ("Mixing efficiency (corrected)", lambda res: f"{res['mixing_efficiency_corrected'] * 100:.1f}%"
-                                                     if res.get("mixing_efficiency_corrected") is not None
-                                                     else "n/a"),
+    ("eACH_uv, CFD-fit (measured ventilation ACH)",
+     lambda res: f"{res['eACH_uv_effective_corrected']:.4g} /hr"),
+    ("Mixing efficiency (using measured ventilation ACH)",
+     lambda res: f"{res['mixing_efficiency_corrected'] * 100:.1f}%"
+                 if res.get("mixing_efficiency_corrected") is not None else "n/a"),
 ]
 
 _ROW_LABELS_RESULTS_STEADY_STATE = [
     ("Average fluence rate", lambda res: f"{res['fluence_mean']:.4g} µW/cm²"
                                           if res.get("fluence_mean") is not None else "n/a"),
     ("Target well-mixed steady-state T", lambda res: f"{res.get('target_T_ss', '?')}"),
+    ("Source injection rate (total, room-wide)",
+     lambda res: f"{res['injection_rate_total']:.4g} T-units/s (see T note below)"
+                 if res.get("injection_rate_total") is not None else "n/a"),
     ("Phase 1 T_ss (no UV)", lambda res: f"{res['phase1']['T_ss']:.4g} "
                                           f"({'plateaued' if res['phase1']['converged'] else 'NOT fully plateaued'}, "
                                           f"{res['phase1']['iterations']} iterations)"),
@@ -64,15 +85,18 @@ _ROW_LABELS_RESULTS_STEADY_STATE = [
                                           f"({'plateaued' if res['phase2']['converged'] else 'NOT fully plateaued'}, "
                                           f"{res['phase2']['iterations']} iterations)"),
     ("Reduction", lambda res: f"{res['reduction_pct']:.1f}%"),
-    ("eACH_uv (steady-state method)", lambda res: f"{res['eACH_uv_steady_state']:.4g} /hr"),
+    ("eACH_uv, steady-state CFD-fit (nominal ventilation ACH)",
+     lambda res: f"{res['eACH_uv_steady_state']:.4g} /hr"),
 ]
 
-# Corrected numbers, derived for free from Phase 1's own steady state - see
-# steady_state_pipeline.run_steady_state_scenario's docstring comment.
+# Ventilation ACH is *measured* here (derived for free from Phase 1's own
+# mass balance, no separate control run needed) instead of assumed at its
+# nominal design value - see steady_state_pipeline.compute_corrected_eACH_uv's
+# docstring. Only present when Phase 1/2 both produced a usable T_ss.
 _ROW_LABELS_RESULTS_STEADY_STATE_CORRECTED = [
     ("Ventilation ACH (measured from Phase 1)",
      lambda res: f"{res['ventilation_ach_measured']:.4g} /hr"),
-    ("eACH_uv, steady-state (corrected)",
+    ("eACH_uv, steady-state CFD-fit (measured ventilation ACH)",
      lambda res: f"{res['eACH_uv_steady_state_corrected']:.4g} /hr"),
 ]
 
@@ -156,6 +180,7 @@ def generate_report_docx(case_dir, out_path):
         outlet_wall=settings["outlet-wall"],
         outlet_center=(settings["outlet-y-input"] / room.y, settings["outlet-z-input"] / room.z),
         outlet_size=(settings["outlet-size-w"], settings["outlet-size-h"]),
+        monitoring_points=settings.get("monitoring_points"),
         title="", **fan_kwargs,
     )
     fig.update_layout(margin=dict(l=0, r=0, t=10, b=0), width=900, height=650)
@@ -175,6 +200,7 @@ def generate_report_docx(case_dir, out_path):
     doc.add_picture(str(image_path), width=Inches(6.0))
 
     doc.add_heading("Results", level=2)
+    doc.add_paragraph().add_run(T_FIELD_NOTE).italic = True
     if "phase1" in results:
         _add_kv_table(doc, [(label, fn(results)) for label, fn in _ROW_LABELS_RESULTS_STEADY_STATE])
         if results.get("ventilation_ach_measured") is not None:
@@ -189,6 +215,10 @@ def generate_report_docx(case_dir, out_path):
     if monitoring_rows:
         doc.add_heading("Monitoring Locations", level=2)
         _add_kv_table(doc, monitoring_rows)
+
+    uniformity_note = mixing_uniformity_note(results)
+    if uniformity_note:
+        doc.add_paragraph().add_run(uniformity_note).italic = True
 
     doc.save(out_path)
     image_path.unlink(missing_ok=True)

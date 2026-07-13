@@ -178,6 +178,32 @@ def _add_fan(fig, center, radius, direction, thickness=0.2, n_points=32, color="
     return fig
 
 
+def _box_mesh(center, size):
+    """Vertex/face arrays (Mesh3d i/j/k triangle format) for an axis-aligned
+    cube of the given side length, centered at `center`."""
+    cx, cy, cz = center
+    h = size / 2
+    x = [cx - h, cx + h, cx + h, cx - h, cx - h, cx + h, cx + h, cx - h]
+    y = [cy - h, cy - h, cy + h, cy + h, cy - h, cy - h, cy + h, cy + h]
+    z = [cz - h, cz - h, cz - h, cz - h, cz + h, cz + h, cz + h, cz + h]
+    i = [0, 0, 4, 4, 0, 0, 3, 3, 0, 0, 1, 1]
+    j = [1, 2, 5, 6, 1, 5, 2, 6, 3, 7, 2, 6]
+    k = [2, 3, 6, 7, 5, 4, 6, 7, 7, 4, 6, 5]
+    return x, y, z, i, j, k
+
+
+def _add_monitoring_point(fig, center, size, label, color="#ff1493"):
+    x, y, z, i, j, k = _box_mesh(center, size)
+    fig.add_trace(go.Mesh3d(
+        x=x, y=y, z=z, i=i, j=j, k=k,
+        color=color, opacity=0.35, flatshading=True,
+        name="Monitoring point", customdata=[f"{label}_monitor_volume"], showlegend=True,
+    ))
+    fig = _add_label(fig, (center[0], center[1], center[2] + size / 2 + 0.1),
+                      label, color, label, f"{label}_monitor_label")
+    return fig
+
+
 def _add_injection(fig, center, color="#9b59b6"):
     cx, cy, cz = center
     fig.add_trace(go.Scatter3d(
@@ -194,10 +220,18 @@ def plot_case(room, inlet_wall="xMin", inlet_center=(0.5, 0.85), inlet_size=(0.3
               fan_center=None, fan_disk_radius=None, fan_disk_thickness=0.2,
               fan_direction=(0, 0, -1), fan_speed=None,
               injection_center=None,
+              monitoring_points=None, cell_size=0.1,
               title=""):
     """Build the full preview figure: room + lamps (RoomPlotter) + inlet/
-    outlet + optional fan + optional injection point + wall labels. Returns
-    a plotly Figure - render with fig.show() or fig.write_html(path).
+    outlet + optional fan + optional injection point + optional monitoring
+    points + wall labels. Returns a plotly Figure - render with fig.show()
+    or fig.write_html(path).
+
+    monitoring_points: optional list of monitoring_points.py-shaped point
+    dicts (name/x/y/z/cells_per_side). Each is drawn as the same box its
+    cells_per_side * cell_size actually gets carved into for real (see
+    monitoring_points.monitoring_topo_set_dict) - not just a placeholder
+    marker, so the preview shows the true averaging volume.
 
     Calc-zone traces RoomPlotter adds automatically (Whole Room Fluence
     etc.) are stripped - not relevant to a CFD case-setup preview.
@@ -215,4 +249,7 @@ def plot_case(room, inlet_wall="xMin", inlet_center=(0.5, 0.85), inlet_size=(0.3
         fig = _add_fan(fig, center, radius, fan_direction, thickness=fan_disk_thickness)
     if injection_center is not None:
         fig = _add_injection(fig, injection_center)
+    for p in (monitoring_points or []):
+        size = p["cells_per_side"] * cell_size
+        fig = _add_monitoring_point(fig, (p["x"], p["y"], p["z"]), size, p.get("name") or "monitor")
     return fig

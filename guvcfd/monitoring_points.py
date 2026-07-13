@@ -163,3 +163,61 @@ def compute_monitoring_results(case_dir, points, cell_size=0.1,
         suffix = f", eACH_uv={entry['eACH_uv_effective']:.4g}/hr" if "eACH_uv_effective" in entry else ""
         log_fn(f"  {p['name']}: {len(t)} points, final volAverage(T)={T[-1]:.4g}{suffix}")
     return results
+
+
+# How far a monitoring point's final T can sit from the room-average final T
+# before it's worth calling out - room-average volAverage(T) is a spatial
+# average, and real rooms are rarely well mixed; a plain average number can
+# badly misrepresent the concentration at any one occupied location.
+_MIXING_UNIFORMITY_THRESHOLD = 0.15
+
+
+def mixing_uniformity_note(result):
+    """Compare each monitoring point's final T against the room-average
+    final T for the same phase (steady-state) or the same end-of-curve
+    point (decay). Returns a warning string if any point deviates by more
+    than _MIXING_UNIFORMITY_THRESHOLD, else None (including when there are
+    no monitoring points to compare against).
+
+    Shared between app.py's Analysis tab and report.py's .docx export -
+    both display the same results.json, so the same check applies to both.
+    """
+    monitoring = result.get("monitoring")
+    if not monitoring:
+        return None
+
+    deviations = []
+    if "phase1" in next(iter(monitoring.values())):
+        for phase_key, phase_label, room_val in (
+            ("phase1", "Phase 1", (result.get("phase1") or {}).get("T_ss")),
+            ("phase2", "Phase 2", (result.get("phase2") or {}).get("T_ss")),
+        ):
+            if not room_val:
+                continue
+            for name, data in monitoring.items():
+                curve = data[phase_key]["volAverage_T"]
+                if not curve:
+                    continue
+                point_val = curve[-1]
+                deviations.append((name, phase_label, point_val, (point_val - room_val) / room_val))
+    else:
+        curve = (result.get("decay_curve") or {}).get("volAverage_T")
+        room_val = curve[-1] if curve else None
+        if room_val:
+            for name, data in monitoring.items():
+                point_curve = data.get("volAverage_T")
+                if not point_curve:
+                    continue
+                point_val = point_curve[-1]
+                deviations.append((name, "final", point_val, (point_val - room_val) / room_val))
+
+    flagged = [d for d in deviations if abs(d[3]) >= _MIXING_UNIFORMITY_THRESHOLD]
+    if not flagged:
+        return None
+
+    parts = [f"'{name}' is {abs(pct * 100):.0f}% {'below' if pct < 0 else 'above'} the room "
+             f"average ({phase_label})" for name, phase_label, point_val, pct in flagged]
+    return ("Note: the room is NOT well mixed - " + "; ".join(parts) + ". Room-average "
+            "volAverage(T) should not be read as representative of concentration at any "
+            "specific location; use the monitoring-location values for occupant-specific "
+            "exposure estimates instead.")

@@ -25,9 +25,9 @@ from .fan import fan_fvoptions_entry
 from .fluence import compute_fluence_at_points, compute_inactivation_rate, compute_well_mixed_eACH
 from . import help_content
 from .initial_fields import compute_inlet_velocity
-from .monitoring_points import compute_monitoring_results
+from .monitoring_points import compute_monitoring_results, mixing_uniformity_note
 from .paraview_launch import launch_paraview
-from .report import generate_report_docx
+from .report import generate_report_docx, T_FIELD_NOTE
 from .run_pipeline import setup_case
 from .splice import set_control_dict_start_from, set_control_dict_time
 from .steady_state_pipeline import run_steady_state_scenario
@@ -280,12 +280,6 @@ def _run_log(msg):
                     _run_state["chunk_base"] = None
                     break
 
-    for line in msg.splitlines():
-        m = _TIME_RE.match(line.strip())
-        if m:
-            base = _run_state.get("chunk_base")
-            _run_state["current_time"] = str(float(m.group(1)) + base) if base is not None else m.group(1)
-
     steps = _run_state.get("steps", [])
     for substr, step_name in _run_state.get("markers", []):
         if substr in msg and step_name in steps:
@@ -294,6 +288,22 @@ def _run_log(msg):
                 _run_state["step_status"][s] = "done" if i < idx else "running" if i == idx else \
                     _run_state["step_status"].get(s, "pending")
             break
+
+
+def _track_solver_time(line):
+    """on_line callback for a solver's (simpleFoam/pimpleFoam) raw stdout -
+    updates the live "Solver time: X/Y - ETA" indicator from "Time = N"
+    lines without appending anything to the visible run log. OpenFOAM
+    prints several residual/continuity-error lines per iteration; over a
+    multi-thousand-iteration run, appending all of it (the old behavior -
+    on_line was just _run_log) flooded the kept log fast enough to scroll
+    real narration (step transitions, convergence summaries, errors) out
+    of the visible window within seconds of the next step starting.
+    """
+    m = _TIME_RE.match(line.strip())
+    if m:
+        base = _run_state.get("chunk_base")
+        _run_state["current_time"] = str(float(m.group(1)) + base) if base is not None else m.group(1)
 
 
 def _fan_kwargs(settings):
@@ -331,6 +341,13 @@ def _save_run_settings(case_dir, settings, guv_path=None):
     # only ever iterates _MESH_AFFECTING_FIELDS.
     if guv_path is not None:
         data["guv_path"] = guv_path
+    # Monitoring points don't affect the mesh/flow field (pure post-
+    # processing - see monitoring_points.py's module docstring), so they're
+    # deliberately not in _MESH_AFFECTING_FIELDS and never trigger a
+    # Continue mismatch warning. Saved here anyway, under their own key,
+    # purely so report.py's case-setup preview picture can draw them later
+    # without needing the original .guv/Dash session still open.
+    data["monitoring_points"] = _gather_monitoring_points(settings)
     with open(f"{case_dir}/run_settings.json", "w") as f:
         json.dump(data, f, indent=2)
 
@@ -350,6 +367,55 @@ def _settings_mismatch(case_dir, current_settings):
     return [(field, prior[field], current_settings.get(field))
             for field in _MESH_AFFECTING_FIELDS
             if field in prior and prior[field] != current_settings.get(field)]
+
+
+# Fields a Run always needs a real numeric value for. Checked upfront so a
+# missing value (a cleared number input, or an older/hand-edited .guvcfd
+# file predating a field - e.g. "z-value": null) fails fast with a clear
+# message, instead of after mesh generation and flow convergence have
+# already run for real and the pipeline reaches the one step that actually
+# needs it (compute_inactivation_rate needing Z, notably, only happens near
+# the very end).
+_ALWAYS_REQUIRED_FIELDS = {
+    "ach": "Ventilation ACH", "z-value": "UV inactivation constant Z",
+    "inlet-y-input": "Inlet Y position", "inlet-z-input": "Inlet Z position",
+    "inlet-size-w": "Inlet width", "inlet-size-h": "Inlet height",
+    "outlet-y-input": "Outlet Y position", "outlet-z-input": "Outlet Z position",
+    "outlet-size-w": "Outlet width", "outlet-size-h": "Outlet height",
+    "pimple-end-time": "Simulation end time", "pimple-write-interval": "Write interval",
+}
+_FAN_REQUIRED_FIELDS = {
+    "fan-speed": "Fan speed", "fan-radius": "Fan radius", "fan-thickness": "Fan thickness",
+    "fan-x-input": "Fan X position", "fan-y-input": "Fan Y position", "fan-z-input": "Fan Z position",
+}
+_STEADY_STATE_REQUIRED_FIELDS = {
+    "target-t-ss": "Target steady-state T",
+    "inject-x-input": "Injection X position", "inject-y-input": "Injection Y position",
+    "inject-z-input": "Injection Z position",
+    "phase1-iterations": "Phase 1 iterations", "phase2-iterations": "Phase 2 iterations",
+}
+
+
+def _validate_settings(settings):
+    """Labels of any required-but-missing (None) field, given the current
+    sim-type/fan/monitoring toggles. [] if everything a Run would touch is
+    present.
+    """
+    required = dict(_ALWAYS_REQUIRED_FIELDS)
+    if settings.get("fan-enable"):
+        required.update(_FAN_REQUIRED_FIELDS)
+    if settings.get("sim-type") == "steady_state":
+        required.update(_STEADY_STATE_REQUIRED_FIELDS)
+    if settings.get("monitoring-enable"):
+        for i in MONITOR_POINT_IDS:
+            if not settings.get(f"monitor{i}-enable"):
+                continue
+            label = settings.get(f"monitor{i}-name") or f"Point {i}"
+            required[f"monitor{i}-x-input"] = f"{label} X position"
+            required[f"monitor{i}-y-input"] = f"{label} Y position"
+            required[f"monitor{i}-z-input"] = f"{label} Z position"
+            required[f"monitor{i}-cells"] = f"{label} cells per side"
+    return [label for field, label in required.items() if settings.get(field) is None]
 
 
 def _gather_monitoring_points(settings):
@@ -386,7 +452,7 @@ def _run_decay(guv_path, case_dir, room, settings):
         outlet_size=(settings["outlet-size-w"], settings["outlet-size-h"]),
         pimple_end_time=settings["pimple-end-time"],
         pimple_write_interval=settings["pimple-write-interval"],
-        log_fn=_run_log, should_stop=_should_stop,
+        log_fn=_run_log, should_stop=_should_stop, solver_log_fn=_track_solver_time,
         **_fan_kwargs(settings),
     )
     if _should_stop():
@@ -401,7 +467,7 @@ def _run_decay(guv_path, case_dir, room, settings):
     _run_log(f"Running pimpleFoam to {settings['pimple-end-time']}s (this can take a while)...")
     r = run_wsl_streaming(
         "pimpleFoam 2>&1 | tee log.pimpleFoam", case_dir_wsl,
-        on_line=_run_log, should_stop=_should_stop, kill_pattern="pimpleFoam",
+        on_line=_track_solver_time, should_stop=_should_stop, kill_pattern="pimpleFoam",
     )
     if _should_stop():
         raise StoppedByUser("Stopped during pimpleFoam.")
@@ -426,7 +492,7 @@ def _run_decay(guv_path, case_dir, room, settings):
             case_dir, f"{case_dir}/no_UV", settings["ach"], room.x, room.y, room.z,
             settings["inlet-wall"], (settings["inlet-size-w"], settings["inlet-size-h"]),
             settings["pimple-end-time"], settings["pimple-write-interval"],
-            log_fn=_run_log, should_stop=_should_stop,
+            log_fn=_run_log, should_stop=_should_stop, solver_log_fn=_track_solver_time,
         )
         _run_log("Updating results.json with corrected mixing efficiency (measured, "
                  "not nominal, ventilation ACH)...")
@@ -490,7 +556,7 @@ def _continue_decay(case_dir, end_time, write_interval):
     _run_log(f"Running pimpleFoam to {end_time}s...")
     r = run_wsl_streaming(
         "pimpleFoam 2>&1 | tee -a log.pimpleFoam", case_dir_wsl,
-        on_line=_run_log, should_stop=_should_stop, kill_pattern="pimpleFoam",
+        on_line=_track_solver_time, should_stop=_should_stop, kill_pattern="pimpleFoam",
     )
     if _should_stop():
         raise StoppedByUser("Stopped during pimpleFoam.")
@@ -560,7 +626,7 @@ def _run_steady_state(guv_path, case_dir, room, settings):
         outlet_wall=settings["outlet-wall"],
         outlet_center=(settings["outlet-y-input"] / room.y, settings["outlet-z-input"] / room.z),
         outlet_size=(settings["outlet-size-w"], settings["outlet-size-h"]),
-        log_fn=_run_log, should_stop=_should_stop,
+        log_fn=_run_log, should_stop=_should_stop, solver_log_fn=_track_solver_time,
         **fan_kwargs,
     )
     if _should_stop():
@@ -597,7 +663,7 @@ def _run_steady_state(guv_path, case_dir, room, settings):
         phase1_iterations=phase1_iterations,
         phase2_iterations=phase2_iterations,
         fan_entry=fan_entry, monitoring_points=_gather_monitoring_points(settings),
-        log_fn=_run_log, should_stop=_should_stop,
+        log_fn=_run_log, should_stop=_should_stop, solver_log_fn=_track_solver_time,
     )
     result["fluence_mean"] = summary["fluence_mean"]
     with open(f"{case_dir}/results.json", "w") as f:
@@ -784,7 +850,7 @@ project_setup_tab = dbc.Row([
                 id="ach", type="number", value=3.0, min=0.1, max=20, step=0.1, debounce=True,
                 className="form-control form-control-sm")),
             _labeled("Z — UV susceptibility (cm²/mJ)", dcc.Input(
-                id="z-value", type="number", value=2.0, min=0.01, max=20, step=0.1, debounce=True,
+                id="z-value", type="number", value=2.0, min=0.01, max=20, step="any", debounce=True,
                 className="form-control form-control-sm")),
         ]),
 
@@ -900,7 +966,6 @@ def _checklist_item(step):
 processing_tab = dbc.Row([
     dbc.Col([
         html.Div(id="run-status-text", className="fs-5 fw-semibold mb-2"),
-        dbc.Progress(id="run-progress-bar", value=0, striped=True, animated=True, className="mb-2"),
         html.Div(id="run-elapsed", className="small text-muted"),
         html.Div(id="run-current-time", className="small text-muted mb-3"),
         dbc.Button("Stop", id="stop-btn", color="danger", size="sm", className="mb-4", disabled=True),
@@ -990,28 +1055,44 @@ def _monitoring_summary_rows(monitoring):
     return rows
 
 
+def _result_notes(result):
+    """T-field explanation (always shown) plus a mixing-uniformity warning
+    (only when monitoring points show the room isn't well mixed) - appended
+    after the kv rows on both summary tabs.
+    """
+    notes = [T_FIELD_NOTE]
+    uniformity = mixing_uniformity_note(result)
+    if uniformity:
+        notes.append(uniformity)
+    return [html.Div(note, className="mb-1 fst-italic text-muted small") for note in notes]
+
+
 def _steady_state_summary(result):
     p1, p2 = result["phase1"], result["phase2"]
     rows = []
     if result.get("fluence_mean") is not None:
         rows.append(("Average fluence rate", f"{result['fluence_mean']:.4g} µW/cm²"))
+    rows.append(("Target T_ss (design)", f"{result.get('target_T_ss', '?')}"))
+    if result.get("injection_rate_total") is not None:
+        rows.append(("Source injection rate (total, room-wide)",
+                      f"{result['injection_rate_total']:.4g} T-units/s (see note below)"))
     rows += [
-        ("Target T_ss (design)", f"{result.get('target_T_ss', '?')}"),
         ("Phase 1 T_ss", f"{p1['T_ss']:.4g}  ({'plateaued' if p1['converged'] else 'NOT fully plateaued'}, "
                           f"{p1['iterations']} iterations)"),
         ("Phase 2 T_ss", f"{p2['T_ss']:.4g}  ({'plateaued' if p2['converged'] else 'NOT fully plateaued'}, "
                           f"{p2['iterations']} iterations)"),
         ("Reduction", f"{result['reduction_pct']:.1f}%"),
-        ("eACH_uv (steady-state method)", f"{result['eACH_uv_steady_state']:.4g} /hr"),
+        ("eACH_uv, steady-state CFD-fit (nominal ventilation ACH)",
+         f"{result['eACH_uv_steady_state']:.4g} /hr"),
     ]
     if result.get("ventilation_ach_measured") is not None:
         rows.append(("Ventilation ACH (measured from Phase 1)",
                       f"{result['ventilation_ach_measured']:.4g} /hr"))
-        rows.append(("eACH_uv (steady-state, corrected)",
+        rows.append(("eACH_uv, steady-state CFD-fit (measured ventilation ACH)",
                       f"{result['eACH_uv_steady_state_corrected']:.4g} /hr"))
     rows += _monitoring_summary_rows(result.get("monitoring"))
     return [html.Div([html.Span(k + ": ", className="text-muted"), html.Span(v)], className="mb-1")
-            for k, v in rows]
+            for k, v in rows] + _result_notes(result)
 
 
 def _decay_figure(result):
@@ -1056,8 +1137,8 @@ def _decay_summary(result):
         rows.append(("Average fluence rate", f"{result['fluence_mean']:.4g} µW/cm²"))
     rows += [
         ("Ventilation ACH (nominal)", f"{result['ventilation_ach']:.3g} /hr"),
-        ("eACH_uv well-mixed", f"{result['eACH_uv_well_mixed']:.4g} /hr"),
-        ("eACH_uv effective (CFD-fit)", f"{result['eACH_uv_effective']:.4g} /hr"),
+        ("eACH_uv, well-mixed (idealized: Z x E_avg)", f"{result['eACH_uv_well_mixed']:.4g} /hr"),
+        ("eACH_uv, CFD-fit (nominal ventilation ACH)", f"{result['eACH_uv_effective']:.4g} /hr"),
         ("Total ACH, effective", f"{result.get('total_ach_effective', 0):.3g} /hr"),
     ]
     if result.get("mixing_efficiency") is not None:
@@ -1065,13 +1146,13 @@ def _decay_summary(result):
     if result.get("ventilation_ach_measured") is not None:
         rows.append(("Ventilation ACH (measured, UV-off control)",
                       f"{result['ventilation_ach_measured']:.4g} /hr"))
-        rows.append(("eACH_uv effective (corrected)",
+        rows.append(("eACH_uv, CFD-fit (measured ventilation ACH)",
                       f"{result['eACH_uv_effective_corrected']:.4g} /hr"))
-        rows.append(("Mixing efficiency (corrected)",
+        rows.append(("Mixing efficiency (using measured ventilation ACH)",
                       f"{result['mixing_efficiency_corrected'] * 100:.1f}%"))
     rows += _monitoring_summary_rows(result.get("monitoring"))
     return [html.Div([html.Span(k + ": ", className="text-muted"), html.Span(v)], className="mb-1")
-            for k, v in rows]
+            for k, v in rows] + _result_notes(result)
 
 
 analysis_tab = dbc.Row([
@@ -1596,6 +1677,12 @@ def _start_run(n_clicks, *values):
 
     sim_type = settings["sim-type"]
 
+    missing = _validate_settings(settings)
+    if missing:
+        return (False, False, True,
+                "Missing required value(s) - fill these in before running: "
+                + ", ".join(missing) + ".", dash.no_update, False, dash.no_update)
+
     if _case_dir_has_data(case_dir):
         _pending_run.update(sim_type=sim_type, guv_path=guv_path, case_dir=case_dir,
                              room=room, settings=settings)
@@ -1698,24 +1785,22 @@ def _render_checklist():
     ]
 
 
-def _format_duration(seconds):
+def _format_mmss(seconds):
     seconds = max(0, int(seconds))
-    m, s = divmod(seconds, 60)
-    h, m = divmod(m, 60)
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
     if h:
-        return f"{h}h {m}m {s}s"
-    if m:
-        return f"{m}m {s}s"
-    return f"{s}s"
+        return f"{h}:{m:02d}:{s:02d}"
+    return f"{m}:{s:02d}"
 
 
 def _solver_progress_text():
-    """'Solver time' line for the Processing tab: current/target within
-    the phase currently running (a flow-convergence chunk, a steady-state
-    phase, or the pimpleFoam decay run - see _PHASE_TARGET_PATTERNS) plus
-    an ETA extrapolated from how fast Time has advanced since that phase
-    started, not the whole run's elapsed time (an earlier phase's pace
-    would otherwise skew the estimate).
+    """'Simulation time step X of Y (pct%)' line for the Processing tab:
+    current/target within the phase currently running (a flow-convergence
+    chunk, a steady-state phase, or the pimpleFoam decay run - see
+    _PHASE_TARGET_PATTERNS). The ETA is a separate line - see
+    _solver_eta_text() - so the Processing tab can put them on their own
+    lines instead of cramming both into one.
     """
     cur = _run_state.get("current_time")
     if not cur:
@@ -1723,21 +1808,39 @@ def _solver_progress_text():
     try:
         cur_val = float(cur)
     except (TypeError, ValueError):
-        return f"Solver time: {cur}"
+        return f"Simulation time step {cur}"
 
     target = _run_state.get("target_time")
     phase_start = _run_state.get("phase_start_time")
     if not target or not phase_start:
-        return f"Solver time: {cur_val:.4g}"
+        return f"Simulation time step {cur_val:.4g}"
 
     pct = min(100, round(100 * cur_val / target))
-    text = f"Solver time: {cur_val:.4g} / {target:.4g} ({pct}%)"
+    return f"Simulation time step {cur_val:.4g} of {target:.4g} ({pct}%)"
+
+
+def _solver_eta_text():
+    """'Expected finish of this step in M:SS' line, extrapolated from how
+    fast Time has advanced since the current phase started (not the whole
+    run's elapsed time - an earlier phase's pace would otherwise skew the
+    estimate). "" if there isn't enough information yet.
+    """
+    cur = _run_state.get("current_time")
+    target = _run_state.get("target_time")
+    phase_start = _run_state.get("phase_start_time")
+    if not cur or not target or not phase_start:
+        return ""
+    try:
+        cur_val = float(cur)
+    except (TypeError, ValueError):
+        return ""
     elapsed = time.time() - phase_start
-    if cur_val > 0 and elapsed > 0:
-        rate = cur_val / elapsed
-        if rate > 0:
-            text += f" — ETA ~{_format_duration((target - cur_val) / rate)}"
-    return text
+    if cur_val <= 0 or elapsed <= 0:
+        return ""
+    rate = cur_val / elapsed
+    if rate <= 0:
+        return ""
+    return f"Expected finish of this step in {_format_mmss((target - cur_val) / rate)}"
 
 
 @app.callback(
@@ -1748,8 +1851,6 @@ def _solver_progress_text():
     Output("run-poll", "disabled"),
     Output("stop-btn", "disabled"),
     Output("run-checklist", "children"),
-    Output("run-progress-bar", "value"),
-    Output("run-progress-bar", "label"),
     Output("run-elapsed", "children"),
     Output("run-current-time", "children"),
     Output("results-data", "data", allow_duplicate=True),
@@ -1768,14 +1869,11 @@ def _poll_run(n_intervals):
     }.get(status, "")
     still_running = status == "running"
 
-    steps = _run_state.get("steps") or []
-    step_status = _run_state.get("step_status", {})
-    n_done = sum(1 for s in steps if step_status.get(s) == "done")
-    pct = round(100 * n_done / len(steps)) if steps else 0
-
     start = _run_state.get("start_time")
-    elapsed = f"Elapsed: {int(time.time() - start)}s" if start else ""
-    cur_time_text = _solver_progress_text()
+    elapsed = f"Elapsed: {_format_mmss(time.time() - start)}" if start else ""
+    progress_line = _solver_progress_text()
+    eta_line = _solver_eta_text()
+    cur_time_text = [progress_line, html.Br(), eta_line] if progress_line and eta_line else progress_line
 
     # Auto-load this run's own results once it finishes, so the Analysis
     # tab has something to show without a separate manual step - polling
@@ -1792,7 +1890,7 @@ def _poll_run(n_intervals):
             results_data = dash.no_update
 
     return (log_text, status_text, still_running, still_running, not still_running, not still_running,
-            _render_checklist(), pct, f"{pct}%", elapsed, cur_time_text, results_data, results_case_dir)
+            _render_checklist(), elapsed, cur_time_text, results_data, results_case_dir)
 
 
 @app.callback(
@@ -1809,11 +1907,16 @@ def _poll_run(n_intervals):
     Input("fan-x-input", "value"), Input("fan-y-input", "value"), Input("fan-z-input", "value"),
     Input("sim-type", "value"),
     Input("inject-x-input", "value"), Input("inject-y-input", "value"), Input("inject-z-input", "value"),
+    Input("monitoring-enable", "value"),
+    *[Input(f"monitor{i}-{suffix}", "value")
+      for i in MONITOR_POINT_IDS
+      for suffix in ("enable", "name", "x-input", "y-input", "z-input", "cells")],
 )
 def _update_preview(_status, inlet_show, inlet_wall, inlet_y, inlet_z, inlet_w, inlet_h,
                      outlet_show, outlet_wall, outlet_y, outlet_z, outlet_w, outlet_h,
                      fan_enable, fan_speed, fan_direction, fan_radius, fan_thickness,
-                     fan_x, fan_y, fan_z, sim_type, inject_x, inject_y, inject_z):
+                     fan_x, fan_y, fan_z, sim_type, inject_x, inject_y, inject_z,
+                     monitoring_enable, *monitor_values):
     room = _loaded["room"]
     if room is None:
         return _empty_preview_figure()
@@ -1831,11 +1934,18 @@ def _update_preview(_status, inlet_show, inlet_wall, inlet_y, inlet_z, inlet_w, 
 
     injection_center = (inject_x, inject_y, inject_z) if sim_type == "steady_state" else None
 
+    monitor_field_ids = [f"monitor{i}-{suffix}" for i in MONITOR_POINT_IDS
+                          for suffix in ("enable", "name", "x-input", "y-input", "z-input", "cells")]
+    monitoring_settings = dict(zip(monitor_field_ids, monitor_values))
+    monitoring_settings["monitoring-enable"] = monitoring_enable
+    monitoring_points = _gather_monitoring_points(monitoring_settings)
+
     fig = plot_case(
         room,
         inlet_wall=inlet_wall, inlet_center=inlet_center, inlet_size=(inlet_w, inlet_h),
         outlet_wall=outlet_wall, outlet_center=outlet_center, outlet_size=(outlet_w, outlet_h),
         injection_center=injection_center,
+        monitoring_points=monitoring_points,
         title="", **fan_kwargs,
     )
     if not inlet_show:

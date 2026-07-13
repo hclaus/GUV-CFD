@@ -24,7 +24,7 @@ _WALL_INFLOW_DIRECTION = {"xMin": (1, 0, 0), "xMax": (-1, 0, 0)}
 def run_ventilation_only_control(case_dir, control_dir, ach, room_x, room_y, room_z,
                                   inlet_wall, inlet_size, pimple_end_time,
                                   pimple_write_interval, pimple_delta_t=0.5,
-                                  log_fn=print, should_stop=None):
+                                  log_fn=print, should_stop=None, solver_log_fn=None):
     """Clone case_dir's mesh/converged flow field into control_dir, remove
     every UV source, reset T fresh, and run the transient decay driven by
     ventilation alone. Returns the control run's results dict (ventilation_ach
@@ -83,7 +83,7 @@ def run_ventilation_only_control(case_dir, control_dir, ach, room_x, room_y, roo
     log_fn(f"Running pimpleFoam (UV-off control) to {pimple_end_time}s...")
     r = run_wsl_streaming(
         "pimpleFoam 2>&1 | tee log.pimpleFoam", control_dir_wsl,
-        on_line=log_fn, should_stop=should_stop, kill_pattern="pimpleFoam",
+        on_line=solver_log_fn or log_fn, should_stop=should_stop, kill_pattern="pimpleFoam",
     )
     if should_stop is not None and should_stop():
         raise StoppedByUser("Stopped during UV-off control pimpleFoam.")

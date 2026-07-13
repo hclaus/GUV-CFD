@@ -1,6 +1,10 @@
 import json
 
-from guvcfd.app import _case_dir_has_data, _save_run_settings, _settings_mismatch, _MESH_AFFECTING_FIELDS
+from guvcfd.app import (
+    _ALWAYS_REQUIRED_FIELDS, _FAN_REQUIRED_FIELDS, _STEADY_STATE_REQUIRED_FIELDS,
+    _case_dir_has_data, _save_run_settings, _settings_mismatch,
+    _validate_settings, _MESH_AFFECTING_FIELDS,
+)
 
 
 def _settings(**overrides):
@@ -80,4 +84,77 @@ def test_save_run_settings_only_persists_mesh_affecting_fields(tmp_path):
     _save_run_settings(case_dir, _settings())
     with open(f"{case_dir}/run_settings.json") as f:
         saved = json.load(f)
-    assert set(saved.keys()) == set(_MESH_AFFECTING_FIELDS)
+    # monitoring_points is saved too, under its own key - it doesn't affect
+    # the mesh/flow field (see _save_run_settings), it's there purely so
+    # report.py's case-setup preview can draw monitoring points later.
+    assert set(saved.keys()) == set(_MESH_AFFECTING_FIELDS) | {"monitoring_points"}
+    assert saved["monitoring_points"] == []
+
+
+def _full_settings(**overrides):
+    # Every field _validate_settings could ever require present and valid
+    # (fan/steady-state fields included even though fan/monitoring start
+    # off, so enabling them in a test doesn't spuriously report every field
+    # in that group as missing) - the happy-path baseline per-test
+    # overrides start from.
+    base = {f: 1.0 for f in _ALWAYS_REQUIRED_FIELDS}
+    base.update({f: 1.0 for f in _FAN_REQUIRED_FIELDS})
+    base.update({f: 1.0 for f in _STEADY_STATE_REQUIRED_FIELDS})
+    base["fan-direction"] = "down"
+    base["sim-type"] = "decay"
+    base["fan-enable"] = False
+    base["monitoring-enable"] = False
+    base.update(overrides)
+    return base
+
+
+def test_validate_settings_passes_when_all_required_fields_present():
+    assert _validate_settings(_full_settings()) == []
+
+
+def test_validate_settings_reports_missing_z_value():
+    settings = _full_settings(**{"z-value": None})
+    assert _validate_settings(settings) == ["UV inactivation constant Z"]
+
+
+def test_validate_settings_reports_missing_ach():
+    settings = _full_settings(ach=None)
+    assert _validate_settings(settings) == ["Ventilation ACH"]
+
+
+def test_validate_settings_ignores_fan_fields_when_fan_disabled():
+    settings = _full_settings(**{"fan-enable": False, "fan-speed": None})
+    assert _validate_settings(settings) == []
+
+
+def test_validate_settings_requires_fan_fields_when_fan_enabled():
+    settings = _full_settings(**{"fan-enable": True, "fan-speed": None})
+    assert _validate_settings(settings) == ["Fan speed"]
+
+
+def test_validate_settings_ignores_steady_state_fields_for_decay():
+    settings = _full_settings(**{"sim-type": "decay", "target-t-ss": None})
+    assert _validate_settings(settings) == []
+
+
+def test_validate_settings_requires_steady_state_fields_for_steady_state():
+    settings = _full_settings(**{"sim-type": "steady_state", "target-t-ss": None})
+    assert _validate_settings(settings) == ["Target steady-state T"]
+
+
+def test_validate_settings_ignores_disabled_monitoring_points():
+    settings = _full_settings(**{
+        "monitoring-enable": True,
+        "monitor1-enable": False, "monitor1-x-input": None,
+    })
+    assert _validate_settings(settings) == []
+
+
+def test_validate_settings_requires_enabled_monitoring_point_fields():
+    settings = _full_settings(**{
+        "monitoring-enable": True,
+        "monitor1-enable": True, "monitor1-name": "Patient",
+        "monitor1-x-input": None, "monitor1-y-input": 1.0,
+        "monitor1-z-input": 1.0, "monitor1-cells": 4,
+    })
+    assert _validate_settings(settings) == ["Patient X position"]

@@ -1,4 +1,6 @@
-from guvcfd.monitoring_points import zone_name, monitoring_topo_set_dict, monitoring_average_dict
+from guvcfd.monitoring_points import (
+    zone_name, monitoring_topo_set_dict, monitoring_average_dict, mixing_uniformity_note,
+)
 
 
 def test_zone_name_sanitizes_spaces_and_punctuation():
@@ -47,3 +49,51 @@ def test_average_dict_uses_given_field_name():
     text = monitoring_average_dict(points, field="U")
     assert "readU" in text
     assert "fields          (U);" in text
+
+
+def test_mixing_uniformity_note_none_without_monitoring():
+    assert mixing_uniformity_note({}) is None
+    assert mixing_uniformity_note({"monitoring": {}}) is None
+
+
+def test_mixing_uniformity_note_none_when_points_track_room_average():
+    result = {
+        "decay_curve": {"volAverage_T": [1.0, 0.5, 0.25]},
+        "monitoring": {"Patient": {"volAverage_T": [1.0, 0.52, 0.26]}},
+    }
+    assert mixing_uniformity_note(result) is None
+
+
+def test_mixing_uniformity_note_flags_decay_scenario_deviation():
+    result = {
+        "decay_curve": {"volAverage_T": [1.0, 0.5, 0.25]},
+        "monitoring": {"Patient": {"volAverage_T": [1.0, 0.4, 0.10]}},
+    }
+    note = mixing_uniformity_note(result)
+    assert note is not None
+    assert "NOT well mixed" in note
+    assert "Patient" in note
+    assert "60%" in note  # (0.25 - 0.10) / 0.25 = 60% below
+
+
+def test_mixing_uniformity_note_flags_steady_state_scenario_deviation():
+    # Real numbers from a completed run: room-average vs monitoring points
+    # differ by 20-70% - exactly the case this note exists to catch.
+    result = {
+        "phase1": {"T_ss": 0.254927},
+        "phase2": {"T_ss": 0.03959168},
+        "monitoring": {
+            "Patient": {
+                "phase1": {"volAverage_T": [0.0, 0.1957093]},
+                "phase2": {"volAverage_T": [0.1957093, 0.01215402]},
+            },
+            "exhaust": {
+                "phase1": {"volAverage_T": [0.0, 0.3078411]},
+                "phase2": {"volAverage_T": [0.3078411, 0.05844288]},
+            },
+        },
+    }
+    note = mixing_uniformity_note(result)
+    assert note is not None
+    assert "NOT well mixed" in note
+    assert "Patient" in note and "exhaust" in note

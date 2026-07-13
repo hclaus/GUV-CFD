@@ -59,7 +59,8 @@ def _is_stable_oscillation(history, window, growth_tol):
 
 def converge_flow_field(case_dir, n_iterations=500, fan_entry=None, log_fn=print,
                          max_iterations=20000, check_field="p", rel_tol=0.005, should_stop=None,
-                         method="simple", oscillation_window=6, oscillation_growth_tol=1.5):
+                         method="simple", oscillation_window=6, oscillation_growth_tol=1.5,
+                         solver_log_fn=None):
     """Run simpleFoam to actually converge the flow field on this mesh,
     starting from whatever is in 0/ (e.g. a mapFields warm start), then copy
     the result back into 0/ so it becomes pimpleFoam's starting point.
@@ -126,6 +127,13 @@ def converge_flow_field(case_dir, n_iterations=500, fan_entry=None, log_fn=print
     next to otherwise-still air). The ddtScheme is always restored back to
     Euler before returning (success, failure, or stop) - the later
     transient (real time-accurate) pimpleFoam decay run needs that, not LTS.
+
+    solver_log_fn: on_line callback for simpleFoam/pimpleFoam's raw stdout
+    (a few lines per iteration, thousands of lines over a full convergence
+    run) - defaults to log_fn if not given, but callers with a visible run
+    log generally want a quieter callback here so per-iteration solver
+    chatter doesn't flood it (log_fn's own chunk-boundary narration is
+    unaffected either way).
     """
     case_dir_wsl = _wsl_path(case_dir)
     solver = "pimpleFoam" if method == "lts" else "simpleFoam"
@@ -181,7 +189,7 @@ def converge_flow_field(case_dir, n_iterations=500, fan_entry=None, log_fn=print
 
             r = _run_wsl_streaming(
                 f"{solver} 2>&1 | tee log.{solver}", case_dir_wsl,
-                on_line=log_fn, should_stop=should_stop, kill_pattern=solver,
+                on_line=solver_log_fn or log_fn, should_stop=should_stop, kill_pattern=solver,
             )
             if should_stop is not None and should_stop():
                 raise StoppedByUser("Stopped during flow convergence.")
@@ -284,7 +292,7 @@ def setup_case(guv_path, case_dir, template_case_dir=None, cell_size=0.1, Z=2.0,
                pimple_end_time=120, pimple_write_interval=10, pimple_delta_t=0.5,
                fan_speed=None, fan_center=None, fan_direction=(0, 0, -1),
                fan_disk_radius=0.6, fan_disk_thickness=0.2, fan_height=None,
-               log_fn=print, should_stop=None):
+               log_fn=print, should_stop=None, solver_log_fn=None):
     """Set up an OpenFOAM case end-to-end from a .guv project. Returns a dict
     summarizing the run (room dims, lamp count, fluence/k ranges, zone count).
 
@@ -404,7 +412,8 @@ def setup_case(guv_path, case_dir, template_case_dir=None, cell_size=0.1, Z=2.0,
         log_fn(f"Converging flow field ({flow_convergence_method}, chunk size="
                f"{simple_foam_iterations} iterations)...")
         converge_flow_field(case_dir, n_iterations=simple_foam_iterations, fan_entry=fan_entry,
-                             log_fn=log_fn, should_stop=should_stop, method=flow_convergence_method)
+                             log_fn=log_fn, should_stop=should_stop, method=flow_convergence_method,
+                             solver_log_fn=solver_log_fn)
         if should_stop is not None and should_stop():
             raise StoppedByUser("Stopped after flow convergence.")
         log_fn("  restoring our own boundary conditions again (simpleFoam's mesh-derived "
