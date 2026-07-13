@@ -23,6 +23,7 @@ from .case_io import read_cell_centers
 from .decay_analysis import write_results_summary
 from .fan import fan_fvoptions_entry
 from .fluence import compute_fluence_at_points, compute_inactivation_rate, compute_well_mixed_eACH
+from . import help_content
 from .initial_fields import compute_inlet_velocity
 from .paraview_launch import launch_paraview
 from .report import generate_report_docx
@@ -988,6 +989,13 @@ app.layout = dbc.Container([
     dcc.Store(id="results-case-dir"),
     dcc.Interval(id="run-poll", interval=2000, n_intervals=0, disabled=True),
     dcc.ConfirmDialog(id="overwrite-confirm"),
+    dbc.Modal(
+        [
+            dbc.ModalHeader(dbc.ModalTitle(id="help-modal-title")),
+            dbc.ModalBody(dcc.Markdown(id="help-modal-body", link_target="_blank")),
+        ],
+        id="help-modal", is_open=False, size="lg", scrollable=True,
+    ),
     dbc.Row([
         dbc.Col(html.H4("GUV-CFD", className="mt-3 mb-1"), width="auto"),
         dbc.Col(dbc.DropdownMenu(
@@ -996,6 +1004,15 @@ app.layout = dbc.Container([
                 dbc.DropdownMenuItem("Open Project...", id="menu-open"),
                 dbc.DropdownMenuItem("Save Project", id="menu-save"),
                 dbc.DropdownMenuItem("Save Project As...", id="menu-save-as"),
+            ],
+        ), width="auto"),
+        dbc.Col(dbc.DropdownMenu(
+            label="Help", color="light", size="sm", className="mt-3",
+            children=[
+                dbc.DropdownMenuItem("About", id="menu-help-about"),
+                dbc.DropdownMenuItem("License", id="menu-help-license"),
+                dbc.DropdownMenuItem("References", id="menu-help-references"),
+                dbc.DropdownMenuItem("OpenFOAM Notes", id="menu-help-openfoam"),
             ],
         ), width="auto"),
         dbc.Col(html.Div("Untitled project", id="project-name-display",
@@ -1303,6 +1320,29 @@ _open_outputs += [Output(fid, "value", allow_duplicate=True) for fid in SETTINGS
 for _prefix, *_ in POSITION_FIELDS:
     _open_outputs.append(Output(f"{_prefix}-slider", "max", allow_duplicate=True))
     _open_outputs.append(Output(f"{_prefix}-input", "max", allow_duplicate=True))
+
+
+_HELP_CONTENT = {
+    "menu-help-about": ("About", help_content.ABOUT),
+    "menu-help-license": ("License", help_content.LICENSE_SUMMARY),
+    "menu-help-references": ("References", help_content.REFERENCES),
+    "menu-help-openfoam": ("OpenFOAM Notes", help_content.OPENFOAM_NOTES),
+}
+
+
+@app.callback(
+    Output("help-modal", "is_open"),
+    Output("help-modal-title", "children"),
+    Output("help-modal-body", "children"),
+    Input("menu-help-about", "n_clicks"),
+    Input("menu-help-license", "n_clicks"),
+    Input("menu-help-references", "n_clicks"),
+    Input("menu-help-openfoam", "n_clicks"),
+    prevent_initial_call=True,
+)
+def _open_help_modal(*_clicks):
+    title, body = _HELP_CONTENT[dash.ctx.triggered_id]
+    return True, title, body
 
 
 @app.callback(
