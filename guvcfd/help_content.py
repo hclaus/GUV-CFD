@@ -58,6 +58,41 @@ REFERENCES = """
 OPENFOAM_NOTES = """
 ## OpenFOAM: what this tool does, and why
 
+### Introduction
+
+This program targets rather unsophisticated, simple room-scale CFD coupled
+with GUV disinfection modeling - not state-of-the-art aerosol/droplet
+science. It solves for a single continuous contaminant concentration field,
+not individual particles.
+
+**Eulerian, not Lagrangian.** There are two fundamentally different ways to
+track how contaminant moves through air:
+
+- **Eulerian** (what this tool uses) - the contaminant is represented as a
+  *concentration field*: a continuous scalar value at every point of a
+  *fixed* mesh, transported by solving an advection-diffusion-reaction
+  equation (OpenFOAM's `scalarTransport` function object) directly on that
+  grid, the same way temperature or pressure would be solved. This is
+  efficient, and it directly gives the volume-averaged, room-scale
+  quantities the tool actually reports - decay curves, steady-state
+  concentrations, eACH - since those are properties of the *field*, not of
+  any individual particle.
+- **Lagrangian** (not used here) - individual particles, representing
+  discrete respiratory droplets or aerosol parcels of a given size, are
+  tracked one at a time as they move through a separately-solved flow
+  field, each subject to its own drag, gravity settling, evaporation, and so
+  on. This is the natural choice for questions this tool does *not* try to
+  answer: where a droplet of a specific size lands, near-field exposure from
+  a single cough, deposition on a particular surface.
+
+Practically: this tool cannot tell you what happens to a 5-micron droplet
+specifically - only what happens to a well-mixed-ish, room-scale contaminant
+concentration field as UV and ventilation remove it over time. That is a
+deliberate scope choice, not an oversight - it is the right level of
+fidelity for comparing ventilation/UV design choices at the room scale, at a
+small fraction of the setup and compute cost a full Lagrangian aerosol
+simulation would need.
+
 ### The two-stage approach
 
 Every run has two distinct OpenFOAM stages sharing one mesh and one
