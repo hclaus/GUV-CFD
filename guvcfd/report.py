@@ -31,6 +31,8 @@ _ROW_LABELS_FAN = [
 ]
 
 _ROW_LABELS_RESULTS_DECAY = [
+    ("Average fluence rate", lambda res: f"{res['fluence_mean']:.4g} µW/cm²"
+                                          if res.get("fluence_mean") is not None else "n/a"),
     ("Ventilation ACH (nominal)", lambda res: f"{res['ventilation_ach']:.3g} /hr"),
     ("eACH_uv, well-mixed (idealized)", lambda res: f"{res['eACH_uv_well_mixed']:.4g} /hr"),
     ("eACH_uv, effective (CFD-fit)", lambda res: f"{res['eACH_uv_effective']:.4g} /hr"),
@@ -52,6 +54,8 @@ _ROW_LABELS_RESULTS_DECAY_CORRECTED = [
 ]
 
 _ROW_LABELS_RESULTS_STEADY_STATE = [
+    ("Average fluence rate", lambda res: f"{res['fluence_mean']:.4g} µW/cm²"
+                                          if res.get("fluence_mean") is not None else "n/a"),
     ("Target well-mixed steady-state T", lambda res: f"{res.get('target_T_ss', '?')}"),
     ("Phase 1 T_ss (no UV)", lambda res: f"{res['phase1']['T_ss']:.4g} "
                                           f"({'plateaued' if res['phase1']['converged'] else 'NOT fully plateaued'}, "

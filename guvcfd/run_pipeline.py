@@ -414,9 +414,11 @@ def setup_case(guv_path, case_dir, template_case_dir=None, cell_size=0.1, Z=2.0,
     log_fn("Computing fluence rate at cell centers...")
     points = read_cell_centers(case_dir, "0")
     values = compute_fluence_at_points(room, points)
-    log_fn(f"  {len(points)} cells, fluence rate range [{values.min():.4g}, {values.max():.4g}]")
+    log_fn(f"  {len(points)} cells, fluence rate range [{values.min():.4g}, {values.max():.4g}], "
+           f"mean {values.mean():.4g}")
     summary["n_cells"] = len(points)
     summary["fluence_range"] = (float(values.min()), float(values.max()))
+    summary["fluence_mean"] = float(values.mean())
     patch_names = read_boundary_patch_names(case_dir)
     write_scalar_field(case_dir, "fluenceRate", values, patch_names)
 

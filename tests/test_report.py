@@ -43,6 +43,7 @@ _STEADY_STATE_RESULTS = {
     "phase2": {"T_ss": 0.0644, "converged": False, "iterations": 3000},
     "reduction_pct": 74.7,
     "eACH_uv_steady_state": 17.73,
+    "fluence_mean": 12.34,
 }
 
 
@@ -66,4 +67,28 @@ def test_steady_state_report_does_not_crash_on_decay_only_fields(tmp_path):
             all_text += "\n" + "\t".join(c.text for c in row.cells)
     assert "74.7%" in all_text
     assert "17.73" in all_text
+    assert "12.34" in all_text  # average fluence rate
     assert len(doc.inline_shapes) == 1  # room preview picture embedded
+
+
+def test_decay_report_shows_fluence_mean(tmp_path):
+    case_dir = str(tmp_path)
+    (tmp_path / "run_settings.json").write_text(json.dumps(_REAL_SETTINGS))
+    decay_results = {
+        "ventilation_ach": 3.0, "eACH_uv_well_mixed": 10.27, "eACH_uv_effective": 8.97,
+        "mixing_efficiency": 0.873, "total_ach_effective": 11.97,
+        "decay_curve": {"t_seconds": [0, 10], "volAverage_T": [1.0, 0.9]},
+        "fluence_mean": 5.678,
+    }
+    (tmp_path / "results.json").write_text(json.dumps(decay_results))
+    out_path = str(tmp_path / "out.docx")
+
+    generate_report_docx(case_dir, out_path)
+
+    from docx import Document
+    doc = Document(out_path)
+    all_text = ""
+    for table in doc.tables:
+        for row in table.rows:
+            all_text += "\n" + "\t".join(c.text for c in row.cells)
+    assert "5.678" in all_text

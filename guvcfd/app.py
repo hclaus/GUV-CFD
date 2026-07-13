@@ -373,7 +373,7 @@ def _run_decay(guv_path, case_dir, room, settings):
     _run_log("Writing results summary...")
     results = write_results_summary(
         case_dir, f"{case_dir}/results.json", settings["ach"],
-        summary["eACH_uv_well_mixed_mean"], extra={"n_lamps": summary["n_lamps"]},
+        summary["eACH_uv_well_mixed_mean"], extra={"n_lamps": summary["n_lamps"], "fluence_mean": summary["fluence_mean"]},
     )
 
     if settings.get("no-uv-control-enable"):
@@ -390,7 +390,7 @@ def _run_decay(guv_path, case_dir, room, settings):
                  "not nominal, ventilation ACH)...")
         results = write_results_summary(
             case_dir, f"{case_dir}/results.json", settings["ach"],
-            summary["eACH_uv_well_mixed_mean"], extra={"n_lamps": summary["n_lamps"]},
+            summary["eACH_uv_well_mixed_mean"], extra={"n_lamps": summary["n_lamps"], "fluence_mean": summary["fluence_mean"]},
             measured_ventilation_ach=control_results["total_ach_effective"],
         )
 
@@ -547,6 +547,7 @@ def _run_steady_state(guv_path, case_dir, room, settings):
         fan_entry=fan_entry,
         log_fn=_run_log, should_stop=_should_stop,
     )
+    result["fluence_mean"] = summary["fluence_mean"]
     with open(f"{case_dir}/results.json", "w") as f:
         json.dump(result, f, indent=2)
     _complete_all_steps()
@@ -885,7 +886,10 @@ def _steady_state_figure(result):
 
 def _steady_state_summary(result):
     p1, p2 = result["phase1"], result["phase2"]
-    rows = [
+    rows = []
+    if result.get("fluence_mean") is not None:
+        rows.append(("Average fluence rate", f"{result['fluence_mean']:.4g} µW/cm²"))
+    rows += [
         ("Target T_ss (design)", f"{result.get('target_T_ss', '?')}"),
         ("Phase 1 T_ss", f"{p1['T_ss']:.4g}  ({'plateaued' if p1['converged'] else 'NOT fully plateaued'}, "
                           f"{p1['iterations']} iterations)"),
@@ -935,7 +939,10 @@ def _decay_figure(result):
 
 
 def _decay_summary(result):
-    rows = [
+    rows = []
+    if result.get("fluence_mean") is not None:
+        rows.append(("Average fluence rate", f"{result['fluence_mean']:.4g} µW/cm²"))
+    rows += [
         ("Ventilation ACH (nominal)", f"{result['ventilation_ach']:.3g} /hr"),
         ("eACH_uv well-mixed", f"{result['eACH_uv_well_mixed']:.4g} /hr"),
         ("eACH_uv effective (CFD-fit)", f"{result['eACH_uv_effective']:.4g} /hr"),
@@ -1164,13 +1171,25 @@ def _load_results(n_clicks, case_dir_field):
 
 
 def _default_report_name(results_case_dir):
-    """<guvcfd project name>_report.docx if a .guvcfd file is currently
-    loaded/saved, else <case directory name>_report.docx as a fallback."""
+    """<.guv project name>_report.docx, using the project that *this run*
+    was actually built from (run_settings.json's own guv_path) - not
+    _loaded["settings_path"] (the Setup tab's currently-open project), which
+    can be a different, unrelated, or stale project from whatever run the
+    Analysis tab happens to be showing right now. Falls back to the
+    Setup tab's project, then the case directory name, if run_settings.json
+    is missing or predates the guv_path field.
+    """
+    run_settings_path = Path(results_case_dir) / "run_settings.json"
+    if run_settings_path.exists():
+        try:
+            with open(run_settings_path) as f:
+                guv_path = json.load(f).get("guv_path")
+            if guv_path:
+                return f"{Path(guv_path).stem}_report.docx"
+        except (json.JSONDecodeError, OSError):
+            pass
     settings_path = _loaded.get("settings_path")
-    if settings_path:
-        stem = Path(settings_path).stem
-    else:
-        stem = Path(results_case_dir).name
+    stem = Path(settings_path).stem if settings_path else Path(results_case_dir).name
     return f"{stem}_report.docx"
 
 
