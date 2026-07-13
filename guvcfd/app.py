@@ -14,16 +14,22 @@ from tkinter import filedialog
 
 import dash
 import dash_bootstrap_components as dbc
+import numpy as np
 import plotly.graph_objs as go
 from dash import Input, Output, State, dcc, html
 from guv_calcs import Project
 
+from .case_io import read_cell_centers
 from .decay_analysis import write_results_summary
 from .fan import fan_fvoptions_entry
+from .fluence import compute_fluence_at_points, compute_inactivation_rate, compute_well_mixed_eACH
 from .initial_fields import compute_inlet_velocity
+from .paraview_launch import launch_paraview
+from .report import generate_report_docx
 from .run_pipeline import setup_case
 from .splice import set_control_dict_start_from, set_control_dict_time
 from .steady_state_pipeline import run_steady_state_scenario
+from .ventilation_control import run_ventilation_only_control
 from .visualization import plot_case
 from .wsl_utils import run_wsl, run_wsl_or_raise, run_wsl_streaming, wsl_path, StoppedByUser
 
@@ -52,7 +58,7 @@ SETTINGS_FIELDS = [
     "outlet-show", "outlet-wall", "outlet-y-input", "outlet-z-input", "outlet-size-w", "outlet-size-h",
     "fan-enable", "fan-speed", "fan-direction", "fan-radius", "fan-thickness",
     "fan-x-input", "fan-y-input", "fan-z-input",
-    "sim-type", "pimple-end-time", "pimple-write-interval",
+    "sim-type", "pimple-end-time", "pimple-write-interval", "no-uv-control-enable",
     "target-t-ss", "inject-x-input", "inject-y-input", "inject-z-input",
     "phase1-iterations", "phase2-iterations",
 ]
@@ -84,7 +90,7 @@ def _compute_default_run_dir():
     from Windows); wsl_utils.wsl_path() converts it back for subprocess use.
     """
     try:
-        r = run_wsl('mkdir -p "$FOAM_RUN"; printf "%s|%s" "$WSL_DISTRO_NAME" "$FOAM_RUN"', "~")
+        r = run_wsl('mkdir -p "$FOAM_RUN"; printf "%s|%s" "$WSL_DISTRO_NAME" "$FOAM_RUN"', "$HOME")
         distro, _, run_path = r.stdout.strip().partition("|")
         if not run_path:
             return ""
@@ -298,9 +304,15 @@ _MESH_AFFECTING_FIELDS = [
 ]
 
 
-def _save_run_settings(case_dir, settings):
+def _save_run_settings(case_dir, settings, guv_path=None):
+    data = {k: settings.get(k) for k in _MESH_AFFECTING_FIELDS}
+    # guv_path is provenance for report generation (reloading the Room to
+    # render a preview image) - not compared by _settings_mismatch, which
+    # only ever iterates _MESH_AFFECTING_FIELDS.
+    if guv_path is not None:
+        data["guv_path"] = guv_path
     with open(f"{case_dir}/run_settings.json", "w") as f:
-        json.dump({k: settings.get(k) for k in _MESH_AFFECTING_FIELDS}, f, indent=2)
+        json.dump(data, f, indent=2)
 
 
 def _settings_mismatch(case_dir, current_settings):
@@ -341,7 +353,7 @@ def _run_decay(guv_path, case_dir, room, settings):
     # Record what the mesh/flow field were actually built with, regardless
     # of whether pimpleFoam below succeeds - Continue compares against this,
     # not against whatever the GUI happens to show later.
-    _save_run_settings(case_dir, settings)
+    _save_run_settings(case_dir, settings, guv_path=guv_path)
 
     case_dir_wsl = wsl_path(case_dir)
     _run_log(f"Running pimpleFoam to {settings['pimple-end-time']}s (this can take a while)...")
@@ -363,9 +375,32 @@ def _run_decay(guv_path, case_dir, room, settings):
         case_dir, f"{case_dir}/results.json", settings["ach"],
         summary["eACH_uv_well_mixed_mean"], extra={"n_lamps": summary["n_lamps"]},
     )
+
+    if settings.get("no-uv-control-enable"):
+        if _should_stop():
+            raise StoppedByUser("Stopped before UV-off control run.")
+        _run_log("=== Running UV-off ventilation-only control (subfolder \"no_UV\") ===")
+        control_results = run_ventilation_only_control(
+            case_dir, f"{case_dir}/no_UV", settings["ach"], room.x, room.y, room.z,
+            settings["inlet-wall"], (settings["inlet-size-w"], settings["inlet-size-h"]),
+            settings["pimple-end-time"], settings["pimple-write-interval"],
+            log_fn=_run_log, should_stop=_should_stop,
+        )
+        _run_log("Updating results.json with corrected mixing efficiency (measured, "
+                 "not nominal, ventilation ACH)...")
+        results = write_results_summary(
+            case_dir, f"{case_dir}/results.json", settings["ach"],
+            summary["eACH_uv_well_mixed_mean"], extra={"n_lamps": summary["n_lamps"]},
+            measured_ventilation_ach=control_results["total_ach_effective"],
+        )
+
     _complete_all_steps()
     _run_log(f"Done. eACH_uv effective={results['eACH_uv_effective']:.4g} /hr "
              f"(well-mixed={results['eACH_uv_well_mixed']:.4g} /hr)")
+    if "mixing_efficiency_corrected" in results:
+        _run_log(f"  Corrected mixing efficiency (measured ventilation baseline): "
+                 f"{results['mixing_efficiency_corrected'] * 100:.1f}% "
+                 f"(vs {results['mixing_efficiency'] * 100:.1f}% using nominal ACH)")
 
 
 def _continue_decay(case_dir, end_time, write_interval):
@@ -425,6 +460,24 @@ def _continue_decay(case_dir, end_time, write_interval):
     _complete_all_steps()
     _run_log(f"Done. eACH_uv effective={results['eACH_uv_effective']:.4g} /hr "
              f"(well-mixed={results['eACH_uv_well_mixed']:.4g} /hr)")
+
+
+def _estimate_well_mixed_eACH(room, z_value, grid_n=(10, 8, 8)):
+    """Quick well-mixed eACH_UV estimate straight from the room/lamps/Z - no
+    CFD mesh needed, since compute_fluence_at_points works on any point
+    cloud (see fluence.py). Used only to prefill a sensible suggested
+    simulated duration / settling time before any OpenFOAM run exists; a
+    coarse grid is fine since this is a starting suggestion the user can
+    always override, not a final result.
+    """
+    nx, ny, nz = grid_n
+    xs = np.linspace(0, room.x, nx + 2)[1:-1]
+    ys = np.linspace(0, room.y, ny + 2)[1:-1]
+    zs = np.linspace(0, room.z, nz + 2)[1:-1]
+    grid = np.stack(np.meshgrid(xs, ys, zs, indexing="ij"), axis=-1).reshape(-1, 3)
+    values = compute_fluence_at_points(room, grid)
+    k_values = compute_inactivation_rate(values, z_value)
+    return float(compute_well_mixed_eACH(k_values).mean())
 
 
 def _settling_iterations(lambda_per_hr, target_fraction=0.995, min_iterations=500, max_iterations=50000):
@@ -554,13 +607,14 @@ def _native_choose_dir(title, initialdir=None):
     return path.replace("/", "\\") if path else None
 
 
-def _native_save_file(title, defaultextension, filetypes):
+def _native_save_file(title, defaultextension, filetypes, initialfile=None):
     root = tk.Tk()
     root.withdraw()
     root.attributes("-topmost", True)
-    path = filedialog.asksaveasfilename(
-        title=title, defaultextension=defaultextension, filetypes=filetypes,
-    )
+    kwargs = {"title": title, "defaultextension": defaultextension, "filetypes": filetypes}
+    if initialfile:
+        kwargs["initialfile"] = initialfile
+    path = filedialog.asksaveasfilename(**kwargs)
     root.destroy()
     return path or None
 
@@ -652,10 +706,10 @@ project_setup_tab = dbc.Row([
 
         _card("Ventilation & UV", [
             _labeled("Air changes per hour (ACH)", dcc.Input(
-                id="ach", type="number", value=3.0, min=0.1, max=20, step=0.1,
+                id="ach", type="number", value=3.0, min=0.1, max=20, step=0.1, debounce=True,
                 className="form-control form-control-sm")),
             _labeled("Z — UV susceptibility (cm²/mJ)", dcc.Input(
-                id="z-value", type="number", value=2.0, min=0.01, max=20, step=0.1,
+                id="z-value", type="number", value=2.0, min=0.01, max=20, step=0.1, debounce=True,
                 className="form-control form-control-sm")),
         ]),
 
@@ -706,9 +760,14 @@ project_setup_tab = dbc.Row([
                 value="decay",
             ),
             html.Div(id="decay-controls", children=[
-                _labeled("Simulated duration (s)", dcc.Input(
-                    id="pimple-end-time", type="number", value=120, min=10, max=7200, step=10,
-                    className="form-control form-control-sm")),
+                _labeled("Simulated duration (s)", dbc.Row([
+                    dbc.Col(dcc.Input(
+                        id="pimple-end-time", type="number", value=120, min=10, max=7200, step=10,
+                        className="form-control form-control-sm"), width=8),
+                    dbc.Col(dbc.Button("Suggest", id="suggest-duration-btn", size="sm",
+                                       color="secondary", outline=True, className="w-100"), width=4),
+                ], className="g-2"),
+                    help_text="Estimated time to 99% reduction from ACH + well-mixed eACH_uv."),
                 _labeled("Write interval (s)", dcc.Input(
                     id="pimple-write-interval", type="number", value=10, min=1, max=600, step=1,
                     className="form-control form-control-sm")),
@@ -727,9 +786,15 @@ project_setup_tab = dbc.Row([
                 _labeled("Phase 2 iterations (UV on)", dcc.Input(
                     id="phase2-iterations", type="number", value=3000, min=500, max=50000, step=500,
                     className="form-control form-control-sm")),
+                dbc.Button("Suggest settling times (99.5%)", id="suggest-phases-btn", size="sm",
+                           color="secondary", outline=True, className="w-100 mt-1"),
             ]),
         ]),
 
+        dbc.Checkbox(id="no-uv-control-enable", value=False,
+                     label="Also run a UV-off control (subfolder \"no_UV\") for corrected "
+                           "mixing efficiency",
+                     className="mb-2"),
         dbc.Button("Run simulation", id="run-btn", color="success", className="w-100 mb-2"),
         dbc.Button("Continue to longer duration", id="continue-btn", color="secondary",
                    outline=True, className="w-100 mb-2"),
@@ -867,13 +932,20 @@ def _decay_figure(result):
 
 def _decay_summary(result):
     rows = [
-        ("Ventilation ACH", f"{result['ventilation_ach']:.3g} /hr"),
+        ("Ventilation ACH (nominal)", f"{result['ventilation_ach']:.3g} /hr"),
         ("eACH_uv well-mixed", f"{result['eACH_uv_well_mixed']:.4g} /hr"),
         ("eACH_uv effective (CFD-fit)", f"{result['eACH_uv_effective']:.4g} /hr"),
         ("Total ACH, effective", f"{result.get('total_ach_effective', 0):.3g} /hr"),
     ]
     if result.get("mixing_efficiency") is not None:
         rows.append(("Mixing efficiency", f"{result['mixing_efficiency'] * 100:.1f}%"))
+    if result.get("ventilation_ach_measured") is not None:
+        rows.append(("Ventilation ACH (measured, UV-off control)",
+                      f"{result['ventilation_ach_measured']:.4g} /hr"))
+        rows.append(("eACH_uv effective (corrected)",
+                      f"{result['eACH_uv_effective_corrected']:.4g} /hr"))
+        rows.append(("Mixing efficiency (corrected)",
+                      f"{result['mixing_efficiency_corrected'] * 100:.1f}%"))
     return [html.Div([html.Span(k + ": ", className="text-muted"), html.Span(v)], className="mb-1")
             for k, v in rows]
 
@@ -882,6 +954,10 @@ analysis_tab = dbc.Row([
     dbc.Col([
         dbc.Button("Load results.json...", id="load-results-btn", color="primary",
                    size="sm", className="w-100 mb-2"),
+        dbc.Button("Export report (.docx)...", id="export-report-btn", color="secondary",
+                   outline=True, size="sm", className="w-100 mb-2"),
+        dbc.Button("Open in ParaView", id="open-paraview-btn", color="secondary",
+                   outline=True, size="sm", className="w-100 mb-2"),
         html.Div(id="analysis-status", className="small text-muted mb-3"),
         html.Div(id="analysis-summary", className="small"),
     ], width=4),
@@ -893,6 +969,7 @@ analysis_tab = dbc.Row([
 app.layout = dbc.Container([
     dcc.Store(id="fresh-room-load"),
     dcc.Store(id="results-data"),
+    dcc.Store(id="results-case-dir"),
     dcc.Interval(id="run-poll", interval=2000, n_intervals=0, disabled=True),
     dcc.ConfirmDialog(id="overwrite-confirm"),
     dbc.Row([
@@ -976,6 +1053,40 @@ def _toggle_fan_controls(enabled):
 
 
 @app.callback(
+    Output("pimple-end-time", "value"),
+    Input("suggest-duration-btn", "n_clicks"),
+    Input("fresh-room-load", "data"),
+    State("ach", "value"),
+    State("z-value", "value"),
+    prevent_initial_call=True,
+)
+def _suggest_duration(n_clicks, _fresh_load, ach, z_value):
+    room = _loaded["room"]
+    if room is None or ach is None or z_value is None:
+        return dash.no_update
+    eACH = _estimate_well_mixed_eACH(room, z_value)
+    return _settling_iterations(ach + eACH, target_fraction=0.99, min_iterations=10, max_iterations=7200)
+
+
+@app.callback(
+    Output("phase1-iterations", "value"),
+    Output("phase2-iterations", "value"),
+    Input("suggest-phases-btn", "n_clicks"),
+    Input("fresh-room-load", "data"),
+    State("ach", "value"),
+    State("z-value", "value"),
+    prevent_initial_call=True,
+)
+def _suggest_phases(n_clicks, _fresh_load, ach, z_value):
+    room = _loaded["room"]
+    if room is None or ach is None or z_value is None:
+        return dash.no_update, dash.no_update
+    eACH = _estimate_well_mixed_eACH(room, z_value)
+    return (_settling_iterations(ach, target_fraction=0.995),
+            _settling_iterations(ach + eACH, target_fraction=0.995))
+
+
+@app.callback(
     Output("project-status", "children"),
     Output("project-description", "value"),
     Output("fresh-room-load", "data"),
@@ -1021,6 +1132,7 @@ def _browse_case_dir(n_clicks, current_dir):
 @app.callback(
     Output("results-data", "data", allow_duplicate=True),
     Output("analysis-status", "children"),
+    Output("results-case-dir", "data", allow_duplicate=True),
     Input("load-results-btn", "n_clicks"),
     State("case-dir", "value"),
     prevent_initial_call=True,
@@ -1036,14 +1148,82 @@ def _load_results(n_clicks, case_dir_field):
         initialdir=initialdir,
     )
     if not path:
-        return dash.no_update, dash.no_update
+        return dash.no_update, dash.no_update, dash.no_update
     try:
         with open(path) as f:
             data = json.load(f)
     except Exception as e:
-        return dash.no_update, f"Failed to load: {e}"
+        return dash.no_update, f"Failed to load: {e}", dash.no_update
     name = path.replace("\\", "/").rsplit("/", 1)[-1]
-    return data, f"Loaded {name}"
+    case_dir = path.replace("\\", "/").rsplit("/", 1)[0]
+    return data, f"Loaded {name}", case_dir
+
+
+def _default_report_name(results_case_dir):
+    """<guvcfd project name>_report.docx if a .guvcfd file is currently
+    loaded/saved, else <case directory name>_report.docx as a fallback."""
+    settings_path = _loaded.get("settings_path")
+    if settings_path:
+        stem = Path(settings_path).stem
+    else:
+        stem = Path(results_case_dir).name
+    return f"{stem}_report.docx"
+
+
+@app.callback(
+    Output("analysis-status", "children", allow_duplicate=True),
+    Input("export-report-btn", "n_clicks"),
+    State("results-case-dir", "data"),
+    prevent_initial_call=True,
+)
+def _export_report(n_clicks, results_case_dir):
+    if not results_case_dir:
+        return "Load a results.json first (or finish a run) before exporting a report."
+    out_path = _native_save_file(
+        "Export simulation report",
+        ".docx",
+        [("Word document", "*.docx"), ("All files", "*.*")],
+        initialfile=_default_report_name(results_case_dir),
+    )
+    if not out_path:
+        return dash.no_update
+    try:
+        generate_report_docx(results_case_dir, out_path)
+    except Exception as e:
+        return f"Failed to export report: {e}"
+    name = out_path.replace("\\", "/").rsplit("/", 1)[-1]
+    return f"Report saved to {name}"
+
+
+@app.callback(
+    Output("analysis-status", "children", allow_duplicate=True),
+    Input("open-paraview-btn", "n_clicks"),
+    State("results-case-dir", "data"),
+    prevent_initial_call=True,
+)
+def _open_paraview(n_clicks, results_case_dir):
+    if not results_case_dir:
+        return "Load a results.json first (or finish a run) before opening ParaView."
+    settings_path = Path(results_case_dir) / "run_settings.json"
+    if not settings_path.exists():
+        return (f"{results_case_dir}/run_settings.json not found - rerun a full "
+                f"simulation here to enable the ParaView preset.")
+    with open(settings_path) as f:
+        settings = json.load(f)
+    try:
+        points = read_cell_centers(results_case_dir, "0")
+        mesh_bounds = (points[:, 0].min(), points[:, 0].max(),
+                       points[:, 1].min(), points[:, 1].max(),
+                       points[:, 2].min(), points[:, 2].max())
+        launch_paraview(
+            results_case_dir, settings["inlet-wall"],
+            settings["inlet-y-input"], settings["inlet-z-input"],
+            (settings["inlet-size-w"], settings["inlet-size-h"]),
+            mesh_bounds,
+        )
+    except Exception as e:
+        return f"Failed to open ParaView: {e}"
+    return "Opened ParaView (volume T + inlet-seeded streamlines colored by U)."
 
 
 @app.callback(
@@ -1375,6 +1555,7 @@ def _solver_progress_text():
     Output("run-elapsed", "children"),
     Output("run-current-time", "children"),
     Output("results-data", "data", allow_duplicate=True),
+    Output("results-case-dir", "data", allow_duplicate=True),
     Input("run-poll", "n_intervals"),
     prevent_initial_call=True,
 )
@@ -1403,15 +1584,17 @@ def _poll_run(n_intervals):
     # stops right after this (run-poll.disabled becomes True), so this
     # only fires once, exactly when status first becomes "done".
     results_data = dash.no_update
+    results_case_dir = dash.no_update
     if status == "done" and _run_state.get("case_dir"):
         try:
             with open(f"{_run_state['case_dir']}/results.json") as f:
                 results_data = json.load(f)
+            results_case_dir = _run_state["case_dir"]
         except Exception:
             results_data = dash.no_update
 
     return (log_text, status_text, still_running, still_running, not still_running, not still_running,
-            _render_checklist(), pct, f"{pct}%", elapsed, cur_time_text, results_data)
+            _render_checklist(), pct, f"{pct}%", elapsed, cur_time_text, results_data, results_case_dir)
 
 
 @app.callback(

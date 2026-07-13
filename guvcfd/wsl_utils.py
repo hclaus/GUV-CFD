@@ -36,7 +36,7 @@ def wsl_path(unc_or_wsl_path):
 
 
 def run_wsl(cmd, cwd_wsl):
-    full_cmd = f"source {OPENFOAM_BASHRC} 2>/dev/null; cd {cwd_wsl} && {cmd}"
+    full_cmd = f'source {OPENFOAM_BASHRC} 2>/dev/null; cd "{cwd_wsl}" && {cmd}'
     for attempt in range(_WSL_RETRY_ATTEMPTS + 1):
         r = subprocess.run(["wsl", "-e", "bash", "-lc", full_cmd], capture_output=True, text=True)
         if not _looks_like_wsl_launch_failure(r.returncode, r.stdout, r.stderr):
@@ -73,7 +73,7 @@ def run_wsl_streaming(cmd, cwd_wsl, on_line=None, should_stop=None, kill_pattern
     covering everything captured so far - callers check should_stop()
     themselves afterward to distinguish a deliberate stop from a crash.
     """
-    full_cmd = f"source {OPENFOAM_BASHRC} 2>/dev/null; cd {cwd_wsl} && {cmd}"
+    full_cmd = f'source {OPENFOAM_BASHRC} 2>/dev/null; cd "{cwd_wsl}" && {cmd}'
 
     for attempt in range(_WSL_RETRY_ATTEMPTS + 1):
         proc = subprocess.Popen(

@@ -41,7 +41,7 @@ def fit_effective_decay_rate(t, T):
     return -slope, intercept
 
 
-def compute_effective_eACH(t, T, ventilation_ach):
+def compute_effective_eACH(t, T, ventilation_ach, ventilation_lambda_per_s=None):
     """Effective eACH_UV [1/hr] implied by an actual CFD decay curve, i.e.
     what UV-only air-change-equivalent would explain the observed *total*
     decay rate once ventilation's own contribution is subtracted out.
@@ -51,9 +51,18 @@ def compute_effective_eACH(t, T, ventilation_ach):
     perfect instantaneous mixing, so it's an upper bound. The gap between
     the two quantifies how much imperfect real-world mixing reduces UV's
     effective disinfection benefit versus that ideal.
+
+    ventilation_lambda_per_s: if given, subtract this *measured* ventilation-
+    only decay rate (from a UV-off control run - see
+    ventilation_control.run_ventilation_only_control) instead of assuming
+    ventilation_ach/3600 exactly. Real ventilation doesn't always achieve its
+    nominal ACH either (the same imperfect-mixing effect this function
+    already isolates for UV) - using the measured baseline removes that
+    small bias from eACH_uv_effective. Defaults to the nominal ACH when not
+    given (the original, uncorrected behavior).
     """
     lambda_total_effective, intercept = fit_effective_decay_rate(t, T)
-    lambda_vent = ventilation_ach / 3600.0
+    lambda_vent = ventilation_lambda_per_s if ventilation_lambda_per_s is not None else ventilation_ach / 3600.0
     eACH_uv_effective = (lambda_total_effective - lambda_vent) * 3600.0
     return eACH_uv_effective, lambda_total_effective, intercept
 
@@ -77,11 +86,18 @@ def check_plateau(T, window=5, rel_tol=0.01):
 
 def write_results_summary(case_dir, out_path, ventilation_ach, well_mixed_eACH_mean,
                            vol_average_dat="postProcessing/volAverage1/0/volFieldValue.dat",
-                           extra=None):
+                           extra=None, measured_ventilation_ach=None):
     """Write a single results.json combining the well-mixed eACH (from
     setup_case's fluence computation) with the CFD-fit effective eACH (from
     an actual completed pimpleFoam run's decay curve) - everything a results
     display needs, in one file, independent of how/where it gets rendered.
+
+    measured_ventilation_ach: the *actual* ventilation-only air-change rate
+    from a UV-off control run (ventilation_control.py), if one was run
+    alongside this case. When given, also writes corrected
+    eACH_uv_effective_corrected/mixing_efficiency_corrected fields that
+    subtract this measured baseline instead of the nominal ventilation_ach -
+    see compute_effective_eACH's docstring for why that's more accurate.
     """
     dat_path = f"{case_dir}/{vol_average_dat}"
     t, T = read_vol_average_dat(dat_path)
@@ -98,6 +114,15 @@ def write_results_summary(case_dir, out_path, ventilation_ach, well_mixed_eACH_m
         "fit_intercept": intercept,
         "decay_curve": {"t_seconds": t.tolist(), "volAverage_T": T.tolist()},
     }
+
+    if measured_ventilation_ach is not None:
+        eACH_eff_corrected, _, _ = compute_effective_eACH(
+            t, T, ventilation_ach, ventilation_lambda_per_s=measured_ventilation_ach / 3600.0)
+        summary["ventilation_ach_measured"] = measured_ventilation_ach
+        summary["eACH_uv_effective_corrected"] = eACH_eff_corrected
+        summary["mixing_efficiency_corrected"] = (
+            eACH_eff_corrected / well_mixed_eACH_mean if well_mixed_eACH_mean else None)
+
     if extra:
         summary.update(extra)
 
