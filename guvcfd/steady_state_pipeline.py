@@ -22,6 +22,7 @@ from .contaminant_source import (
 from .decay_analysis import read_vol_average_dat, check_plateau
 from .initial_fields import restore_boundary_conditions
 from .monitoring import write_vol_average_dict
+from .monitoring_points import compute_monitoring_results
 from .splice import splice_fv_options_into_control_dict, set_control_dict_time, ensure_simple_fvsolution
 from .wsl_utils import wsl_path, run_wsl_or_raise, run_wsl_streaming, StoppedByUser
 
@@ -130,7 +131,7 @@ def run_steady_state_scenario(case_dir, room_x, room_y, room_z, ach, Z, nbins=25
                                phase1_iterations=8000, phase1_write_interval=200,
                                phase2_iterations=3000, phase2_write_interval=100,
                                plateau_window=5, plateau_rel_tol=0.01,
-                               fan_entry=None,
+                               fan_entry=None, monitoring_points=None,
                                patches_to_monitor=("outlet",), log_fn=print, should_stop=None):
     """Run both phases of a continuous-source steady-state scenario against
     an already-converged case (mesh + flow + fluenceRate/kUV must already
@@ -142,6 +143,16 @@ def run_steady_state_scenario(case_dir, room_x, room_y, room_z, ach, Z, nbins=25
     was already carved as part of setup_case()'s flow convergence (so the
     converged flow field already reflects the fan's influence), just pass
     the same entry text again here - no need to re-carve the zone.
+
+    monitoring_points: optional list of monitoring_points.py-shaped point
+    dicts. Computed once per phase, right after that phase's own _run_phase()
+    call and before its time directories get cleaned up (phase 1's are
+    deleted by _clean_time_dirs after being copied into 0/) - unlike the
+    decay scenario, this can't be done in a single pass at the very end,
+    since each phase's own on-disk time-directory history only survives
+    until the next phase starts. fit_decay=False for both: a build-up curve
+    isn't a decay curve, fitting compute_effective_eACH's exponential-decay
+    model to it would produce nonsense.
     """
     case_dir_wsl = wsl_path(case_dir)
     room_volume = room_x * room_y * room_z
@@ -186,6 +197,10 @@ def run_steady_state_scenario(case_dir, room_x, room_y, room_z, ach, Z, nbins=25
     )
     summary["phase1"] = {"T_ss": float(T1[-1]), "converged": converged1, "iterations": latest1,
                           "decay_curve": {"t": t1.tolist(), "T": T1.tolist()}}
+    monitoring_phase1 = None
+    if monitoring_points:
+        monitoring_phase1 = compute_monitoring_results(
+            case_dir, monitoring_points, cell_size=cell_size, fit_decay=False, log_fn=log_fn)
     _copy_latest_to_zero(case_dir_wsl, latest1, include_T=True, log_fn=log_fn)
     _clean_time_dirs(case_dir_wsl)
 
@@ -203,6 +218,13 @@ def run_steady_state_scenario(case_dir, room_x, room_y, room_z, ach, Z, nbins=25
     )
     summary["phase2"] = {"T_ss": float(T2[-1]), "converged": converged2, "iterations": latest2,
                           "decay_curve": {"t": t2.tolist(), "T": T2.tolist()}}
+    if monitoring_points:
+        monitoring_phase2 = compute_monitoring_results(
+            case_dir, monitoring_points, cell_size=cell_size, fit_decay=False, log_fn=log_fn)
+        summary["monitoring"] = {
+            name: {"phase1": monitoring_phase1[name], "phase2": monitoring_phase2[name]}
+            for name in monitoring_phase2
+        }
     _copy_latest_to_zero(case_dir_wsl, latest2, include_T=True, log_fn=log_fn)
 
     lambda_vent = ach / 3600.0

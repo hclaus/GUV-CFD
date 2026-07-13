@@ -77,6 +77,31 @@ _ROW_LABELS_RESULTS_STEADY_STATE_CORRECTED = [
 ]
 
 
+def _monitoring_rows(monitoring):
+    """Row list for monitoring locations, if any were computed. Handles both
+    decay's shape ({name: {t_seconds, volAverage_T, eACH_uv_effective?}})
+    and steady-state's shape ({name: {phase1: {...}, phase2: {...}}}).
+    """
+    if not monitoring:
+        return []
+    rows = []
+    for name, data in monitoring.items():
+        if "phase1" in data:
+            p1, p2 = data["phase1"], data["phase2"]
+            T1 = p1["volAverage_T"][-1] if p1["volAverage_T"] else None
+            T2 = p2["volAverage_T"][-1] if p2["volAverage_T"] else None
+            value = f"T_ss1={T1:.4g}, T_ss2={T2:.4g}" if T1 is not None and T2 is not None else "n/a"
+            if T1:
+                value += f", reduction={(1 - T2 / T1) * 100:.1f}%"
+        else:
+            T_final = data["volAverage_T"][-1] if data["volAverage_T"] else None
+            value = f"final volAverage(T)={T_final:.4g}" if T_final is not None else "n/a"
+            if data.get("eACH_uv_effective") is not None:
+                value += f", eACH_uv={data['eACH_uv_effective']:.4g}/hr"
+        rows.append((name, value))
+    return rows
+
+
 def _add_kv_table(doc, rows):
     table = doc.add_table(rows=0, cols=2)
     table.style = "Light Grid Accent 1"
@@ -159,6 +184,11 @@ def generate_report_docx(case_dir, out_path):
         _add_kv_table(doc, [(label, fn(results)) for label, fn in _ROW_LABELS_RESULTS_DECAY])
         if results.get("ventilation_ach_measured") is not None:
             _add_kv_table(doc, [(label, fn(results)) for label, fn in _ROW_LABELS_RESULTS_DECAY_CORRECTED])
+
+    monitoring_rows = _monitoring_rows(results.get("monitoring"))
+    if monitoring_rows:
+        doc.add_heading("Monitoring Locations", level=2)
+        _add_kv_table(doc, monitoring_rows)
 
     doc.save(out_path)
     image_path.unlink(missing_ok=True)

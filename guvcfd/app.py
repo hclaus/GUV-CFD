@@ -25,6 +25,7 @@ from .fan import fan_fvoptions_entry
 from .fluence import compute_fluence_at_points, compute_inactivation_rate, compute_well_mixed_eACH
 from . import help_content
 from .initial_fields import compute_inlet_velocity
+from .monitoring_points import compute_monitoring_results
 from .paraview_launch import launch_paraview
 from .report import generate_report_docx
 from .run_pipeline import setup_case
@@ -62,7 +63,16 @@ SETTINGS_FIELDS = [
     "sim-type", "pimple-end-time", "pimple-write-interval", "no-uv-control-enable",
     "target-t-ss", "inject-x-input", "inject-y-input", "inject-z-input",
     "phase1-iterations", "phase2-iterations",
+    "monitoring-enable",
+    "monitor1-enable", "monitor1-name", "monitor1-x-input", "monitor1-y-input",
+    "monitor1-z-input", "monitor1-cells",
+    "monitor2-enable", "monitor2-name", "monitor2-x-input", "monitor2-y-input",
+    "monitor2-z-input", "monitor2-cells",
+    "monitor3-enable", "monitor3-name", "monitor3-x-input", "monitor3-y-input",
+    "monitor3-z-input", "monitor3-cells",
 ]
+
+MONITOR_POINT_IDS = [1, 2, 3]
 
 # Position-field spec: (prefix, label, room-dimension attr for the slider's
 # max, default-value function of room, initial default/min/max/step used
@@ -80,6 +90,15 @@ POSITION_FIELDS = [
     ("inject-x", "X position (m)", "x", lambda r: r.x / 2, 2.0, 0, 10, 0.05),
     ("inject-y", "Y position (m)", "y", lambda r: r.y / 2, 1.5, 0, 10, 0.05),
     ("inject-z", "Height — Z (m)", "z", lambda r: min(1.5, r.z), 1.5, 0, 5, 0.05),
+    ("monitor1-x", "X position (m)", "x", lambda r: r.x / 2, 2.0, 0, 10, 0.05),
+    ("monitor1-y", "Y position (m)", "y", lambda r: r.y / 2, 1.5, 0, 10, 0.05),
+    ("monitor1-z", "Height — Z (m)", "z", lambda r: min(1.5, r.z), 1.5, 0, 5, 0.05),
+    ("monitor2-x", "X position (m)", "x", lambda r: 0.75 * r.x, 3.0, 0, 10, 0.05),
+    ("monitor2-y", "Y position (m)", "y", lambda r: r.y / 2, 1.5, 0, 10, 0.05),
+    ("monitor2-z", "Height — Z (m)", "z", lambda r: min(1.5, r.z), 1.5, 0, 5, 0.05),
+    ("monitor3-x", "X position (m)", "x", lambda r: 0.25 * r.x, 1.0, 0, 10, 0.05),
+    ("monitor3-y", "Y position (m)", "y", lambda r: r.y / 2, 1.5, 0, 10, 0.05),
+    ("monitor3-z", "Height — Z (m)", "z", lambda r: min(1.5, r.z), 1.5, 0, 5, 0.05),
 ]
 _POSITION_FIELD_BY_PREFIX = {f[0]: f for f in POSITION_FIELDS}
 
@@ -333,6 +352,28 @@ def _settings_mismatch(case_dir, current_settings):
             if field in prior and prior[field] != current_settings.get(field)]
 
 
+def _gather_monitoring_points(settings):
+    """Enabled monitoring points from settings, in the shape
+    monitoring_points.compute_monitoring_results() expects. [] if the
+    master "monitoring-enable" toggle is off, or no individual point is
+    enabled under it.
+    """
+    if not settings.get("monitoring-enable"):
+        return []
+    points = []
+    for i in MONITOR_POINT_IDS:
+        if not settings.get(f"monitor{i}-enable"):
+            continue
+        points.append({
+            "name": settings.get(f"monitor{i}-name") or f"Point {i}",
+            "x": settings[f"monitor{i}-x-input"],
+            "y": settings[f"monitor{i}-y-input"],
+            "z": settings[f"monitor{i}-z-input"],
+            "cells_per_side": settings[f"monitor{i}-cells"],
+        })
+    return points
+
+
 def _run_decay(guv_path, case_dir, room, settings):
     summary = setup_case(
         guv_path, case_dir, template_case_dir=TEMPLATE_CASE_DIR,
@@ -394,6 +435,16 @@ def _run_decay(guv_path, case_dir, room, settings):
             summary["eACH_uv_well_mixed_mean"], extra={"n_lamps": summary["n_lamps"], "fluence_mean": summary["fluence_mean"]},
             measured_ventilation_ach=control_results["total_ach_effective"],
         )
+
+    points = _gather_monitoring_points(settings)
+    if points:
+        if _should_stop():
+            raise StoppedByUser("Stopped before monitoring locations.")
+        _run_log("=== Computing monitoring locations ===")
+        results["monitoring"] = compute_monitoring_results(
+            case_dir, points, ventilation_ach=settings["ach"], log_fn=_run_log)
+        with open(f"{case_dir}/results.json", "w") as f:
+            json.dump(results, f, indent=2)
 
     _complete_all_steps()
     _run_log(f"Done. eACH_uv effective={results['eACH_uv_effective']:.4g} /hr "
@@ -545,7 +596,7 @@ def _run_steady_state(guv_path, case_dir, room, settings):
         inlet_velocity=inlet_velocity,
         phase1_iterations=phase1_iterations,
         phase2_iterations=phase2_iterations,
-        fan_entry=fan_entry,
+        fan_entry=fan_entry, monitoring_points=_gather_monitoring_points(settings),
         log_fn=_run_log, should_stop=_should_stop,
     )
     result["fluence_mean"] = summary["fluence_mean"]
@@ -686,6 +737,24 @@ def _injection_position_controls():
     return [_position_field_component(p) for p in ("inject-x", "inject-y", "inject-z")]
 
 
+def _monitoring_point_controls(i):
+    prefix = f"monitor{i}"
+    return html.Div([
+        dbc.Checkbox(id=f"{prefix}-enable", value=False, label=f"Enable Point {i}",
+                     className="mb-2"),
+        html.Div(id=f"{prefix}-controls", children=[
+            _labeled("Name", dcc.Input(id=f"{prefix}-name", type="text", value=f"Point {i}",
+                                        className="form-control form-control-sm")),
+            *[_position_field_component(f"{prefix}-{axis}") for axis in ("x", "y", "z")],
+            _labeled("Averaging box size (cells per side)", dcc.Input(
+                id=f"{prefix}-cells", type="number", value=4, min=1, max=20, step=1,
+                className="form-control form-control-sm"),
+                help_text="Box side length = this many mesh cells (default cell size 0.1m, "
+                          "so 4 -> a 0.4m cube)."),
+        ]),
+    ], className="mb-3 pb-2 border-bottom")
+
+
 project_setup_tab = dbc.Row([
     # --- left column: inputs ---
     dbc.Col([
@@ -749,6 +818,16 @@ project_setup_tab = dbc.Row([
                     id="fan-thickness", type="number", value=0.2, min=0.05, max=1.0, step=0.05,
                     className="form-control form-control-sm")),
                 *_fan_position_controls(),
+            ]),
+        ]),
+
+        _card("Monitoring locations", [
+            dbc.Checkbox(id="monitoring-enable", value=False,
+                         label="Enable monitoring locations", className="mb-2"),
+            html.Div(id="monitoring-controls", children=[
+                _monitoring_point_controls(1),
+                _monitoring_point_controls(2),
+                _monitoring_point_controls(3),
             ]),
         ]),
 
@@ -885,6 +964,32 @@ def _steady_state_figure(result):
     return fig
 
 
+def _monitoring_summary_rows(monitoring):
+    """Extra Analysis-tab rows for monitoring locations, if any were
+    computed. Handles both decay's shape
+    ({name: {t_seconds, volAverage_T, eACH_uv_effective?}}) and
+    steady-state's shape ({name: {phase1: {...}, phase2: {...}}}).
+    """
+    if not monitoring:
+        return []
+    rows = [("Monitoring locations", "")]
+    for name, data in monitoring.items():
+        if "phase1" in data:
+            p1, p2 = data["phase1"], data["phase2"]
+            T1 = p1["volAverage_T"][-1] if p1["volAverage_T"] else None
+            T2 = p2["volAverage_T"][-1] if p2["volAverage_T"] else None
+            value = f"T_ss1={T1:.4g}, T_ss2={T2:.4g}" if T1 is not None and T2 else "n/a"
+            if T1:
+                value += f", reduction={(1 - T2 / T1) * 100:.1f}%"
+        else:
+            T_final = data["volAverage_T"][-1] if data["volAverage_T"] else None
+            value = f"final volAverage(T)={T_final:.4g}" if T_final is not None else "n/a"
+            if data.get("eACH_uv_effective") is not None:
+                value += f", eACH_uv={data['eACH_uv_effective']:.4g}/hr"
+        rows.append((f"  {name}", value))
+    return rows
+
+
 def _steady_state_summary(result):
     p1, p2 = result["phase1"], result["phase2"]
     rows = []
@@ -904,6 +1009,7 @@ def _steady_state_summary(result):
                       f"{result['ventilation_ach_measured']:.4g} /hr"))
         rows.append(("eACH_uv (steady-state, corrected)",
                       f"{result['eACH_uv_steady_state_corrected']:.4g} /hr"))
+    rows += _monitoring_summary_rows(result.get("monitoring"))
     return [html.Div([html.Span(k + ": ", className="text-muted"), html.Span(v)], className="mb-1")
             for k, v in rows]
 
@@ -963,6 +1069,7 @@ def _decay_summary(result):
                       f"{result['eACH_uv_effective_corrected']:.4g} /hr"))
         rows.append(("Mixing efficiency (corrected)",
                       f"{result['mixing_efficiency_corrected'] * 100:.1f}%"))
+    rows += _monitoring_summary_rows(result.get("monitoring"))
     return [html.Div([html.Span(k + ": ", className="text-muted"), html.Span(v)], className="mb-1")
             for k, v in rows]
 
@@ -1083,6 +1190,29 @@ def _toggle_sim_type_controls(sim_type):
 )
 def _toggle_fan_controls(enabled):
     return {"display": "block"} if enabled else {"display": "none", "opacity": "0.4"}
+
+
+@app.callback(
+    Output("monitoring-controls", "style"),
+    Input("monitoring-enable", "value"),
+)
+def _toggle_monitoring_controls(enabled):
+    return {"display": "block"} if enabled else {"display": "none", "opacity": "0.4"}
+
+
+def _register_monitor_point_toggle(i):
+    @app.callback(
+        Output(f"monitor{i}-controls", "style"),
+        Input(f"monitor{i}-enable", "value"),
+    )
+    def _toggle(enabled):
+        return {"display": "block"} if enabled else {"display": "none", "opacity": "0.4"}
+
+    _toggle.__name__ = f"_toggle_monitor{i}_controls"
+
+
+for _i in MONITOR_POINT_IDS:
+    _register_monitor_point_toggle(_i)
 
 
 @app.callback(
