@@ -898,6 +898,11 @@ def _steady_state_summary(result):
         ("Reduction", f"{result['reduction_pct']:.1f}%"),
         ("eACH_uv (steady-state method)", f"{result['eACH_uv_steady_state']:.4g} /hr"),
     ]
+    if result.get("ventilation_ach_measured") is not None:
+        rows.append(("Ventilation ACH (measured from Phase 1)",
+                      f"{result['ventilation_ach_measured']:.4g} /hr"))
+        rows.append(("eACH_uv (steady-state, corrected)",
+                      f"{result['eACH_uv_steady_state_corrected']:.4g} /hr"))
     return [html.Div([html.Span(k + ": ", className="text-muted"), html.Span(v)], className="mb-1")
             for k, v in rows]
 

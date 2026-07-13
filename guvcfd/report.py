@@ -67,6 +67,15 @@ _ROW_LABELS_RESULTS_STEADY_STATE = [
     ("eACH_uv (steady-state method)", lambda res: f"{res['eACH_uv_steady_state']:.4g} /hr"),
 ]
 
+# Corrected numbers, derived for free from Phase 1's own steady state - see
+# steady_state_pipeline.run_steady_state_scenario's docstring comment.
+_ROW_LABELS_RESULTS_STEADY_STATE_CORRECTED = [
+    ("Ventilation ACH (measured from Phase 1)",
+     lambda res: f"{res['ventilation_ach_measured']:.4g} /hr"),
+    ("eACH_uv, steady-state (corrected)",
+     lambda res: f"{res['eACH_uv_steady_state_corrected']:.4g} /hr"),
+]
+
 
 def _add_kv_table(doc, rows):
     table = doc.add_table(rows=0, cols=2)
@@ -143,6 +152,9 @@ def generate_report_docx(case_dir, out_path):
     doc.add_heading("Results", level=2)
     if "phase1" in results:
         _add_kv_table(doc, [(label, fn(results)) for label, fn in _ROW_LABELS_RESULTS_STEADY_STATE])
+        if results.get("ventilation_ach_measured") is not None:
+            _add_kv_table(doc, [(label, fn(results))
+                                 for label, fn in _ROW_LABELS_RESULTS_STEADY_STATE_CORRECTED])
     else:
         _add_kv_table(doc, [(label, fn(results)) for label, fn in _ROW_LABELS_RESULTS_DECAY])
         if results.get("ventilation_ach_measured") is not None:

@@ -92,3 +92,24 @@ def test_decay_report_shows_fluence_mean(tmp_path):
         for row in table.rows:
             all_text += "\n" + "\t".join(c.text for c in row.cells)
     assert "5.678" in all_text
+
+
+def test_steady_state_report_shows_corrected_fields_when_present(tmp_path):
+    case_dir = str(tmp_path)
+    (tmp_path / "run_settings.json").write_text(json.dumps(_REAL_SETTINGS))
+    results = dict(_STEADY_STATE_RESULTS)
+    results["ventilation_ach_measured"] = 2.55
+    results["eACH_uv_steady_state_corrected"] = 18.1
+    (tmp_path / "results.json").write_text(json.dumps(results))
+    out_path = str(tmp_path / "out.docx")
+
+    generate_report_docx(case_dir, out_path)
+
+    from docx import Document
+    doc = Document(out_path)
+    all_text = ""
+    for table in doc.tables:
+        for row in table.rows:
+            all_text += "\n" + "\t".join(c.text for c in row.cells)
+    assert "2.55" in all_text
+    assert "18.1" in all_text

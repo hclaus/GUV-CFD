@@ -26,6 +26,31 @@ from .splice import splice_fv_options_into_control_dict, set_control_dict_time, 
 from .wsl_utils import wsl_path, run_wsl_or_raise, run_wsl_streaming, StoppedByUser
 
 
+def compute_corrected_eACH_uv(T_ss1, T_ss2, Su, source_volume, room_volume):
+    """Corrected eACH_uv using the *actual* ventilation removal rate instead
+    of the nominal ACH - derived for free from Phase 1's own steady state,
+    no separate UV-off control run needed (unlike the decay scenario).
+
+    G (the total room-wide injection rate) was calibrated as
+    room_volume*lambda_vent_nominal*target_T_ss (see
+    contaminant_source.compute_source_strength). Phase 1 (source + no UV)
+    reaches a real steady state T_ss1 under whatever ventilation efficiency
+    this mesh/flow field actually achieves - at that equilibrium,
+    injection = removal, so:
+        lambda_vent_actual = G / (room_volume * T_ss1)
+                            = lambda_vent_nominal * (target_T_ss / T_ss1)
+
+    Returns (ventilation_ach_measured, eACH_uv_corrected), or (None, None)
+    if T_ss1/T_ss2 aren't usable (zero/falsy).
+    """
+    if not T_ss1 or not T_ss2:
+        return None, None
+    G_total = Su * source_volume
+    lambda_vent_actual = G_total / (room_volume * T_ss1)
+    eACH_uv_corrected = lambda_vent_actual * (T_ss1 / T_ss2 - 1) * 3600
+    return lambda_vent_actual * 3600, eACH_uv_corrected
+
+
 def _uv_fvoptions_entries(k_values, nbins):
     """Recompute UV sink zone fvOptions entry text from an existing kUV
     field (matches whatever cellZones setup_case() already wrote to
@@ -187,6 +212,18 @@ def run_steady_state_scenario(case_dir, room_x, room_y, room_z, ach, Z, nbins=25
     summary["reduction_pct"] = reduction_pct
     summary["eACH_uv_steady_state"] = eACH_uv
     log_fn(f"Reduction: {reduction_pct:.1f}%, eACH_uv (steady-state method) = {eACH_uv:.4g} /hr")
+
+    # Corrected eACH_uv using the actual (not nominal) ventilation removal
+    # rate - see compute_corrected_eACH_uv's docstring. Unlike the decay
+    # scenario, this is free: no separate UV-off control run needed.
+    ventilation_ach_measured, eACH_uv_corrected = compute_corrected_eACH_uv(
+        T_ss1, T_ss2, Su, source_volume, room_volume)
+    if ventilation_ach_measured is not None:
+        summary["ventilation_ach_measured"] = ventilation_ach_measured
+        summary["eACH_uv_steady_state_corrected"] = eACH_uv_corrected
+        log_fn(f"  Measured ventilation ACH (from Phase 1's own steady state) = "
+               f"{ventilation_ach_measured:.4g} /hr (nominal was {ach:.4g} /hr); "
+               f"corrected eACH_uv = {eACH_uv_corrected:.4g} /hr")
 
     run_wsl_or_raise("touch case.foam", case_dir_wsl, "touching case.foam")
 
