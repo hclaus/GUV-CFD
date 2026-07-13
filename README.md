@@ -16,6 +16,17 @@ Standalone tool, connected to [Illuminate](https://github.com/hclaus/Illuminate_
 
 - Python 3.11+, [uv](https://docs.astral.sh/uv/)
 - WSL with OpenFOAM installed (developed against OpenFOAM v2412 on Ubuntu/WSL2) — this tool shells out to `wsl.exe` to run `blockMesh`/`topoSet`/`simpleFoam`/`pimpleFoam`/`postProcess`, so it currently only works from Windows with WSL. Native Linux support would just need `wsl_utils.py`'s subprocess calls adjusted to run directly instead of through `wsl -e bash -lc`.
+- [ParaView](https://www.paraview.org/) (optional) — only needed for the GUI's "Open in ParaView" button; everything else works without it.
+
+## Getting started
+
+```
+git clone https://github.com/hclaus/GUV-CFD.git
+cd GUV-CFD
+uv sync
+uv run python -m guvcfd.app
+```
+`uv sync` installs everything in `pyproject.toml`, including `guv-calcs` itself (pinned to a specific commit on GitHub). OpenFOAM/WSL and ParaView are separate, manual installs (see Prerequisites) — `uv sync` doesn't touch those.
 
 ## Structure
 
@@ -32,8 +43,11 @@ Standalone tool, connected to [Illuminate](https://github.com/hclaus/Illuminate_
 - `guvcfd/run_pipeline.py` — `setup_case()`, the one-call orchestrator for mesh → flow convergence → fluence/UV-zones → splice.
 - `guvcfd/steady_state_pipeline.py` — `run_steady_state_scenario()`, the two-phase (no-UV steady state → UV-on steady state) orchestrator.
 - `guvcfd/visualization.py` — 3D case preview (room, lamps, inlet/outlet, fan) built on `guv_calcs`' `RoomPlotter`.
-- `guvcfd/app.py` — Dash GUI: load a `.guv` file, configure inlet/outlet/fan and simulation type, preview the case live. Run with `uv run python -m guvcfd.app`.
+- `guvcfd/ventilation_control.py` — optional UV-off control run (clones the case's mesh/flow field, strips the UV source) to measure the *actual* ventilation-only air-change rate, correcting `mixing_efficiency` for the gap between nominal and achieved ACH.
+- `guvcfd/report.py` — `.docx` report export (room setup, rendered preview, results).
+- `guvcfd/paraview_launch.py` — launches ParaView with a preset view (volume-rendered T, inlet-seeded streamlines colored by U).
+- `guvcfd/app.py` — Dash GUI: load a `.guv` file, configure inlet/outlet/fan and simulation type, preview the case live, run/continue a simulation, and view/export results. Run with `uv run python -m guvcfd.app`.
 
 ## Status
 
-Early — case setup/preview GUI exists (`guvcfd/app.py`); running a simulation and viewing results is still only wired up via a Python REPL / `guvcfd/cli.py`, not yet from the GUI.
+The GUI (`guvcfd/app.py`) covers the full workflow: case setup/preview, running a decay or steady-state simulation, extending an already-completed decay run to a longer duration ("Continue"), viewing/comparing results in the Analysis tab, exporting a `.docx` report, and opening the case in ParaView with a working preset view. `guvcfd/cli.py` still exists for scripting/REPL use outside the GUI.

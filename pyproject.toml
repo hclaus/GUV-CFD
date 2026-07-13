@@ -18,6 +18,3 @@ dev = [
 
 [tool.uv]
 package = false
-
-[tool.uv.sources]
-guv-calcs = { path = "../guv-calcHC", editable = true }
