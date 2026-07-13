@@ -49,6 +49,23 @@ try:
     reader.UpdatePipeline()
     _log_step(f"reader loaded, {{len(reader.TimestepValues)}} timesteps available")
 
+    # Constructing a reader via paraview.simple directly (as opposed to the
+    # GUI's own File > Open, which sets this automatically) leaves the
+    # animation scene's PlayMode at the generic default ('Sequence' with
+    # NumberOfFrames=1) even though TimeKeeper.TimestepValues already has
+    # every real timestep - verified directly (scene.NumberOfFrames == 1
+    # right after Show(), despite tk.TimestepValues having all 100). With
+    # only 1 frame across the whole time range, the GUI's time slider has
+    # nothing meaningful to step through. 'Snap To TimeSteps' makes the
+    # scene follow the reader's own discrete timesteps directly, which is
+    # what OpenFOAM's stepped time-directory data actually is.
+    scene = GetAnimationScene()
+    scene.PlayMode = 'Snap To TimeSteps'
+    tk = GetTimeKeeper()
+    _log_step(f"animation scene PlayMode=Snap To TimeSteps, "
+              f"{{len(tk.TimestepValues)}} timesteps in scene, "
+              f"range [{{scene.StartTime}}, {{scene.EndTime}}]")
+
     view1 = GetActiveViewOrCreate('RenderView')
     view1.ViewSize = [900, 700]
     disp1 = Show(reader, view1)
