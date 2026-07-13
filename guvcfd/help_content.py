@@ -93,6 +93,11 @@ fidelity for comparing ventilation/UV design choices at the room scale, at a
 small fraction of the setup and compute cost a full Lagrangian aerosol
 simulation would need.
 
+This applied method will provide simulations of a room, on a
+non-sophisticated PC (no graphics-card/GPU calculations involved), within
+typically 15-30 minutes - unless oscillating flow conditions appear (see
+"Genuinely unsteady flows" below), which can take substantially longer.
+
 ### The two-stage approach
 
 Every run has two distinct OpenFOAM stages sharing one mesh and one
