@@ -514,6 +514,10 @@ def _run_steady_state(guv_path, case_dir, room, settings):
     if _should_stop():
         raise StoppedByUser("Stopped after case setup.")
 
+    # Same record _run_decay writes - Continue's settings-mismatch check and
+    # the .docx report generator both need it regardless of scenario type.
+    _save_run_settings(case_dir, settings, guv_path=guv_path)
+
     fan_entry = None
     if settings["fan-enable"]:
         fan_entry = fan_fvoptions_entry(settings["fan-speed"], direction=fan_kwargs["fan_direction"])

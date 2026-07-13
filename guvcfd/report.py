@@ -30,8 +30,8 @@ _ROW_LABELS_FAN = [
                              f"{s['fan-z-input']:.3g})m, radius={s['fan-radius']:.3g}m"),
 ]
 
-_ROW_LABELS_RESULTS = [
-    ("Ventilation ACH", lambda res: f"{res['ventilation_ach']:.3g} /hr"),
+_ROW_LABELS_RESULTS_DECAY = [
+    ("Ventilation ACH (nominal)", lambda res: f"{res['ventilation_ach']:.3g} /hr"),
     ("eACH_uv, well-mixed (idealized)", lambda res: f"{res['eACH_uv_well_mixed']:.4g} /hr"),
     ("eACH_uv, effective (CFD-fit)", lambda res: f"{res['eACH_uv_effective']:.4g} /hr"),
     ("Mixing efficiency", lambda res: f"{res['mixing_efficiency'] * 100:.1f}%"
@@ -39,6 +39,28 @@ _ROW_LABELS_RESULTS = [
     ("Total ACH, effective", lambda res: f"{res.get('total_ach_effective', 0):.3g} /hr"),
     ("Simulated duration", lambda res: f"{res['decay_curve']['t_seconds'][-1]:.4g} s"
                                          if res.get("decay_curve", {}).get("t_seconds") else "n/a"),
+]
+
+# Corrected (UV-off control) numbers - only present when that option was used.
+_ROW_LABELS_RESULTS_DECAY_CORRECTED = [
+    ("Ventilation ACH (measured, UV-off control)",
+     lambda res: f"{res['ventilation_ach_measured']:.4g} /hr"),
+    ("eACH_uv, effective (corrected)", lambda res: f"{res['eACH_uv_effective_corrected']:.4g} /hr"),
+    ("Mixing efficiency (corrected)", lambda res: f"{res['mixing_efficiency_corrected'] * 100:.1f}%"
+                                                     if res.get("mixing_efficiency_corrected") is not None
+                                                     else "n/a"),
+]
+
+_ROW_LABELS_RESULTS_STEADY_STATE = [
+    ("Target well-mixed steady-state T", lambda res: f"{res.get('target_T_ss', '?')}"),
+    ("Phase 1 T_ss (no UV)", lambda res: f"{res['phase1']['T_ss']:.4g} "
+                                          f"({'plateaued' if res['phase1']['converged'] else 'NOT fully plateaued'}, "
+                                          f"{res['phase1']['iterations']} iterations)"),
+    ("Phase 2 T_ss (UV on)", lambda res: f"{res['phase2']['T_ss']:.4g} "
+                                          f"({'plateaued' if res['phase2']['converged'] else 'NOT fully plateaued'}, "
+                                          f"{res['phase2']['iterations']} iterations)"),
+    ("Reduction", lambda res: f"{res['reduction_pct']:.1f}%"),
+    ("eACH_uv (steady-state method)", lambda res: f"{res['eACH_uv_steady_state']:.4g} /hr"),
 ]
 
 
@@ -115,7 +137,12 @@ def generate_report_docx(case_dir, out_path):
     doc.add_picture(str(image_path), width=Inches(6.0))
 
     doc.add_heading("Results", level=2)
-    _add_kv_table(doc, [(label, fn(results)) for label, fn in _ROW_LABELS_RESULTS])
+    if "phase1" in results:
+        _add_kv_table(doc, [(label, fn(results)) for label, fn in _ROW_LABELS_RESULTS_STEADY_STATE])
+    else:
+        _add_kv_table(doc, [(label, fn(results)) for label, fn in _ROW_LABELS_RESULTS_DECAY])
+        if results.get("ventilation_ach_measured") is not None:
+            _add_kv_table(doc, [(label, fn(results)) for label, fn in _ROW_LABELS_RESULTS_DECAY_CORRECTED])
 
     doc.save(out_path)
     image_path.unlink(missing_ok=True)
