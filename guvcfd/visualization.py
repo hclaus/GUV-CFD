@@ -13,7 +13,8 @@ import numpy as np
 import plotly.graph_objs as go
 from guv_calcs.room_plotter import RoomPlotter
 
-from .mesh_gen import _opening_box
+from .initial_fields import WALL_INFLOW_DIRECTION
+from .mesh_gen import _opening_box, _WALL_SPECS
 
 _WALL_LABEL_POSITIONS = {
     # wall name -> (position, room-fraction basis)
@@ -24,11 +25,6 @@ _WALL_LABEL_POSITIONS = {
     "floor": lambda Lx, Ly, Lz: (Lx / 2, Ly / 2, 0),
     "ceiling": lambda Lx, Ly, Lz: (Lx / 2, Ly / 2, Lz),
 }
-
-# Direction air moves through the room, wall the opening sits on -> unit vector.
-# Used for both inlet (flow entering) and outlet (flow continuing/exiting) arrows,
-# so both point the same way - reads as "this is the direction flow moves".
-_WALL_FLOW_DIRECTION = {"xMin": (1, 0, 0), "xMax": (1, 0, 0)}
 
 
 def _remove_zone_traces(fig):
@@ -57,16 +53,21 @@ def _add_wall_labels(fig, Lx, Ly, Lz):
 
 
 def _rect_outline(center, wall, size):
-    """(x,y,z) outline of a rectangular opening on an xMin/xMax wall."""
-    cx, cy, cz = center
+    """(x,y,z) outline of a rectangular opening on any of the 6 room walls -
+    drawn in whichever two axes are actually in-plane for this wall (see
+    mesh_gen._WALL_SPECS), not always (y,z)."""
+    _, _, (a1, a2) = _WALL_SPECS[wall]
     w, h = size
-    corners_yz = [(cy - w / 2, cz - h / 2), (cy + w / 2, cz - h / 2),
-                  (cy + w / 2, cz + h / 2), (cy - w / 2, cz + h / 2),
-                  (cy - w / 2, cz - h / 2)]
-    x = [cx] * 5
-    y = [c[0] for c in corners_yz]
-    z = [c[1] for c in corners_yz]
-    return x, y, z
+    corners = [(-w / 2, -h / 2), (w / 2, -h / 2), (w / 2, h / 2), (-w / 2, h / 2), (-w / 2, -h / 2)]
+    xs, ys, zs = [], [], []
+    for d1, d2 in corners:
+        p = list(center)
+        p[a1] += d1
+        p[a2] += d2
+        xs.append(p[0])
+        ys.append(p[1])
+        zs.append(p[2])
+    return xs, ys, zs
 
 
 def _add_label(fig, position, text, color, name, customdata, size=10):
@@ -79,7 +80,14 @@ def _add_label(fig, position, text, color, name, customdata, size=10):
     return fig
 
 
-def _add_opening(fig, label, wall, center_frac, size, Lx, Ly, Lz, color):
+def _add_opening(fig, label, wall, center_frac, size, Lx, Ly, Lz, color, flow_direction):
+    """flow_direction: unit vector the arrow points along - the caller
+    decides this (inlet: WALL_INFLOW_DIRECTION[wall], i.e. air entering;
+    outlet: the negated inward normal, i.e. air leaving) rather than this
+    function guessing intent from `label`, since now that openings can be
+    on any of the 6 walls there's no single "always +X" convention that
+    makes sense the way it did when only xMin/xMax were possible.
+    """
     lo, hi = _opening_box(wall, Lx, Ly, Lz, center_frac, size, eps=0.0)
     center = tuple((a + b) / 2 for a, b in zip(lo, hi))
     x, y, z = _rect_outline(center, wall, size)
@@ -87,17 +95,18 @@ def _add_opening(fig, label, wall, center_frac, size, Lx, Ly, Lz, color):
         x=x, y=y, z=z, mode="lines", line=dict(color=color, width=5),
         name=label, customdata=[f"{label}_outline"], showlegend=True,
     ))
-    direction = _WALL_FLOW_DIRECTION[wall]
     arrow_len = min(Lx, Ly, Lz) * 0.15
-    tip = tuple(c + d * arrow_len for c, d in zip(center, direction))
+    tip = tuple(c + d * arrow_len for c, d in zip(center, flow_direction))
     fig.add_trace(go.Scatter3d(
         x=[center[0], tip[0]], y=[center[1], tip[1]], z=[center[2], tip[2]],
         mode="lines+markers", line=dict(color=color, width=4),
         marker=dict(size=[0, 5], color=color, symbol="diamond"),
         name=label + " flow", customdata=[f"{label}_arrow"], showlegend=False,
     ))
-    label_pos = (center[0], center[1], center[2] + size[1] / 2 + 0.1)
-    fig = _add_label(fig, label_pos, label, color, label, f"{label}_label")
+    _, _, (a1, a2) = _WALL_SPECS[wall]
+    label_pos = list(center)
+    label_pos[a2] += size[1] / 2 + 0.1
+    fig = _add_label(fig, tuple(label_pos), label, color, label, f"{label}_label")
     return fig
 
 
@@ -217,15 +226,20 @@ def _add_injection(fig, center, color="#9b59b6"):
 
 def plot_case(room, inlet_wall="xMin", inlet_center=(0.5, 0.85), inlet_size=(0.3, 0.3),
               outlet_wall="xMax", outlet_center=(0.5, 0.15), outlet_size=(0.3, 0.3),
+              inlet2_wall=None, inlet2_center=None, inlet2_size=None,
+              outlet2_wall=None, outlet2_center=None, outlet2_size=None,
               fan_center=None, fan_disk_radius=None, fan_disk_thickness=0.2,
               fan_direction=(0, 0, -1), fan_speed=None,
               injection_center=None,
               monitoring_points=None, cell_size=0.1,
               title=""):
     """Build the full preview figure: room + lamps (RoomPlotter) + inlet/
-    outlet + optional fan + optional injection point + optional monitoring
-    points + wall labels. Returns a plotly Figure - render with fig.show()
-    or fig.write_html(path).
+    outlet (+ optional 2nd inlet/outlet) + optional fan + optional
+    injection point + optional monitoring points + wall labels. Returns a
+    plotly Figure - render with fig.show() or fig.write_html(path).
+
+    inlet2_*/outlet2_*: an optional 2nd inlet/outlet, same shape as the
+    primary one - None (the default) draws nothing extra.
 
     monitoring_points: optional list of monitoring_points.py-shaped point
     dicts (name/x/y/z/cells_per_side). Each is drawn as the same box its
@@ -240,9 +254,19 @@ def plot_case(room, inlet_wall="xMin", inlet_center=(0.5, 0.85), inlet_size=(0.3
     fig = _remove_zone_traces(fig)
     fig = _add_wall_labels(fig, room.x, room.y, room.z)
     fig = _add_opening(fig, "inlet", inlet_wall, inlet_center, inlet_size,
-                        room.x, room.y, room.z, color="#2ecc71")
+                        room.x, room.y, room.z, color="#2ecc71",
+                        flow_direction=WALL_INFLOW_DIRECTION[inlet_wall])
     fig = _add_opening(fig, "outlet", outlet_wall, outlet_center, outlet_size,
-                        room.x, room.y, room.z, color="#e74c3c")
+                        room.x, room.y, room.z, color="#e74c3c",
+                        flow_direction=tuple(-d for d in WALL_INFLOW_DIRECTION[outlet_wall]))
+    if inlet2_wall is not None:
+        fig = _add_opening(fig, "inlet2", inlet2_wall, inlet2_center, inlet2_size,
+                            room.x, room.y, room.z, color="#2ecc71",
+                            flow_direction=WALL_INFLOW_DIRECTION[inlet2_wall])
+    if outlet2_wall is not None:
+        fig = _add_opening(fig, "outlet2", outlet2_wall, outlet2_center, outlet2_size,
+                            room.x, room.y, room.z, color="#e74c3c",
+                            flow_direction=tuple(-d for d in WALL_INFLOW_DIRECTION[outlet2_wall]))
     if fan_speed is not None:
         center = fan_center or (room.x / 2, room.y / 2, room.z - 0.3)
         radius = fan_disk_radius or 0.6

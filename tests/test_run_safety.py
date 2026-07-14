@@ -3,6 +3,7 @@ from datetime import datetime
 
 from guvcfd.app import (
     _ALWAYS_REQUIRED_FIELDS, _FAN_REQUIRED_FIELDS, _STEADY_STATE_REQUIRED_FIELDS,
+    _INLET2_REQUIRED_FIELDS, _OUTLET2_REQUIRED_FIELDS,
     _case_dir_has_data, _record_run_timing, _save_run_settings, _settings_mismatch,
     _validate_settings, _MESH_AFFECTING_FIELDS,
 )
@@ -124,10 +125,14 @@ def _full_settings(**overrides):
     base = {f: 1.0 for f in _ALWAYS_REQUIRED_FIELDS}
     base.update({f: 1.0 for f in _FAN_REQUIRED_FIELDS})
     base.update({f: 1.0 for f in _STEADY_STATE_REQUIRED_FIELDS})
+    base.update({f: 1.0 for f in _INLET2_REQUIRED_FIELDS})
+    base.update({f: 1.0 for f in _OUTLET2_REQUIRED_FIELDS})
     base["fan-direction"] = "down"
     base["sim-type"] = "decay"
     base["fan-enable"] = False
     base["monitoring-enable"] = False
+    base["inlet2-enable"] = False
+    base["outlet2-enable"] = False
     base.update(overrides)
     return base
 
@@ -182,3 +187,35 @@ def test_validate_settings_requires_enabled_monitoring_point_fields():
         "monitor1-z-input": 1.0, "monitor1-cells": 4,
     })
     assert _validate_settings(settings) == ["Patient X position"]
+
+
+def test_validate_settings_ignores_inlet2_fields_when_disabled():
+    settings = _full_settings(**{"inlet2-enable": False, "inlet2-size-w": None})
+    assert _validate_settings(settings) == []
+
+
+def test_validate_settings_requires_inlet2_fields_when_enabled():
+    settings = _full_settings(**{"inlet2-enable": True, "inlet2-size-w": None})
+    assert _validate_settings(settings) == ["2nd inlet width"]
+
+
+def test_validate_settings_requires_outlet2_fields_when_enabled():
+    settings = _full_settings(**{"outlet2-enable": True, "outlet2-y-input": None})
+    assert _validate_settings(settings) == ["2nd outlet Y position"]
+
+
+def test_mesh_affecting_fields_includes_second_openings():
+    # A 2nd inlet/outlet genuinely changes the mesh (an extra carved
+    # patch) - unlike monitoring points, it must trigger Continue's
+    # mismatch check.
+    for field in ("inlet2-enable", "inlet2-wall", "inlet2-size-w", "inlet2-size-h",
+                  "outlet2-enable", "outlet2-wall", "outlet2-size-w", "outlet2-size-h"):
+        assert field in _MESH_AFFECTING_FIELDS
+
+
+def test_changed_inlet2_wall_is_reported_as_mismatch(tmp_path):
+    case_dir = str(tmp_path / "case")
+    (tmp_path / "case").mkdir()
+    _save_run_settings(case_dir, _settings(**{"inlet2-enable": True, "inlet2-wall": "ceiling"}))
+    mismatches = _settings_mismatch(case_dir, _settings(**{"inlet2-enable": True, "inlet2-wall": "floor"}))
+    assert ("inlet2-wall", "ceiling", "floor") in mismatches

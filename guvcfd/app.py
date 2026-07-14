@@ -25,7 +25,7 @@ from .decay_analysis import write_results_summary
 from .fan import fan_fvoptions_entry
 from .fluence import compute_fluence_at_points, compute_inactivation_rate, compute_well_mixed_eACH
 from . import help_content
-from .initial_fields import compute_inlet_velocity
+from .initial_fields import compute_inlet_velocities
 from .monitoring_points import compute_monitoring_results, mixing_uniformity_note
 from .paraview_launch import launch_paraview
 from .report import generate_report_docx, T_FIELD_NOTE
@@ -49,7 +49,8 @@ TEMPLATE_CASE_DIR = str(Path(__file__).parent / "templates" / "case_template")
 # settings_path is the currently open/saved .guvcfd file (None if unsaved).
 _loaded = {"project": None, "room": None, "path": None, "settings_path": None}
 
-WALL_OPTIONS = [{"label": w, "value": w} for w in ("xMin", "xMax")]
+WALL_OPTIONS = [{"label": w, "value": w} for w in
+                ("xMin", "xMax", "frontWall", "backWall", "floor", "ceiling")]
 
 # Every plain-value form field that a GUV-CFD project file (.guvcfd, JSON)
 # saves/restores. Position fields use their "-input" id, not "-slider" -
@@ -59,6 +60,8 @@ SETTINGS_FIELDS = [
     "project-description", "case-dir", "ach", "z-value",
     "inlet-show", "inlet-wall", "inlet-y-input", "inlet-z-input", "inlet-size-w", "inlet-size-h",
     "outlet-show", "outlet-wall", "outlet-y-input", "outlet-z-input", "outlet-size-w", "outlet-size-h",
+    "inlet2-enable", "inlet2-wall", "inlet2-y-input", "inlet2-z-input", "inlet2-size-w", "inlet2-size-h",
+    "outlet2-enable", "outlet2-wall", "outlet2-y-input", "outlet2-z-input", "outlet2-size-w", "outlet2-size-h",
     "fan-enable", "fan-speed", "fan-direction", "fan-radius", "fan-thickness",
     "fan-x-input", "fan-y-input", "fan-z-input",
     "sim-type", "pimple-end-time", "pimple-write-interval", "no-uv-control-enable",
@@ -81,10 +84,18 @@ MONITOR_POINT_IDS = [1, 2, 3]
 # controls so their slider<->number sync + "reset to room" callbacks can be
 # registered in one loop instead of duplicated per field.
 POSITION_FIELDS = [
-    ("inlet-y", "Across-wall position — Y (m)", "y", lambda r: r.y / 2, 1.5, 0, 10, 0.05),
-    ("inlet-z", "Height — Z (m)", "z", lambda r: 0.85 * r.z, 2.1, 0, 5, 0.05),
-    ("outlet-y", "Across-wall position — Y (m)", "y", lambda r: r.y / 2, 1.5, 0, 10, 0.05),
-    ("outlet-z", "Height — Z (m)", "z", lambda r: 0.15 * r.z, 0.4, 0, 5, 0.05),
+    # Labels are generic ("Position 1/2") rather than wall-specific ("Across-
+    # wall Y"/"Height Z") since these openings can now be on any of the 6
+    # room walls (not just xMin/xMax) - each opening's own wall dropdown,
+    # right above its position fields, gives the needed context instead.
+    ("inlet-y", "Position 1 (m)", "y", lambda r: r.y / 2, 1.5, 0, 10, 0.05),
+    ("inlet-z", "Position 2 (m)", "z", lambda r: 0.85 * r.z, 2.1, 0, 5, 0.05),
+    ("outlet-y", "Position 1 (m)", "y", lambda r: r.y / 2, 1.5, 0, 10, 0.05),
+    ("outlet-z", "Position 2 (m)", "z", lambda r: 0.15 * r.z, 0.4, 0, 5, 0.05),
+    ("inlet2-y", "Position 1 (m)", "x", lambda r: r.x / 2, 2.0, 0, 10, 0.05),
+    ("inlet2-z", "Position 2 (m)", "y", lambda r: r.y / 2, 1.5, 0, 10, 0.05),
+    ("outlet2-y", "Position 1 (m)", "x", lambda r: r.x / 2, 2.0, 0, 10, 0.05),
+    ("outlet2-z", "Position 2 (m)", "y", lambda r: r.y / 2, 1.5, 0, 10, 0.05),
     ("fan-x", "X position (m)", "x", lambda r: r.x / 2, 2.0, 0, 10, 0.05),
     ("fan-y", "Y position (m)", "y", lambda r: r.y / 2, 1.5, 0, 10, 0.05),
     ("fan-z", "Height — Z (m)", "z", lambda r: max(r.z - 0.3, 0), 2.2, 0, 5, 0.05),
@@ -320,6 +331,36 @@ def _fan_kwargs(settings):
     )
 
 
+def _center_frac_for_wall(wall, val1, val2, room):
+    """(c1, c2) fractions of whichever room dimensions are actually
+    in-plane for `wall` (see _WALL_POSITION_DIMS), not always (room.y,
+    room.z) - necessary now that an opening can be on any of the 6 walls,
+    not just xMin/xMax.
+    """
+    dim1, dim2 = _WALL_POSITION_DIMS[wall]
+    return (val1 / getattr(room, dim1), val2 / getattr(room, dim2))
+
+
+def _opening_center_frac(settings, prefix, room):
+    """(c1, c2) fractions for setup_case()'s inlet_center/outlet_center."""
+    return _center_frac_for_wall(settings[f"{prefix}-wall"], settings[f"{prefix}-y-input"],
+                                  settings[f"{prefix}-z-input"], room)
+
+
+def _second_opening_kwargs(settings, prefix, room):
+    """setup_case()'s inlet2_*/outlet2_* kwargs for a 2nd inlet/outlet -
+    {} when its own enable toggle is off, matching setup_case()'s "no 2nd
+    opening" default (same shape as _fan_kwargs).
+    """
+    if not settings.get(f"{prefix}-enable"):
+        return {}
+    return {
+        f"{prefix}_wall": settings[f"{prefix}-wall"],
+        f"{prefix}_center": _opening_center_frac(settings, prefix, room),
+        f"{prefix}_size": (settings[f"{prefix}-size-w"], settings[f"{prefix}-size-h"]),
+    }
+
+
 # Settings that determine the mesh/flow field/UV zones a full Run builds -
 # everything Continue reuses as-is without regenerating. If any of these
 # differ between what's on disk and what the GUI currently shows, Continue
@@ -330,6 +371,13 @@ _MESH_AFFECTING_FIELDS = [
     "ach", "z-value",
     "inlet-wall", "inlet-y-input", "inlet-z-input", "inlet-size-w", "inlet-size-h",
     "outlet-wall", "outlet-y-input", "outlet-z-input", "outlet-size-w", "outlet-size-h",
+    # Unlike monitoring points/source_center below, a 2nd inlet/outlet
+    # genuinely changes the mesh (an extra carved patch) - these belong
+    # here, not in the "purely informational" bucket.
+    "inlet2-enable", "inlet2-wall", "inlet2-y-input", "inlet2-z-input",
+    "inlet2-size-w", "inlet2-size-h",
+    "outlet2-enable", "outlet2-wall", "outlet2-y-input", "outlet2-z-input",
+    "outlet2-size-w", "outlet2-size-h",
     "fan-enable", "fan-speed", "fan-direction", "fan-radius", "fan-thickness",
     "fan-x-input", "fan-y-input", "fan-z-input",
 ]
@@ -400,6 +448,14 @@ _FAN_REQUIRED_FIELDS = {
     "fan-speed": "Fan speed", "fan-radius": "Fan radius", "fan-thickness": "Fan thickness",
     "fan-x-input": "Fan X position", "fan-y-input": "Fan Y position", "fan-z-input": "Fan Z position",
 }
+_INLET2_REQUIRED_FIELDS = {
+    "inlet2-y-input": "2nd inlet Y position", "inlet2-z-input": "2nd inlet Z position",
+    "inlet2-size-w": "2nd inlet width", "inlet2-size-h": "2nd inlet height",
+}
+_OUTLET2_REQUIRED_FIELDS = {
+    "outlet2-y-input": "2nd outlet Y position", "outlet2-z-input": "2nd outlet Z position",
+    "outlet2-size-w": "2nd outlet width", "outlet2-size-h": "2nd outlet height",
+}
 _STEADY_STATE_REQUIRED_FIELDS = {
     "target-t-ss": "Target steady-state T",
     "inject-x-input": "Injection X position", "inject-y-input": "Injection Y position",
@@ -416,6 +472,10 @@ def _validate_settings(settings):
     required = dict(_ALWAYS_REQUIRED_FIELDS)
     if settings.get("fan-enable"):
         required.update(_FAN_REQUIRED_FIELDS)
+    if settings.get("inlet2-enable"):
+        required.update(_INLET2_REQUIRED_FIELDS)
+    if settings.get("outlet2-enable"):
+        required.update(_OUTLET2_REQUIRED_FIELDS)
     if settings.get("sim-type") == "steady_state":
         required.update(_STEADY_STATE_REQUIRED_FIELDS)
     if settings.get("monitoring-enable"):
@@ -457,15 +517,17 @@ def _run_decay(guv_path, case_dir, room, settings):
         guv_path, case_dir, template_case_dir=TEMPLATE_CASE_DIR,
         Z=settings["z-value"], ach=settings["ach"],
         inlet_wall=settings["inlet-wall"],
-        inlet_center=(settings["inlet-y-input"] / room.y, settings["inlet-z-input"] / room.z),
+        inlet_center=_opening_center_frac(settings, "inlet", room),
         inlet_size=(settings["inlet-size-w"], settings["inlet-size-h"]),
         outlet_wall=settings["outlet-wall"],
-        outlet_center=(settings["outlet-y-input"] / room.y, settings["outlet-z-input"] / room.z),
+        outlet_center=_opening_center_frac(settings, "outlet", room),
         outlet_size=(settings["outlet-size-w"], settings["outlet-size-h"]),
         pimple_end_time=settings["pimple-end-time"],
         pimple_write_interval=settings["pimple-write-interval"],
         log_fn=_run_log, should_stop=_should_stop, solver_log_fn=_track_solver_time,
         **_fan_kwargs(settings),
+        **_second_opening_kwargs(settings, "inlet2", room),
+        **_second_opening_kwargs(settings, "outlet2", room),
     )
     if _should_stop():
         raise StoppedByUser("Stopped after case setup.")
@@ -504,6 +566,10 @@ def _run_decay(guv_path, case_dir, room, settings):
             case_dir, f"{case_dir}/no_UV", settings["ach"], room.x, room.y, room.z,
             settings["inlet-wall"], (settings["inlet-size-w"], settings["inlet-size-h"]),
             settings["pimple-end-time"], settings["pimple-write-interval"],
+            inlet2_wall=settings["inlet2-wall"] if settings.get("inlet2-enable") else None,
+            inlet2_size=(settings["inlet2-size-w"], settings["inlet2-size-h"])
+            if settings.get("inlet2-enable") else None,
+            has_outlet2=bool(settings.get("outlet2-enable")),
             log_fn=_run_log, should_stop=_should_stop, solver_log_fn=_track_solver_time,
         )
         _run_log("Updating results.json with corrected mixing efficiency (measured, "
@@ -633,13 +699,15 @@ def _run_steady_state(guv_path, case_dir, room, settings):
         guv_path, case_dir, template_case_dir=TEMPLATE_CASE_DIR,
         Z=settings["z-value"], ach=settings["ach"],
         inlet_wall=settings["inlet-wall"],
-        inlet_center=(settings["inlet-y-input"] / room.y, settings["inlet-z-input"] / room.z),
+        inlet_center=_opening_center_frac(settings, "inlet", room),
         inlet_size=(settings["inlet-size-w"], settings["inlet-size-h"]),
         outlet_wall=settings["outlet-wall"],
-        outlet_center=(settings["outlet-y-input"] / room.y, settings["outlet-z-input"] / room.z),
+        outlet_center=_opening_center_frac(settings, "outlet", room),
         outlet_size=(settings["outlet-size-w"], settings["outlet-size-h"]),
         log_fn=_run_log, should_stop=_should_stop, solver_log_fn=_track_solver_time,
         **fan_kwargs,
+        **_second_opening_kwargs(settings, "inlet2", room),
+        **_second_opening_kwargs(settings, "outlet2", room),
     )
     if _should_stop():
         raise StoppedByUser("Stopped after case setup.")
@@ -652,11 +720,15 @@ def _run_steady_state(guv_path, case_dir, room, settings):
     if settings["fan-enable"]:
         fan_entry = fan_fvoptions_entry(settings["fan-speed"], direction=fan_kwargs["fan_direction"])
 
-    inlet_area = settings["inlet-size-w"] * settings["inlet-size-h"]
     room_volume = room.x * room.y * room.z
-    inflow_dir = (1, 0, 0) if settings["inlet-wall"] == "xMin" else (-1, 0, 0)
-    v_mag = compute_inlet_velocity(settings["ach"], room_volume, inlet_area)
-    inlet_velocity = tuple(v_mag * d for d in inflow_dir)
+    openings = [(settings["inlet-wall"], settings["inlet-size-w"] * settings["inlet-size-h"])]
+    has_inlet2 = bool(settings.get("inlet2-enable"))
+    if has_inlet2:
+        openings.append((settings["inlet2-wall"], settings["inlet2-size-w"] * settings["inlet2-size-h"]))
+    velocities = compute_inlet_velocities(settings["ach"], room_volume, openings)
+    inlet_velocity = velocities[0]
+    inlet2_velocity = velocities[1] if has_inlet2 else None
+    has_outlet2 = bool(settings.get("outlet2-enable"))
 
     ach = settings["ach"]
     eACH_uv = summary.get("eACH_uv_well_mixed_mean", 0.0)
@@ -667,14 +739,16 @@ def _run_steady_state(guv_path, case_dir, room, settings):
              f"(ACH+eACH_uv={ach + eACH_uv:.3g}/hr) - using the larger of this and the configured "
              f"value for each phase ({phase1_iterations}, {phase2_iterations}).")
 
+    patches_to_monitor = ("outlet", "outlet2") if has_outlet2 else ("outlet",)
     result = run_steady_state_scenario(
         case_dir, room.x, room.y, room.z, settings["ach"], settings["z-value"],
         source_center=(settings["inject-x-input"], settings["inject-y-input"], settings["inject-z-input"]),
         target_T_ss=settings["target-t-ss"],
-        inlet_velocity=inlet_velocity,
+        inlet_velocity=inlet_velocity, inlet2_velocity=inlet2_velocity, has_outlet2=has_outlet2,
         phase1_iterations=phase1_iterations,
         phase2_iterations=phase2_iterations,
         fan_entry=fan_entry, monitoring_points=_gather_monitoring_points(settings),
+        patches_to_monitor=patches_to_monitor,
         log_fn=_run_log, should_stop=_should_stop, solver_log_fn=_track_solver_time,
     )
     result["fluence_mean"] = summary["fluence_mean"]
@@ -828,6 +902,17 @@ def _opening_controls(prefix, default_wall):
     ]
 
 
+def _second_opening_controls(prefix, label, default_wall):
+    """A 2nd inlet/outlet, off by default - same layout shape as
+    _monitoring_point_controls' enable-toggle + collapsible sub-section.
+    """
+    return html.Div([
+        dbc.Checkbox(id=f"{prefix}-enable", value=False, label=f"Enable 2nd {label}",
+                     className="mb-2"),
+        html.Div(id=f"{prefix}-controls", children=_opening_controls(prefix, default_wall)),
+    ], className="mt-3 pt-3 border-top")
+
+
 def _fan_position_controls():
     return [_position_field_component(p) for p in ("fan-x", "fan-y", "fan-z")]
 
@@ -887,9 +972,11 @@ project_setup_tab = dbc.Row([
                 className="form-control form-control-sm")),
         ]),
 
-        _card("Inlet", _opening_controls("inlet", "xMin")),
+        _card("Inlet", _opening_controls("inlet", "xMin")
+              + [_second_opening_controls("inlet2", "Inlet", "ceiling")]),
 
-        _card("Outlet", _opening_controls("outlet", "xMax")),
+        _card("Outlet", _opening_controls("outlet", "xMax")
+              + [_second_opening_controls("outlet2", "Outlet", "floor")]),
 
         _card("Mixing fan", [
             dbc.Checkbox(id="fan-enable", value=False, label="Enable fan", className="mb-2"),
@@ -1287,6 +1374,45 @@ for _prefix, _label, _dim, _default_fn, *_rest in POSITION_FIELDS:
     _register_position_field(_prefix, _dim, _default_fn)
 
 
+# Which room dimension each opening's two position fields (named "-y-input"/
+# "-z-input" for historical xMin/xMax-only reasons) actually bound against,
+# now that an opening can be on any of the 6 walls - mirrors mesh_gen.
+# _WALL_SPECS' in-plane-axis convention (e.g. floor/ceiling vary in x/y,
+# not y/z). _register_position_field's own room-load reset still assumes
+# the field's original dim (y/z) - fine for the default xMin/xMax walls;
+# this callback keeps the slider bounds correct after the wall dropdown
+# changes to something else.
+_WALL_POSITION_DIMS = {
+    "xMin": ("y", "z"), "xMax": ("y", "z"),
+    "frontWall": ("x", "z"), "backWall": ("x", "z"),
+    "floor": ("x", "y"), "ceiling": ("x", "y"),
+}
+
+
+def _register_opening_wall_axes(prefix):
+    @app.callback(
+        Output(f"{prefix}-y-slider", "max"),
+        Output(f"{prefix}-y-input", "max"),
+        Output(f"{prefix}-z-slider", "max"),
+        Output(f"{prefix}-z-input", "max"),
+        Input(f"{prefix}-wall", "value"),
+        prevent_initial_call=True,
+    )
+    def _update_bounds(wall):
+        room = _loaded["room"]
+        if room is None or wall not in _WALL_POSITION_DIMS:
+            return dash.no_update, dash.no_update, dash.no_update, dash.no_update
+        dim1, dim2 = _WALL_POSITION_DIMS[wall]
+        max1, max2 = round(getattr(room, dim1), 3), round(getattr(room, dim2), 3)
+        return max1, max1, max2, max2
+
+    _update_bounds.__name__ = f"_wall_axes_{prefix.replace('-', '_')}"
+
+
+for _opening_prefix in ("inlet", "outlet", "inlet2", "outlet2"):
+    _register_opening_wall_axes(_opening_prefix)
+
+
 @app.callback(
     Output("decay-controls", "style"),
     Output("steady-state-controls", "style"),
@@ -1303,6 +1429,22 @@ def _toggle_sim_type_controls(sim_type):
     Input("fan-enable", "value"),
 )
 def _toggle_fan_controls(enabled):
+    return {"display": "block"} if enabled else {"display": "none", "opacity": "0.4"}
+
+
+@app.callback(
+    Output("inlet2-controls", "style"),
+    Input("inlet2-enable", "value"),
+)
+def _toggle_inlet2_controls(enabled):
+    return {"display": "block"} if enabled else {"display": "none", "opacity": "0.4"}
+
+
+@app.callback(
+    Output("outlet2-controls", "style"),
+    Input("outlet2-enable", "value"),
+)
+def _toggle_outlet2_controls(enabled):
     return {"display": "block"} if enabled else {"display": "none", "opacity": "0.4"}
 
 
@@ -1936,6 +2078,12 @@ def _poll_run(n_intervals):
     Input("outlet-show", "value"), Input("outlet-wall", "value"),
     Input("outlet-y-input", "value"), Input("outlet-z-input", "value"),
     Input("outlet-size-w", "value"), Input("outlet-size-h", "value"),
+    Input("inlet2-enable", "value"), Input("inlet2-wall", "value"),
+    Input("inlet2-y-input", "value"), Input("inlet2-z-input", "value"),
+    Input("inlet2-size-w", "value"), Input("inlet2-size-h", "value"),
+    Input("outlet2-enable", "value"), Input("outlet2-wall", "value"),
+    Input("outlet2-y-input", "value"), Input("outlet2-z-input", "value"),
+    Input("outlet2-size-w", "value"), Input("outlet2-size-h", "value"),
     Input("fan-enable", "value"), Input("fan-speed", "value"), Input("fan-direction", "value"),
     Input("fan-radius", "value"), Input("fan-thickness", "value"),
     Input("fan-x-input", "value"), Input("fan-y-input", "value"), Input("fan-z-input", "value"),
@@ -1948,6 +2096,8 @@ def _poll_run(n_intervals):
 )
 def _update_preview(_status, inlet_show, inlet_wall, inlet_y, inlet_z, inlet_w, inlet_h,
                      outlet_show, outlet_wall, outlet_y, outlet_z, outlet_w, outlet_h,
+                     inlet2_enable, inlet2_wall, inlet2_y, inlet2_z, inlet2_w, inlet2_h,
+                     outlet2_enable, outlet2_wall, outlet2_y, outlet2_z, outlet2_w, outlet2_h,
                      fan_enable, fan_speed, fan_direction, fan_radius, fan_thickness,
                      fan_x, fan_y, fan_z, sim_type, inject_x, inject_y, inject_z,
                      monitoring_enable, *monitor_values):
@@ -1955,8 +2105,20 @@ def _update_preview(_status, inlet_show, inlet_wall, inlet_y, inlet_z, inlet_w, 
     if room is None:
         return _empty_preview_figure()
 
-    inlet_center = (inlet_y / room.y, inlet_z / room.z)
-    outlet_center = (outlet_y / room.y, outlet_z / room.z)
+    inlet_center = _center_frac_for_wall(inlet_wall, inlet_y, inlet_z, room)
+    outlet_center = _center_frac_for_wall(outlet_wall, outlet_y, outlet_z, room)
+
+    opening2_kwargs = {}
+    if inlet2_enable:
+        opening2_kwargs.update(
+            inlet2_wall=inlet2_wall, inlet2_center=_center_frac_for_wall(inlet2_wall, inlet2_y, inlet2_z, room),
+            inlet2_size=(inlet2_w, inlet2_h),
+        )
+    if outlet2_enable:
+        opening2_kwargs.update(
+            outlet2_wall=outlet2_wall, outlet2_center=_center_frac_for_wall(outlet2_wall, outlet2_y, outlet2_z, room),
+            outlet2_size=(outlet2_w, outlet2_h),
+        )
 
     fan_kwargs = {}
     if fan_enable:
@@ -1980,7 +2142,7 @@ def _update_preview(_status, inlet_show, inlet_wall, inlet_y, inlet_z, inlet_w, 
         outlet_wall=outlet_wall, outlet_center=outlet_center, outlet_size=(outlet_w, outlet_h),
         injection_center=injection_center,
         monitoring_points=monitoring_points,
-        title="", **fan_kwargs,
+        title="", **fan_kwargs, **opening2_kwargs,
     )
     if not inlet_show:
         fig.data = [t for t in fig.data if not (t.customdata and str(t.customdata[0]).startswith("inlet"))]

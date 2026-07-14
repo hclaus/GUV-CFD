@@ -48,3 +48,38 @@ def test_plot_case_monitoring_box_size_matches_cells_per_side():
     box_trace = next(t for t in fig.data if t.customdata and t.customdata[0] == "Patient_monitor_volume")
     # cells_per_side=4, cell_size=0.1 -> box side 0.4, centered at x=1.0.
     assert min(box_trace.x) == 1.0 - 0.2 and max(box_trace.x) == 1.0 + 0.2
+
+
+def test_plot_case_without_second_openings_has_no_inlet2_outlet2_traces():
+    room = _load_room()
+    fig = plot_case(room)
+    tags = [str(t.customdata[0]) for t in fig.data if t.customdata]
+    assert not any(tag.startswith("inlet2") or tag.startswith("outlet2") for tag in tags)
+
+
+def test_plot_case_draws_second_inlet_and_outlet_when_given():
+    room = _load_room()
+    fig = plot_case(
+        room,
+        inlet2_wall="ceiling", inlet2_center=(0.5, 0.5), inlet2_size=(0.2, 0.2),
+        outlet2_wall="floor", outlet2_center=(0.5, 0.5), outlet2_size=(0.2, 0.2),
+    )
+    tags = [str(t.customdata[0]) for t in fig.data if t.customdata]
+    assert "inlet2_outline" in tags
+    assert "outlet2_outline" in tags
+
+
+def test_plot_case_opening_on_floor_stays_in_the_xy_plane():
+    room = _load_room()
+    fig = plot_case(room, inlet_wall="floor", inlet_center=(0.5, 0.5), inlet_size=(0.3, 0.3))
+    outline = next(t for t in fig.data if t.customdata and t.customdata[0] == "inlet_outline")
+    assert all(abs(z) < 1e-6 for z in outline.z)  # floor is z=0 - must not vary in z
+    assert max(outline.x) - min(outline.x) > 0  # but must vary in x and y
+    assert max(outline.y) - min(outline.y) > 0
+
+
+def test_plot_case_inlet_arrow_points_into_the_room_from_ceiling():
+    room = _load_room()
+    fig = plot_case(room, inlet_wall="ceiling", inlet_center=(0.5, 0.5), inlet_size=(0.3, 0.3))
+    arrow = next(t for t in fig.data if t.customdata and t.customdata[0] == "inlet_arrow")
+    assert arrow.z[1] < arrow.z[0]  # ceiling's inward normal points down

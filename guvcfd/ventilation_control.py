@@ -8,7 +8,7 @@ measured_ventilation_lambda_per_s parameter, which this feeds).
 """
 from .contaminant_source import write_fvoptions_file
 from .decay_analysis import write_results_summary
-from .initial_fields import compute_inlet_velocity, restore_boundary_conditions
+from .initial_fields import compute_inlet_velocities, restore_boundary_conditions
 from .monitoring import write_vol_average_dict
 from .splice import (
     splice_fv_options_into_control_dict,
@@ -18,18 +18,22 @@ from .splice import (
 )
 from .wsl_utils import wsl_path, run_wsl_or_raise, run_wsl_streaming, StoppedByUser
 
-_WALL_INFLOW_DIRECTION = {"xMin": (1, 0, 0), "xMax": (-1, 0, 0)}
-
 
 def run_ventilation_only_control(case_dir, control_dir, ach, room_x, room_y, room_z,
                                   inlet_wall, inlet_size, pimple_end_time,
                                   pimple_write_interval, pimple_delta_t=0.5,
+                                  inlet2_wall=None, inlet2_size=None, has_outlet2=False,
                                   log_fn=print, should_stop=None, solver_log_fn=None):
     """Clone case_dir's mesh/converged flow field into control_dir, remove
     every UV source, reset T fresh, and run the transient decay driven by
     ventilation alone. Returns the control run's results dict (ventilation_ach
     set, eACH_uv_well_mixed=0.0) - its total_ach_effective is the actual
     measured ventilation air-change rate.
+
+    inlet2_wall/inlet2_size/has_outlet2: mirror whatever 2nd inlet/outlet
+    the original case_dir was actually built with (see setup_case) - the
+    mesh is cloned as-is, so these only need to match for the boundary
+    condition *values* to come out right, not to change the mesh itself.
     """
     control_dir_wsl = wsl_path(control_dir)
     case_dir_wsl_src = wsl_path(case_dir)
@@ -57,13 +61,16 @@ def run_ventilation_only_control(case_dir, control_dir, ach, room_x, room_y, roo
         raise StoppedByUser("Stopped before UV-off control run.")
 
     room_volume = room_x * room_y * room_z
-    inlet_area = inlet_size[0] * inlet_size[1]
-    v_mag = compute_inlet_velocity(ach, room_volume, inlet_area)
-    inflow_dir = _WALL_INFLOW_DIRECTION[inlet_wall]
-    inlet_velocity = tuple(v_mag * d for d in inflow_dir)
+    openings = [(inlet_wall, inlet_size[0] * inlet_size[1])]
+    if inlet2_wall is not None:
+        openings.append((inlet2_wall, inlet2_size[0] * inlet2_size[1]))
+    velocities = compute_inlet_velocities(ach, room_volume, openings)
+    inlet_velocity = velocities[0]
+    inlet2_velocity = velocities[1] if inlet2_wall is not None else None
 
     log_fn("Resetting T to a fresh initial condition (U/p/k/omega/nut untouched)...")
-    restore_boundary_conditions(control_dir, inlet_velocity=inlet_velocity)
+    restore_boundary_conditions(control_dir, inlet_velocity=inlet_velocity,
+                                 inlet2_velocity=inlet2_velocity, has_outlet2=has_outlet2)
 
     log_fn("Writing an empty constant/fvOptions (no UV source - ventilation only)...")
     write_fvoptions_file(control_dir, [])

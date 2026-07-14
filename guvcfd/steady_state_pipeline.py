@@ -128,6 +128,7 @@ def _run_phase(case_dir, case_dir_wsl, n_iterations, write_interval, plateau_win
 def run_steady_state_scenario(case_dir, room_x, room_y, room_z, ach, Z, nbins=25,
                                source_center=None, source_size=0.3, target_T_ss=0.3,
                                cell_size=0.1, inlet_velocity=(0.278, 0, 0),
+                               inlet2_velocity=None, has_outlet2=False,
                                phase1_iterations=8000, phase1_write_interval=200,
                                phase2_iterations=3000, phase2_write_interval=100,
                                plateau_window=5, plateau_rel_tol=0.01,
@@ -194,7 +195,8 @@ def run_steady_state_scenario(case_dir, room_x, room_y, room_z, ach, Z, nbins=25
     write_fvoptions_file(case_dir, [source_entry] + fan_entries)
     _, n_open, n_close = splice_fv_options_into_control_dict(case_dir)
     assert n_open == n_close, f"Brace mismatch: {n_open} vs {n_close}"
-    restore_boundary_conditions(case_dir, inlet_velocity=inlet_velocity, T_initial=0)
+    restore_boundary_conditions(case_dir, inlet_velocity=inlet_velocity, T_initial=0,
+                                 inlet2_velocity=inlet2_velocity, has_outlet2=has_outlet2)
 
     latest1, t1, T1, converged1 = _run_phase(
         case_dir, case_dir_wsl, phase1_iterations, phase1_write_interval,

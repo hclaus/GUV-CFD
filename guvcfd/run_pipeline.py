@@ -16,7 +16,7 @@ from .contaminant_source import write_fvoptions_file
 from .decay_analysis import read_vol_average_dat
 from .fan import write_fan_topo_set_dict, fan_fvoptions_entry
 from .fluence import compute_fluence_at_points, compute_inactivation_rate, compute_well_mixed_eACH
-from .initial_fields import write_initial_fields, compute_inlet_velocity, restore_boundary_conditions
+from .initial_fields import write_initial_fields, compute_inlet_velocities, restore_boundary_conditions
 from .mesh_gen import write_mesh_dicts, write_map_fields_dict
 from .monitoring import write_vol_average_dict
 from .splice import (
@@ -281,13 +281,12 @@ def converge_flow_field(case_dir, n_iterations=500, fan_entry=None, log_fn=print
     return str(total_run)
 
 
-_WALL_INFLOW_DIRECTION = {"xMin": (1, 0, 0), "xMax": (-1, 0, 0)}
-
-
 def setup_case(guv_path, case_dir, template_case_dir=None, cell_size=0.1, Z=2.0, nbins=25,
                source_field="T", map_from_case=None, map_from_time=0, ach=3.0,
                inlet_wall="xMin", inlet_center=(0.5, 0.85), inlet_size=(0.3, 0.3),
                outlet_wall="xMax", outlet_center=(0.5, 0.15), outlet_size=(0.3, 0.3),
+               inlet2_wall=None, inlet2_center=None, inlet2_size=None,
+               outlet2_wall=None, outlet2_center=None, outlet2_size=None,
                converge_flow=True, simple_foam_iterations=500, flow_convergence_method="simple",
                pimple_end_time=120, pimple_write_interval=10, pimple_delta_t=0.5,
                fan_speed=None, fan_center=None, fan_direction=(0, 0, -1),
@@ -299,6 +298,13 @@ def setup_case(guv_path, case_dir, template_case_dir=None, cell_size=0.1, Z=2.0,
     ach: target air changes per hour [1/hr] - inlet velocity is derived from
     this and the room volume/inlet area (see initial_fields.compute_inlet_velocity),
     rather than a fixed velocity that would silently drift ACH as room size changes.
+
+    inlet2_wall/center/size, outlet2_wall/center/size: an optional 2nd inlet
+    and/or 2nd outlet, each on any of the 6 room walls. When given, both
+    inlets share the same velocity magnitude (see
+    initial_fields.compute_inlet_velocities) - flow splits between them in
+    proportion to each inlet's own opening area. None (the default) means
+    "no 2nd opening", matching today's single-inlet/outlet behavior exactly.
 
     converge_flow: if True, run simpleFoam (see converge_flow_field()) to get
     a genuinely converged flow field for this mesh, rather than trusting
@@ -351,7 +357,9 @@ def setup_case(guv_path, case_dir, template_case_dir=None, cell_size=0.1, Z=2.0,
     log_fn("Writing mesh dicts (blockMeshDict/topoSetDict/createPatchDict)...")
     write_mesh_dicts(case_dir, room.x, room.y, room.z, cell_size=cell_size,
                       inlet_wall=inlet_wall, inlet_center=inlet_center, inlet_size=inlet_size,
-                      outlet_wall=outlet_wall, outlet_center=outlet_center, outlet_size=outlet_size)
+                      outlet_wall=outlet_wall, outlet_center=outlet_center, outlet_size=outlet_size,
+                      inlet2_wall=inlet2_wall, inlet2_center=inlet2_center, inlet2_size=inlet2_size,
+                      outlet2_wall=outlet2_wall, outlet2_center=outlet2_center, outlet2_size=outlet2_size)
 
     log_fn("Running blockMesh...")
     _run_wsl_or_raise("blockMesh", case_dir_wsl, "blockMesh")
@@ -380,17 +388,25 @@ def setup_case(guv_path, case_dir, template_case_dir=None, cell_size=0.1, Z=2.0,
         summary["fan"] = {"center": center, "speed": fan_speed, "direction": fan_direction}
 
     room_volume = room.x * room.y * room.z
-    inlet_area = inlet_size[0] * inlet_size[1]
-    inflow_dir = _WALL_INFLOW_DIRECTION[inlet_wall]
-    v_mag = compute_inlet_velocity(ach, room_volume, inlet_area)
-    inlet_velocity = tuple(v_mag * d for d in inflow_dir)
+    openings = [(inlet_wall, inlet_size[0] * inlet_size[1])]
+    if inlet2_wall is not None:
+        openings.append((inlet2_wall, inlet2_size[0] * inlet2_size[1]))
+    velocities = compute_inlet_velocities(ach, room_volume, openings)
+    inlet_velocity = velocities[0]
+    inlet2_velocity = velocities[1] if inlet2_wall is not None else None
     log_fn(f"Writing initial fields (0/{{U,p,k,omega,nut,T}}), ACH={ach} -> "
-           f"inlet velocity {inlet_velocity} m/s (room volume={room_volume:.3g} m^3, "
-           f"inlet area={inlet_area:.3g} m^2)...")
+           f"inlet velocity {inlet_velocity} m/s"
+           + (f", inlet2 velocity {inlet2_velocity} m/s" if inlet2_velocity else "")
+           + f" (room volume={room_volume:.3g} m^3, total inlet area="
+           f"{sum(a for _, a in openings):.3g} m^2)...")
+    has_outlet2 = outlet2_wall is not None
     Path(f"{case_dir}/0").mkdir(parents=True, exist_ok=True)
-    write_initial_fields(case_dir, inlet_velocity=inlet_velocity)
+    write_initial_fields(case_dir, inlet_velocity=inlet_velocity, inlet2_velocity=inlet2_velocity,
+                          has_outlet2=has_outlet2)
     summary["ach"] = ach
     summary["inlet_velocity"] = inlet_velocity
+    if inlet2_velocity:
+        summary["inlet2_velocity"] = inlet2_velocity
 
     log_fn("Running writeCellCentres...")
     _run_wsl_or_raise("postProcess -func writeCellCentres -time 0", case_dir_wsl, "writeCellCentres")
@@ -406,7 +422,8 @@ def setup_case(guv_path, case_dir, template_case_dir=None, cell_size=0.1, Z=2.0,
         _run_wsl_or_raise("postProcess -func writeCellCentres -time 0", case_dir_wsl, "writeCellCentres (post-map)")
         log_fn("  restoring our own boundary conditions (mapFields also clobbers fixedValue "
                "patches like inlet with interpolated garbage)...")
-        restore_boundary_conditions(case_dir, inlet_velocity=inlet_velocity)
+        restore_boundary_conditions(case_dir, inlet_velocity=inlet_velocity, inlet2_velocity=inlet2_velocity,
+                                     has_outlet2=has_outlet2)
 
     if converge_flow:
         log_fn(f"Converging flow field ({flow_convergence_method}, chunk size="
@@ -418,7 +435,8 @@ def setup_case(guv_path, case_dir, template_case_dir=None, cell_size=0.1, Z=2.0,
             raise StoppedByUser("Stopped after flow convergence.")
         log_fn("  restoring our own boundary conditions again (simpleFoam's mesh-derived "
                "boundary values aren't necessarily our fixedValue settings either)...")
-        restore_boundary_conditions(case_dir, inlet_velocity=inlet_velocity)
+        restore_boundary_conditions(case_dir, inlet_velocity=inlet_velocity, inlet2_velocity=inlet2_velocity,
+                                     has_outlet2=has_outlet2)
 
     log_fn("Computing fluence rate at cell centers...")
     points = read_cell_centers(case_dir, "0")
