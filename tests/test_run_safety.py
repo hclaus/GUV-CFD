@@ -3,9 +3,10 @@ from datetime import datetime
 
 from guvcfd.app import (
     _ALWAYS_REQUIRED_FIELDS, _FAN_REQUIRED_FIELDS, _STEADY_STATE_REQUIRED_FIELDS,
-    _INLET2_REQUIRED_FIELDS, _OUTLET2_REQUIRED_FIELDS,
+    _INLET2_REQUIRED_FIELDS, _OUTLET2_REQUIRED_FIELDS, _NEW_FIELD_DEFAULTS,
+    _WALL_POSITION_DIMS,
     _case_dir_has_data, _record_run_timing, _save_run_settings, _settings_mismatch,
-    _validate_settings, _MESH_AFFECTING_FIELDS,
+    _validate_settings, _MESH_AFFECTING_FIELDS, SETTINGS_FIELDS,
 )
 
 
@@ -219,3 +220,32 @@ def test_changed_inlet2_wall_is_reported_as_mismatch(tmp_path):
     _save_run_settings(case_dir, _settings(**{"inlet2-enable": True, "inlet2-wall": "ceiling"}))
     mismatches = _settings_mismatch(case_dir, _settings(**{"inlet2-enable": True, "inlet2-wall": "floor"}))
     assert ("inlet2-wall", "ceiling", "floor") in mismatches
+
+
+def _restore_field_values(saved_settings):
+    """Mirrors _open_project's own field_values construction exactly."""
+    return dict(zip(SETTINGS_FIELDS, [
+        saved_settings.get(fid, _NEW_FIELD_DEFAULTS.get(fid)) for fid in SETTINGS_FIELDS
+    ]))
+
+
+def test_opening_project_backfills_missing_second_opening_fields():
+    # Regression test: opening a .guvcfd saved before the 2nd-inlet/2nd-
+    # outlet feature existed left these keys missing from the file -
+    # settings.get(fid) alone pushed a bare None into e.g. the wall
+    # dropdown, which crashed _center_frac_for_wall
+    # (_WALL_POSITION_DIMS[None] -> KeyError) the moment a 2nd opening was
+    # enabled, since the dropdown never got a real value in the first place.
+    old_settings = {"ach": 3.0, "z-value": 2.0}  # predates the feature entirely
+    restored = _restore_field_values(old_settings)
+    assert restored["inlet2-wall"] in _WALL_POSITION_DIMS
+    assert restored["outlet2-wall"] in _WALL_POSITION_DIMS
+    assert restored["inlet2-enable"] is False
+    assert restored["outlet2-enable"] is False
+
+
+def test_opening_project_does_not_override_explicitly_saved_second_opening_fields():
+    saved_settings = {"outlet2-wall": "backWall", "outlet2-enable": True}
+    restored = _restore_field_values(saved_settings)
+    assert restored["outlet2-wall"] == "backWall"
+    assert restored["outlet2-enable"] is True

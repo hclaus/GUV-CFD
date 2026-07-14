@@ -29,6 +29,7 @@ from .initial_fields import compute_inlet_velocities
 from .monitoring_points import compute_monitoring_results, mixing_uniformity_note
 from .paraview_launch import launch_paraview
 from .report import generate_report_docx, T_FIELD_NOTE
+from .result_figures import steady_state_figure, decay_figure
 from .run_pipeline import setup_case
 from .splice import set_control_dict_start_from, set_control_dict_time
 from .steady_state_pipeline import run_steady_state_scenario
@@ -954,9 +955,10 @@ project_setup_tab = dbc.Row([
 
         _card("OpenFOAM project directory", [
             _labeled("Project directory (WSL path)", dbc.Row([
-                dbc.Col(dcc.Input(
-                    id="case-dir", type="text", debounce=True, value=_DEFAULT_RUN_DIR,
+                dbc.Col(dcc.Textarea(
+                    id="case-dir", value=_DEFAULT_RUN_DIR,
                     placeholder=r"\\wsl.localhost\Ubuntu\home\...\run",
+                    style={"height": "60px", "resize": "vertical"},
                     className="form-control form-control-sm"), width=8),
                 dbc.Col(dbc.Button("Browse...", id="browse-case-dir-btn", size="sm",
                                    color="secondary", className="w-100"), width=4),
@@ -1109,46 +1111,6 @@ def _empty_analysis_figure():
     ))
 
 
-def _steady_state_figure(result):
-    """T over time as a percentage of phase 1's steady state (100%), phase
-    1 and phase 2 plotted on one continuous linear timeline (phase 2
-    shifted to start where phase 1 ends) so the UV-on transition and its
-    reduction read directly off the curve. Time axis is linear - the
-    underlying OpenFOAM write schedule is what's log-spaced (see
-    _settling_write_schedule()), not this plot.
-    """
-    p1, p2 = result["phase1"], result["phase2"]
-    T_ss1 = p1["T_ss"] or 1.0
-    t1 = p1["decay_curve"]["t"]
-    T1 = p1["decay_curve"]["T"]
-    t1_end = t1[-1] if t1 else 0.0
-
-    t2 = p2["decay_curve"]["t"]
-    T2 = p2["decay_curve"]["T"]
-    t2_shifted = [t1_end + v for v in t2]
-
-    pct1 = [100 * v / T_ss1 for v in T1]
-    pct2 = [100 * v / T_ss1 for v in T2]
-
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=t1, y=pct1, mode="lines+markers", name="Phase 1 (no UV)",
-                              line=dict(color="#e67e22", width=2)))
-    fig.add_trace(go.Scatter(x=t2_shifted, y=pct2, mode="lines+markers", name="Phase 2 (UV on)",
-                              line=dict(color="#2ecc71", width=2)))
-    fig.add_hline(y=100, line_dash="dot", line_color="gray",
-                  annotation_text="Phase 1 steady state (100%)", annotation_position="top left")
-    pct2_ss = 100 * p2["T_ss"] / T_ss1
-    fig.add_hline(y=pct2_ss, line_dash="dot", line_color="#2ecc71",
-                  annotation_text=f"Phase 2 steady state ({pct2_ss:.1f}%)", annotation_position="bottom left")
-    fig.add_vline(x=t1_end, line_dash="dash", line_color="gray", annotation_text="UV on")
-    fig.update_layout(
-        xaxis_title="Time (s)", yaxis_title="T (% of phase 1 steady state)",
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
-        margin=dict(l=50, r=20, t=30, b=45),
-    )
-    return fig
-
-
 def _monitoring_summary_rows(monitoring):
     """Extra Analysis-tab rows for monitoring locations, if any were
     computed. Handles both decay's shape
@@ -1215,42 +1177,6 @@ def _steady_state_summary(result):
             for k, v in rows] + _result_notes(result)
 
 
-def _decay_figure(result):
-    """Actual CFD decay curve plus two idealized well-mixed reference curves
-    (pure ventilation, and ventilation+UV at the well-mixed eACH estimate)
-    computed from the same T[0] starting value - so the gap between the real
-    (CFD) curve and each reference visually shows how much imperfect mixing
-    slows disinfection versus the idealized box-model assumption. Log y-axis
-    since decay is exponential - a straight line here is a pure exponential,
-    and curvature/kinks reveal where the real mixing deviates from one.
-    """
-    curve = result["decay_curve"]
-    t, T = curve["t_seconds"], curve["volAverage_T"]
-    T0 = T[0] if T else 1.0
-
-    lambda_vent = result["ventilation_ach"] / 3600.0
-    lambda_well_mixed = lambda_vent + result["eACH_uv_well_mixed"] / 3600.0
-    ach_curve = [T0 * math.exp(-lambda_vent * ti) for ti in t]
-    well_mixed_curve = [T0 * math.exp(-lambda_well_mixed * ti) for ti in t]
-
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=t, y=T, mode="lines+markers", name="volAverage(T) - actual (CFD)",
-                              line=dict(color="#3498db", width=2)))
-    fig.add_trace(go.Scatter(x=t, y=ach_curve, mode="lines",
-                              name=f"Ventilation ACH only ({result['ventilation_ach']:.3g}/hr)",
-                              line=dict(color="#95a5a6", width=2, dash="dash")))
-    fig.add_trace(go.Scatter(x=t, y=well_mixed_curve, mode="lines",
-                              name=f"Well-mixed, ACH+eACH_uv "
-                                   f"({result['ventilation_ach'] + result['eACH_uv_well_mixed']:.3g}/hr)",
-                              line=dict(color="#e67e22", width=2, dash="dash")))
-    fig.update_layout(
-        xaxis_title="Time (s)", yaxis_title="volAverage(T)", yaxis_type="log",
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
-        margin=dict(l=50, r=20, t=30, b=45),
-    )
-    return fig
-
-
 def _decay_summary(result):
     rows = []
     if result.get("fluence_mean") is not None:
@@ -1304,10 +1230,16 @@ app.layout = dbc.Container([
         ],
         id="help-modal", is_open=False, size="lg", scrollable=True,
     ),
-    dbc.Row([
+    dbc.Row(
         dbc.Col(html.H4("GUV-CFD", className="mt-3 mb-1"), width="auto"),
+    ),
+    dbc.Row(dbc.Col(html.Div(
+        "Combining GUV lighting calculation with Open Foam",
+        className="text-muted small mb-1",
+    ))),
+    dbc.Row([
         dbc.Col(dbc.DropdownMenu(
-            label="File", color="light", size="sm", className="mt-3",
+            label="File", color="light", size="sm",
             children=[
                 dbc.DropdownMenuItem("Open Project...", id="menu-open"),
                 dbc.DropdownMenuItem("Save Project", id="menu-save"),
@@ -1315,7 +1247,7 @@ app.layout = dbc.Container([
             ],
         ), width="auto"),
         dbc.Col(dbc.DropdownMenu(
-            label="Help", color="light", size="sm", className="mt-3",
+            label="Help", color="light", size="sm",
             children=[
                 dbc.DropdownMenuItem("About", id="menu-help-about"),
                 dbc.DropdownMenuItem("License", id="menu-help-license"),
@@ -1323,13 +1255,12 @@ app.layout = dbc.Container([
                 dbc.DropdownMenuItem("OpenFOAM Notes", id="menu-help-openfoam"),
             ],
         ), width="auto"),
-        dbc.Col(html.Div("Untitled project", id="project-name-display",
-                          className="mt-3 text-muted fst-italic"), width="auto"),
-    ], align="center", className="g-3"),
-    dbc.Row(dbc.Col(html.Div(
-        "guv-calcs UV fluence × OpenFOAM CFD — configure a case, preview it, then run.",
-        className="text-muted small mb-3",
-    ))),
+        dbc.Col(html.Div([
+            html.Span("Project file: ", className="text-muted"),
+            html.Span("Untitled project", id="project-name-display",
+                       className="text-muted fst-italic"),
+        ]), width="auto", className="ms-3"),
+    ], align="center", className="g-3 mt-2 mb-3"),
     dbc.Tabs([
         dbc.Tab(project_setup_tab, label="Project Setup", tab_id="project-setup"),
         dbc.Tab(processing_tab, label="Processing", tab_id="processing"),
@@ -1390,11 +1321,16 @@ _WALL_POSITION_DIMS = {
 
 
 def _register_opening_wall_axes(prefix):
+    # allow_duplicate=True: _register_position_field's own per-field
+    # callback already owns {prefix}-y/z-slider/input's "max" (as part of
+    # its "reset to room dimensions on fresh load" behavior) - this
+    # callback is a second, independent writer to those same four outputs,
+    # firing on a different trigger (the wall dropdown, not fresh-room-load).
     @app.callback(
-        Output(f"{prefix}-y-slider", "max"),
-        Output(f"{prefix}-y-input", "max"),
-        Output(f"{prefix}-z-slider", "max"),
-        Output(f"{prefix}-z-input", "max"),
+        Output(f"{prefix}-y-slider", "max", allow_duplicate=True),
+        Output(f"{prefix}-y-input", "max", allow_duplicate=True),
+        Output(f"{prefix}-z-slider", "max", allow_duplicate=True),
+        Output(f"{prefix}-z-input", "max", allow_duplicate=True),
         Input(f"{prefix}-wall", "value"),
         prevent_initial_call=True,
     )
@@ -1667,8 +1603,8 @@ def _render_analysis(data):
     if not data:
         return _empty_analysis_figure(), []
     if "phase1" in data:
-        return _steady_state_figure(data), _steady_state_summary(data)
-    return _decay_figure(data), _decay_summary(data)
+        return steady_state_figure(data), _steady_state_summary(data)
+    return decay_figure(data), _decay_summary(data)
 
 
 @app.callback(
@@ -1732,6 +1668,24 @@ def _open_help_modal(*_clicks):
     return True, title, body
 
 
+# Fallback values for fields that predate a project file's save - loading
+# a .guvcfd saved before the 2nd-inlet/2nd-outlet feature existed leaves
+# these keys missing from the JSON, and settings.get(fid) alone would push
+# a bare None into e.g. the wall dropdowns, crashing anything that looks
+# the wall up (_center_frac_for_wall etc.) the moment the field is enabled
+# - even though "enabled" itself defaults safely to None/falsy. Values
+# here match the layout's own component defaults (_opening_controls's
+# "ceiling"/"floor", POSITION_FIELDS' inlet2/outlet2 defaults).
+_NEW_FIELD_DEFAULTS = {
+    "inlet2-enable": False, "inlet2-wall": "ceiling",
+    "inlet2-y-input": 2.0, "inlet2-z-input": 1.5,
+    "inlet2-size-w": 0.3, "inlet2-size-h": 0.3,
+    "outlet2-enable": False, "outlet2-wall": "floor",
+    "outlet2-y-input": 2.0, "outlet2-z-input": 1.5,
+    "outlet2-size-w": 0.3, "outlet2-size-h": 0.3,
+}
+
+
 @app.callback(
     *_open_outputs,
     Input("menu-open", "n_clicks"),
@@ -1775,7 +1729,7 @@ def _open_project(n_clicks):
     _loaded["settings_path"] = path
     proj_name = path.replace("\\", "/").rsplit("/", 1)[-1]
 
-    field_values = [settings.get(fid) for fid in SETTINGS_FIELDS]
+    field_values = [settings.get(fid, _NEW_FIELD_DEFAULTS.get(fid)) for fid in SETTINGS_FIELDS]
     max_values = []
     for _prefix, _label, dim, _default_fn, *_rest in POSITION_FIELDS:
         if room is not None:

@@ -1,4 +1,16 @@
-from guvcfd.run_pipeline import _is_stable_oscillation
+import inspect
+
+from guvcfd.run_pipeline import _is_stable_oscillation, converge_flow_field
+
+
+def test_flow_convergence_default_tolerance_is_one_percent():
+    # Regression guard for a deliberate tuning choice: real room-
+    # ventilation flows often oscillate in the 0.5-1% band without ever
+    # settling further (see converge_flow_field's own docstring and the
+    # bounded-oscillation acceptance fallback) - chasing 0.5% wastes
+    # wall-clock time without buying real accuracy downstream.
+    default = inspect.signature(converge_flow_field).parameters["rel_tol"].default
+    assert default == 0.01
 
 
 def test_not_enough_history_rejected():

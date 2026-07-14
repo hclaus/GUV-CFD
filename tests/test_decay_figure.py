@@ -1,6 +1,6 @@
 import math
 
-from guvcfd.app import _decay_figure
+from guvcfd.result_figures import decay_figure as _decay_figure
 
 
 def _sample_result():

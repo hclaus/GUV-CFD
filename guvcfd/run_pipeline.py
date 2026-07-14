@@ -58,7 +58,7 @@ def _is_stable_oscillation(history, window, growth_tol):
 
 
 def converge_flow_field(case_dir, n_iterations=500, fan_entry=None, log_fn=print,
-                         max_iterations=20000, check_field="p", rel_tol=0.005, should_stop=None,
+                         max_iterations=20000, check_field="p", rel_tol=0.01, should_stop=None,
                          method="simple", oscillation_window=6, oscillation_growth_tol=1.5,
                          solver_log_fn=None):
     """Run simpleFoam to actually converge the flow field on this mesh,
