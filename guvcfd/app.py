@@ -9,6 +9,7 @@ import re
 import threading
 import time
 import tkinter as tk
+from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog
 
@@ -348,6 +349,17 @@ def _save_run_settings(case_dir, settings, guv_path=None):
     # purely so report.py's case-setup preview picture can draw them later
     # without needing the original .guv/Dash session still open.
     data["monitoring_points"] = _gather_monitoring_points(settings)
+    # Same idea for the steady-state contaminant source position - carved as
+    # its own cellZone independent of setup_case()'s mesh (see
+    # steady_state_pipeline.run_steady_state_scenario), so it's not mesh-
+    # affecting either, but paraview_launch needs it later to seed a
+    # source-colored-by-T view. None for decay scenarios, which have no
+    # continuous point source.
+    if settings.get("sim-type") == "steady_state":
+        data["source_center"] = (
+            settings.get("inject-x-input"), settings.get("inject-y-input"),
+            settings.get("inject-z-input"),
+        )
     with open(f"{case_dir}/run_settings.json", "w") as f:
         json.dump(data, f, indent=2)
 
@@ -673,13 +685,34 @@ def _run_steady_state(guv_path, case_dir, room, settings):
              f"eACH_uv={result['eACH_uv_steady_state']:.4g} /hr")
 
 
+def _record_run_timing(case_dir, started_at, elapsed_seconds):
+    """Add run_started_at/run_elapsed_seconds to results.json after a
+    successful run - report.py reads these for the "Simulation date"/
+    "Total elapsed time" report rows. A no-op if results.json somehow
+    isn't there (shouldn't happen after a "done" status, but this is purely
+    informational, not worth failing the run over).
+    """
+    results_path = f"{case_dir}/results.json"
+    if not Path(results_path).exists():
+        return
+    with open(results_path) as f:
+        results = json.load(f)
+    results["run_started_at"] = started_at.isoformat()
+    results["run_elapsed_seconds"] = elapsed_seconds
+    with open(results_path, "w") as f:
+        json.dump(results, f, indent=2)
+
+
 def _run_pipeline_thread(sim_type, guv_path, case_dir, room, settings):
+    started_at = datetime.now()
+    start = time.time()
     try:
         if sim_type == "decay":
             _run_decay(guv_path, case_dir, room, settings)
         else:
             _run_steady_state(guv_path, case_dir, room, settings)
         _run_state["status"] = "done"
+        _record_run_timing(case_dir, started_at, time.time() - start)
     except StoppedByUser as e:
         _run_log(f"Stopped: {e}")
         _run_state["status"] = "stopped"
@@ -1471,15 +1504,16 @@ def _open_paraview(n_clicks, results_case_dir):
         mesh_bounds = (points[:, 0].min(), points[:, 0].max(),
                        points[:, 1].min(), points[:, 1].max(),
                        points[:, 2].min(), points[:, 2].max())
-        launch_paraview(
-            results_case_dir, settings["inlet-wall"],
-            settings["inlet-y-input"], settings["inlet-z-input"],
-            (settings["inlet-size-w"], settings["inlet-size-h"]),
-            mesh_bounds,
-        )
+        source_center = settings.get("source_center")
+        if source_center and any(v is None for v in source_center):
+            source_center = None  # incomplete/old record - skip the 3rd view rather than crash
+        launch_paraview(results_case_dir, mesh_bounds, source_center=source_center)
     except Exception as e:
         return f"Failed to open ParaView: {e}"
-    return "Opened ParaView (volume T + inlet-seeded streamlines colored by U)."
+    msg = "Opened ParaView (log-scale volume T + room-seeded streamlines colored by U"
+    if source_center:
+        msg += " + source-seeded streamlines colored by T"
+    return msg + ")."
 
 
 @app.callback(

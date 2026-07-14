@@ -3,14 +3,47 @@ setup parameters, a rendered picture of the case setup (inlet/outlet/fan/
 lamps), and the key result numbers - for sharing outside the GUI itself.
 """
 import json
+from datetime import datetime
 from pathlib import Path
 
 from docx import Document
 from docx.shared import Inches
 from guv_calcs import Project
 
+from .contaminant_source import compute_source_strength
 from .monitoring_points import mixing_uniformity_note
+from .system_info import get_system_info
 from .visualization import plot_case
+
+
+def _format_elapsed(seconds):
+    seconds = max(0, int(seconds))
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}h {m}m {s}s"
+    if m:
+        return f"{m}m {s}s"
+    return f"{s}s"
+
+
+def _run_timing(case_dir, results):
+    """(started_at, elapsed_seconds) for the "Simulation date"/"Total
+    elapsed time" report rows - from results.json's own run_started_at/
+    run_elapsed_seconds if this run recorded them, else a rough fallback
+    from run_settings.json's/results.json's file-modified times (written
+    near the start and end of a run respectively) for older or
+    still-in-progress case directories that predate that tracking.
+    """
+    if results.get("run_started_at") is not None:
+        started_at = datetime.fromisoformat(results["run_started_at"])
+        return started_at, results.get("run_elapsed_seconds")
+    try:
+        start_mtime = (Path(case_dir) / "run_settings.json").stat().st_mtime
+        end_mtime = (Path(case_dir) / "results.json").stat().st_mtime
+        return datetime.fromtimestamp(start_mtime), max(0, end_mtime - start_mtime)
+    except OSError:
+        return None, None
 
 # What "T" actually is - shown once under the Results heading in both the
 # .docx report and the Analysis tab (imported from here by app.py) since
@@ -163,6 +196,17 @@ def generate_report_docx(case_dir, out_path):
     project = Project.load(guv_path)
     room = next(iter(project.rooms.values()))
 
+    # injection_rate_total predates this field for case dirs from before it
+    # was added to steady_state_pipeline.py - it's a deterministic function
+    # of room volume/ACH/target_T_ss (see compute_source_strength), so an
+    # older results.json missing it can still show the real number instead
+    # of "n/a" rather than needing a rerun.
+    if "phase1" in results and results.get("injection_rate_total") is None \
+            and results.get("target_T_ss") and settings.get("ach"):
+        results = dict(results)
+        results["injection_rate_total"] = compute_source_strength(
+            room.x * room.y * room.z, settings["ach"], results["target_T_ss"])
+
     fan_kwargs = {}
     if settings.get("fan-enable"):
         direction = (0, 0, -1) if settings["fan-direction"] == "down" else (0, 0, 1)
@@ -190,6 +234,21 @@ def generate_report_docx(case_dir, out_path):
     doc = Document()
     doc.add_heading("GUV-CFD Simulation Report", level=1)
     doc.add_paragraph(f"Case directory: {case_dir}")
+
+    started_at, elapsed_seconds = _run_timing(case_dir, results)
+    system_info = get_system_info()
+    metadata_rows = []
+    if started_at is not None:
+        metadata_rows.append(("Simulation date", started_at.strftime("%Y-%m-%d %H:%M")))
+    if elapsed_seconds is not None:
+        metadata_rows.append(("Total elapsed time", _format_elapsed(elapsed_seconds)))
+    metadata_rows.append(("CPU", system_info["cpu"]))
+    if system_info["ram_gb"] is not None:
+        metadata_rows.append(("RAM", f"{system_info['ram_gb']:.1f} GB"))
+    if system_info["gpu"]:
+        metadata_rows.append(("GPU", f"{system_info['gpu']} (not used - this pipeline's "
+                                      "OpenFOAM solve is CPU-only)"))
+    _add_kv_table(doc, metadata_rows)
 
     doc.add_heading("Room Setup", level=2)
     _add_kv_table(doc, [(label, fn(room, settings)) for label, fn in _ROW_LABELS_ROOM])

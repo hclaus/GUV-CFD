@@ -1,8 +1,9 @@
 import json
+from datetime import datetime
 
 from guvcfd.app import (
     _ALWAYS_REQUIRED_FIELDS, _FAN_REQUIRED_FIELDS, _STEADY_STATE_REQUIRED_FIELDS,
-    _case_dir_has_data, _save_run_settings, _settings_mismatch,
+    _case_dir_has_data, _record_run_timing, _save_run_settings, _settings_mismatch,
     _validate_settings, _MESH_AFFECTING_FIELDS,
 )
 
@@ -89,6 +90,29 @@ def test_save_run_settings_only_persists_mesh_affecting_fields(tmp_path):
     # report.py's case-setup preview can draw monitoring points later.
     assert set(saved.keys()) == set(_MESH_AFFECTING_FIELDS) | {"monitoring_points"}
     assert saved["monitoring_points"] == []
+
+
+def test_record_run_timing_adds_fields_to_results_json(tmp_path):
+    case_dir = str(tmp_path / "case")
+    (tmp_path / "case").mkdir()
+    (tmp_path / "case" / "results.json").write_text(json.dumps({"reduction_pct": 50.0}))
+
+    started_at = datetime(2026, 7, 13, 14, 30, 0)
+    _record_run_timing(case_dir, started_at, 125.4)
+
+    with open(f"{case_dir}/results.json") as f:
+        saved = json.load(f)
+    assert saved["reduction_pct"] == 50.0  # existing fields untouched
+    assert saved["run_started_at"] == "2026-07-13T14:30:00"
+    assert saved["run_elapsed_seconds"] == 125.4
+
+
+def test_record_run_timing_is_a_noop_without_results_json(tmp_path):
+    case_dir = str(tmp_path / "case")
+    (tmp_path / "case").mkdir()
+    # No results.json - should not raise.
+    _record_run_timing(case_dir, datetime.now(), 10.0)
+    assert not (tmp_path / "case" / "results.json").exists()
 
 
 def _full_settings(**overrides):

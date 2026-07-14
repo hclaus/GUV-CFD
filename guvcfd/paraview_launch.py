@@ -1,8 +1,17 @@
 """Launch ParaView pointed at a case directory with a useful default view
 already set up, instead of a blank scene the user has to configure by hand
-every time: a volume render of T (contamination) in one view, and a Stream
-Tracer following flow from the inlet toward the outlet, colored by U, in a
-second view.
+every time: a log-scale volume render of T (contamination) in one view, a
+Stream Tracer seeded broadly through the room (colored by U) in a second
+(tiled) view showing the general circulation pattern, and - for steady-
+state runs, where a source_center is known - a third view, in its own
+separate layout tab, of streamlines seeded at the contaminant source
+itself, colored by T, showing where contaminant-carrying air actually goes.
+
+The room-wide seed (rather than seeding tightly at the inlet opening) is
+deliberate: a small seed cloud right at the inlet just retraces the jet
+core already visible in the T volume render and says nothing about the
+room's broader circulation (recirculation zones, dead spots) - verified
+directly, it produced a single redundant bundle of near-identical lines.
 
 Finding the real ParaView install rather than assuming it's on PATH -
 Windows installs it under Program Files and does not add it to PATH by
@@ -87,18 +96,36 @@ try:
     # showing a blank volume view, since there's no data at an invalid time.
     # Explicitly return to the first real timestep afterward.
     scene.GoToFirst()
+
+    # T is a concentration field with a source (or initial condition) many
+    # orders of magnitude above the rest of the room - a linear color scale
+    # makes almost the entire domain render as one flat "low" color even
+    # though there's a real, continuous gradient, making the room look
+    # emptier/less-mixed than it actually is. Log scale shows that gradient.
+    # MapControlPointsToLogSpace() requires a strictly-positive range - T can
+    # be exactly 0 in cells contaminant hasn't reached yet, so the true data
+    # minimum isn't usable; floor it to a small fraction of the max instead.
+    ctfT = GetColorTransferFunction('T')
+    data_min, data_max = ctfT.RGBPoints[0], ctfT.RGBPoints[-4]
+    floor = data_max * 1e-3 if data_max > 0 else 1e-6
+    log_min = max(data_min, floor) if data_min > 0 else floor
+    ctfT.RescaleTransferFunction(log_min, data_max)
+    ctfT.MapControlPointsToLogSpace()
+    ctfT.UseLogScale = 1
+    _log_step(f"T color map set to log scale, range [{{log_min}}, {{data_max}}] "
+              f"(true data min was {{data_min}})")
+
     ResetCamera(view1)
-    _log_step(f"view1 (volume T) shown, color range fixed across all timesteps, "
-              f"scene time reset to {{scene.AnimationTime}}")
+    _log_step(f"view1 (log-scale volume T) shown, scene time reset to {{scene.AnimationTime}}")
 
     streamTracer = StreamTracer(Input=reader, SeedType='Point Cloud')
     streamTracer.Vectors = ['POINTS', 'U']
-    streamTracer.SeedType.Center = [{inlet_x}, {inlet_y}, {inlet_z}]
-    streamTracer.SeedType.Radius = {seed_radius}
-    streamTracer.SeedType.NumberOfPoints = 80
+    streamTracer.SeedType.Center = [{room_center_x}, {room_center_y}, {room_center_z}]
+    streamTracer.SeedType.Radius = {room_seed_radius}
+    streamTracer.SeedType.NumberOfPoints = 200
     streamTracer.MaximumStreamlineLength = {max_length}
     streamTracer.UpdatePipeline()
-    _log_step("stream tracer computed")
+    _log_step("room-seeded stream tracer computed")
 
     try:
         layout1 = GetLayout(view1)
@@ -111,6 +138,7 @@ try:
         _log_step("split view2 into layout")
     except Exception:
         _log_step("layout split failed, falling back to a separate view:\\n" + traceback.format_exc())
+        layout1 = None
         view2 = CreateRenderView()
 
     view2.ViewSize = [900, 700]
@@ -119,8 +147,8 @@ try:
     disp2.RescaleTransferFunctionToDataRange(True)
     Show(reader, view2).Opacity = 0.08
     ResetCamera(view2)
-    _log_step("view2 (stream tracer U) shown")
-
+    _log_step("view2 (room-seeded stream tracer, colored by U) shown")
+{view3_lines}
     RenderAllViews()
     _log_step("rendered")
     {screenshot_lines}
@@ -131,41 +159,99 @@ finally:
     _log.close()
 '''
 
+_VIEW3_TEMPLATE = '''
+    sourceStreamTracer = StreamTracer(Input=reader, SeedType='Point Cloud')
+    sourceStreamTracer.Vectors = ['POINTS', 'U']
+    sourceStreamTracer.SeedType.Center = [{source_x}, {source_y}, {source_z}]
+    sourceStreamTracer.SeedType.Radius = {source_seed_radius}
+    sourceStreamTracer.SeedType.NumberOfPoints = 80
+    sourceStreamTracer.MaximumStreamlineLength = {max_length}
+    sourceStreamTracer.UpdatePipeline()
+    _log_step("source-seeded stream tracer computed")
 
-def _screenshot_lines(view1_png, view2_png):
-    if not view1_png and not view2_png:
+    # A second nested split of an already-split layout (e.g.
+    # layout1.SplitVertical(2, 0.5) then AssignView(4, view3)) depends on
+    # ParaView's internal cell-numbering scheme after that first split,
+    # which isn't consistent across versions - verified directly: it ran
+    # with no exception, but the new cell stayed empty (view3 got attached
+    # to the wrong slot). A brand new layout tab sidesteps that guesswork
+    # entirely - CreateRenderView() always attaches to the current
+    # (freshly created, still-empty) layout on its own.
+    try:
+        CreateLayout('Source View (T)')
+        view3 = CreateRenderView()
+        _log_step("created separate 'Source View (T)' layout tab for view3")
+    except Exception:
+        _log_step("creating layout tab for view3 failed, falling back to a bare view:\\n"
+                   + traceback.format_exc())
+        view3 = CreateRenderView()
+
+    view3.ViewSize = [900, 700]
+    disp3 = Show(sourceStreamTracer, view3)
+    # Colored by T using the *same* transfer function view1 already put in
+    # log scale (ParaView shares one color map per field name by default) -
+    # deliberately not rescaled again here, which would silently narrow that
+    # shared map to just the streamline-sampled range and undo view1's
+    # carefully-set full-domain log range.
+    ColorBy(disp3, ('POINTS', 'T'))
+    Show(reader, view3).Opacity = 0.08
+    ResetCamera(view3)
+    _log_step("view3 (source-seeded stream tracer, colored by T) shown")
+'''
+
+
+def _screenshot_lines(view1_png, view2_png, view3_png=None):
+    if not view1_png and not view2_png and not view3_png:
         return ""
     lines = []
     if view1_png:
         lines.append(f'SaveScreenshot(r"{view1_png}", view1, ImageResolution=[900, 700])')
     if view2_png:
         lines.append(f'SaveScreenshot(r"{view2_png}", view2, ImageResolution=[900, 700])')
+    if view3_png:
+        lines.append(f'SaveScreenshot(r"{view3_png}", view3, ImageResolution=[900, 700])')
     return "\n    ".join(lines)
 
 
-def build_preset_script(case_dir, inlet_wall, inlet_y, inlet_z, inlet_size,
-                         mesh_bounds, log_path, screenshot_paths=(None, None)):
-    """mesh_bounds: (xmin, xmax, ymin, ymax, zmin, zmax) - used to place the
-    stream tracer seed just inside the inlet opening (a small inward offset
-    from the wall, not exactly on it). log_path: where the script writes its
-    own step-by-step progress/traceback - launched as a detached GUI process,
-    so stdout/stderr redirection from the launcher side isn't reliable.
+def build_preset_script(case_dir, mesh_bounds, log_path, screenshot_paths=(None, None, None),
+                         source_center=None, source_seed_radius=0.1):
+    """mesh_bounds: (xmin, xmax, ymin, ymax, zmin, zmax) - used to seed the
+    room-wide stream tracer (a sphere centered on the room, sized to
+    circumscribe its full bounding box - seeds landing outside the actual
+    mesh just don't produce a visible line, harmless). log_path: where the
+    script writes its own step-by-step progress/traceback - launched as a
+    detached GUI process, so stdout/stderr redirection from the launcher
+    side isn't reliable.
+
+    source_center: (x, y, z) of the steady-state contaminant source, if
+    known - adds a third view of streamlines seeded there, colored by T, so
+    it's clear where contaminant-carrying air actually goes. None for
+    decay-scenario cases, which have no continuous point source.
     """
-    xmin, xmax = mesh_bounds[0], mesh_bounds[1]
-    offset = 0.05
-    inlet_x = xmin + offset if inlet_wall == "xMin" else xmax - offset
-    seed_radius = max(min(inlet_size) / 2, 0.05)
+    xmin, xmax, ymin, ymax, zmin, zmax = mesh_bounds
     max_length = (xmax - xmin) * 3
+    room_center = ((xmin + xmax) / 2, (ymin + ymax) / 2, (zmin + zmax) / 2)
+    dx, dy, dz = xmax - xmin, ymax - ymin, zmax - zmin
+    room_seed_radius = ((dx ** 2 + dy ** 2 + dz ** 2) ** 0.5) / 2
+
+    view3_lines = ""
+    if source_center is not None:
+        view3_lines = _VIEW3_TEMPLATE.format(
+            source_x=source_center[0], source_y=source_center[1], source_z=source_center[2],
+            source_seed_radius=source_seed_radius, max_length=max_length,
+        )
+
     return _SCRIPT_TEMPLATE.format(
         case_foam=f"{case_dir}/case.foam",
-        inlet_x=inlet_x, inlet_y=inlet_y, inlet_z=inlet_z,
-        seed_radius=seed_radius, max_length=max_length,
+        room_center_x=room_center[0], room_center_y=room_center[1], room_center_z=room_center[2],
+        room_seed_radius=room_seed_radius, max_length=max_length,
         log_path=log_path,
+        view3_lines=view3_lines,
         screenshot_lines=_screenshot_lines(*screenshot_paths),
     )
 
 
-def launch_paraview(case_dir, inlet_wall, inlet_y, inlet_z, inlet_size, mesh_bounds):
+def launch_paraview(case_dir, mesh_bounds, source_center=None):
     """Write the preset script to a temp file and launch paraview.exe with
     it via --script - non-blocking (ParaView is its own GUI application).
     Raises FileNotFoundError if ParaView isn't installed. Returns
@@ -180,8 +266,7 @@ def launch_paraview(case_dir, inlet_wall, inlet_y, inlet_z, inlet_size, mesh_bou
         )
     fd, script_path = tempfile.mkstemp(suffix=".py", prefix="guvcfd_paraview_")
     log_path = script_path + ".log"
-    script = build_preset_script(case_dir, inlet_wall, inlet_y, inlet_z, inlet_size,
-                                  mesh_bounds, log_path)
+    script = build_preset_script(case_dir, mesh_bounds, log_path, source_center=source_center)
     with open(fd, "w") as f:
         f.write(script)
     subprocess.Popen([exe, f"--script={script_path}"])
