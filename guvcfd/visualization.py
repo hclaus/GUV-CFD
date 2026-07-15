@@ -16,6 +16,22 @@ from guv_calcs.room_plotter import RoomPlotter
 from .initial_fields import WALL_INFLOW_DIRECTION
 from .mesh_gen import _opening_box, _WALL_SPECS
 
+WALL_POSITION_DIMS = {
+    "xMin": ("y", "z"), "xMax": ("y", "z"),
+    "frontWall": ("x", "z"), "backWall": ("x", "z"),
+    "floor": ("x", "y"), "ceiling": ("x", "y"),
+}
+
+
+def center_frac_for_wall(wall, val1, val2, room):
+    """(c1, c2) fractions of whichever room dimensions are actually
+    in-plane for `wall` (see WALL_POSITION_DIMS), not always (room.y,
+    room.z) - an opening can be on any of the 6 walls, not just xMin/xMax.
+    """
+    dim1, dim2 = WALL_POSITION_DIMS[wall]
+    return (val1 / getattr(room, dim1), val2 / getattr(room, dim2))
+
+
 _WALL_LABEL_POSITIONS = {
     # wall name -> (position, room-fraction basis)
     "xMinWall": lambda Lx, Ly, Lz: (0, Ly / 2, Lz / 2),

@@ -87,10 +87,10 @@ def test_save_run_settings_only_persists_mesh_affecting_fields(tmp_path):
     _save_run_settings(case_dir, _settings())
     with open(f"{case_dir}/run_settings.json") as f:
         saved = json.load(f)
-    # monitoring_points is saved too, under its own key - it doesn't affect
-    # the mesh/flow field (see _save_run_settings), it's there purely so
-    # report.py's case-setup preview can draw monitoring points later.
-    assert set(saved.keys()) == set(_MESH_AFFECTING_FIELDS) | {"monitoring_points"}
+    # monitoring_points and settings_path are saved too, under their own
+    # keys - neither affects the mesh/flow field (see _save_run_settings),
+    # they're there purely for report.py's case-setup preview/provenance.
+    assert set(saved.keys()) == set(_MESH_AFFECTING_FIELDS) | {"monitoring_points", "settings_path"}
     assert saved["monitoring_points"] == []
 
 

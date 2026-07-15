@@ -34,7 +34,7 @@ from .run_pipeline import setup_case
 from .splice import set_control_dict_start_from, set_control_dict_time
 from .steady_state_pipeline import run_steady_state_scenario
 from .ventilation_control import run_ventilation_only_control
-from .visualization import plot_case
+from .visualization import WALL_POSITION_DIMS, center_frac_for_wall, plot_case
 from .wsl_utils import run_wsl, run_wsl_or_raise, run_wsl_streaming, wsl_path, StoppedByUser
 
 # Reference case setup_case() copies its static config (controlDict,
@@ -332,14 +332,9 @@ def _fan_kwargs(settings):
     )
 
 
-def _center_frac_for_wall(wall, val1, val2, room):
-    """(c1, c2) fractions of whichever room dimensions are actually
-    in-plane for `wall` (see _WALL_POSITION_DIMS), not always (room.y,
-    room.z) - necessary now that an opening can be on any of the 6 walls,
-    not just xMin/xMax.
-    """
-    dim1, dim2 = _WALL_POSITION_DIMS[wall]
-    return (val1 / getattr(room, dim1), val2 / getattr(room, dim2))
+# Re-exported under their old private names - moved to visualization.py so
+# report.py can reuse them too without a circular import back into app.py.
+_center_frac_for_wall = center_frac_for_wall
 
 
 def _opening_center_frac(settings, prefix, room):
@@ -391,6 +386,9 @@ def _save_run_settings(case_dir, settings, guv_path=None):
     # only ever iterates _MESH_AFFECTING_FIELDS.
     if guv_path is not None:
         data["guv_path"] = guv_path
+    # The currently-open .guvcfd project file (if any) - provenance for the
+    # report's "Project file:" line, same idea as guv_path above.
+    data["settings_path"] = _loaded.get("settings_path")
     # Monitoring points don't affect the mesh/flow field (pure post-
     # processing - see monitoring_points.py's module docstring), so they're
     # deliberately not in _MESH_AFFECTING_FIELDS and never trigger a
@@ -753,6 +751,7 @@ def _run_steady_state(guv_path, case_dir, room, settings):
         log_fn=_run_log, should_stop=_should_stop, solver_log_fn=_track_solver_time,
     )
     result["fluence_mean"] = summary["fluence_mean"]
+    result["eACH_uv_well_mixed"] = summary.get("eACH_uv_well_mixed_mean")
     with open(f"{case_dir}/results.json", "w") as f:
         json.dump(result, f, indent=2)
     _complete_all_steps()
@@ -1313,11 +1312,7 @@ for _prefix, _label, _dim, _default_fn, *_rest in POSITION_FIELDS:
 # the field's original dim (y/z) - fine for the default xMin/xMax walls;
 # this callback keeps the slider bounds correct after the wall dropdown
 # changes to something else.
-_WALL_POSITION_DIMS = {
-    "xMin": ("y", "z"), "xMax": ("y", "z"),
-    "frontWall": ("x", "z"), "backWall": ("x", "z"),
-    "floor": ("x", "y"), "ceiling": ("x", "y"),
-}
+_WALL_POSITION_DIMS = WALL_POSITION_DIMS
 
 
 def _register_opening_wall_axes(prefix):

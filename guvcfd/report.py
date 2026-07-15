@@ -3,6 +3,7 @@ setup parameters, a rendered picture of the case setup (inlet/outlet/fan/
 lamps), and the key result numbers - for sharing outside the GUI itself.
 """
 import json
+import tempfile
 from datetime import datetime
 from pathlib import Path
 
@@ -12,8 +13,9 @@ from guv_calcs import Project
 
 from .contaminant_source import compute_source_strength
 from .monitoring_points import mixing_uniformity_note
+from .result_figures import decay_figure, steady_state_figure
 from .system_info import get_system_info
-from .visualization import plot_case
+from .visualization import center_frac_for_wall, plot_case
 
 
 def _format_elapsed(seconds):
@@ -47,13 +49,13 @@ def _run_timing(case_dir, results):
 
 # What "T" actually is - shown once under the Results heading in both the
 # .docx report and the Analysis tab (imported from here by app.py) since
-# neither this pipeline nor OpenFOAM itself assigns it a physical unit.
+# neither this simulation nor OpenFOAM itself assigns it a physical unit.
 T_FIELD_NOTE = (
     "Note: T is the OpenFOAM field name for the transported scalar this "
-    "whole pipeline tracks - the substance being reduced, per unit volume. "
+    "whole simulation tracks - the substance being reduced, per unit volume. "
     "In a GUV disinfection context this is typically a pathogen "
     "concentration, e.g. CFU/m³ (colony-forming units per cubic meter) or "
-    "an equivalent airborne-contaminant unit; the pipeline itself is "
+    "an equivalent airborne-contaminant unit; the CFD itself is "
     "unit-agnostic and just tracks relative concentration."
 )
 
@@ -61,7 +63,7 @@ _ROW_LABELS_ROOM = [
     ("Room dimensions", lambda r, s: f"{r.x:.3g} x {r.y:.3g} x {r.z:.3g} {r.units}"),
     ("Lamps", lambda r, s: str(len(r.lamps))),
     ("Ventilation ACH", lambda r, s: f"{s['ach']:.3g} /hr"),
-    ("UV inactivation constant Z", lambda r, s: f"{s['z-value']:.3g} m^2/J"),
+    ("UV inactivation constant Z", lambda r, s: f"{s['z-value']:.3g} cm²/mJ"),
     ("Inlet", lambda r, s: f"{s['inlet-wall']}, y={s['inlet-y-input']:.3g}m "
                            f"z={s['inlet-z-input']:.3g}m, size={s['inlet-size-w']:.3g}x"
                            f"{s['inlet-size-h']:.3g}m"),
@@ -118,20 +120,29 @@ _ROW_LABELS_RESULTS_STEADY_STATE = [
                                           f"({'plateaued' if res['phase2']['converged'] else 'NOT fully plateaued'}, "
                                           f"{res['phase2']['iterations']} iterations)"),
     ("Reduction", lambda res: f"{res['reduction_pct']:.1f}%"),
-    ("eACH_uv, steady-state CFD-fit (nominal ventilation ACH)",
-     lambda res: f"{res['eACH_uv_steady_state']:.4g} /hr"),
+    ("Theoretical eACH_uv, steady-state (well mixed ventilation eACH = Z*Eavg)",
+     lambda res: f"{res['eACH_uv_well_mixed']:.4g} /hr"
+                 if res.get("eACH_uv_well_mixed") is not None else "n/a"),
 ]
 
 # Ventilation ACH is *measured* here (derived for free from Phase 1's own
 # mass balance, no separate control run needed) instead of assumed at its
 # nominal design value - see steady_state_pipeline.compute_corrected_eACH_uv's
 # docstring. Only present when Phase 1/2 both produced a usable T_ss.
-_ROW_LABELS_RESULTS_STEADY_STATE_CORRECTED = [
-    ("Ventilation ACH (measured from Phase 1)",
+_ROW_LABELS_RESULTS_STEADY_STATE_MEASURED = [
+    ("CFD measured Mechanical Ventilation ACH (determined from Phase 1)",
      lambda res: f"{res['ventilation_ach_measured']:.4g} /hr"),
-    ("eACH_uv, steady-state CFD-fit (measured ventilation ACH)",
+    ("CFD measured eACH_uv",
      lambda res: f"{res['eACH_uv_steady_state_corrected']:.4g} /hr"),
 ]
+
+
+def _total_ach_row(results):
+    ach = results.get("ventilation_ach_measured")
+    eACH_uv = results.get("eACH_uv_steady_state_corrected")
+    if ach is None or eACH_uv is None:
+        return "n/a"
+    return f"{ach + eACH_uv:.4g} /hr"
 
 
 def _monitoring_rows(monitoring):
@@ -156,6 +167,32 @@ def _monitoring_rows(monitoring):
             if data.get("eACH_uv_effective") is not None:
                 value += f", eACH_uv={data['eACH_uv_effective']:.4g}/hr"
         rows.append((name, value))
+    return rows
+
+
+def _room_setup_rows(room, settings):
+    """_ROW_LABELS_ROOM's base rows, plus a 2nd inlet/outlet row (only when
+    enabled), an injection-point row (steady-state runs only), and one row
+    per monitoring point - all read straight from run_settings.json, same
+    provenance as everything else in this table.
+    """
+    rows = [(label, fn(room, settings)) for label, fn in _ROW_LABELS_ROOM]
+    if settings.get("inlet2-enable"):
+        rows.append(("Inlet 2", f"{settings['inlet2-wall']}, y={settings['inlet2-y-input']:.3g}m "
+                                 f"z={settings['inlet2-z-input']:.3g}m, size={settings['inlet2-size-w']:.3g}x"
+                                 f"{settings['inlet2-size-h']:.3g}m"))
+    if settings.get("outlet2-enable"):
+        rows.append(("Outlet 2", f"{settings['outlet2-wall']}, y={settings['outlet2-y-input']:.3g}m "
+                                  f"z={settings['outlet2-z-input']:.3g}m, size={settings['outlet2-size-w']:.3g}x"
+                                  f"{settings['outlet2-size-h']:.3g}m"))
+    source_center = settings.get("source_center")
+    if source_center and all(v is not None for v in source_center):
+        rows.append(("Injection point",
+                      f"({source_center[0]:.3g}, {source_center[1]:.3g}, {source_center[2]:.3g}) m"))
+    for pt in settings.get("monitoring_points") or []:
+        rows.append((f"Monitoring point: {pt['name']}",
+                      f"({pt['x']:.3g}, {pt['y']:.3g}, {pt['z']:.3g}) m, "
+                      f"box={pt['cells_per_side']} cells/side"))
     return rows
 
 
@@ -207,6 +244,17 @@ def generate_report_docx(case_dir, out_path):
         results["injection_rate_total"] = compute_source_strength(
             room.x * room.y * room.z, settings["ach"], results["target_T_ss"])
 
+    # eACH_uv_well_mixed predates this field for steady-state case dirs from
+    # before app.py's _run_steady_state started copying it out of setup_case()'s
+    # summary - it's exactly Z * fluence_mean * 3.6 (see fluence.py's
+    # compute_inactivation_rate/compute_well_mixed_eACH: linear in E, so
+    # order of averaging doesn't matter), and fluence_mean has always been
+    # saved, so an older results.json can still show the real number.
+    if "phase1" in results and results.get("eACH_uv_well_mixed") is None \
+            and results.get("fluence_mean") is not None and settings.get("z-value") is not None:
+        results = dict(results)
+        results["eACH_uv_well_mixed"] = settings["z-value"] * results["fluence_mean"] * 3.6
+
     fan_kwargs = {}
     if settings.get("fan-enable"):
         direction = (0, 0, -1) if settings["fan-direction"] == "down" else (0, 0, 1)
@@ -216,6 +264,27 @@ def generate_report_docx(case_dir, out_path):
             fan_center=(settings["fan-x-input"], settings["fan-y-input"], settings["fan-z-input"]),
             fan_direction=direction,
         )
+
+    opening2_kwargs = {}
+    if settings.get("inlet2-enable"):
+        opening2_kwargs.update(
+            inlet2_wall=settings["inlet2-wall"],
+            inlet2_center=center_frac_for_wall(
+                settings["inlet2-wall"], settings["inlet2-y-input"], settings["inlet2-z-input"], room),
+            inlet2_size=(settings["inlet2-size-w"], settings["inlet2-size-h"]),
+        )
+    if settings.get("outlet2-enable"):
+        opening2_kwargs.update(
+            outlet2_wall=settings["outlet2-wall"],
+            outlet2_center=center_frac_for_wall(
+                settings["outlet2-wall"], settings["outlet2-y-input"], settings["outlet2-z-input"], room),
+            outlet2_size=(settings["outlet2-size-w"], settings["outlet2-size-h"]),
+        )
+
+    source_center = settings.get("source_center")
+    injection_center = (tuple(source_center)
+                         if source_center and all(v is not None for v in source_center) else None)
+
     fig = plot_case(
         room,
         inlet_wall=settings["inlet-wall"],
@@ -224,16 +293,50 @@ def generate_report_docx(case_dir, out_path):
         outlet_wall=settings["outlet-wall"],
         outlet_center=(settings["outlet-y-input"] / room.y, settings["outlet-z-input"] / room.z),
         outlet_size=(settings["outlet-size-w"], settings["outlet-size-h"]),
+        injection_center=injection_center,
         monitoring_points=settings.get("monitoring_points"),
-        title="", **fan_kwargs,
+        title="", **fan_kwargs, **opening2_kwargs,
     )
     fig.update_layout(margin=dict(l=0, r=0, t=10, b=0), width=900, height=650)
-    image_path = Path(out_path).with_suffix(".preview.png")
-    fig.write_image(str(image_path))
 
+    # Result curve (phase timeline for steady-state, decay curve for decay)
+    # - only when the run actually recorded curve data, so older/minimal
+    # case dirs still generate a report, just without this picture.
+    if "phase1" in results:
+        has_curve = bool(results["phase1"].get("decay_curve", {}).get("t")
+                          and results["phase2"].get("decay_curve", {}).get("t"))
+        curve_fig = steady_state_figure(results) if has_curve else None
+    else:
+        has_curve = bool(results.get("decay_curve", {}).get("t_seconds")
+                          and results.get("eACH_uv_well_mixed") is not None)
+        curve_fig = decay_figure(results) if has_curve else None
+    if curve_fig is not None:
+        curve_fig.update_layout(margin=dict(l=50, r=20, t=30, b=45), width=900, height=500)
+
+    # Rendered pictures are staged in a real temp directory, not next to
+    # out_path - if write_image() or doc.save() blows up partway through
+    # (kaleido is known to be flaky - see test_report.py), nothing gets left
+    # behind that could be mistaken for the report itself.
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        image_path = Path(tmp_dir) / "preview.png"
+        fig.write_image(str(image_path))
+        curve_image_path = None
+        if curve_fig is not None:
+            curve_image_path = Path(tmp_dir) / "curve.png"
+            curve_fig.write_image(str(curve_image_path))
+        _write_report_docx(doc_out_path=out_path, case_dir=case_dir, guv_path=guv_path,
+                            settings=settings, results=results, room=room,
+                            image_path=image_path, curve_image_path=curve_image_path)
+    return out_path
+
+
+def _write_report_docx(doc_out_path, case_dir, guv_path, settings, results, room,
+                        image_path, curve_image_path):
     doc = Document()
     doc.add_heading("GUV-CFD Simulation Report", level=1)
-    doc.add_paragraph(f"Case directory: {case_dir}")
+    doc.add_paragraph(f"Illuminate room design file: {guv_path}")
+    doc.add_paragraph(f"CFD Project file: {settings.get('settings_path') or 'n/a'}")
+    doc.add_paragraph(f"OpenFoam directory: {case_dir}")
 
     started_at, elapsed_seconds = _run_timing(case_dir, results)
     system_info = get_system_info()
@@ -246,12 +349,12 @@ def generate_report_docx(case_dir, out_path):
     if system_info["ram_gb"] is not None:
         metadata_rows.append(("RAM", f"{system_info['ram_gb']:.1f} GB"))
     if system_info["gpu"]:
-        metadata_rows.append(("GPU", f"{system_info['gpu']} (not used - this pipeline's "
+        metadata_rows.append(("GPU", f"{system_info['gpu']} (not used - this simulation's "
                                       "OpenFOAM solve is CPU-only)"))
     _add_kv_table(doc, metadata_rows)
 
     doc.add_heading("Room Setup", level=2)
-    _add_kv_table(doc, [(label, fn(room, settings)) for label, fn in _ROW_LABELS_ROOM])
+    _add_kv_table(doc, _room_setup_rows(room, settings))
     if settings.get("fan-enable"):
         _add_kv_table(doc, [(label, fn(settings)) for label, fn in _ROW_LABELS_FAN])
 
@@ -261,24 +364,26 @@ def generate_report_docx(case_dir, out_path):
     doc.add_heading("Results", level=2)
     doc.add_paragraph().add_run(T_FIELD_NOTE).italic = True
     if "phase1" in results:
-        _add_kv_table(doc, [(label, fn(results)) for label, fn in _ROW_LABELS_RESULTS_STEADY_STATE])
+        rows = [(label, fn(results)) for label, fn in _ROW_LABELS_RESULTS_STEADY_STATE]
         if results.get("ventilation_ach_measured") is not None:
-            _add_kv_table(doc, [(label, fn(results))
-                                 for label, fn in _ROW_LABELS_RESULTS_STEADY_STATE_CORRECTED])
+            rows += [(label, fn(results)) for label, fn in _ROW_LABELS_RESULTS_STEADY_STATE_MEASURED]
+        rows.append(("Total ACH in room (ACH+eACH_uv)", _total_ach_row(results)))
+        _add_kv_table(doc, rows)
     else:
         _add_kv_table(doc, [(label, fn(results)) for label, fn in _ROW_LABELS_RESULTS_DECAY])
         if results.get("ventilation_ach_measured") is not None:
             _add_kv_table(doc, [(label, fn(results)) for label, fn in _ROW_LABELS_RESULTS_DECAY_CORRECTED])
 
+    if curve_image_path is not None:
+        doc.add_picture(str(curve_image_path), width=Inches(6.0))
+
     monitoring_rows = _monitoring_rows(results.get("monitoring"))
     if monitoring_rows:
-        doc.add_heading("Monitoring Locations", level=2)
+        doc.add_heading("Monitoring Results", level=2)
         _add_kv_table(doc, monitoring_rows)
 
     uniformity_note = mixing_uniformity_note(results)
     if uniformity_note:
         doc.add_paragraph().add_run(uniformity_note).italic = True
 
-    doc.save(out_path)
-    image_path.unlink(missing_ok=True)
-    return out_path
+    doc.save(doc_out_path)
