@@ -71,6 +71,39 @@ def splice_fv_options_into_control_dict(case_dir, indent="        "):
     return cd_path, n_open, n_close
 
 
+def splice_into_functions_block(case_dir, block_text):
+    """Insert `block_text` (one or more already-indented function-object
+    entries, e.g. from monitoring.live_vol_average_functions()) as a new
+    sibling inside controlDict's outer functions{} block (where
+    scalarTransport1 already lives), just before its closing brace.
+    Returns (controlDict_path, n_open, n_close) so the caller can verify
+    brace balance, same convention as splice_fv_options_into_control_dict.
+    """
+    cd_path = f"{case_dir}/system/controlDict"
+    with open(cd_path) as f:
+        content = f.read()
+
+    m = re.search(r'\n(\s*)functions\s*\n(\s*)\{', content)
+    if not m:
+        raise RuntimeError("Could not find 'functions' block inside controlDict")
+    keyword_indent = m.group(1)
+    open_brace_pos = content.index("{", m.end() - 1)
+    close_brace_pos = _find_matching_brace(content, open_brace_pos)
+
+    new_content = (
+        content[:close_brace_pos]
+        + "\n" + block_text + "\n" + keyword_indent
+        + content[close_brace_pos:]
+    )
+
+    with open(cd_path, "w") as f:
+        f.write(new_content)
+
+    n_open = new_content.count("{")
+    n_close = new_content.count("}")
+    return cd_path, n_open, n_close
+
+
 def set_function_object_enabled(case_dir, function_name, enabled):
     """Set (or insert) an `enabled` entry at the top of a functions{}
     sub-dict in controlDict - e.g. to disable scalarTransport1 while running
@@ -130,6 +163,35 @@ def set_control_dict_time(case_dir, end_time=None, write_interval=None, delta_t=
         content = re.sub(r'(\n[ \t]*)deltaT(\s+)[\d.]+;', rf'\g<1>deltaT\g<2>{delta_t};', content, count=1)
     with open(cd_path, "w") as f:
         f.write(content)
+    return cd_path
+
+
+def set_function_write_interval(case_dir, function_name, value):
+    """Set a specific functions{} sub-block's own writeInterval, scoped to
+    just that block - unlike set_control_dict_time's blanket sweep across
+    the whole file. Used to re-pin a live-tracking function object's
+    writeInterval at 1 (every iteration) after a set_control_dict_time()
+    call for a later phase would otherwise clobber it back to that phase's
+    (much sparser) write_interval - see steady_state_pipeline._run_phase.
+    """
+    cd_path = f"{case_dir}/system/controlDict"
+    with open(cd_path) as f:
+        content = f.read()
+
+    m = re.search(rf'\n(\s*){re.escape(function_name)}\s*\n(\s*)\{{', content)
+    if not m:
+        raise RuntimeError(f"Could not find '{function_name}' block inside controlDict")
+    open_brace_pos = content.index("{", m.end() - 1)
+    close_brace_pos = _find_matching_brace(content, open_brace_pos)
+
+    body = content[open_brace_pos:close_brace_pos]
+    new_body, n = re.subn(r'(\n[ \t]*writeInterval\s+)[\d.]+;', rf'\g<1>{value};', body)
+    if n == 0:
+        raise RuntimeError(f"No writeInterval found inside '{function_name}' block")
+
+    new_content = content[:open_brace_pos] + new_body + content[close_brace_pos:]
+    with open(cd_path, "w") as f:
+        f.write(new_content)
     return cd_path
 
 

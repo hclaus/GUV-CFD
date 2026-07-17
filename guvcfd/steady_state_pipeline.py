@@ -21,9 +21,12 @@ from .contaminant_source import (
 )
 from .decay_analysis import read_vol_average_dat, check_plateau
 from .initial_fields import restore_boundary_conditions
-from .monitoring import write_vol_average_dict
-from .monitoring_points import compute_monitoring_results
-from .splice import splice_fv_options_into_control_dict, set_control_dict_time, ensure_simple_fvsolution
+from .monitoring import write_vol_average_dict, live_vol_average_functions
+from .monitoring_points import compute_monitoring_results, write_monitoring_topo_set_dict, zone_name
+from .splice import (
+    splice_fv_options_into_control_dict, splice_into_functions_block,
+    set_control_dict_time, set_function_write_interval, ensure_simple_fvsolution,
+)
 from .wsl_utils import wsl_path, run_wsl_or_raise, run_wsl_streaming, StoppedByUser
 
 
@@ -93,9 +96,36 @@ def _copy_latest_to_zero(case_dir_wsl, latest, include_T, log_fn):
 
 
 def _run_phase(case_dir, case_dir_wsl, n_iterations, write_interval, plateau_window, plateau_rel_tol,
-                log_fn, should_stop=None, solver_log_fn=None):
+                log_fn, should_stop=None, solver_log_fn=None, live_monitoring_zones=None,
+                live_patches=()):
     set_control_dict_time(case_dir, end_time=n_iterations, write_interval=write_interval, delta_t=1)
     _clean_time_dirs(case_dir_wsl)
+
+    # Additive/opt-in: splice a live (every-iteration) volAverage tracker
+    # into controlDict's functions{} block, alongside whatever's already
+    # there (e.g. scalarTransport1) - see monitoring.live_vol_average_functions
+    # and splice.splice_into_functions_block. None (the default) leaves
+    # controlDict exactly as set_control_dict_time() produced it.
+    # Idempotent: controlDict persists across both phases (never
+    # regenerated in between), so a phase-2 call would otherwise splice a
+    # second, duplicate copy of the same named entries - only splice once.
+    if live_monitoring_zones is not None:
+        live_block_names = ["volAverageLive1"] + [f"{p}AverageLive" for p in live_patches] \
+            + [f"monitor_{z}Live" for z in live_monitoring_zones]
+        with open(f"{case_dir}/system/controlDict") as f:
+            already_spliced = "volAverageLive1" in f.read()
+        if not already_spliced:
+            block = live_vol_average_functions(
+                field="T", patches=live_patches, monitoring_zones=live_monitoring_zones)
+            _, n_open, n_close = splice_into_functions_block(case_dir, block)
+            assert n_open == n_close, f"Brace mismatch after live-volAverage splice: {n_open} vs {n_close}"
+        else:
+            # The set_control_dict_time() call above sweeps writeInterval
+            # everywhere in the file, including inside these live blocks
+            # (left over from an earlier phase) - re-pin them to 1 without
+            # touching the main solve's own writeInterval.
+            for name in live_block_names:
+                set_function_write_interval(case_dir, name, 1)
 
     log_fn(f"Running simpleFoam ({n_iterations} iterations, writing every {write_interval})...")
     r = run_wsl_streaming(
@@ -116,13 +146,25 @@ def _run_phase(case_dir, case_dir_wsl, n_iterations, write_interval, plateau_win
     if not latest or latest == "0":
         raise RuntimeError(f"simpleFoam did not write any new time directory (found: {latest!r})")
 
+    # The live function object (if any) already wrote its own
+    # postProcessing/*Live/<startTime>/ files during the solve above - read
+    # those back *before* wiping postProcessing/ for the postProcess pass,
+    # since postProcess doesn't touch (or need) them.
+    live_curves = None
+    if live_monitoring_zones is not None:
+        live_curves = {"room": read_vol_average_dat(
+            f"{case_dir}/postProcessing/volAverageLive1/0/volFieldValue.dat")}
+        for zone in live_monitoring_zones:
+            live_curves[zone] = read_vol_average_dat(
+                f"{case_dir}/postProcessing/monitor_{zone}Live/0/volFieldValue.dat")
+
     run_wsl_or_raise("rm -rf postProcessing", case_dir_wsl, "clearing stale postProcessing")
     run_wsl_or_raise("postProcess -dict system/volAverageDict", case_dir_wsl, "postProcess volAverage")
     t, T = read_vol_average_dat(f"{case_dir}/postProcessing/volAverage1/0/volFieldValue.dat")
     converged, rel_spread = check_plateau(T, window=plateau_window, rel_tol=plateau_rel_tol)
     log_fn(f"  Stopped at time {latest}. T_ss={T[-1]:.4g} (last-{plateau_window} rel. spread={rel_spread:.4g}, "
            f"{'plateaued' if converged else 'NOT YET PLATEAUED - consider more iterations'})")
-    return latest, t, T, converged
+    return latest, t, T, converged, live_curves
 
 
 def run_steady_state_scenario(case_dir, room_x, room_y, room_z, ach, Z, nbins=25,
@@ -134,7 +176,7 @@ def run_steady_state_scenario(case_dir, room_x, room_y, room_z, ach, Z, nbins=25
                                plateau_window=5, plateau_rel_tol=0.01,
                                fan_entry=None, monitoring_points=None,
                                patches_to_monitor=("outlet",), log_fn=print, should_stop=None,
-                               solver_log_fn=None):
+                               solver_log_fn=None, live_monitoring_points=None):
     """Run both phases of a continuous-source steady-state scenario against
     an already-converged case (mesh + flow + fluenceRate/kUV must already
     exist - see run_pipeline.setup_case()). Returns a summary dict.
@@ -155,6 +197,14 @@ def run_steady_state_scenario(case_dir, room_x, room_y, room_z, ach, Z, nbins=25
     until the next phase starts. fit_decay=False for both: a build-up curve
     isn't a decay curve, fitting compute_effective_eACH's exponential-decay
     model to it would produce nonsense.
+
+    live_monitoring_points: EXPERIMENTAL, additive/opt-in - same shape as
+    monitoring_points; when given, also tracks room-wide T and each point
+    every solver iteration (not just at write_interval snapshots), via a
+    live controlDict function object (see monitoring.live_vol_average_functions).
+    Stored under summary["phase1"/"phase2"]["live"] as extra data - doesn't
+    change T_ss/decay_curve/monitoring or anything else in summary. None
+    (the default) leaves this function's behavior completely unchanged.
     """
     case_dir_wsl = wsl_path(case_dir)
     room_volume = room_x * room_y * room_z
@@ -167,6 +217,19 @@ def run_steady_state_scenario(case_dir, room_x, room_y, room_z, ach, Z, nbins=25
     log_fn("Ensuring SIMPLE fvSolution and outlet-average monitoring are set up...")
     ensure_simple_fvsolution(case_dir)
     write_vol_average_dict(case_dir, field="T", patches=patches_to_monitor)
+
+    # EXPERIMENTAL live-tracking setup: carve monitoring cellZones now,
+    # before either phase's solve, instead of the normal after-each-phase
+    # timing (compute_monitoring_results) - topoSet is mesh-only (not
+    # field-dependent), and the mesh is fixed for the rest of this scenario,
+    # so the zones carved here stay valid for both phase 1 and phase 2's
+    # live function objects.
+    live_zone_names = None
+    if live_monitoring_points is not None:
+        write_monitoring_topo_set_dict(case_dir, live_monitoring_points, cell_size)
+        run_wsl_or_raise("topoSet -dict system/monitoringTopoSetDict", case_dir_wsl,
+                          "topoSet (live monitoring zones)")
+        live_zone_names = [zone_name(p["name"]) for p in live_monitoring_points]
 
     log_fn(f"Carving source cellZone at {source_center}, size {source_size}...")
     write_source_topo_set_dict(case_dir, source_center, source_size)
@@ -198,13 +261,18 @@ def run_steady_state_scenario(case_dir, room_x, room_y, room_z, ach, Z, nbins=25
     restore_boundary_conditions(case_dir, inlet_velocity=inlet_velocity, T_initial=0,
                                  inlet2_velocity=inlet2_velocity, has_outlet2=has_outlet2)
 
-    latest1, t1, T1, converged1 = _run_phase(
+    latest1, t1, T1, converged1, live1 = _run_phase(
         case_dir, case_dir_wsl, phase1_iterations, phase1_write_interval,
         plateau_window, plateau_rel_tol, log_fn, should_stop=should_stop,
-        solver_log_fn=solver_log_fn,
+        solver_log_fn=solver_log_fn, live_monitoring_zones=live_zone_names,
+        live_patches=patches_to_monitor,
     )
     summary["phase1"] = {"T_ss": float(T1[-1]), "converged": converged1, "iterations": latest1,
                           "decay_curve": {"t": t1.tolist(), "T": T1.tolist()}}
+    if live1 is not None:
+        summary["phase1"]["live"] = {
+            name: {"t": t.tolist(), "T": T.tolist()} for name, (t, T) in live1.items()
+        }
     monitoring_phase1 = None
     if monitoring_points:
         monitoring_phase1 = compute_monitoring_results(
@@ -220,13 +288,18 @@ def run_steady_state_scenario(case_dir, room_x, room_y, room_z, ach, Z, nbins=25
     _, n_open, n_close = splice_fv_options_into_control_dict(case_dir)
     assert n_open == n_close, f"Brace mismatch: {n_open} vs {n_close}"
 
-    latest2, t2, T2, converged2 = _run_phase(
+    latest2, t2, T2, converged2, live2 = _run_phase(
         case_dir, case_dir_wsl, phase2_iterations, phase2_write_interval,
         plateau_window, plateau_rel_tol, log_fn, should_stop=should_stop,
-        solver_log_fn=solver_log_fn,
+        solver_log_fn=solver_log_fn, live_monitoring_zones=live_zone_names,
+        live_patches=patches_to_monitor,
     )
     summary["phase2"] = {"T_ss": float(T2[-1]), "converged": converged2, "iterations": latest2,
                           "decay_curve": {"t": t2.tolist(), "T": T2.tolist()}}
+    if live2 is not None:
+        summary["phase2"]["live"] = {
+            name: {"t": t.tolist(), "T": T.tolist()} for name, (t, T) in live2.items()
+        }
     if monitoring_points:
         monitoring_phase2 = compute_monitoring_results(
             case_dir, monitoring_points, cell_size=cell_size, fit_decay=False, log_fn=log_fn)
