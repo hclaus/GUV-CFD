@@ -71,8 +71,8 @@ def fan_fvoptions_entry(speed, direction=(0, 0, -1), zone_name="fanZone",
                          field_name="U", entry_name="fanSource"):
     """fvOptions entry text for the fan's meanVelocityForce. speed [m/s]
     should be within SPEED_RANGE (typical ceiling fan induced velocity);
-    silently clamped if outside that range rather than erroring, since
-    this is meant to become a GUI slider later.
+    silently clamped if outside that range rather than erroring, since the
+    GUI's own fan-speed slider (app.py) is already range-limited too.
     """
     speed = clamp_fan_speed(speed)
     dx, dy, dz = direction

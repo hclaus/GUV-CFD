@@ -1,0 +1,64 @@
+/* Project Setup tab's left input column - denser than Bootstrap's defaults
+   so more of the form fits without scrolling. Scoped to .compact-panel
+   only; the 3D preview / other tabs are untouched. Bootstrap components
+   set their own font-size/padding in rem (not relative to a parent's
+   font-size), so each needs an explicit override here rather than relying
+   on inheritance from a single container rule. */
+
+.compact-panel {
+  font-size: 0.8rem;
+}
+
+.compact-panel .card {
+  margin-bottom: 0.5rem !important;
+}
+
+.compact-panel .card-header {
+  padding: 0.35rem 0.65rem;
+  font-size: 0.72rem;
+}
+
+.compact-panel .card-body {
+  padding: 0.5rem 0.65rem;
+}
+
+.compact-panel .form-label {
+  margin-bottom: 0.15rem !important;
+  font-size: 0.78rem;
+}
+
+.compact-panel .form-text {
+  font-size: 0.68rem;
+  margin-top: 0.05rem;
+}
+
+.compact-panel .form-control,
+.compact-panel .form-control-sm,
+.compact-panel .form-select,
+.compact-panel .form-select-sm {
+  font-size: 0.78rem;
+  padding: 0.2rem 0.4rem;
+}
+
+.compact-panel textarea.form-control {
+  padding: 0.3rem 0.4rem;
+}
+
+.compact-panel .btn,
+.compact-panel .btn-sm {
+  font-size: 0.78rem;
+  padding: 0.25rem 0.5rem;
+}
+
+.compact-panel .mb-1 { margin-bottom: 0.2rem !important; }
+.compact-panel .mb-2 { margin-bottom: 0.4rem !important; }
+.compact-panel .mb-3 { margin-bottom: 0.6rem !important; }
+.compact-panel .mb-4 { margin-bottom: 0.8rem !important; }
+.compact-panel .mt-3 { margin-top: 0.6rem !important; }
+
+.compact-panel .small {
+  font-size: 0.72rem;
+}
+
+/* the Y/Z position sliders' own tooltip bubble + track are a fixed-height
+   dcc.Slider component, not text - leave those alone */

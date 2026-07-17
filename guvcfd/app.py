@@ -20,6 +20,7 @@ import plotly.graph_objs as go
 from dash import Input, Output, State, dcc, html
 from guv_calcs import Project
 
+from .app_settings import ADVANCED_SETTINGS_DEFAULTS, load_advanced_settings, save_advanced_settings
 from .case_io import read_cell_centers
 from .decay_analysis import write_results_summary
 from .fan import fan_fvoptions_entry
@@ -512,6 +513,7 @@ def _gather_monitoring_points(settings):
 
 
 def _run_decay(guv_path, case_dir, room, settings):
+    adv = load_advanced_settings()
     summary = setup_case(
         guv_path, case_dir, template_case_dir=TEMPLATE_CASE_DIR,
         Z=settings["z-value"], ach=settings["ach"],
@@ -523,6 +525,9 @@ def _run_decay(guv_path, case_dir, room, settings):
         outlet_size=(settings["outlet-size-w"], settings["outlet-size-h"]),
         pimple_end_time=settings["pimple-end-time"],
         pimple_write_interval=settings["pimple-write-interval"],
+        pimple_delta_t=adv["pimple-delta-t"],
+        cell_size=adv["mesh-cell-size"], nbins=adv["uv-zone-bins"],
+        flow_rel_tol=adv["flow-rel-tol"] / 100.0,
         log_fn=_run_log, should_stop=_should_stop, solver_log_fn=_track_solver_time,
         **_fan_kwargs(settings),
         **_second_opening_kwargs(settings, "inlet2", room),
@@ -585,7 +590,8 @@ def _run_decay(guv_path, case_dir, room, settings):
             raise StoppedByUser("Stopped before monitoring locations.")
         _run_log("=== Computing monitoring locations ===")
         results["monitoring"] = compute_monitoring_results(
-            case_dir, points, ventilation_ach=settings["ach"], log_fn=_run_log)
+            case_dir, points, cell_size=adv["mesh-cell-size"],
+            ventilation_ach=settings["ach"], log_fn=_run_log)
         with open(f"{case_dir}/results.json", "w") as f:
             json.dump(results, f, indent=2)
 
@@ -691,6 +697,7 @@ def _settling_iterations(lambda_per_hr, target_fraction=0.995, min_iterations=50
 
 
 def _run_steady_state(guv_path, case_dir, room, settings):
+    adv = load_advanced_settings()
     fan_kwargs = _fan_kwargs(settings)
 
     _run_log("=== Setting up mesh, flow field, and UV zones ===")
@@ -703,6 +710,8 @@ def _run_steady_state(guv_path, case_dir, room, settings):
         outlet_wall=settings["outlet-wall"],
         outlet_center=_opening_center_frac(settings, "outlet", room),
         outlet_size=(settings["outlet-size-w"], settings["outlet-size-h"]),
+        cell_size=adv["mesh-cell-size"], nbins=adv["uv-zone-bins"],
+        flow_rel_tol=adv["flow-rel-tol"] / 100.0,
         log_fn=_run_log, should_stop=_should_stop, solver_log_fn=_track_solver_time,
         **fan_kwargs,
         **_second_opening_kwargs(settings, "inlet2", room),
@@ -747,6 +756,9 @@ def _run_steady_state(guv_path, case_dir, room, settings):
         phase1_iterations=phase1_iterations,
         phase2_iterations=phase2_iterations,
         window_frac=settings.get("t-ss-window-frac") or 0.15,
+        cell_size=adv["mesh-cell-size"], nbins=adv["uv-zone-bins"],
+        source_size=adv["source-zone-size"],
+        plateau_window=adv["plateau-window"], plateau_rel_tol=adv["plateau-rel-tol"] / 100.0,
         fan_entry=fan_entry, monitoring_points=_gather_monitoring_points(settings),
         patches_to_monitor=patches_to_monitor,
         log_fn=_run_log, should_stop=_should_stop, solver_log_fn=_track_solver_time,
@@ -870,6 +882,25 @@ def _labeled(label, component, help_text=None):
     if help_text:
         children.append(html.Div(help_text, className="form-text small"))
     return html.Div(children, className="mb-2")
+
+
+def _settings_field(field_id, label, tooltip, unit, value):
+    """One row of the Settings modal: label + hover (i) explanation + a
+    right-aligned numeric input with its unit shown inline next to it.
+    """
+    icon_id = f"{field_id}-info"
+    return dbc.Row([
+        dbc.Col(html.Div([
+            html.Span(label, className="small"),
+            html.Span(" ⓘ", id=icon_id, className="text-muted", style={"cursor": "help"}),
+            dbc.Tooltip(tooltip, target=icon_id, placement="top"),
+        ]), width=8),
+        dbc.Col(dbc.InputGroup([
+            dcc.Input(id=field_id, type="number", value=value,
+                       className="form-control form-control-sm text-end"),
+            dbc.InputGroupText(unit, className="small"),
+        ], size="sm"), width=4),
+    ], align="center", className="mb-2 gx-2")
 
 
 def _position_field(prefix, label, default, minv, maxv, step):
@@ -1079,7 +1110,7 @@ project_setup_tab = dbc.Row([
         dbc.Button("Continue to longer duration", id="continue-btn", color="secondary",
                    outline=True, className="w-100 mb-2"),
         html.Div(id="run-validation-msg", className="small text-danger text-center mb-4"),
-    ], width=4, style={"maxHeight": "88vh", "overflowY": "auto"}),
+    ], width=4, className="compact-panel", style={"maxHeight": "88vh", "overflowY": "auto"}),
 
     # --- right column: 3D preview ---
     dbc.Col([
@@ -1230,6 +1261,111 @@ analysis_tab = dbc.Row([
     ], width=8),
 ], className="mt-3")
 
+# Advanced/cross-project tunables (see app_settings.py) - grouped
+# top-to-bottom by how likely a user is to actually touch them:
+# convergence tolerances (already revisited once already) -> decay solver
+# timing -> mesh/zone resolution (expert tier, bottom).
+_adv_defaults = load_advanced_settings()
+settings_modal = dbc.Modal(
+    [
+        dbc.ModalHeader(dbc.ModalTitle("Advanced Settings")),
+        dbc.ModalBody(
+            [
+                html.Div("Convergence tolerances", className="small fw-bold text-uppercase mb-1"),
+                html.Div(
+                    "How strictly each solve decides “this has settled” — loosen to "
+                    "save wall-clock time, tighten if a case runs out of iterations while still "
+                    "visibly drifting.",
+                    className="small text-muted mb-2",
+                ),
+                _settings_field(
+                    "settings-flow-rel-tol", "Flow convergence tolerance",
+                    "How much the room-average pressure is allowed to change between "
+                    "convergence-check chunks before the flow field counts as settled. Real "
+                    "turbulent rooms often oscillate slightly rather than truly converging — "
+                    "this tolerance avoids burning iterations chasing that noise. Lower = stricter "
+                    "and slower; higher = looser and faster.",
+                    "%", _adv_defaults["flow-rel-tol"],
+                ),
+                _settings_field(
+                    "settings-plateau-rel-tol", "Steady-state plateau tolerance",
+                    "How much the room's contaminant level (T) may vary over the trailing sample "
+                    "window before a steady-state phase counts as “plateaued.” Same idea "
+                    "as flow tolerance above, applied to Phase 1/Phase 2 instead of the flow field.",
+                    "%", _adv_defaults["plateau-rel-tol"],
+                ),
+                _settings_field(
+                    "settings-plateau-window", "Steady-state plateau window",
+                    "How many of the most recent saved samples get compared when checking whether "
+                    "a phase has plateaued. A larger window is more resistant to noise but slower "
+                    "to confirm convergence.",
+                    "samples", _adv_defaults["plateau-window"],
+                ),
+                html.Hr(className="my-2"),
+                html.Div("Decay-mode solver timing", className="small fw-bold text-uppercase mb-1"),
+                html.Div(
+                    "Only affects decay-mode runs (steady-state uses its own iteration counts, "
+                    "set on the Project Setup tab).",
+                    className="small text-muted mb-2",
+                ),
+                _settings_field(
+                    "settings-pimple-delta-t", "Decay solver time step",
+                    "The physical time step (seconds) the transient UV-decay solver (pimpleFoam) "
+                    "advances by. Smaller steps are more numerically stable but take longer to "
+                    "reach the same simulated duration.",
+                    "s", _adv_defaults["pimple-delta-t"],
+                ),
+                html.Hr(className="my-2"),
+                html.Div("Mesh & zone resolution", className="small fw-bold text-uppercase mb-1"),
+                html.Div(
+                    "Expert / rarely-changed — these affect mesh size and solve cost "
+                    "directly. Leave at defaults unless you have a specific reason to adjust them.",
+                    className="small text-muted mb-2",
+                ),
+                _settings_field(
+                    "settings-mesh-cell-size", "Mesh cell size",
+                    "The uniform cell size (meters) used to build the room's mesh. A cell is one "
+                    "small cube-shaped control volume; the mesh is the whole room filled "
+                    "edge-to-edge with thousands of these cells, like LEGO bricks filling a box — "
+                    "cells bundle up into the mesh, not the other way round. Smaller cells resolve "
+                    "airflow detail more accurately, but cost grows fast: halving this value "
+                    "roughly eightfolds the total cell count (all 3 dimensions shrink at once), "
+                    "not doubles it.",
+                    "m", _adv_defaults["mesh-cell-size"],
+                ),
+                _settings_field(
+                    "settings-uv-zone-bins", "UV inactivation zone bins",
+                    "Every cell already gets its own continuously-varying fluence/inactivation "
+                    "rate from the lamp calculation — but OpenFOAM's sink terms attach to a "
+                    "cellZone (a named group of cells sharing one fixed rate), not to individual "
+                    "cells. Giving every cell its own truly unique rate would mean one cellZone "
+                    "per cell — tens of thousands of entries, impractical to build or solve. "
+                    "Binning sorts cells by rate into this many groups instead, each becoming one "
+                    "cellZone with one representative rate.",
+                    "bins", _adv_defaults["uv-zone-bins"],
+                ),
+                _settings_field(
+                    "settings-source-zone-size", "Source zone size",
+                    "The physical side length (meters) of the cube-shaped cellZone used to inject "
+                    "the contaminant source in steady-state mode. Larger zones dilute the "
+                    "injection over more cells; smaller zones concentrate it into fewer, "
+                    "higher-rate cells.",
+                    "m", _adv_defaults["source-zone-size"],
+                ),
+                html.Div(id="settings-status", className="small text-success mt-2"),
+            ],
+            style={"maxHeight": "64vh", "overflowY": "auto"},
+        ),
+        dbc.ModalFooter([
+            dbc.Button("Reset to defaults", id="settings-reset-btn", color="link", size="sm",
+                       className="me-auto text-muted"),
+            dbc.Button("Cancel", id="settings-cancel-btn", color="secondary", outline=True, size="sm"),
+            dbc.Button("Save", id="settings-save-btn", color="primary", size="sm"),
+        ]),
+    ],
+    id="settings-modal", is_open=False, size="lg",
+)
+
 app.layout = dbc.Container([
     dcc.Store(id="fresh-room-load"),
     dcc.Store(id="results-data"),
@@ -1243,6 +1379,7 @@ app.layout = dbc.Container([
         ],
         id="help-modal", is_open=False, size="lg", scrollable=True,
     ),
+    settings_modal,
     dbc.Row(
         dbc.Col(html.H4("GUV-CFD", className="mt-3 mb-1"), width="auto"),
     ),
@@ -1259,6 +1396,7 @@ app.layout = dbc.Container([
                 dbc.DropdownMenuItem("Save Project As...", id="menu-save-as"),
             ],
         ), width="auto"),
+        dbc.Col(dbc.Button("Settings", id="menu-settings", color="light", size="sm"), width="auto"),
         dbc.Col(dbc.DropdownMenu(
             label="Help", color="light", size="sm",
             children=[
@@ -1675,6 +1813,65 @@ _HELP_CONTENT = {
 def _open_help_modal(*_clicks):
     title, body = _HELP_CONTENT[dash.ctx.triggered_id]
     return True, title, body
+
+
+_SETTINGS_FIELD_IDS = [
+    "settings-flow-rel-tol", "settings-plateau-rel-tol", "settings-plateau-window",
+    "settings-pimple-delta-t", "settings-mesh-cell-size", "settings-uv-zone-bins",
+    "settings-source-zone-size",
+]
+# Same order as _SETTINGS_FIELD_IDS - maps each GUI field to its
+# app_settings.py storage key (see ADVANCED_SETTINGS_DEFAULTS).
+_SETTINGS_FIELD_KEYS = [
+    "flow-rel-tol", "plateau-rel-tol", "plateau-window",
+    "pimple-delta-t", "mesh-cell-size", "uv-zone-bins", "source-zone-size",
+]
+
+
+@app.callback(
+    Output("settings-modal", "is_open"),
+    Input("menu-settings", "n_clicks"),
+    Input("settings-cancel-btn", "n_clicks"),
+    Input("settings-save-btn", "n_clicks"),
+    State("settings-modal", "is_open"),
+    prevent_initial_call=True,
+)
+def _toggle_settings_modal(_open, _cancel, _save, is_open):
+    return not is_open
+
+
+@app.callback(
+    [Output(fid, "value") for fid in _SETTINGS_FIELD_IDS],
+    Input("menu-settings", "n_clicks"),
+    prevent_initial_call=True,
+)
+def _populate_settings_modal(_n):
+    # Fresh read on every open (not just at app startup) - so a value
+    # changed by hand-editing advanced_settings.json, or by another
+    # instance of the app, is always what the modal shows.
+    saved = load_advanced_settings()
+    return [saved[k] for k in _SETTINGS_FIELD_KEYS]
+
+
+@app.callback(
+    [Output(fid, "value", allow_duplicate=True) for fid in _SETTINGS_FIELD_IDS],
+    Input("settings-reset-btn", "n_clicks"),
+    prevent_initial_call=True,
+)
+def _reset_settings_modal(_n):
+    return [ADVANCED_SETTINGS_DEFAULTS[k] for k in _SETTINGS_FIELD_KEYS]
+
+
+@app.callback(
+    Output("settings-status", "children"),
+    Input("settings-save-btn", "n_clicks"),
+    [State(fid, "value") for fid in _SETTINGS_FIELD_IDS],
+    prevent_initial_call=True,
+)
+def _save_settings(_n, *values):
+    settings = dict(zip(_SETTINGS_FIELD_KEYS, values))
+    save_advanced_settings(settings)
+    return "Saved."
 
 
 # Fallback values for fields that predate a project file's save - loading

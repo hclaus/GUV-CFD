@@ -1,10 +1,27 @@
+import inspect
+
 import numpy as np
 
-from guvcfd.steady_state_pipeline import _point_phase_summary, _room_phase_summary
+from guvcfd.steady_state_pipeline import _point_phase_summary, _room_phase_summary, run_steady_state_scenario
 
 
 def _log(msg):
     pass
+
+
+def test_run_steady_state_scenario_still_accepts_advanced_settings_params():
+    # Regression guard: the Settings menu (app.py) calls this function with
+    # explicit cell_size/nbins/source_size/plateau_window/plateau_rel_tol -
+    # if any of these were ever renamed/removed, that call site would break
+    # silently (kwargs just vanish into **nothing** until the next real
+    # WSL run). Locks in both presence and the original defaults.
+    params = inspect.signature(run_steady_state_scenario).parameters
+    assert params["cell_size"].default == 0.1
+    assert params["nbins"].default == 25
+    assert params["source_size"].default == 0.3
+    assert params["plateau_window"].default == 5
+    assert params["plateau_rel_tol"].default == 0.01
+    assert params["window_frac"].default == 0.15
 
 
 def test_room_phase_summary_uses_windowed_mean_not_last_point():

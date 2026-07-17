@@ -4,3 +4,7 @@ __pycache__/
 uv.lock
 *.egg-info/
 .pytest_cache/
+
+# Per-installation advanced Settings (Settings menu, right of File) -
+# local preferences, not something to ship/share across clones.
+advanced_settings.json

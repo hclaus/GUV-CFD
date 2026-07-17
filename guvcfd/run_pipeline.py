@@ -288,7 +288,7 @@ def setup_case(guv_path, case_dir, template_case_dir=None, cell_size=0.1, Z=2.0,
                inlet2_wall=None, inlet2_center=None, inlet2_size=None,
                outlet2_wall=None, outlet2_center=None, outlet2_size=None,
                converge_flow=True, simple_foam_iterations=500, flow_convergence_method="simple",
-               pimple_end_time=120, pimple_write_interval=10, pimple_delta_t=0.5,
+               flow_rel_tol=0.01, pimple_end_time=120, pimple_write_interval=10, pimple_delta_t=0.5,
                fan_speed=None, fan_center=None, fan_direction=(0, 0, -1),
                fan_disk_radius=0.6, fan_disk_thickness=0.2, fan_height=None,
                log_fn=print, should_stop=None, solver_log_fn=None):
@@ -310,11 +310,13 @@ def setup_case(guv_path, case_dir, template_case_dir=None, cell_size=0.1, Z=2.0,
     a genuinely converged flow field for this mesh, rather than trusting
     mapFields' interpolated guess as-is.
 
-    pimple_end_time/pimple_write_interval/pimple_delta_t: the transient
-    UV-decay run's simulated duration [s], write cadence [s], and time step
-    [s] - these (along with Z and ach above) are all destined to become GUI
-    input fields; keeping them as plain function arguments here rather than
-    hardcoded so that wiring is a small change, not a rework.
+    pimple_end_time/pimple_write_interval: the transient UV-decay run's
+    simulated duration [s] and write cadence [s] - GUI-exposed per-project
+    (Project Setup tab), like Z and ach above.
+
+    pimple_delta_t/flow_rel_tol/cell_size/nbins: GUI-exposed too, but as
+    cross-project "advanced" defaults (Settings menu, right of File) rather
+    than per-project fields - see app_settings.py.
 
     fan_speed: if given (m/s, see fan.SPEED_RANGE), adds an optional mixing
     fan (see fan.py) - a cylindrical cellZone (default radius 0.6m, a 1.2m
@@ -430,7 +432,7 @@ def setup_case(guv_path, case_dir, template_case_dir=None, cell_size=0.1, Z=2.0,
                f"{simple_foam_iterations} iterations)...")
         converge_flow_field(case_dir, n_iterations=simple_foam_iterations, fan_entry=fan_entry,
                              log_fn=log_fn, should_stop=should_stop, method=flow_convergence_method,
-                             solver_log_fn=solver_log_fn)
+                             rel_tol=flow_rel_tol, solver_log_fn=solver_log_fn)
         if should_stop is not None and should_stop():
             raise StoppedByUser("Stopped after flow convergence.")
         log_fn("  restoring our own boundary conditions again (simpleFoam's mesh-derived "

@@ -1,6 +1,6 @@
 import inspect
 
-from guvcfd.run_pipeline import _is_stable_oscillation, converge_flow_field
+from guvcfd.run_pipeline import _is_stable_oscillation, converge_flow_field, setup_case
 
 
 def test_flow_convergence_default_tolerance_is_one_percent():
@@ -11,6 +11,16 @@ def test_flow_convergence_default_tolerance_is_one_percent():
     # wall-clock time without buying real accuracy downstream.
     default = inspect.signature(converge_flow_field).parameters["rel_tol"].default
     assert default == 0.01
+
+
+def test_setup_case_has_flow_rel_tol_passthrough_matching_converge_flow_field():
+    # setup_case() must expose the same rel_tol converge_flow_field() itself
+    # defaults to, so a caller that doesn't pass flow_rel_tol explicitly
+    # (any caller predating the Settings menu, or tests) gets identical
+    # behavior to before this parameter was added.
+    params = inspect.signature(setup_case).parameters
+    assert "flow_rel_tol" in params
+    assert params["flow_rel_tol"].default == inspect.signature(converge_flow_field).parameters["rel_tol"].default
 
 
 def test_not_enough_history_rejected():
