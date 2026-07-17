@@ -84,6 +84,32 @@ def check_plateau(T, window=5, rel_tol=0.01):
     return bool(rel_spread <= rel_tol), float(rel_spread)
 
 
+def windowed_stats(t, T, frac=0.15):
+    """Mean/std/CV of the trailing `frac` fraction of `T` (by sample count,
+    floored at 2 points so stdev is always defined) - a steadier read of
+    "steady state" than T[-1] alone, especially for turbulent monitoring
+    points where the instantaneous last sample can be off by 25-50%+ from
+    a real converged run (see the live-volAverage validation). Since T is a
+    passive linear scalar here, this window's *relative* noise (CV) doesn't
+    change with source strength - only averaging over more samples (a
+    live per-iteration series, not just write_interval snapshots) narrows
+    the standard error of the mean.
+
+    Returns (mean, std, cv, n, window_span) - window_span is
+    t[-1] - t[-n], the window's actual duration/iteration-count, for
+    labeling ("last {window_span} iterations"). cv is None when mean is 0.
+    """
+    T = np.asarray(T, dtype=float)
+    t = np.asarray(t, dtype=float)
+    n = max(2, round(len(T) * frac))
+    tail = T[-n:]
+    mean = float(tail.mean())
+    std = float(tail.std(ddof=1))
+    cv = (std / mean) if mean else None
+    window_span = float(t[-1] - t[-n])
+    return mean, std, cv, n, window_span
+
+
 def write_results_summary(case_dir, out_path, ventilation_ach, well_mixed_eACH_mean,
                            vol_average_dat="postProcessing/volAverage1/0/volFieldValue.dat",
                            extra=None, measured_ventilation_ach=None):

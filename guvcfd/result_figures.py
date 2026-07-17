@@ -7,31 +7,57 @@ import math
 import plotly.graph_objs as go
 
 
+def _window_rect_and_line(fig, t, T_ss1, T_ss, window_span, color, shift=0.0):
+    """Shade the trailing moving-average window (see decay_analysis.
+    windowed_stats) on a phase's curve and mark its mean - same visual
+    design validated in the live-volAverage comparison artifact. `shift`
+    offsets x into steady_state_figure's shared timeline (phase 2 only).
+    """
+    if not t or window_span is None:
+        return
+    x0, x1 = shift + t[-1] - window_span, shift + t[-1]
+    pct_mean = 100 * T_ss / T_ss1
+    fig.add_vrect(x0=x0, x1=x1, fillcolor=color, opacity=0.12, line_width=0)
+    fig.add_shape(type="line", x0=x0, x1=x1, y0=pct_mean, y1=pct_mean,
+                  line=dict(color=color, width=1.5, dash="dot"))
+
+
 def steady_state_figure(result):
     """T over time as a percentage of phase 1's steady state (100%), phase
     1 and phase 2 plotted on one continuous linear timeline (phase 2
     shifted to start where phase 1 ends) so the UV-on transition and its
     reduction read directly off the curve. Time axis is linear - the
     underlying OpenFOAM write schedule is what's log-spaced, not this plot.
+
+    Uses the dense live per-iteration series (result["phase1/2"]["live"])
+    when present - much less noisy-looking than the sparse write_interval
+    samples it replaces - with the trailing moving-average window (T_ss is
+    now that window's mean, not a single last sample - see
+    decay_analysis.windowed_stats) shaded and its mean marked. Falls back
+    to the old sparse decay_curve for results.json predating live tracking.
     """
     p1, p2 = result["phase1"], result["phase2"]
     T_ss1 = p1["T_ss"] or 1.0
-    t1 = p1["decay_curve"]["t"]
-    T1 = p1["decay_curve"]["T"]
+    curve1 = p1.get("live", p1["decay_curve"])
+    t1 = curve1["t"]
+    T1 = curve1["T"]
     t1_end = t1[-1] if t1 else 0.0
 
-    t2 = p2["decay_curve"]["t"]
-    T2 = p2["decay_curve"]["T"]
+    curve2 = p2.get("live", p2["decay_curve"])
+    t2 = curve2["t"]
+    T2 = curve2["T"]
     t2_shifted = [t1_end + v for v in t2]
 
     pct1 = [100 * v / T_ss1 for v in T1]
     pct2 = [100 * v / T_ss1 for v in T2]
 
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=t1, y=pct1, mode="lines+markers", name="Phase 1 (no UV)",
-                              line=dict(color="#e67e22", width=2)))
-    fig.add_trace(go.Scatter(x=t2_shifted, y=pct2, mode="lines+markers", name="Phase 2 (UV on)",
-                              line=dict(color="#2ecc71", width=2)))
+    fig.add_trace(go.Scatter(x=t1, y=pct1, mode="lines", name="Phase 1 (no UV)",
+                              line=dict(color="#e67e22", width=1.5)))
+    fig.add_trace(go.Scatter(x=t2_shifted, y=pct2, mode="lines", name="Phase 2 (UV on)",
+                              line=dict(color="#2ecc71", width=1.5)))
+    _window_rect_and_line(fig, t1, T_ss1, p1["T_ss"], p1.get("T_ss_window_span"), "#e67e22")
+    _window_rect_and_line(fig, t2, T_ss1, p2["T_ss"], p2.get("T_ss_window_span"), "#2ecc71", shift=t1_end)
     fig.add_hline(y=100, line_dash="dot", line_color="gray",
                   annotation_text="Phase 1 steady state (100%)", annotation_position="top left")
     pct2_ss = 100 * p2["T_ss"] / T_ss1

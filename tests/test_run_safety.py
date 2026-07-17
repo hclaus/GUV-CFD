@@ -249,3 +249,12 @@ def test_opening_project_does_not_override_explicitly_saved_second_opening_field
     restored = _restore_field_values(saved_settings)
     assert restored["outlet2-wall"] == "backWall"
     assert restored["outlet2-enable"] is True
+
+
+def test_opening_project_backfills_missing_t_ss_window_frac():
+    # A .guvcfd saved before the live-volAverage windowed-average feature
+    # existed has no "t-ss-window-frac" key - must backfill to the same
+    # 0.15 default the GUI field itself uses, not None.
+    old_settings = {"ach": 3.0, "z-value": 2.0}
+    restored = _restore_field_values(old_settings)
+    assert restored["t-ss-window-frac"] == 0.15

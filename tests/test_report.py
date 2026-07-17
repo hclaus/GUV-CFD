@@ -87,6 +87,44 @@ def test_steady_state_report_does_not_crash_on_decay_only_fields(tmp_path):
     assert len(doc.inline_shapes) == 2  # room preview + phase-timeline curve pictures embedded
 
 
+def test_steady_state_report_shows_moving_average_and_cv_when_present(tmp_path):
+    case_dir = str(tmp_path)
+    (tmp_path / "run_settings.json").write_text(json.dumps(_REAL_SETTINGS))
+    results = dict(_STEADY_STATE_RESULTS)
+    results["phase1"] = dict(results["phase1"], T_ss_std=0.003, T_ss_cv=0.012, T_ss_window_span=1234)
+    results["phase2"] = dict(results["phase2"], T_ss_std=0.0009, T_ss_cv=0.14, T_ss_window_span=456)
+    (tmp_path / "results.json").write_text(json.dumps(results))
+    out_path = str(tmp_path / "out.docx")
+
+    generate_report_docx(case_dir, out_path)
+
+    from docx import Document
+    doc = Document(out_path)
+    text = _table_text(doc)
+    assert "Phase 1 moving average (no UV, last 1234 iterations)" in text
+    assert "Phase 1 CV (no UV, last 1234 iterations)" in text
+    assert "1.2%" in text
+    assert "Phase 2 moving average (UV on, last 456 iterations)" in text
+    assert "14.0%" in text
+    assert "Phase 1 T_ss (no UV)" not in text
+
+
+def test_steady_state_report_falls_back_to_plain_t_ss_when_window_fields_absent(tmp_path):
+    case_dir = str(tmp_path)
+    (tmp_path / "run_settings.json").write_text(json.dumps(_REAL_SETTINGS))
+    (tmp_path / "results.json").write_text(json.dumps(_STEADY_STATE_RESULTS))
+    out_path = str(tmp_path / "out.docx")
+
+    generate_report_docx(case_dir, out_path)
+
+    from docx import Document
+    doc = Document(out_path)
+    text = _table_text(doc)
+    assert "Phase 1 T_ss (no UV)" in text
+    assert "Phase 2 T_ss (UV on)" in text
+    assert "moving average" not in text
+
+
 def test_decay_report_shows_fluence_mean(tmp_path):
     case_dir = str(tmp_path)
     (tmp_path / "run_settings.json").write_text(json.dumps(_REAL_SETTINGS))
@@ -432,6 +470,30 @@ def test_monitoring_results_heading_renamed(tmp_path):
     headings = [p.text for p in doc.paragraphs if p.style.name.startswith("Heading")]
     assert "Monitoring Results" in headings
     assert "Monitoring Locations" not in headings
+
+
+def test_monitoring_row_shows_windowed_t_ss_and_cv_when_present(tmp_path):
+    case_dir = str(tmp_path)
+    (tmp_path / "run_settings.json").write_text(json.dumps(_REAL_SETTINGS))
+    results = dict(_STEADY_STATE_RESULTS)
+    results["monitoring"] = {
+        "Patient": {
+            "phase1": {"volAverage_T": [0.0, 0.21], "T_ss": 0.207, "T_ss_cv": 0.052},
+            "phase2": {"volAverage_T": [0.21, 0.003], "T_ss": 0.0020, "T_ss_cv": 0.541},
+        },
+    }
+    (tmp_path / "results.json").write_text(json.dumps(results))
+    out_path = str(tmp_path / "out.docx")
+
+    generate_report_docx(case_dir, out_path)
+
+    from docx import Document
+    doc = Document(out_path)
+    text = _table_text(doc)
+    assert "T_ss1=0.207" in text
+    assert "T_ss2=0.002" in text
+    assert "CV1=5.2%" in text
+    assert "CV2=54.1%" in text
 
 
 def test_steady_state_report_embeds_phase_timeline_curve(tmp_path):

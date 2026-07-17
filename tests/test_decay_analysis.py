@@ -3,7 +3,7 @@ import math
 
 import numpy as np
 
-from guvcfd.decay_analysis import compute_effective_eACH, write_results_summary
+from guvcfd.decay_analysis import compute_effective_eACH, windowed_stats, write_results_summary
 
 
 def _synthetic_decay(lambda_per_s, t_max=1000, dt=10, T0=1.0):
@@ -60,3 +60,55 @@ def test_write_results_summary_adds_corrected_fields_only_when_measured_given(tm
     with open(out_path) as f:
         saved = json.load(f)
     assert saved["ventilation_ach_measured"] == 2.67
+
+
+def test_windowed_stats_flat_series_has_zero_cv():
+    t = list(range(100))
+    T = [5.0] * 100
+    mean, std, cv, n, span = windowed_stats(t, T, frac=0.15)
+    assert mean == 5.0
+    assert std == 0.0
+    assert cv == 0.0
+    assert n == 15
+    assert span == t[-1] - t[-15]
+
+
+def test_windowed_stats_only_uses_trailing_fraction():
+    t = list(range(100))
+    T = [0.0] * 80 + [10.0] * 20  # a jump partway through
+    mean, std, cv, n, span = windowed_stats(t, T, frac=0.15)
+    assert n == 15
+    # last 15 samples are all in the post-jump plateau, so the mean should
+    # reflect that plateau, not be dragged down by the earlier zeros.
+    assert mean == 10.0
+    assert std == 0.0
+
+
+def test_windowed_stats_noisy_plateau_estimates_true_mean():
+    import random
+    random.seed(0)
+    t = list(range(1000))
+    true_mean = 0.3
+    T = [true_mean + random.uniform(-0.05, 0.05) for _ in t]
+    mean, std, cv, n, span = windowed_stats(t, T, frac=0.15)
+    assert n == 150
+    assert abs(mean - true_mean) < 0.01
+    assert std > 0
+    assert cv is not None and cv > 0
+
+
+def test_windowed_stats_short_series_floors_at_two_points():
+    t = [0, 1, 2]
+    T = [1.0, 2.0, 3.0]
+    mean, std, cv, n, span = windowed_stats(t, T, frac=0.15)
+    assert n == 2  # round(3 * 0.15) = 0, floored to 2
+    assert mean == 2.5  # mean of last 2 points
+    assert span == t[-1] - t[-2]
+
+
+def test_windowed_stats_cv_is_none_for_zero_mean():
+    t = [0, 1, 2, 3]
+    T = [1.0, -1.0, 1.0, -1.0]
+    mean, std, cv, n, span = windowed_stats(t, T, frac=1.0)
+    assert mean == 0.0
+    assert cv is None

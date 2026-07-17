@@ -28,7 +28,7 @@ from . import help_content
 from .initial_fields import compute_inlet_velocities
 from .monitoring_points import compute_monitoring_results, mixing_uniformity_note
 from .paraview_launch import launch_paraview
-from .report import generate_report_docx, T_FIELD_NOTE
+from .report import generate_report_docx, T_FIELD_NOTE, _phase_ss_rows
 from .result_figures import steady_state_figure, decay_figure
 from .run_pipeline import setup_case
 from .splice import set_control_dict_start_from, set_control_dict_time
@@ -67,7 +67,7 @@ SETTINGS_FIELDS = [
     "fan-x-input", "fan-y-input", "fan-z-input",
     "sim-type", "pimple-end-time", "pimple-write-interval", "no-uv-control-enable",
     "target-t-ss", "inject-x-input", "inject-y-input", "inject-z-input",
-    "phase1-iterations", "phase2-iterations",
+    "phase1-iterations", "phase2-iterations", "t-ss-window-frac",
     "monitoring-enable",
     "monitor1-enable", "monitor1-name", "monitor1-x-input", "monitor1-y-input",
     "monitor1-z-input", "monitor1-cells",
@@ -746,6 +746,7 @@ def _run_steady_state(guv_path, case_dir, room, settings):
         inlet_velocity=inlet_velocity, inlet2_velocity=inlet2_velocity, has_outlet2=has_outlet2,
         phase1_iterations=phase1_iterations,
         phase2_iterations=phase2_iterations,
+        window_frac=settings.get("t-ss-window-frac") or 0.15,
         fan_entry=fan_entry, monitoring_points=_gather_monitoring_points(settings),
         patches_to_monitor=patches_to_monitor,
         log_fn=_run_log, should_stop=_should_stop, solver_log_fn=_track_solver_time,
@@ -1060,6 +1061,13 @@ project_setup_tab = dbc.Row([
                     className="form-control form-control-sm")),
                 dbc.Button("Suggest settling times (99.5%)", id="suggest-phases-btn", size="sm",
                            color="secondary", outline=True, className="w-100 mt-1"),
+                _labeled("T_ss moving-average window (fraction of samples)", dcc.Input(
+                    id="t-ss-window-frac", type="number", value=0.15, min=0.01, max=0.9, step=0.01,
+                    className="form-control form-control-sm"),
+                    help_text="Room-wide T and every monitoring point report a trailing-window "
+                              "mean/CV over this fraction of the live per-iteration samples, "
+                              "instead of a single last-sample read - see the live-volAverage "
+                              "validation. 0.15 = last 15% of samples."),
             ]),
         ]),
 
@@ -1122,9 +1130,17 @@ def _monitoring_summary_rows(monitoring):
     for name, data in monitoring.items():
         if "phase1" in data:
             p1, p2 = data["phase1"], data["phase2"]
-            T1 = p1["volAverage_T"][-1] if p1["volAverage_T"] else None
-            T2 = p2["volAverage_T"][-1] if p2["volAverage_T"] else None
+            # T_ss/T_ss_cv (trailing-window moving average, see
+            # decay_analysis.windowed_stats) when present; falls back to the
+            # old last-sample read for results.json predating live tracking.
+            T1 = p1.get("T_ss", p1["volAverage_T"][-1] if p1["volAverage_T"] else None)
+            T2 = p2.get("T_ss", p2["volAverage_T"][-1] if p2["volAverage_T"] else None)
             value = f"T_ss1={T1:.4g}, T_ss2={T2:.4g}" if T1 is not None and T2 else "n/a"
+            cv1, cv2 = p1.get("T_ss_cv"), p2.get("T_ss_cv")
+            if cv1 is not None or cv2 is not None:
+                cv1_text = f"{cv1 * 100:.1f}%" if cv1 is not None else "n/a"
+                cv2_text = f"{cv2 * 100:.1f}%" if cv2 is not None else "n/a"
+                value += f" (CV1={cv1_text}, CV2={cv2_text})"
             if T1:
                 value += f", reduction={(1 - T2 / T1) * 100:.1f}%"
         else:
@@ -1157,11 +1173,9 @@ def _steady_state_summary(result):
     if result.get("injection_rate_total") is not None:
         rows.append(("Source injection rate (total, room-wide)",
                       f"{result['injection_rate_total']:.4g} T-units/s (see note below)"))
+    rows += _phase_ss_rows(1, "no UV", p1)
+    rows += _phase_ss_rows(2, "UV on", p2)
     rows += [
-        ("Phase 1 T_ss", f"{p1['T_ss']:.4g}  ({'plateaued' if p1['converged'] else 'NOT fully plateaued'}, "
-                          f"{p1['iterations']} iterations)"),
-        ("Phase 2 T_ss", f"{p2['T_ss']:.4g}  ({'plateaued' if p2['converged'] else 'NOT fully plateaued'}, "
-                          f"{p2['iterations']} iterations)"),
         ("Reduction", f"{result['reduction_pct']:.1f}%"),
         ("eACH_uv, steady-state CFD-fit (nominal ventilation ACH)",
          f"{result['eACH_uv_steady_state']:.4g} /hr"),
@@ -1678,6 +1692,7 @@ _NEW_FIELD_DEFAULTS = {
     "outlet2-enable": False, "outlet2-wall": "floor",
     "outlet2-y-input": 2.0, "outlet2-z-input": 1.5,
     "outlet2-size-w": 0.3, "outlet2-size-h": 0.3,
+    "t-ss-window-frac": 0.15,
 }
 
 

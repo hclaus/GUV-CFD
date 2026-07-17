@@ -106,24 +106,42 @@ _ROW_LABELS_RESULTS_DECAY_CORRECTED = [
                  if res.get("mixing_efficiency_corrected") is not None else "n/a"),
 ]
 
-_ROW_LABELS_RESULTS_STEADY_STATE = [
+_ROW_LABELS_RESULTS_STEADY_STATE_BEFORE_PHASES = [
     ("Average fluence rate", lambda res: f"{res['fluence_mean']:.4g} µW/cm²"
                                           if res.get("fluence_mean") is not None else "n/a"),
     ("Target well-mixed steady-state T", lambda res: f"{res.get('target_T_ss', '?')}"),
     ("Source injection rate (total, room-wide)",
      lambda res: f"{res['injection_rate_total']:.4g} T-units/s (see T note below)"
                  if res.get("injection_rate_total") is not None else "n/a"),
-    ("Phase 1 T_ss (no UV)", lambda res: f"{res['phase1']['T_ss']:.4g} "
-                                          f"({'plateaued' if res['phase1']['converged'] else 'NOT fully plateaued'}, "
-                                          f"{res['phase1']['iterations']} iterations)"),
-    ("Phase 2 T_ss (UV on)", lambda res: f"{res['phase2']['T_ss']:.4g} "
-                                          f"({'plateaued' if res['phase2']['converged'] else 'NOT fully plateaued'}, "
-                                          f"{res['phase2']['iterations']} iterations)"),
+]
+
+_ROW_LABELS_RESULTS_STEADY_STATE_AFTER_PHASES = [
     ("Reduction", lambda res: f"{res['reduction_pct']:.1f}%"),
     ("Theoretical eACH_uv, steady-state (well mixed ventilation eACH = Z*Eavg)",
      lambda res: f"{res['eACH_uv_well_mixed']:.4g} /hr"
                  if res.get("eACH_uv_well_mixed") is not None else "n/a"),
 ]
+
+
+def _phase_ss_rows(phase_num, uv_note, phase):
+    """Steady-state phase1/phase2 rows: a trailing-window moving average +
+    CV (see decay_analysis.windowed_stats) when the live per-iteration data
+    is present, falling back to the old plain-T_ss row (exact original
+    wording, e.g. "Phase 1 T_ss (no UV)") for older results.json files
+    that predate live tracking.
+    """
+    plateau_note = f"({'plateaued' if phase['converged'] else 'NOT fully plateaued'}, " \
+                    f"{phase['iterations']} iterations)"
+    span = phase.get("T_ss_window_span")
+    if span is None:
+        return [(f"Phase {phase_num} T_ss ({uv_note})", f"{phase['T_ss']:.4g} {plateau_note}")]
+    cv = phase.get("T_ss_cv")
+    return [
+        (f"Phase {phase_num} moving average ({uv_note}, last {span:.4g} iterations)",
+         f"{phase['T_ss']:.4g} {plateau_note}"),
+        (f"Phase {phase_num} CV ({uv_note}, last {span:.4g} iterations)",
+         f"{cv * 100:.1f}%" if cv is not None else "n/a"),
+    ]
 
 # Ventilation ACH is *measured* here (derived for free from Phase 1's own
 # mass balance, no separate control run needed) instead of assumed at its
@@ -156,9 +174,17 @@ def _monitoring_rows(monitoring):
     for name, data in monitoring.items():
         if "phase1" in data:
             p1, p2 = data["phase1"], data["phase2"]
-            T1 = p1["volAverage_T"][-1] if p1["volAverage_T"] else None
-            T2 = p2["volAverage_T"][-1] if p2["volAverage_T"] else None
+            # T_ss/T_ss_cv (trailing-window moving average, see
+            # decay_analysis.windowed_stats) when present; falls back to the
+            # old last-sample read for results.json predating live tracking.
+            T1 = p1.get("T_ss", p1["volAverage_T"][-1] if p1["volAverage_T"] else None)
+            T2 = p2.get("T_ss", p2["volAverage_T"][-1] if p2["volAverage_T"] else None)
             value = f"T_ss1={T1:.4g}, T_ss2={T2:.4g}" if T1 is not None and T2 is not None else "n/a"
+            cv1, cv2 = p1.get("T_ss_cv"), p2.get("T_ss_cv")
+            if cv1 is not None or cv2 is not None:
+                cv1_text = f"{cv1 * 100:.1f}%" if cv1 is not None else "n/a"
+                cv2_text = f"{cv2 * 100:.1f}%" if cv2 is not None else "n/a"
+                value += f" (CV1={cv1_text}, CV2={cv2_text})"
             if T1:
                 value += f", reduction={(1 - T2 / T1) * 100:.1f}%"
         else:
@@ -364,7 +390,10 @@ def _write_report_docx(doc_out_path, case_dir, guv_path, settings, results, room
     doc.add_heading("Results", level=2)
     doc.add_paragraph().add_run(T_FIELD_NOTE).italic = True
     if "phase1" in results:
-        rows = [(label, fn(results)) for label, fn in _ROW_LABELS_RESULTS_STEADY_STATE]
+        rows = [(label, fn(results)) for label, fn in _ROW_LABELS_RESULTS_STEADY_STATE_BEFORE_PHASES]
+        rows += _phase_ss_rows(1, "no UV", results["phase1"])
+        rows += _phase_ss_rows(2, "UV on", results["phase2"])
+        rows += [(label, fn(results)) for label, fn in _ROW_LABELS_RESULTS_STEADY_STATE_AFTER_PHASES]
         if results.get("ventilation_ach_measured") is not None:
             rows += [(label, fn(results)) for label, fn in _ROW_LABELS_RESULTS_STEADY_STATE_MEASURED]
         rows.append(("Total ACH in room (ACH+eACH_uv)", _total_ach_row(results)))

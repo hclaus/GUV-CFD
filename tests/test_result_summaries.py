@@ -76,6 +76,27 @@ def test_steady_state_summary_corrected_row_names_the_correction():
     assert "eACH_uv, steady-state CFD-fit (measured ventilation ACH)" in text
 
 
+def test_steady_state_summary_shows_moving_average_and_cv_when_present():
+    result = dict(_STEADY_STATE_RESULT)
+    result["phase1"] = dict(result["phase1"], T_ss_std=0.003, T_ss_cv=0.012, T_ss_window_span=1234)
+    result["phase2"] = dict(result["phase2"], T_ss_std=0.0009, T_ss_cv=0.014, T_ss_window_span=456)
+    text = _all_text(_steady_state_summary(result))
+    assert "Phase 1 moving average (no UV, last 1234 iterations)" in text
+    assert "Phase 1 CV (no UV, last 1234 iterations)" in text
+    assert "1.2%" in text
+    assert "Phase 2 moving average (UV on, last 456 iterations)" in text
+    assert "1.4%" in text
+
+
+def test_steady_state_summary_falls_back_to_plain_t_ss_when_window_fields_absent():
+    # Old results.json predating live-volAverage tracking has no
+    # T_ss_window_span - must show the old plain-T_ss row, not crash.
+    text = _all_text(_steady_state_summary(_STEADY_STATE_RESULT))
+    assert "Phase 1 T_ss" in text
+    assert "moving average" not in text
+    assert "CV (last" not in text
+
+
 def test_steady_state_summary_flags_non_uniform_mixing():
     result = dict(_STEADY_STATE_RESULT)
     result["monitoring"] = {
