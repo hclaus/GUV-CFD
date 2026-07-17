@@ -9,6 +9,11 @@ reset to uniform values since the original's internalField was solved data
 copied from a later timestep on a *different* mesh (different cell count/
 topology) - not valid to reuse directly.
 """
+import math
+
+import numpy as np
+
+from .case_io import read_patch_face_centers
 
 _WALL_PATCHES = ("xMinWall", "xMaxWall", "floor", "ceiling", "frontWall", "backWall")
 
@@ -57,6 +62,80 @@ def compute_inlet_velocities(ach, room_volume, openings):
     total_area = sum(area for _, area in openings)
     v_mag = compute_inlet_velocity(ach, room_volume, total_area)
     return [tuple(v_mag * d for d in WALL_INFLOW_DIRECTION[wall]) for wall, _ in openings]
+
+
+# Which two room dimensions are tangent to (in the plane of) each wall, in
+# (x,y,z)-index form - mirrors mesh_gen._WALL_SPECS's own in-plane-axis
+# model (same 6 walls, same axis pairing), needed here to project a
+# radial-diffuser direction onto the wall's own plane rather than mesh_gen's
+# private constant.
+_WALL_IN_PLANE_AXES = {
+    "xMin": (1, 2), "xMax": (1, 2),
+    "frontWall": (0, 2), "backWall": (0, 2),
+    "floor": (0, 1), "ceiling": (0, 1),
+}
+
+
+def compute_radial_inlet_velocities(face_centers, opening_center, wall, v_mag, surface_angle_deg=15):
+    """Per-face velocity vectors [m/s] for a surface-attached (ceiling/wall)
+    diffuser: air spreads radially outward from the opening's center,
+    along the plane of the mounting wall (Coanda-effect ceiling
+    attachment), tilted `surface_angle_deg` down into the room - instead
+    of every face sharing one "direct jet" vector straight into the room.
+
+    Validated in practice (Srebric & Chen 2002, HVAC&R Research) for
+    round/square ceiling, vortex, and grille diffusers - not for
+    multi-jet diffusers (slot/nozzle/valve), which need real measured jet
+    profiles instead of a fixed formula.
+
+    face_centers: (N,3) array/list, e.g. from case_io.read_patch_face_centers.
+    opening_center: (x,y,z) of the opening's own center (not the room's).
+    v_mag: same magnitude on every face (total flow rate conserved,
+    uniform-mesh faces are similar size).
+
+    Returns a list of (vx,vy,vz), same order as `face_centers`.
+    """
+    normal = np.array(WALL_INFLOW_DIRECTION[wall], dtype=float)
+    center = np.array(opening_center, dtype=float)
+    angle = math.radians(surface_angle_deg)
+    velocities = []
+    for fc in np.asarray(face_centers, dtype=float):
+        delta = fc - center
+        in_plane = delta - np.dot(delta, normal) * normal
+        norm = np.linalg.norm(in_plane)
+        if norm < 1e-9:
+            # face center coincides with the opening center (e.g. a
+            # degenerate/point-like opening) - no radial direction to
+            # take, fall back to straight into the room.
+            direction = normal
+        else:
+            radial = in_plane / norm
+            direction = radial * math.cos(angle) + normal * math.sin(angle)
+        # float(...) - not np.float64 - so this list is directly
+        # JSON-serializable once it lands in a results.json/summary dict,
+        # same as every other plain-tuple velocity in this codebase.
+        velocities.append(tuple(float(v) for v in v_mag * direction))
+    return velocities
+
+
+def resolve_inlet_velocity(case_dir, patch_name, wall, opening_center, v_mag, diffuser_type="direct"):
+    """The inlet velocity to use for `patch_name`'s U boundary condition -
+    a plain (vx,vy,vz) tuple ("direct jet", today's only behavior) or a
+    per-face list of tuples ("ceiling"/surface-attached diffuser - see
+    compute_radial_inlet_velocities).
+
+    Stateless and cheap (a local polyMesh file parse, no WSL round-trip) -
+    a caller that needs this at multiple points in a run (the initial
+    write, a post-mapFields restore, steady-state's phase-1 restore) just
+    calls it again each time rather than threading a precomputed value
+    through; the mesh/opening geometry doesn't change during a run.
+    """
+    if diffuser_type == "direct":
+        return tuple(v_mag * d for d in WALL_INFLOW_DIRECTION[wall])
+    if diffuser_type == "ceiling":
+        face_centers = read_patch_face_centers(case_dir, patch_name)
+        return compute_radial_inlet_velocities(face_centers, opening_center, wall, v_mag)
+    raise ValueError(f"Unknown diffuser_type: {diffuser_type!r} (expected 'direct' or 'ceiling')")
 
 
 _FIELD_SPECS = {
@@ -122,11 +201,35 @@ def _patch_block(spec_entry):
     return lines
 
 
+def _is_per_face_velocity(inlet_velocity):
+    """True for a surface-attached diffuser's per-face list of (vx,vy,vz)
+    tuples (see resolve_inlet_velocity), False for a plain single
+    (vx,vy,vz) tuple ("direct jet", today's only shape before this)."""
+    return len(inlet_velocity) > 0 and isinstance(inlet_velocity[0], (tuple, list, np.ndarray))
+
+
+def _nonuniform_vector_block(values):
+    """`nonuniform List<vector> N (\\n(x y z)\\n...\\n)` text for a
+    boundaryField value - the per-face vector analog of case_io.
+    write_scalar_field's `nonuniform List<scalar>` internalField pattern.
+    """
+    lines = [f"nonuniform List<vector> ", str(len(values)), "("]
+    lines += [f"({vx:.6g} {vy:.6g} {vz:.6g})" for vx, vy, vz in values]
+    lines.append(")")
+    return "\n        ".join(lines)
+
+
+def _inlet_velocity_value(inlet_velocity):
+    if _is_per_face_velocity(inlet_velocity):
+        return _nonuniform_vector_block(inlet_velocity)
+    vx, vy, vz = inlet_velocity
+    return f"uniform ({vx:.6g} {vy:.6g} {vz:.6g})"
+
+
 def _field_spec(field_name, inlet_velocity, T_initial=1):
     spec = _FIELD_SPECS[field_name]
     if field_name == "U":
-        vx, vy, vz = inlet_velocity
-        spec = {**spec, "inlet": ("fixedValue", f"uniform ({vx:.6g} {vy:.6g} {vz:.6g})")}
+        spec = {**spec, "inlet": ("fixedValue", _inlet_velocity_value(inlet_velocity))}
     elif field_name == "T":
         spec = {**spec, "internal": f"uniform {T_initial:.6g}"}
     return spec

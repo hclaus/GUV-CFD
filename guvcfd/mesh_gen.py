@@ -89,6 +89,16 @@ def _opening_box(wall, Lx, Ly, Lz, center_frac, size, eps=1e-4):
     return tuple(lo), tuple(hi)
 
 
+def opening_center(wall, Lx, Ly, Lz, center_frac, size):
+    """The opening's own absolute (x,y,z) center - not the room's - for
+    callers that need real-world coordinates (e.g. initial_fields.
+    resolve_inlet_velocity's radial-diffuser direction computation)
+    rather than just the boxToFace carving region _opening_box() builds.
+    """
+    lo, hi = _opening_box(wall, Lx, Ly, Lz, center_frac, size)
+    return tuple((l + h) / 2 for l, h in zip(lo, hi))
+
+
 def _face_set_action(name, box):
     (x0, y0, z0), (x1, y1, z1) = box
     box_str = f"({x0:.6g} {y0:.6g} {z0:.6g}) ({x1:.6g} {y1:.6g} {z1:.6g})"

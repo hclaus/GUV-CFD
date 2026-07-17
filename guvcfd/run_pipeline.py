@@ -16,8 +16,10 @@ from .contaminant_source import write_fvoptions_file
 from .decay_analysis import read_vol_average_dat
 from .fan import write_fan_topo_set_dict, fan_fvoptions_entry
 from .fluence import compute_fluence_at_points, compute_inactivation_rate, compute_well_mixed_eACH
-from .initial_fields import write_initial_fields, compute_inlet_velocities, restore_boundary_conditions
-from .mesh_gen import write_mesh_dicts, write_map_fields_dict
+from .initial_fields import (
+    write_initial_fields, compute_inlet_velocity, restore_boundary_conditions, resolve_inlet_velocity,
+)
+from .mesh_gen import write_mesh_dicts, write_map_fields_dict, opening_center
 from .monitoring import write_vol_average_dict
 from .splice import (
     splice_fv_options_into_control_dict,
@@ -284,8 +286,10 @@ def converge_flow_field(case_dir, n_iterations=500, fan_entry=None, log_fn=print
 def setup_case(guv_path, case_dir, template_case_dir=None, cell_size=0.1, Z=2.0, nbins=25,
                source_field="T", map_from_case=None, map_from_time=0, ach=3.0,
                inlet_wall="xMin", inlet_center=(0.5, 0.85), inlet_size=(0.3, 0.3),
+               inlet_diffuser_type="direct",
                outlet_wall="xMax", outlet_center=(0.5, 0.15), outlet_size=(0.3, 0.3),
                inlet2_wall=None, inlet2_center=None, inlet2_size=None,
+               inlet2_diffuser_type="direct",
                outlet2_wall=None, outlet2_center=None, outlet2_size=None,
                converge_flow=True, simple_foam_iterations=500, flow_convergence_method="simple",
                flow_rel_tol=0.01, pimple_end_time=120, pimple_write_interval=10, pimple_delta_t=0.5,
@@ -298,6 +302,13 @@ def setup_case(guv_path, case_dir, template_case_dir=None, cell_size=0.1, Z=2.0,
     ach: target air changes per hour [1/hr] - inlet velocity is derived from
     this and the room volume/inlet area (see initial_fields.compute_inlet_velocity),
     rather than a fixed velocity that would silently drift ACH as room size changes.
+
+    inlet_diffuser_type/inlet2_diffuser_type: "direct" (a single vector
+    straight into the room, matching every version of this pipeline before
+    this parameter existed) or "ceiling" (a real diffuser's discharge:
+    velocity spread radially outward across the opening, in the plane of
+    its wall - see initial_fields.resolve_inlet_velocity/
+    compute_radial_inlet_velocities for the physical justification).
 
     inlet2_wall/center/size, outlet2_wall/center/size: an optional 2nd inlet
     and/or 2nd outlet, each on any of the 6 room walls. When given, both
@@ -393,14 +404,30 @@ def setup_case(guv_path, case_dir, template_case_dir=None, cell_size=0.1, Z=2.0,
     openings = [(inlet_wall, inlet_size[0] * inlet_size[1])]
     if inlet2_wall is not None:
         openings.append((inlet2_wall, inlet2_size[0] * inlet2_size[1]))
-    velocities = compute_inlet_velocities(ach, room_volume, openings)
-    inlet_velocity = velocities[0]
-    inlet2_velocity = velocities[1] if inlet2_wall is not None else None
+    total_area = sum(a for _, a in openings)
+    v_mag = compute_inlet_velocity(ach, room_volume, total_area)
+
+    # Mesh already exists at this point (blockMesh/topoSet/createPatch
+    # above) - resolve_inlet_velocity() can read the "ceiling" diffuser's
+    # real per-face geometry straight from constant/polyMesh, no need to
+    # wait for the writeCellCentres step further below. Computed once,
+    # reused for every write_initial_fields()/restore_boundary_conditions()
+    # call in this function - stateless/cheap, and mesh geometry doesn't
+    # change mid-run.
+    inlet_velocity = resolve_inlet_velocity(
+        case_dir, "inlet", inlet_wall, opening_center(inlet_wall, room.x, room.y, room.z, inlet_center, inlet_size),
+        v_mag, diffuser_type=inlet_diffuser_type)
+    inlet2_velocity = None
+    if inlet2_wall is not None:
+        inlet2_velocity = resolve_inlet_velocity(
+            case_dir, "inlet2", inlet2_wall,
+            opening_center(inlet2_wall, room.x, room.y, room.z, inlet2_center, inlet2_size),
+            v_mag, diffuser_type=inlet2_diffuser_type)
     log_fn(f"Writing initial fields (0/{{U,p,k,omega,nut,T}}), ACH={ach} -> "
-           f"inlet velocity {inlet_velocity} m/s"
-           + (f", inlet2 velocity {inlet2_velocity} m/s" if inlet2_velocity else "")
+           f"inlet velocity magnitude {v_mag:.4g} m/s ({inlet_diffuser_type})"
+           + (f", inlet2 ({inlet2_diffuser_type})" if inlet2_velocity else "")
            + f" (room volume={room_volume:.3g} m^3, total inlet area="
-           f"{sum(a for _, a in openings):.3g} m^2)...")
+           f"{total_area:.3g} m^2)...")
     has_outlet2 = outlet2_wall is not None
     Path(f"{case_dir}/0").mkdir(parents=True, exist_ok=True)
     write_initial_fields(case_dir, inlet_velocity=inlet_velocity, inlet2_velocity=inlet2_velocity,

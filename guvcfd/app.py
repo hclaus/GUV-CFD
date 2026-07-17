@@ -61,8 +61,10 @@ WALL_OPTIONS = [{"label": w, "value": w} for w in
 SETTINGS_FIELDS = [
     "project-description", "case-dir", "ach", "z-value",
     "inlet-show", "inlet-wall", "inlet-y-input", "inlet-z-input", "inlet-size-w", "inlet-size-h",
+    "inlet-diffuser-type",
     "outlet-show", "outlet-wall", "outlet-y-input", "outlet-z-input", "outlet-size-w", "outlet-size-h",
     "inlet2-enable", "inlet2-wall", "inlet2-y-input", "inlet2-z-input", "inlet2-size-w", "inlet2-size-h",
+    "inlet2-diffuser-type",
     "outlet2-enable", "outlet2-wall", "outlet2-y-input", "outlet2-z-input", "outlet2-size-w", "outlet2-size-h",
     "fan-enable", "fan-speed", "fan-direction", "fan-radius", "fan-thickness",
     "fan-x-input", "fan-y-input", "fan-z-input",
@@ -351,11 +353,14 @@ def _second_opening_kwargs(settings, prefix, room):
     """
     if not settings.get(f"{prefix}-enable"):
         return {}
-    return {
+    kwargs = {
         f"{prefix}_wall": settings[f"{prefix}-wall"],
         f"{prefix}_center": _opening_center_frac(settings, prefix, room),
         f"{prefix}_size": (settings[f"{prefix}-size-w"], settings[f"{prefix}-size-h"]),
     }
+    if prefix == "inlet2":  # only inlets have a diffuser type, not outlets
+        kwargs["inlet2_diffuser_type"] = settings.get("inlet2-diffuser-type", "direct")
+    return kwargs
 
 
 # Settings that determine the mesh/flow field/UV zones a full Run builds -
@@ -367,12 +372,18 @@ def _second_opening_kwargs(settings, prefix, room):
 _MESH_AFFECTING_FIELDS = [
     "ach", "z-value",
     "inlet-wall", "inlet-y-input", "inlet-z-input", "inlet-size-w", "inlet-size-h",
+    # Doesn't change the mesh itself, but does change the converged flow
+    # field's boundary values - Continue reusing a flow field solved under
+    # the OLD diffuser type would silently keep using it, so this needs
+    # the same mismatch-detection treatment as genuinely mesh-affecting
+    # fields (same reasoning as ach/inlet position above).
+    "inlet-diffuser-type",
     "outlet-wall", "outlet-y-input", "outlet-z-input", "outlet-size-w", "outlet-size-h",
     # Unlike monitoring points/source_center below, a 2nd inlet/outlet
     # genuinely changes the mesh (an extra carved patch) - these belong
     # here, not in the "purely informational" bucket.
     "inlet2-enable", "inlet2-wall", "inlet2-y-input", "inlet2-z-input",
-    "inlet2-size-w", "inlet2-size-h",
+    "inlet2-size-w", "inlet2-size-h", "inlet2-diffuser-type",
     "outlet2-enable", "outlet2-wall", "outlet2-y-input", "outlet2-z-input",
     "outlet2-size-w", "outlet2-size-h",
     "fan-enable", "fan-speed", "fan-direction", "fan-radius", "fan-thickness",
@@ -520,6 +531,7 @@ def _run_decay(guv_path, case_dir, room, settings):
         inlet_wall=settings["inlet-wall"],
         inlet_center=_opening_center_frac(settings, "inlet", room),
         inlet_size=(settings["inlet-size-w"], settings["inlet-size-h"]),
+        inlet_diffuser_type=settings.get("inlet-diffuser-type", "direct"),
         outlet_wall=settings["outlet-wall"],
         outlet_center=_opening_center_frac(settings, "outlet", room),
         outlet_size=(settings["outlet-size-w"], settings["outlet-size-h"]),
@@ -707,6 +719,7 @@ def _run_steady_state(guv_path, case_dir, room, settings):
         inlet_wall=settings["inlet-wall"],
         inlet_center=_opening_center_frac(settings, "inlet", room),
         inlet_size=(settings["inlet-size-w"], settings["inlet-size-h"]),
+        inlet_diffuser_type=settings.get("inlet-diffuser-type", "direct"),
         outlet_wall=settings["outlet-wall"],
         outlet_center=_opening_center_frac(settings, "outlet", room),
         outlet_size=(settings["outlet-size-w"], settings["outlet-size-h"]),
@@ -753,6 +766,13 @@ def _run_steady_state(guv_path, case_dir, room, settings):
         source_center=(settings["inject-x-input"], settings["inject-y-input"], settings["inject-z-input"]),
         target_T_ss=settings["target-t-ss"],
         inlet_velocity=inlet_velocity, inlet2_velocity=inlet2_velocity, has_outlet2=has_outlet2,
+        inlet_diffuser_type=settings.get("inlet-diffuser-type", "direct"),
+        inlet_wall=settings["inlet-wall"], inlet_center=_opening_center_frac(settings, "inlet", room),
+        inlet_size=(settings["inlet-size-w"], settings["inlet-size-h"]),
+        inlet2_diffuser_type=settings.get("inlet2-diffuser-type", "direct") if has_inlet2 else "direct",
+        inlet2_wall=settings["inlet2-wall"] if has_inlet2 else None,
+        inlet2_center=_opening_center_frac(settings, "inlet2", room) if has_inlet2 else None,
+        inlet2_size=(settings["inlet2-size-w"], settings["inlet2-size-h"]) if has_inlet2 else None,
         phase1_iterations=phase1_iterations,
         phase2_iterations=phase2_iterations,
         window_frac=settings.get("t-ss-window-frac") or 0.15,
@@ -918,8 +938,14 @@ def _position_field_component(prefix):
     return _position_field(prefix, label, default, minv, maxv, step)
 
 
-def _opening_controls(prefix, default_wall):
-    return [
+DIFFUSER_TYPE_OPTIONS = [
+    {"label": "Direct jet", "value": "direct"},
+    {"label": "Surface-attached (ceiling/wall diffuser)", "value": "ceiling"},
+]
+
+
+def _opening_controls(prefix, default_wall, is_inlet=True):
+    controls = [
         dbc.Checkbox(id=f"{prefix}-show", value=True, label="Show in preview", className="mb-2"),
         _labeled("Wall", dcc.Dropdown(id=f"{prefix}-wall", options=WALL_OPTIONS,
                                        value=default_wall, clearable=False)),
@@ -932,16 +958,24 @@ def _opening_controls(prefix, default_wall):
                                min=0.05, max=2.0, step=0.05, className="form-control form-control-sm")),
         ])),
     ]
+    if is_inlet:
+        controls.append(_labeled("Diffuser type", dcc.Dropdown(
+            id=f"{prefix}-diffuser-type", options=DIFFUSER_TYPE_OPTIONS,
+            value="ceiling", clearable=False),
+            help_text="Direct jet: a single beam straight into the room. Surface-attached: "
+                      "spreads radially along the wall/ceiling like a real diffuser - "
+                      "validated for round/square ceiling, vortex, and grille types."))
+    return controls
 
 
-def _second_opening_controls(prefix, label, default_wall):
+def _second_opening_controls(prefix, label, default_wall, is_inlet=True):
     """A 2nd inlet/outlet, off by default - same layout shape as
     _monitoring_point_controls' enable-toggle + collapsible sub-section.
     """
     return html.Div([
         dbc.Checkbox(id=f"{prefix}-enable", value=False, label=f"Enable 2nd {label}",
                      className="mb-2"),
-        html.Div(id=f"{prefix}-controls", children=_opening_controls(prefix, default_wall)),
+        html.Div(id=f"{prefix}-controls", children=_opening_controls(prefix, default_wall, is_inlet=is_inlet)),
     ], className="mt-3 pt-3 border-top")
 
 
@@ -1008,8 +1042,8 @@ project_setup_tab = dbc.Row([
         _card("Inlet", _opening_controls("inlet", "xMin")
               + [_second_opening_controls("inlet2", "Inlet", "ceiling")]),
 
-        _card("Outlet", _opening_controls("outlet", "xMax")
-              + [_second_opening_controls("outlet2", "Outlet", "floor")]),
+        _card("Outlet", _opening_controls("outlet", "xMax", is_inlet=False)
+              + [_second_opening_controls("outlet2", "Outlet", "floor", is_inlet=False)]),
 
         _card("Mixing fan", [
             dbc.Checkbox(id="fan-enable", value=False, label="Enable fan", className="mb-2"),
@@ -1890,6 +1924,7 @@ _NEW_FIELD_DEFAULTS = {
     "outlet2-y-input": 2.0, "outlet2-z-input": 1.5,
     "outlet2-size-w": 0.3, "outlet2-size-h": 0.3,
     "t-ss-window-frac": 0.15,
+    "inlet-diffuser-type": "ceiling", "inlet2-diffuser-type": "ceiling",
 }
 
 

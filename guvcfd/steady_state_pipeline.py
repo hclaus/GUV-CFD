@@ -20,7 +20,8 @@ from .contaminant_source import (
     write_fvoptions_file,
 )
 from .decay_analysis import read_vol_average_dat, check_plateau, windowed_stats
-from .initial_fields import restore_boundary_conditions
+from .initial_fields import restore_boundary_conditions, resolve_inlet_velocity
+from .mesh_gen import opening_center
 from .monitoring import write_vol_average_dict, live_vol_average_functions
 from .monitoring_points import write_monitoring_topo_set_dict, zone_name
 from .splice import (
@@ -202,6 +203,10 @@ def run_steady_state_scenario(case_dir, room_x, room_y, room_z, ach, Z, nbins=25
                                source_center=None, source_size=0.3, target_T_ss=0.3,
                                cell_size=0.1, inlet_velocity=(0.278, 0, 0),
                                inlet2_velocity=None, has_outlet2=False,
+                               inlet_diffuser_type="direct", inlet_wall=None,
+                               inlet_center=None, inlet_size=None,
+                               inlet2_diffuser_type="direct", inlet2_wall=None,
+                               inlet2_center=None, inlet2_size=None,
                                phase1_iterations=8000, phase1_write_interval=200,
                                phase2_iterations=3000, phase2_write_interval=100,
                                plateau_window=5, plateau_rel_tol=0.01, window_frac=0.15,
@@ -280,6 +285,23 @@ def run_steady_state_scenario(case_dir, room_x, room_y, room_z, ach, Z, nbins=25
 
     source_entry = source_fvoptions_entry(Su)
     fan_entries = [fan_entry] if fan_entry is not None else []
+
+    # setup_case() already resolved "ceiling"-diffuser inlets into a
+    # per-face velocity list once; mapFields/flow-convergence's own
+    # restore_boundary_conditions() calls (inside setup_case()) may have
+    # since overwritten 0/U with that resolved value, but this scenario
+    # starts by explicitly rewriting boundary conditions again (T_initial=0
+    # for the steady-state build-up) - re-resolve the same way here rather
+    # than assuming the plain inlet_velocity tuple this function received
+    # is still the right BC value for a "ceiling" inlet.
+    if inlet_diffuser_type == "ceiling":
+        v_mag = float(np.linalg.norm(inlet_velocity))
+        center = opening_center(inlet_wall, room_x, room_y, room_z, inlet_center, inlet_size)
+        inlet_velocity = resolve_inlet_velocity(case_dir, "inlet", inlet_wall, center, v_mag, "ceiling")
+    if inlet2_diffuser_type == "ceiling" and inlet2_velocity is not None:
+        v_mag2 = float(np.linalg.norm(inlet2_velocity))
+        center2 = opening_center(inlet2_wall, room_x, room_y, room_z, inlet2_center, inlet2_size)
+        inlet2_velocity = resolve_inlet_velocity(case_dir, "inlet2", inlet2_wall, center2, v_mag2, "ceiling")
 
     # --- Phase 1: source only, no UV ---
     log_fn("=== Phase 1: source only (no UV) ===")
