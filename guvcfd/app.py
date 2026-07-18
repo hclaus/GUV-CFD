@@ -540,6 +540,7 @@ def _run_decay(guv_path, case_dir, room, settings):
         pimple_delta_t=adv["pimple-delta-t"],
         cell_size=adv["mesh-cell-size"], nbins=adv["uv-zone-bins"],
         flow_rel_tol=adv["flow-rel-tol"] / 100.0, flow_max_iterations=adv["flow-max-iterations"],
+        momentum_relaxation=adv["momentum-relaxation"], scalar_relaxation=adv["scalar-relaxation"],
         log_fn=_run_log, should_stop=_should_stop, solver_log_fn=_track_solver_time,
         **_fan_kwargs(settings),
         **_second_opening_kwargs(settings, "inlet2", room),
@@ -725,6 +726,7 @@ def _run_steady_state(guv_path, case_dir, room, settings):
         outlet_size=(settings["outlet-size-w"], settings["outlet-size-h"]),
         cell_size=adv["mesh-cell-size"], nbins=adv["uv-zone-bins"],
         flow_rel_tol=adv["flow-rel-tol"] / 100.0, flow_max_iterations=adv["flow-max-iterations"],
+        momentum_relaxation=adv["momentum-relaxation"], scalar_relaxation=adv["scalar-relaxation"],
         log_fn=_run_log, should_stop=_should_stop, solver_log_fn=_track_solver_time,
         **fan_kwargs,
         **_second_opening_kwargs(settings, "inlet2", room),
@@ -778,7 +780,7 @@ def _run_steady_state(guv_path, case_dir, room, settings):
         window_frac=settings.get("t-ss-window-frac") or 0.15,
         cell_size=adv["mesh-cell-size"], nbins=adv["uv-zone-bins"],
         source_size=adv["source-zone-size"],
-        plateau_window=adv["plateau-window"], plateau_rel_tol=adv["plateau-rel-tol"] / 100.0,
+        plateau_rel_tol=adv["plateau-rel-tol"] / 100.0,
         fan_entry=fan_entry, monitoring_points=_gather_monitoring_points(settings),
         patches_to_monitor=patches_to_monitor,
         log_fn=_run_log, should_stop=_should_stop, solver_log_fn=_track_solver_time,
@@ -1339,17 +1341,42 @@ settings_modal = dbc.Modal(
                 ),
                 _settings_field(
                     "settings-plateau-rel-tol", "Steady-state plateau tolerance",
-                    "How much the room's contaminant level (T) may vary over the trailing sample "
-                    "window before a steady-state phase counts as “plateaued.” Same idea "
-                    "as flow tolerance above, applied to Phase 1/Phase 2 instead of the flow field.",
+                    "The trailing-window coefficient of variation (CV) below which a steady-state "
+                    "phase (Phase 1/Phase 2) counts as “plateaued” - same trailing window (fraction "
+                    "of samples) as the reported T_ss itself, so the “plateaued” message and the "
+                    "actual result are always checking the same thing. Lower = stricter (demands a "
+                    "flatter tail before declaring convergence); higher = looser.",
                     "%", _adv_defaults["plateau-rel-tol"],
                 ),
+                html.Hr(className="my-2"),
+                html.Div("Solver stability (under-relaxation)", className="small fw-bold text-uppercase mb-1"),
+                html.Div(
+                    "Each SIMPLE solver iteration only takes a fraction of the step toward its "
+                    "newly-computed value, instead of fully accepting it — this damps oscillation "
+                    "that would otherwise grow and diverge (an unrelaxed iterative solve is a lot "
+                    "like a spring with no friction: every overshoot gets bigger, not smaller). "
+                    "Lower = more damping, more resistant to a diverging/oscillating solve, but "
+                    "slower to converge. Higher = faster, but more prone to instability on harder "
+                    "cases (elongated openings, inlet/outlet close together, strong local source "
+                    "terms).",
+                    className="small text-muted mb-2",
+                ),
                 _settings_field(
-                    "settings-plateau-window", "Steady-state plateau window",
-                    "How many of the most recent saved samples get compared when checking whether "
-                    "a phase has plateaued. A larger window is more resistant to noise but slower "
-                    "to confirm convergence.",
-                    "samples", _adv_defaults["plateau-window"],
+                    "settings-momentum-relaxation", "Momentum/turbulence relaxation",
+                    "Damping factor for velocity (U) and turbulence (k, omega) each solver "
+                    "iteration. 0.7 is the standard, well-tested default for room-ventilation "
+                    "flows — raising it can speed up convergence on easy cases, but is the first "
+                    "thing to lower if a run's flow field oscillates instead of settling.",
+                    "", _adv_defaults["momentum-relaxation"],
+                ),
+                _settings_field(
+                    "settings-scalar-relaxation", "Contaminant (T) relaxation",
+                    "Damping factor for the transported contaminant field (T) each solver "
+                    "iteration, independent of momentum/turbulence above — a stiff or strong "
+                    "source/sink term can destabilize T even when the flow field itself is "
+                    "perfectly well-behaved. Lower this first if a steady-state run's T grows "
+                    "or oscillates without bound instead of settling toward equilibrium.",
+                    "", _adv_defaults["scalar-relaxation"],
                 ),
                 html.Hr(className="my-2"),
                 html.Div("Decay-mode solver timing", className="small fw-bold text-uppercase mb-1"),
@@ -1867,13 +1894,15 @@ def _open_help_modal(*_clicks):
 
 _SETTINGS_FIELD_IDS = [
     "settings-flow-rel-tol", "settings-flow-max-iterations", "settings-plateau-rel-tol",
-    "settings-plateau-window", "settings-pimple-delta-t", "settings-mesh-cell-size",
+    "settings-momentum-relaxation", "settings-scalar-relaxation",
+    "settings-pimple-delta-t", "settings-mesh-cell-size",
     "settings-uv-zone-bins", "settings-source-zone-size",
 ]
 # Same order as _SETTINGS_FIELD_IDS - maps each GUI field to its
 # app_settings.py storage key (see ADVANCED_SETTINGS_DEFAULTS).
 _SETTINGS_FIELD_KEYS = [
-    "flow-rel-tol", "flow-max-iterations", "plateau-rel-tol", "plateau-window",
+    "flow-rel-tol", "flow-max-iterations", "plateau-rel-tol",
+    "momentum-relaxation", "scalar-relaxation",
     "pimple-delta-t", "mesh-cell-size", "uv-zone-bins", "source-zone-size",
 ]
 

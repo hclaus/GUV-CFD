@@ -61,9 +61,9 @@ def test_save_persists_given_values_and_confirms(_isolated_settings_file):
 
 def test_save_then_populate_round_trips(_isolated_settings_file):
     new_values = [ADVANCED_SETTINGS_DEFAULTS[k] for k in _SETTINGS_FIELD_KEYS]
-    new_values[_SETTINGS_FIELD_KEYS.index("plateau-window")] = 12
+    new_values[_SETTINGS_FIELD_KEYS.index("momentum-relaxation")] = 0.5
 
     _save_settings(1, *new_values)
     populated = _populate_settings_modal(1)
 
-    assert populated[_SETTINGS_FIELD_KEYS.index("plateau-window")] == 12
+    assert populated[_SETTINGS_FIELD_KEYS.index("momentum-relaxation")] == 0.5

@@ -67,21 +67,25 @@ def compute_effective_eACH(t, T, ventilation_ach, ventilation_lambda_per_s=None)
     return eACH_uv_effective, lambda_total_effective, intercept
 
 
-def check_plateau(T, window=5, rel_tol=0.01):
+def check_plateau_windowed(t, T, frac=0.15, rel_tol=0.01):
     """Has a value curve genuinely plateaued (steady state reached), or did
     the run just exhaust its iteration budget while still drifting?
 
-    Compares the spread of the last `window` values against their mean; if
-    that relative spread is above rel_tol, the run needs more iterations.
-    Used to verify each steady-state phase actually converged rather than
-    just assuming a fixed iteration budget was enough.
+    Uses the SAME windowed_stats() the reported T_ss itself comes from -
+    the trailing `frac` fraction of the dense, every-iteration live series
+    - rather than a separate, cruder check. An earlier version compared
+    just the last 5 *sparse* postProcess-cadence samples' (max-min)/mean
+    "spread," which is both noisier (5 points, and a spread isn't a real
+    deviation measure) and a genuinely different signal than the T_ss the
+    run actually reports - it could (and did, on a real run) flag "NOT YET
+    PLATEAUED" while the dense windowed CV showed a tight, clearly-settled
+    0.69% - misleadingly implying the reported T_ss was less trustworthy
+    than it actually was. Using the same statistic for both the log
+    message and the reported value keeps them consistent by construction.
     """
-    T = np.asarray(T, dtype=float)
-    tail = T[-window:]
-    spread = tail.max() - tail.min()
-    mean = tail.mean()
-    rel_spread = spread / mean if mean else float("inf")
-    return bool(rel_spread <= rel_tol), float(rel_spread)
+    _, _, cv, _, _ = windowed_stats(t, T, frac=frac)
+    converged = cv is not None and cv <= rel_tol
+    return converged, cv
 
 
 def windowed_stats(t, T, frac=0.15):

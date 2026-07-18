@@ -15,12 +15,13 @@ ADVANCED_SETTINGS_PATH = Path(__file__).resolve().parent.parent / "advanced_sett
 ADVANCED_SETTINGS_DEFAULTS = {
     "flow-rel-tol": 1.0,       # % - converge_flow_field's rel_tol
     "flow-max-iterations": 20000,  # hard cap on total flow-convergence iterations
-    "plateau-rel-tol": 1.0,    # % - steady-state phase plateau rel_tol
-    "plateau-window": 5,       # samples
+    "plateau-rel-tol": 1.0,    # % - steady-state phase plateau CV threshold (same window as T_ss)
     "pimple-delta-t": 0.5,     # seconds - decay solver time step
     "mesh-cell-size": 0.10,    # meters
     "uv-zone-bins": 25,        # bins
     "source-zone-size": 0.30,  # meters
+    "momentum-relaxation": 0.7,  # SIMPLE under-relaxation for U/(k|omega)
+    "scalar-relaxation": 0.7,    # SIMPLE under-relaxation for T
 }
 
 

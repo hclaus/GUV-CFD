@@ -72,5 +72,6 @@ relaxationFactors
     {
         U               0.7;
         "(k|omega)"     0.7;
+        T               0.7;
     }
 }

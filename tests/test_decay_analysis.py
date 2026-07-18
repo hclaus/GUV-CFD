@@ -3,7 +3,7 @@ import math
 
 import numpy as np
 
-from guvcfd.decay_analysis import compute_effective_eACH, windowed_stats, write_results_summary
+from guvcfd.decay_analysis import compute_effective_eACH, windowed_stats, write_results_summary, check_plateau_windowed
 
 
 def _synthetic_decay(lambda_per_s, t_max=1000, dt=10, T0=1.0):
@@ -111,4 +111,47 @@ def test_windowed_stats_cv_is_none_for_zero_mean():
     T = [1.0, -1.0, 1.0, -1.0]
     mean, std, cv, n, span = windowed_stats(t, T, frac=1.0)
     assert mean == 0.0
+    assert cv is None
+
+
+def test_check_plateau_windowed_flat_series_is_plateaued():
+    t = list(range(100))
+    T = [5.0] * 100
+    converged, cv = check_plateau_windowed(t, T, frac=0.15, rel_tol=0.01)
+    assert converged is True
+    assert cv == 0.0
+
+
+def test_check_plateau_windowed_still_rising_is_not_plateaued():
+    # A monotonically rising series - the trailing window still has real
+    # spread (not yet settled), so CV should exceed a strict tolerance.
+    t = list(range(100))
+    T = [float(i) for i in t]
+    converged, cv = check_plateau_windowed(t, T, frac=0.15, rel_tol=0.01)
+    assert converged is False
+    assert cv > 0.01
+
+
+def test_check_plateau_windowed_matches_reported_t_ss_statistic():
+    # This is the whole point of the fix: the same statistic (windowed CV)
+    # must drive both the "plateaued" verdict and the actual reported
+    # T_ss/T_ss_cv - unlike the old sparse 5-sample-spread check, which
+    # could disagree with the reported value entirely.
+    import random
+    random.seed(1)
+    t = list(range(1000))
+    T = [1.94 + random.uniform(-0.02, 0.02) for _ in t]  # tight plateau, ~1% noise
+    mean, std, cv_reported, n, span = windowed_stats(t, T, frac=0.15)
+    converged, cv_checked = check_plateau_windowed(t, T, frac=0.15, rel_tol=0.05)
+    assert cv_checked == cv_reported
+    assert converged is True
+
+
+def test_check_plateau_windowed_none_cv_never_converges():
+    # Zero-mean trailing window (cv is None from windowed_stats) must not
+    # be silently treated as "plateaued".
+    t = [0, 1, 2, 3]
+    T = [1.0, -1.0, 1.0, -1.0]
+    converged, cv = check_plateau_windowed(t, T, frac=1.0, rel_tol=0.01)
+    assert converged is False
     assert cv is None

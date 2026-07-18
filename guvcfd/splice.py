@@ -240,6 +240,7 @@ relaxationFactors
     {
         U               0.7;
         "(k|omega)"     0.7;
+        T               0.7;
     }
 }
 """
@@ -265,6 +266,39 @@ def ensure_simple_fvsolution(case_dir):
         return fvs_path  # already present, nothing to do
     with open(fvs_path, "w") as f:
         f.write(content.rstrip("\n") + "\n" + _SIMPLE_BLOCK)
+    return fvs_path
+
+
+def set_relaxation_factors(case_dir, momentum_factor=None, scalar_factor=None):
+    """Overwrite fvSolution's relaxationFactors{}.equations entries for
+    U/(k|omega) (momentum_factor) and T (scalar_factor) - GUI-exposed as
+    cross-project "advanced" defaults (Settings menu), like flow_rel_tol/
+    cell_size above.
+
+    Under-relaxation damps SIMPLE's outer iteration: each pass, instead of
+    fully accepting the newly-solved value for a field, only a fraction of
+    the change is taken (factor 1.0 = no damping, most prone to overshoot;
+    lower = slower but more resistant to oscillating/diverging). Momentum
+    (U) and turbulence (k, omega) share one factor since they're already
+    grouped under a single "(k|omega)" regex entry in the template; T gets
+    its own since a stiff/strong source or sink term interacting with the
+    flow field can destabilize the scalar transport independently of
+    whether momentum itself is well-behaved (see steady_state_pipeline's
+    docstring / CHANGELOG for the real case this fixed).
+
+    None (either arg) leaves that entry at whatever the template already
+    has - only touches what's explicitly asked for.
+    """
+    fvs_path = f"{case_dir}/system/fvSolution"
+    with open(fvs_path) as f:
+        content = f.read()
+    if momentum_factor is not None:
+        content = re.sub(r'(\n[ \t]*U\s+)[\d.]+;', rf'\g<1>{momentum_factor};', content, count=1)
+        content = re.sub(r'(\n[ \t]*"\(k\|omega\)"\s+)[\d.]+;', rf'\g<1>{momentum_factor};', content, count=1)
+    if scalar_factor is not None:
+        content = re.sub(r'(\n[ \t]*T\s+)[\d.]+;', rf'\g<1>{scalar_factor};', content, count=1)
+    with open(fvs_path, "w") as f:
+        f.write(content)
     return fvs_path
 
 

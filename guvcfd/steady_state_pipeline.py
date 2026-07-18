@@ -19,7 +19,7 @@ from .contaminant_source import (
     write_source_topo_set_dict, compute_source_strength, source_Su, source_fvoptions_entry,
     write_fvoptions_file,
 )
-from .decay_analysis import read_vol_average_dat, check_plateau, windowed_stats
+from .decay_analysis import read_vol_average_dat, check_plateau_windowed, windowed_stats
 from .initial_fields import restore_boundary_conditions, resolve_inlet_velocity
 from .mesh_gen import opening_center, opening_half_extents
 from .monitoring import write_vol_average_dict, live_vol_average_functions
@@ -96,7 +96,7 @@ def _copy_latest_to_zero(case_dir_wsl, latest, include_T, log_fn):
     run_wsl_or_raise(f"cp -f {cp_targets} 0/", case_dir_wsl, "copying converged fields")
 
 
-def _run_phase(case_dir, case_dir_wsl, n_iterations, write_interval, plateau_window, plateau_rel_tol,
+def _run_phase(case_dir, case_dir_wsl, n_iterations, write_interval, window_frac, plateau_rel_tol,
                 log_fn, should_stop=None, solver_log_fn=None, live_monitoring_zones=(),
                 live_patches=()):
     set_control_dict_time(case_dir, end_time=n_iterations, write_interval=write_interval, delta_t=1)
@@ -159,8 +159,10 @@ def _run_phase(case_dir, case_dir_wsl, n_iterations, write_interval, plateau_win
     run_wsl_or_raise("rm -rf postProcessing", case_dir_wsl, "clearing stale postProcessing")
     run_wsl_or_raise("postProcess -dict system/volAverageDict", case_dir_wsl, "postProcess volAverage")
     t, T = read_vol_average_dat(f"{case_dir}/postProcessing/volAverage1/0/volFieldValue.dat")
-    converged, rel_spread = check_plateau(T, window=plateau_window, rel_tol=plateau_rel_tol)
-    log_fn(f"  Stopped at time {latest}. T_ss={T[-1]:.4g} (last-{plateau_window} rel. spread={rel_spread:.4g}, "
+    live_t, live_T = live_curves["room"]
+    converged, cv = check_plateau_windowed(live_t, live_T, frac=window_frac, rel_tol=plateau_rel_tol)
+    cv_text = f"{cv * 100:.2f}%" if cv is not None else "n/a"
+    log_fn(f"  Stopped at time {latest}. T_ss={T[-1]:.4g} (trailing-{window_frac:.0%} CV={cv_text}, "
            f"{'plateaued' if converged else 'NOT YET PLATEAUED - consider more iterations'})")
     return latest, t, T, converged, live_curves
 
@@ -209,7 +211,7 @@ def run_steady_state_scenario(case_dir, room_x, room_y, room_z, ach, Z, nbins=25
                                inlet2_center=None, inlet2_size=None,
                                phase1_iterations=8000, phase1_write_interval=200,
                                phase2_iterations=3000, phase2_write_interval=100,
-                               plateau_window=5, plateau_rel_tol=0.01, window_frac=0.15,
+                               plateau_rel_tol=0.01, window_frac=0.15,
                                fan_entry=None, monitoring_points=None,
                                patches_to_monitor=("outlet",), log_fn=print, should_stop=None,
                                solver_log_fn=None):
@@ -319,7 +321,7 @@ def run_steady_state_scenario(case_dir, room_x, room_y, room_z, ach, Z, nbins=25
 
     latest1, t1, T1, converged1, live1 = _run_phase(
         case_dir, case_dir_wsl, phase1_iterations, phase1_write_interval,
-        plateau_window, plateau_rel_tol, log_fn, should_stop=should_stop,
+        window_frac, plateau_rel_tol, log_fn, should_stop=should_stop,
         solver_log_fn=solver_log_fn, live_monitoring_zones=live_zone_names,
         live_patches=patches_to_monitor,
     )
@@ -337,7 +339,7 @@ def run_steady_state_scenario(case_dir, room_x, room_y, room_z, ach, Z, nbins=25
 
     latest2, t2, T2, converged2, live2 = _run_phase(
         case_dir, case_dir_wsl, phase2_iterations, phase2_write_interval,
-        plateau_window, plateau_rel_tol, log_fn, should_stop=should_stop,
+        window_frac, plateau_rel_tol, log_fn, should_stop=should_stop,
         solver_log_fn=solver_log_fn, live_monitoring_zones=live_zone_names,
         live_patches=patches_to_monitor,
     )

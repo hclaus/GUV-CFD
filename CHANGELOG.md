@@ -1,5 +1,48 @@
 # Changelog
 
+## 2026-07-18 — Validate ceiling-diffuser fix; T under-relaxation; consolidate plateau check
+
+Re-ran the originally-failing project (`patient_ward_4B1_v5`) end-to-end
+with the geometry fix from the entry below and `ceiling` diffuser type
+restored. Phase 1 completed cleanly (`T_ss=1.95`, sane), but Phase 2
+(source + UV) still diverged early (`Time=362` of 2500) - confirmed via
+an isolation run that `direct` diffuser type handles this same UV-on
+phase fine, so the remaining instability was still connected to the
+ceiling diffuser's flow field, just triggered specifically once the UV
+sink `fvOptions` terms were added on top of it.
+
+Root cause: `fvSolution` had **no under-relaxation factor for `T`** at
+all (only `p`/`U`/`k`/`omega` were relaxed) - a stiff/strong source or
+sink term interacting with an imperfectly-smooth flow field is a classic
+case for outer-iteration instability, and under-relaxation is the
+standard fix. Added `T 0.7;` to `relaxationFactors.equations` (both the
+real template and `splice.py`'s fallback `_SIMPLE_BLOCK`). Re-validated
+against the same project: **both phases now complete cleanly**, Phase 2
+even reports "plateaued" (previously impossible to reach).
+
+- New `splice.set_relaxation_factors(case_dir, momentum_factor,
+  scalar_factor)` and two new advanced settings (Settings menu, right of
+  File): **Momentum/turbulence relaxation** (U/k/omega, default 0.7) and
+  **Contaminant (T) relaxation** (default 0.7) - both GUI-exposed and
+  documented with a note on what under-relaxation does and why lowering
+  them is the first lever to reach for if a run oscillates/diverges
+  instead of settling.
+
+While investigating, found the "plateaued"/"NOT YET PLATEAUED" log
+message was checking a **different, staler statistic** than the actual
+reported `T_ss`: the old `check_plateau()` used the last 5 *sparse*
+`postProcess`-cadence samples' `(max-min)/mean` spread, while `T_ss`
+itself comes from `windowed_stats()`'s dense, every-iteration trailing-
+15%-of-samples mean/CV (the "windowed moving-average T_ss" feature from
+2026-07-17). These two could - and on a real run, did - disagree: 2.32%
+sparse spread ("NOT YET PLATEAUED") vs. 0.69% dense CV (clearly settled).
+Replaced `check_plateau()` with `check_plateau_windowed()`, using the
+exact same statistic as the reported value, so the log message and the
+result can never contradict each other again. This also removed the now-
+redundant `plateau-window` setting (a separate "how many sparse samples"
+knob) - `window_frac` (already used for `T_ss`'s own window, and now for
+the convergence check too) replaces it.
+
 ## 2026-07-18 — Fix ceiling-diffuser instability; revert to opt-in
 
 A real steady-state run (`patient_ward_4B1_v5`, 0.6x0.3m ceiling-diffuser

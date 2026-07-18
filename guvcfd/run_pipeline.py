@@ -27,6 +27,7 @@ from .splice import (
     set_control_dict_time,
     ensure_simple_fvsolution,
     set_lts_ddt_scheme,
+    set_relaxation_factors,
 )
 from .wsl_utils import (
     wsl_path as _wsl_path,
@@ -293,6 +294,7 @@ def setup_case(guv_path, case_dir, template_case_dir=None, cell_size=0.1, Z=2.0,
                outlet2_wall=None, outlet2_center=None, outlet2_size=None,
                converge_flow=True, simple_foam_iterations=500, flow_convergence_method="simple",
                flow_rel_tol=0.01, flow_max_iterations=20000,
+               momentum_relaxation=None, scalar_relaxation=None,
                pimple_end_time=120, pimple_write_interval=10, pimple_delta_t=0.5,
                fan_speed=None, fan_center=None, fan_direction=(0, 0, -1),
                fan_disk_radius=0.6, fan_disk_thickness=0.2, fan_height=None,
@@ -327,6 +329,11 @@ def setup_case(guv_path, case_dir, template_case_dir=None, cell_size=0.1, Z=2.0,
     what happens when this is hit without converging) - GUI-exposed as a
     cross-project "advanced" default (Settings menu, right of File), like
     flow_rel_tol/cell_size/nbins above.
+
+    momentum_relaxation/scalar_relaxation: SIMPLE under-relaxation factors
+    for U/(k|omega) and T respectively (see splice.set_relaxation_factors)
+    - None (the default) leaves the template's own values untouched.
+    GUI-exposed as cross-project "advanced" defaults too.
 
     pimple_end_time/pimple_write_interval: the transient UV-decay run's
     simulated duration [s] and write cadence [s] - GUI-exposed per-project
@@ -366,6 +373,9 @@ def setup_case(guv_path, case_dir, template_case_dir=None, cell_size=0.1, Z=2.0,
             src = Path(f"{template_case_dir}/constant/{name}")
             if src.exists():
                 shutil.copy(src, f"{case_dir}/constant/{name}")
+        if momentum_relaxation is not None or scalar_relaxation is not None:
+            set_relaxation_factors(case_dir, momentum_factor=momentum_relaxation,
+                                    scalar_factor=scalar_relaxation)
 
     log_fn(f"Loading project {guv_path} ...")
     project = Project.load(guv_path)
