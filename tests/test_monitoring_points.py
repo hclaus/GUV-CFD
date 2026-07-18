@@ -31,6 +31,27 @@ def test_topo_set_dict_has_one_box_per_point():
     assert "0.8 1.3 1" in text  # lo corner (y=1.5-0.2=1.3, z=1.2-0.2=1.0)
 
 
+def test_topo_set_dict_snaps_off_grid_center_to_nearest_grid_line():
+    # An arbitrary, not-grid-aligned position (1.73, 1.47, 1.21) on a
+    # cell_size=0.1 mesh - each box edge should land on an exact multiple
+    # of 0.1, not the raw unsnapped value, avoiding a boxToCell floating-
+    # point boundary tie right where the user happened to click.
+    points = [{"name": "Patient", "x": 1.73, "y": 1.47, "z": 1.21, "cells_per_side": 4}]
+    text = monitoring_topo_set_dict(points, cell_size=0.1)
+    import re
+    m = re.search(r"box\s+\(([^)]*)\)\s+\(([^)]*)\)", text)
+    lo = [float(v) for v in m.group(1).split()]
+    hi = [float(v) for v in m.group(2).split()]
+    for v in lo + hi:
+        assert abs(round(v / 0.1) * 0.1 - v) < 1e-9
+
+
+def test_topo_set_dict_snap_is_noop_for_already_aligned_center():
+    points = [{"name": "Exhaust", "x": 3.9, "y": 1.5, "z": 2.4, "cells_per_side": 2}]
+    text = monitoring_topo_set_dict(points, cell_size=0.1)
+    assert "3.8 1.4 2.3" in text  # lo corner: 3.9-0.1, 1.5-0.1, 2.4-0.1 (size=0.2)
+
+
 def test_average_dict_has_one_volfieldvalue_per_point_and_shared_read():
     points = [
         {"name": "Patient", "x": 1.0, "y": 1.5, "z": 1.2, "cells_per_side": 4},

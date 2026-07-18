@@ -36,6 +36,17 @@ def monitoring_topo_set_dict(points, cell_size):
     this package's uniform-cell mesh, not just an approximate physical size.
 
     points: list of dicts with keys name, x, y, z, cells_per_side.
+
+    A monitoring point's (x, y, z) is an arbitrary user-picked position, not
+    generally a multiple of cell_size, so the raw box edges (center +/-
+    size/2) can land right on a boxToCell floating-point boundary tie -
+    same problem as mesh_gen._opening_box, and the same fix: snap each of
+    the 6 edges independently to the nearest grid line, rather than
+    snapping the center then assuming a fixed size - snapping the center
+    alone would be wrong whenever cells_per_side is odd (an odd cell count
+    can't be centered exactly on a mesh vertex, same parity issue as an
+    opening), so each edge must be free to land on whichever grid line is
+    nearest to it.
     """
     action_lines = []
     for p in points:
@@ -43,8 +54,13 @@ def monitoring_topo_set_dict(points, cell_size):
         cellset_name = f"{zname}Cells"
         size = p["cells_per_side"] * cell_size
         cx, cy, cz = p["x"], p["y"], p["z"]
-        lo = (cx - size / 2, cy - size / 2, cz - size / 2)
-        hi = (cx + size / 2, cy + size / 2, cz + size / 2)
+        lo = [cx - size / 2, cy - size / 2, cz - size / 2]
+        hi = [cx + size / 2, cy + size / 2, cz + size / 2]
+        for i in range(3):
+            lo[i] = round(lo[i] / cell_size) * cell_size
+            hi[i] = round(hi[i] / cell_size) * cell_size
+            if hi[i] <= lo[i]:
+                hi[i] = lo[i] + cell_size
         action_lines += [
             "    {", f"        name    {cellset_name};", "        type    cellSet;",
             "        action  new;", "        source  boxToCell;",

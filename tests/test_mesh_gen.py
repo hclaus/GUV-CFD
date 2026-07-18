@@ -1,4 +1,4 @@
-from guvcfd.mesh_gen import _opening_box, topo_set_dict, create_patch_dict, write_mesh_dicts
+from guvcfd.mesh_gen import _opening_box, opening_center, topo_set_dict, create_patch_dict, write_mesh_dicts
 
 _ROOM = (3.2, 4.8, 2.57)  # Lx, Ly, Lz
 
@@ -87,3 +87,57 @@ def test_write_mesh_dicts_with_second_openings_on_different_walls(tmp_path):
     for name in ("inlet", "outlet", "inlet2", "outlet2"):
         assert f"{name}Faces" in topo_text
         assert f"name        {name};" in patch_text
+
+
+def test_opening_box_snaps_edges_to_grid_when_cell_size_given():
+    # A 4x3m room's exact center (2.0, 1.5) sits on a mesh vertex when
+    # cell_size=0.1 (both dims divide evenly) - a 0.3m-wide opening
+    # centered there needs 3 cells, an odd count that can't straddle a
+    # vertex symmetrically, so the raw (unsnapped) box edges land almost
+    # exactly on a face-center grid line (1.85, 2.15) - a boxToFace
+    # floating-point boundary tie that produces a lopsided carved patch.
+    # Snapping should instead produce edges that are exact multiples of
+    # cell_size, regardless of that parity mismatch.
+    lo, hi = _opening_box("ceiling", 4.0, 3.0, 2.7, (0.5, 0.5), (0.3, 0.3), cell_size=0.1, eps=0.0)
+    for v in (lo[0], hi[0], lo[1], hi[1]):
+        # a multiple of 0.1, allowing for float roundoff
+        assert abs(round(v / 0.1) * 0.1 - v) < 1e-9
+
+
+def test_opening_box_snapping_never_collapses_to_zero_width():
+    # A very small opening (smaller than one cell) must still snap to at
+    # least one whole cell, not collapse to a zero-width (empty) box.
+    lo, hi = _opening_box("ceiling", 4.0, 3.0, 2.7, (0.5, 0.5), (0.02, 0.02), cell_size=0.1, eps=0.0)
+    assert hi[0] - lo[0] >= 0.1
+    assert hi[1] - lo[1] >= 0.1
+
+
+def test_opening_box_snapping_is_a_noop_when_already_grid_aligned():
+    # An opening that already divides evenly (0.4m on a 0.1m grid, 4
+    # cells - an even count, so it *can* straddle the vertex-centered
+    # room center symmetrically) shouldn't be perturbed by snapping.
+    lo_raw, hi_raw = _opening_box("ceiling", 4.0, 3.0, 2.7, (0.5, 0.5), (0.4, 0.4), eps=0.0)
+    lo_snap, hi_snap = _opening_box("ceiling", 4.0, 3.0, 2.7, (0.5, 0.5), (0.4, 0.4), cell_size=0.1, eps=0.0)
+    for a, b in zip(lo_raw, lo_snap):
+        assert abs(a - b) < 1e-9
+    for a, b in zip(hi_raw, hi_snap):
+        assert abs(a - b) < 1e-9
+
+
+def test_opening_center_uses_the_same_snapped_box_as_write_mesh_dicts():
+    # opening_center() must reflect the *actual* carved geometry (same
+    # cell_size passed to write_mesh_dicts), not the nominal/unsnapped
+    # center - otherwise the ceiling-diffuser radial direction math would
+    # be centered on a point that doesn't match the real patch. For this
+    # room, the nominal center (2.0, 1.5) sits exactly on a mesh vertex,
+    # and a 0.3m opening (3 cells - an odd, unstraddleable count) forces a
+    # real half-cell shift in x once snapped, while y (2 cells - even)
+    # doesn't need to shift.
+    center_unsnapped = opening_center("ceiling", 4.0, 3.0, 2.7, (0.5, 0.5), (0.3, 0.3))
+    center_snapped = opening_center("ceiling", 4.0, 3.0, 2.7, (0.5, 0.5), (0.3, 0.3), cell_size=0.1)
+    lo, hi = _opening_box("ceiling", 4.0, 3.0, 2.7, (0.5, 0.5), (0.3, 0.3), cell_size=0.1, eps=0.0)
+    expected = tuple((l + h) / 2 for l, h in zip(lo, hi))
+    assert center_snapped[0] == expected[0] and center_snapped[1] == expected[1]
+    assert center_unsnapped == (2.0, 1.5, 2.7)
+    assert abs(abs(center_snapped[0] - 2.0) - 0.05) < 1e-9  # shifted by half a cell in x
+    assert abs(center_snapped[1] - 1.5) < 1e-9  # y needed no shift (even cell count)

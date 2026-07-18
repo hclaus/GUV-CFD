@@ -265,7 +265,7 @@ def run_steady_state_scenario(case_dir, room_x, room_y, room_z, ach, Z, nbins=25
         live_zone_names = [zone_name(p["name"]) for p in monitoring_points]
 
     log_fn(f"Carving source cellZone at {source_center}, size {source_size}...")
-    write_source_topo_set_dict(case_dir, source_center, source_size)
+    write_source_topo_set_dict(case_dir, source_center, source_size, cell_size=cell_size)
     r = run_wsl_or_raise("topoSet -dict system/sourceTopoSetDict", case_dir_wsl, "topoSet (source zone)")
     m = re.search(r"cellSet sourceZoneCells now size (\d+)", r.stdout)
     if not m:
@@ -296,11 +296,11 @@ def run_steady_state_scenario(case_dir, room_x, room_y, room_z, ach, Z, nbins=25
     # is still the right BC value for a "ceiling" inlet.
     if inlet_diffuser_type == "ceiling":
         v_mag = float(np.linalg.norm(inlet_velocity))
-        center = opening_center(inlet_wall, room_x, room_y, room_z, inlet_center, inlet_size)
+        center = opening_center(inlet_wall, room_x, room_y, room_z, inlet_center, inlet_size, cell_size=cell_size)
         inlet_velocity = resolve_inlet_velocity(case_dir, "inlet", inlet_wall, center, v_mag, "ceiling")
     if inlet2_diffuser_type == "ceiling" and inlet2_velocity is not None:
         v_mag2 = float(np.linalg.norm(inlet2_velocity))
-        center2 = opening_center(inlet2_wall, room_x, room_y, room_z, inlet2_center, inlet2_size)
+        center2 = opening_center(inlet2_wall, room_x, room_y, room_z, inlet2_center, inlet2_size, cell_size=cell_size)
         inlet2_velocity = resolve_inlet_velocity(case_dir, "inlet2", inlet2_wall, center2, v_mag2, "ceiling")
 
     # --- Phase 1: source only, no UV ---

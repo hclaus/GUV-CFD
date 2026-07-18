@@ -943,6 +943,10 @@ DIFFUSER_TYPE_OPTIONS = [
     {"label": "Surface-attached (ceiling/wall diffuser)", "value": "ceiling"},
 ]
 
+_GRID_SNAP_NOTE = ("Position and size are automatically snapped to the mesh grid (cell size, "
+                    "Settings menu) - the actual carved geometry may shift by up to half a cell "
+                    "from the exact values entered here.")
+
 
 def _opening_controls(prefix, default_wall, is_inlet=True):
     controls = [
@@ -956,7 +960,7 @@ def _opening_controls(prefix, default_wall, is_inlet=True):
                                min=0.05, max=2.0, step=0.05, className="form-control form-control-sm")),
             dbc.Col(dcc.Input(id=f"{prefix}-size-h", type="number", value=0.3,
                                min=0.05, max=2.0, step=0.05, className="form-control form-control-sm")),
-        ])),
+        ]), help_text=_GRID_SNAP_NOTE),
     ]
     if is_inlet:
         controls.append(_labeled("Diffuser type", dcc.Dropdown(
@@ -1117,6 +1121,7 @@ project_setup_tab = dbc.Row([
                     help_text="Injection flow (source strength) is calculated automatically "
                               "from this target and the ACH above."),
                 html.Div("Injection position", className="small fw-semibold text-uppercase mt-3 mb-1"),
+                html.Div(_GRID_SNAP_NOTE, className="form-text small mb-2"),
                 *_injection_position_controls(),
                 _labeled("Phase 1 iterations (no UV)", dcc.Input(
                     id="phase1-iterations", type="number", value=8000, min=500, max=50000, step=500,

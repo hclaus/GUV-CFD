@@ -415,13 +415,14 @@ def setup_case(guv_path, case_dir, template_case_dir=None, cell_size=0.1, Z=2.0,
     # call in this function - stateless/cheap, and mesh geometry doesn't
     # change mid-run.
     inlet_velocity = resolve_inlet_velocity(
-        case_dir, "inlet", inlet_wall, opening_center(inlet_wall, room.x, room.y, room.z, inlet_center, inlet_size),
+        case_dir, "inlet", inlet_wall,
+        opening_center(inlet_wall, room.x, room.y, room.z, inlet_center, inlet_size, cell_size=cell_size),
         v_mag, diffuser_type=inlet_diffuser_type)
     inlet2_velocity = None
     if inlet2_wall is not None:
         inlet2_velocity = resolve_inlet_velocity(
             case_dir, "inlet2", inlet2_wall,
-            opening_center(inlet2_wall, room.x, room.y, room.z, inlet2_center, inlet2_size),
+            opening_center(inlet2_wall, room.x, room.y, room.z, inlet2_center, inlet2_size, cell_size=cell_size),
             v_mag, diffuser_type=inlet2_diffuser_type)
     log_fn(f"Writing initial fields (0/{{U,p,k,omega,nut,T}}), ACH={ach} -> "
            f"inlet velocity magnitude {v_mag:.4g} m/s ({inlet_diffuser_type})"

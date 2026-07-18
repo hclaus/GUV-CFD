@@ -7,7 +7,8 @@ Standalone tool, connected to [Illuminate](https://github.com/hclaus/Illuminate_
 ## What it does
 
 - Computes UV fluence rate directly at OpenFOAM mesh cell centers (occlusion + reflectance aware, no CSV/interpolation round-trip) from a `.guv` project's room/lamp geometry.
-- Generates a room mesh (single-block, `topoSet`-carved inlet/outlet) sized directly from the `.guv` room's dimensions.
+- Generates a room mesh (single-block, `topoSet`-carved inlet/outlet) sized directly from the `.guv` room's dimensions. Inlet/outlet/source/monitoring-point geometry is automatically snapped to the mesh grid (see "Mesh-grid alignment" below) — no user action needed, but the actual carved position can differ from the entered value by up to half a cell.
+- Inlet diffuser type: **Direct jet** (a single vector straight into the room) or **Surface-attached (ceiling/wall diffuser)** — a radial, Coandă-style discharge along the mounting wall (validated for round/square ceiling, vortex, and grille diffusers per Srebric & Chen 2002, *HVAC&R Research*); the latter is the default.
 - Runs the full flow-convergence → UV-decay or steady-state-source pipeline, including all the OpenFOAM-specific bookkeeping this needed (`fvOptions` splicing into `controlDict`'s `scalarTransport` function object, `SIMPLE`/`PIMPLE` `fvSolution` coexistence, `writeInterval` sync across nested function objects, `mapFields` warm-starting from a converged reference case).
 - Optional continuous contaminant source (steady-state build-up/mitigation scenarios) and mixing fan (`meanVelocityForce`).
 - Computes and compares three independent eACH (equivalent air changes per hour from UV) estimates: well-mixed (fluence-based), decay-curve-fit, and steady-state-ratio.
@@ -47,6 +48,34 @@ uv run python -m guvcfd.app
 - `guvcfd/report.py` — `.docx` report export (room setup, rendered preview, results).
 - `guvcfd/paraview_launch.py` — launches ParaView with a preset view (volume-rendered T, inlet-seeded streamlines colored by U).
 - `guvcfd/app.py` — Dash GUI: load a `.guv` file, configure inlet/outlet/fan and simulation type, preview the case live, run/continue a simulation, and view/export results. Run with `uv run python -m guvcfd.app`.
+
+## Mesh-grid alignment
+
+Inlet/outlet openings (`mesh_gen._opening_box`), the contaminant source zone
+(`contaminant_source.source_topo_set_dict`), and monitoring-point zones
+(`monitoring_points.monitoring_topo_set_dict`) are all carved with
+`topoSet`'s `boxToFace`/`boxToCell`, which requires exact box-edge
+coordinates. A box edge computed from a raw `center ± size/2` can land
+almost exactly on a mesh grid line — this happens whenever a feature is
+centered on a point that coincides with a mesh vertex (e.g. a room's exact
+center, when both dimensions divide evenly by the cell size) combined with
+a size that needs an odd number of cells (which can't straddle a vertex
+symmetrically). That's a floating-point boundary tie for `topoSet`: cells
+right at the edge get included or excluded almost arbitrarily, producing a
+lopsided/irregular carved patch or zone instead of a clean block — most
+visible as an oddly-shaped inlet patch (e.g. a "ring with a hole," missing
+its center cell) once the surface-attached diffuser's per-face directions
+make the true carved shape visible.
+
+The fix: every one of these box computations snaps each of its edges
+independently to the nearest grid line (a multiple of `cell_size` from the
+room origin) before writing the `topoSetDict`, rather than requiring users
+to pick sizes/positions that divide evenly. This is equivalent to shifting
+the center by up to half a cell on whichever side(s) need it — invisible
+for already-aligned geometry (an even cell count centered on a vertex, or
+any size centered on a cell center, is untouched), automatic otherwise.
+The GUI surfaces a note next to inlet/outlet/source position fields
+reminding users the entered value may shift slightly for this reason.
 
 ## Status
 

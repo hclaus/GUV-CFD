@@ -1,5 +1,51 @@
 # Changelog
 
+## 2026-07-17 — Surface-attached ceiling/wall diffuser inlet, mesh-grid alignment fix
+
+The inlet boundary condition used to be a single uniform vector straight
+into the room ("direct jet") — not how a real diffuser behaves. Added a
+2nd preset, **surface-attached (ceiling/wall diffuser)**: a per-face
+radial velocity field (computed from the inlet patch's real face
+geometry, read directly from `constant/polyMesh`), spreading outward
+along the plane of the mounting wall and tilted 15° into the room
+(Coandă-effect discharge). Validated for round/square ceiling, vortex,
+and grille diffusers per Srebric & Chen 2002 (*HVAC&R Research* 8(3),
+"Simplified Numerical Models for Complex Air Supply Diffusers") — the
+dominant real-world HVAC diffuser types. Confirmed working end-to-end
+against a real OpenFOAM run (mesh generation, `simpleFoam` flow
+convergence, `pimpleFoam` transient UV-decay all solve cleanly with the
+new `nonuniform List<vector>` boundary condition) before making it the
+new default (`direct` remains available as the opt-out).
+
+While visually inspecting a diffuser case in ParaView, found and fixed a
+**pre-existing mesh-grid alignment bug**, not new to this feature but
+newly *visible* because per-face geometry is now rendered directly: inlet/
+outlet openings, the contaminant source zone, and monitoring-point zones
+are all carved via `topoSet`'s `boxToFace`/`boxToCell`, which needs exact
+box-edge coordinates. Whenever a feature's center coincides with a mesh
+vertex (e.g. a room's exact center, if both dimensions divide evenly by
+the cell size) *and* its size needs an odd cell count (which can't
+straddle a vertex symmetrically), the raw box edges land almost exactly on
+a grid line — a floating-point boundary tie for `topoSet`, where edge
+cells get included/excluded almost arbitrarily. This produced a lopsided,
+irregular carved patch/zone (observed as an inlet patch shaped like a
+"ring with a hole," missing its center cell) instead of a clean block.
+
+- `mesh_gen._opening_box`, `contaminant_source.source_topo_set_dict`, and
+  `monitoring_points.monitoring_topo_set_dict` now snap every box edge
+  independently to the nearest mesh grid line before writing the
+  `topoSetDict` — equivalent to shifting the center by up to half a cell
+  on whichever side(s) need it, rather than requiring users to pick
+  sizes/positions that divide evenly. A no-op for already-aligned
+  geometry.
+- `opening_center()` (used by the ceiling-diffuser radial direction math)
+  derives from the same snapped box, so the computed radial center always
+  matches the real carved patch.
+- New GUI note next to inlet/outlet/source position fields: entered
+  values may shift by up to half a cell to align with the mesh grid.
+
+See README's new "Mesh-grid alignment" section for the full explanation.
+
 ## 2026-07-17 — Windowed moving-average T_ss for steady-state runs
 
 Real turbulent rooms never fully settle — a single last-sample read of

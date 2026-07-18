@@ -96,15 +96,19 @@ def _add_label(fig, position, text, color, name, customdata, size=10):
     return fig
 
 
-def _add_opening(fig, label, wall, center_frac, size, Lx, Ly, Lz, color, flow_direction):
+def _add_opening(fig, label, wall, center_frac, size, Lx, Ly, Lz, color, flow_direction, cell_size=None):
     """flow_direction: unit vector the arrow points along - the caller
     decides this (inlet: WALL_INFLOW_DIRECTION[wall], i.e. air entering;
     outlet: the negated inward normal, i.e. air leaving) rather than this
     function guessing intent from `label`, since now that openings can be
     on any of the 6 walls there's no single "always +X" convention that
     makes sense the way it did when only xMin/xMax were possible.
+
+    cell_size: passed through to _opening_box's grid-snapping so the
+    preview outline matches the patch that actually gets carved, rather
+    than the raw (possibly boundary-ambiguous) nominal box.
     """
-    lo, hi = _opening_box(wall, Lx, Ly, Lz, center_frac, size, eps=0.0)
+    lo, hi = _opening_box(wall, Lx, Ly, Lz, center_frac, size, cell_size=cell_size, eps=0.0)
     center = tuple((a + b) / 2 for a, b in zip(lo, hi))
     x, y, z = _rect_outline(center, wall, size)
     fig.add_trace(go.Scatter3d(
@@ -271,18 +275,18 @@ def plot_case(room, inlet_wall="xMin", inlet_center=(0.5, 0.85), inlet_size=(0.3
     fig = _add_wall_labels(fig, room.x, room.y, room.z)
     fig = _add_opening(fig, "inlet", inlet_wall, inlet_center, inlet_size,
                         room.x, room.y, room.z, color="#2ecc71",
-                        flow_direction=WALL_INFLOW_DIRECTION[inlet_wall])
+                        flow_direction=WALL_INFLOW_DIRECTION[inlet_wall], cell_size=cell_size)
     fig = _add_opening(fig, "outlet", outlet_wall, outlet_center, outlet_size,
                         room.x, room.y, room.z, color="#e74c3c",
-                        flow_direction=tuple(-d for d in WALL_INFLOW_DIRECTION[outlet_wall]))
+                        flow_direction=tuple(-d for d in WALL_INFLOW_DIRECTION[outlet_wall]), cell_size=cell_size)
     if inlet2_wall is not None:
         fig = _add_opening(fig, "inlet2", inlet2_wall, inlet2_center, inlet2_size,
                             room.x, room.y, room.z, color="#2ecc71",
-                            flow_direction=WALL_INFLOW_DIRECTION[inlet2_wall])
+                            flow_direction=WALL_INFLOW_DIRECTION[inlet2_wall], cell_size=cell_size)
     if outlet2_wall is not None:
         fig = _add_opening(fig, "outlet2", outlet2_wall, outlet2_center, outlet2_size,
                             room.x, room.y, room.z, color="#e74c3c",
-                            flow_direction=tuple(-d for d in WALL_INFLOW_DIRECTION[outlet2_wall]))
+                            flow_direction=tuple(-d for d in WALL_INFLOW_DIRECTION[outlet2_wall]), cell_size=cell_size)
     if fan_speed is not None:
         center = fan_center or (room.x / 2, room.y / 2, room.z - 0.3)
         radius = fan_disk_radius or 0.6

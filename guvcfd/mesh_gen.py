@@ -68,12 +68,27 @@ _WALL_SPECS = {
 }
 
 
-def _opening_box(wall, Lx, Ly, Lz, center_frac, size, eps=1e-4):
+def _opening_box(wall, Lx, Ly, Lz, center_frac, size, cell_size=None, eps=1e-4):
     """Return ((xmin,ymin,zmin),(xmax,ymax,zmax)) for a boxToFace opening on
     any of the 6 room walls (see _WALL_SPECS), centered at center_frac of
     the wall's two in-plane dimensions (fractions, in axis-index order -
     e.g. (y,z) for xMin/xMax, (x,y) for floor/ceiling), with the given
     (width, height) opening size.
+
+    cell_size: if given, snap both in-plane edges to the nearest mesh grid
+    line (a multiple of cell_size from the room origin) instead of using
+    the raw center_frac/size arithmetic as-is. Without this, a nominal
+    center/size combination that doesn't land on a whole number of cells
+    (e.g. an odd cell count centered exactly on a mesh vertex, which can't
+    be symmetric - 3 cells can't straddle a vertex evenly) produces box
+    edges that coincide almost exactly with a face-center or vertex
+    coordinate, which is a boxToFace floating-point boundary tie: some
+    cells right at the edge get included, others excluded, essentially at
+    random, producing a lopsided/irregular carved patch instead of a clean
+    block. Snapping each edge independently to its nearest grid line
+    sidesteps this rather than requiring the caller to pick sizes that
+    divide evenly - effectively "shifting the center by up to half a cell"
+    on whichever side(s) need it, handling any parity automatically.
     """
     if wall not in _WALL_SPECS:
         raise ValueError(f"Unsupported wall {wall!r}, expected one of {sorted(_WALL_SPECS)}")
@@ -84,18 +99,31 @@ def _opening_box(wall, Lx, Ly, Lz, center_frac, size, eps=1e-4):
     lo, hi = [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]
     lo[a1], hi[a1] = c1 * dims[a1] - w / 2, c1 * dims[a1] + w / 2
     lo[a2], hi[a2] = c2 * dims[a2] - h / 2, c2 * dims[a2] + h / 2
+    if cell_size:
+        lo[a1], hi[a1] = round(lo[a1] / cell_size) * cell_size, round(hi[a1] / cell_size) * cell_size
+        lo[a2], hi[a2] = round(lo[a2] / cell_size) * cell_size, round(hi[a2] / cell_size) * cell_size
+        if hi[a1] <= lo[a1]:
+            hi[a1] = lo[a1] + cell_size
+        if hi[a2] <= lo[a2]:
+            hi[a2] = lo[a2] + cell_size
     pos = normal_pos_fn(Lx, Ly, Lz)
     lo[normal_axis], hi[normal_axis] = pos - eps, pos + eps
     return tuple(lo), tuple(hi)
 
 
-def opening_center(wall, Lx, Ly, Lz, center_frac, size):
+def opening_center(wall, Lx, Ly, Lz, center_frac, size, cell_size=None):
     """The opening's own absolute (x,y,z) center - not the room's - for
     callers that need real-world coordinates (e.g. initial_fields.
     resolve_inlet_velocity's radial-diffuser direction computation)
     rather than just the boxToFace carving region _opening_box() builds.
+
+    cell_size: must match what write_mesh_dicts() carved the opening with
+    (see _opening_box's grid-snapping) - otherwise this returns the
+    nominal, unsnapped center rather than the true center of the patch
+    that actually got carved, throwing off the radial-diffuser direction
+    math by up to half a cell.
     """
-    lo, hi = _opening_box(wall, Lx, Ly, Lz, center_frac, size)
+    lo, hi = _opening_box(wall, Lx, Ly, Lz, center_frac, size, cell_size=cell_size)
     return tuple((l + h) / 2 for l, h in zip(lo, hi))
 
 
@@ -198,11 +226,11 @@ def write_mesh_dicts(case_dir, Lx, Ly, Lz, cell_size=0.1,
     default) means "no 2nd opening", carving the same 2-patch mesh as
     before this parameter existed.
     """
-    inlet_box = _opening_box(inlet_wall, Lx, Ly, Lz, inlet_center, inlet_size)
-    outlet_box = _opening_box(outlet_wall, Lx, Ly, Lz, outlet_center, outlet_size)
-    inlet2_box = _opening_box(inlet2_wall, Lx, Ly, Lz, inlet2_center, inlet2_size) \
+    inlet_box = _opening_box(inlet_wall, Lx, Ly, Lz, inlet_center, inlet_size, cell_size=cell_size)
+    outlet_box = _opening_box(outlet_wall, Lx, Ly, Lz, outlet_center, outlet_size, cell_size=cell_size)
+    inlet2_box = _opening_box(inlet2_wall, Lx, Ly, Lz, inlet2_center, inlet2_size, cell_size=cell_size) \
         if inlet2_wall is not None else None
-    outlet2_box = _opening_box(outlet2_wall, Lx, Ly, Lz, outlet2_center, outlet2_size) \
+    outlet2_box = _opening_box(outlet2_wall, Lx, Ly, Lz, outlet2_center, outlet2_size, cell_size=cell_size) \
         if outlet2_wall is not None else None
 
     paths = {}
