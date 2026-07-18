@@ -1,5 +1,20 @@
 # Changelog
 
+## 2026-07-18 — Surface Extrapolated T∞ in report/Analysis tab; derive ACH from it
+
+- `.docx` report and Analysis tab now show a **"Phase N extrapolated T∞
+  (n→∞)"** row (with its own fit CV) alongside the existing moving-average
+  row, whenever `fit_asymptotic_value` succeeded - both `app.py`'s
+  Analysis tab and `report.py`'s `.docx` export already shared the same
+  `_phase_ss_rows` helper, so one change covers both.
+- Since `ventilation_ach_measured`/`eACH_uv_steady_state(_corrected)` are
+  derived from Phase 1/2's T_ss ratio, they inherit whatever bias T_ss
+  has - now computed from the extrapolated T∞ instead of the windowed
+  average whenever *both* phases produced one (falls back to the
+  windowed average otherwise, unchanged from before). A new
+  `ach_source` field records which was used; the report/Analysis tab
+  note it directly on the Reduction and measured-ACH/eACH_uv rows.
+
 ## 2026-07-18 — Detrended CV reporting; exponential extrapolation for T_ss
 
 While reviewing the validated run's numbers, checked whether the reported

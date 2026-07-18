@@ -97,6 +97,51 @@ def test_steady_state_summary_falls_back_to_plain_t_ss_when_window_fields_absent
     assert "CV (last" not in text
 
 
+def test_steady_state_summary_shows_extrapolated_t_infinity_when_present():
+    result = dict(_STEADY_STATE_RESULT)
+    result["phase1"] = dict(result["phase1"], T_ss_cv=0.012, T_ss_window_span=1234,
+                             T_inf_extrapolated=0.271, T_inf_extrapolation_detail={"fit_cv": 0.0008})
+    result["phase2"] = dict(result["phase2"], T_ss_cv=0.014, T_ss_window_span=456,
+                             T_inf_extrapolated=0.061, T_inf_extrapolation_detail={"fit_cv": 0.0012})
+    text = _all_text(_steady_state_summary(result))
+    assert "Phase 1 extrapolated T∞ (no UV, n→∞)" in text
+    assert "0.271" in text
+    assert "Phase 2 extrapolated T∞ (UV on, n→∞)" in text
+    assert "0.061" in text
+
+
+def test_steady_state_summary_omits_extrapolated_t_infinity_when_absent():
+    result = dict(_STEADY_STATE_RESULT)
+    result["phase1"] = dict(result["phase1"], T_ss_cv=0.012, T_ss_window_span=1234)
+    result["phase2"] = dict(result["phase2"], T_ss_cv=0.014, T_ss_window_span=456)
+    text = _all_text(_steady_state_summary(result))
+    assert "extrapolated T∞" not in text
+
+
+def test_steady_state_summary_notes_ach_source_when_extrapolated():
+    result = dict(_STEADY_STATE_RESULT)
+    result["ach_source"] = "extrapolated_T_infinity"
+    result["ventilation_ach_measured"] = 3.2
+    result["eACH_uv_steady_state_corrected"] = 40.1
+    text = _all_text(_steady_state_summary(result))
+    assert "using extrapolated T∞" in text
+
+
+def test_steady_state_summary_notes_ach_source_when_windowed():
+    result = dict(_STEADY_STATE_RESULT)
+    result["ach_source"] = "windowed_average"
+    text = _all_text(_steady_state_summary(result))
+    assert "T∞ extrapolation unavailable" in text
+
+
+def test_steady_state_summary_no_ach_source_note_for_old_results():
+    # Predates the ach_source field entirely - must not crash or show a
+    # note that doesn't apply.
+    text = _all_text(_steady_state_summary(_STEADY_STATE_RESULT))
+    assert "extrapolated T∞" not in text
+    assert "T∞ extrapolation unavailable" not in text
+
+
 def test_steady_state_summary_flags_non_uniform_mixing():
     result = dict(_STEADY_STATE_RESULT)
     result["monitoring"] = {

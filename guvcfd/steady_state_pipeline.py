@@ -379,8 +379,27 @@ def run_steady_state_scenario(case_dir, room_x, room_y, room_z, ach, Z, nbins=25
 
     lambda_vent = ach / 3600.0
     T_ss1, T_ss2 = summary["phase1"]["T_ss"], summary["phase2"]["T_ss"]
-    reduction_pct = (1 - T_ss2 / T_ss1) * 100 if T_ss1 else None
-    eACH_uv = lambda_vent * (T_ss1 / T_ss2 - 1) * 3600 if T_ss2 else None
+
+    # ACH/eACH_uv are a ratio of T_ss1/T_ss2 (see compute_corrected_eACH_uv's
+    # docstring) - if either phase's curve hadn't fully flattened within its
+    # iteration budget, the windowed average is a biased estimate of the
+    # true steady state (confirmed on a real run: every windowed average
+    # tried was ~3% off a well-fit exponential extrapolation - see
+    # decay_analysis.fit_asymptotic_value), and that bias would propagate
+    # straight into these derived numbers. Use the extrapolated T-infinity
+    # instead whenever BOTH phases produced one; T_ss itself (the displayed
+    # "moving average" row) is untouched either way.
+    Tinf1 = summary["phase1"].get("T_inf_extrapolated")
+    Tinf2 = summary["phase2"].get("T_inf_extrapolated")
+    using_extrapolated = Tinf1 is not None and Tinf2 is not None
+    T_ss1_ach, T_ss2_ach = (Tinf1, Tinf2) if using_extrapolated else (T_ss1, T_ss2)
+    summary["ach_source"] = "extrapolated_T_infinity" if using_extrapolated else "windowed_average"
+    if using_extrapolated:
+        log_fn(f"  Using extrapolated T-infinity (T_ss1={T_ss1_ach:.4g}, T_ss2={T_ss2_ach:.4g}), "
+               f"not the windowed average, for ACH/eACH_uv calculations below.")
+
+    reduction_pct = (1 - T_ss2_ach / T_ss1_ach) * 100 if T_ss1_ach else None
+    eACH_uv = lambda_vent * (T_ss1_ach / T_ss2_ach - 1) * 3600 if T_ss2_ach else None
     summary["reduction_pct"] = reduction_pct
     summary["eACH_uv_steady_state"] = eACH_uv
     log_fn(f"Reduction: {reduction_pct:.1f}%, eACH_uv (steady-state method) = {eACH_uv:.4g} /hr")
@@ -389,7 +408,7 @@ def run_steady_state_scenario(case_dir, room_x, room_y, room_z, ach, Z, nbins=25
     # rate - see compute_corrected_eACH_uv's docstring. Unlike the decay
     # scenario, this is free: no separate UV-off control run needed.
     ventilation_ach_measured, eACH_uv_corrected = compute_corrected_eACH_uv(
-        T_ss1, T_ss2, Su, source_volume, room_volume)
+        T_ss1_ach, T_ss2_ach, Su, source_volume, room_volume)
     if ventilation_ach_measured is not None:
         summary["ventilation_ach_measured"] = ventilation_ach_measured
         summary["eACH_uv_steady_state_corrected"] = eACH_uv_corrected

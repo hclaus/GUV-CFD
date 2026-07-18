@@ -115,8 +115,23 @@ _ROW_LABELS_RESULTS_STEADY_STATE_BEFORE_PHASES = [
                  if res.get("injection_rate_total") is not None else "n/a"),
 ]
 
+def _ach_source_note(res):
+    """Appended to Reduction/measured-ACH rows: whether these were derived
+    from the extrapolated T-infinity (see decay_analysis.fit_asymptotic_value)
+    or the plain windowed average - see run_steady_state_scenario's
+    "ach_source" field. Absent (empty string) for older results.json files
+    that predate this distinction.
+    """
+    source = res.get("ach_source")
+    if source == "extrapolated_T_infinity":
+        return " (using extrapolated T∞)"
+    if source == "windowed_average":
+        return " (using windowed average - T∞ extrapolation unavailable)"
+    return ""
+
+
 _ROW_LABELS_RESULTS_STEADY_STATE_AFTER_PHASES = [
-    ("Reduction", lambda res: f"{res['reduction_pct']:.1f}%"),
+    ("Reduction", lambda res: f"{res['reduction_pct']:.1f}%{_ach_source_note(res)}"),
     ("Theoretical eACH_uv, steady-state (well mixed ventilation eACH = Z*Eavg)",
      lambda res: f"{res['eACH_uv_well_mixed']:.4g} /hr"
                  if res.get("eACH_uv_well_mixed") is not None else "n/a"),
@@ -125,10 +140,16 @@ _ROW_LABELS_RESULTS_STEADY_STATE_AFTER_PHASES = [
 
 def _phase_ss_rows(phase_num, uv_note, phase):
     """Steady-state phase1/phase2 rows: a trailing-window moving average +
-    CV (see decay_analysis.windowed_stats) when the live per-iteration data
-    is present, falling back to the old plain-T_ss row (exact original
-    wording, e.g. "Phase 1 T_ss (no UV)") for older results.json files
-    that predate live tracking.
+    CV (see decay_analysis.windowed_stats_detrended) when the live
+    per-iteration data is present, falling back to the old plain-T_ss row
+    (exact original wording, e.g. "Phase 1 T_ss (no UV)") for older
+    results.json files that predate live tracking.
+
+    Extrapolated T-infinity (decay_analysis.fit_asymptotic_value) is an
+    independent, model-based estimate of the true n->infinity value - not
+    just another window - shown as its own row only when the fit
+    succeeded (None for older results.json files, or when the fit didn't
+    converge/the data isn't well-described by a single exponential).
     """
     plateau_note = f"({'plateaued' if phase['converged'] else 'NOT fully plateaued'}, " \
                     f"{phase['iterations']} iterations)"
@@ -136,12 +157,20 @@ def _phase_ss_rows(phase_num, uv_note, phase):
     if span is None:
         return [(f"Phase {phase_num} T_ss ({uv_note})", f"{phase['T_ss']:.4g} {plateau_note}")]
     cv = phase.get("T_ss_cv")
-    return [
+    rows = [
         (f"Phase {phase_num} moving average ({uv_note}, last {span:.4g} iterations)",
          f"{phase['T_ss']:.4g} {plateau_note}"),
         (f"Phase {phase_num} CV ({uv_note}, last {span:.4g} iterations)",
          f"{cv * 100:.1f}%" if cv is not None else "n/a"),
     ]
+    Tinf = phase.get("T_inf_extrapolated")
+    if Tinf is not None:
+        detail = phase.get("T_inf_extrapolation_detail") or {}
+        fit_cv = detail.get("fit_cv")
+        fit_cv_text = f", fit CV={fit_cv * 100:.2f}%" if fit_cv is not None else ""
+        rows.append((f"Phase {phase_num} extrapolated T∞ ({uv_note}, n→∞)",
+                      f"{Tinf:.4g}{fit_cv_text}"))
+    return rows
 
 # Ventilation ACH is *measured* here (derived for free from Phase 1's own
 # mass balance, no separate control run needed) instead of assumed at its
@@ -149,9 +178,9 @@ def _phase_ss_rows(phase_num, uv_note, phase):
 # docstring. Only present when Phase 1/2 both produced a usable T_ss.
 _ROW_LABELS_RESULTS_STEADY_STATE_MEASURED = [
     ("CFD measured Mechanical Ventilation ACH (determined from Phase 1)",
-     lambda res: f"{res['ventilation_ach_measured']:.4g} /hr"),
+     lambda res: f"{res['ventilation_ach_measured']:.4g} /hr{_ach_source_note(res)}"),
     ("CFD measured eACH_uv",
-     lambda res: f"{res['eACH_uv_steady_state_corrected']:.4g} /hr"),
+     lambda res: f"{res['eACH_uv_steady_state_corrected']:.4g} /hr{_ach_source_note(res)}"),
 ]
 
 

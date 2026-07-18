@@ -29,7 +29,7 @@ from . import help_content
 from .initial_fields import compute_inlet_velocities
 from .monitoring_points import compute_monitoring_results, mixing_uniformity_note
 from .paraview_launch import launch_paraview
-from .report import generate_report_docx, T_FIELD_NOTE, _phase_ss_rows
+from .report import generate_report_docx, T_FIELD_NOTE, _phase_ss_rows, _ach_source_note
 from .result_figures import steady_state_figure, decay_figure
 from .run_pipeline import setup_case
 from .splice import set_control_dict_start_from, set_control_dict_time
@@ -1249,16 +1249,17 @@ def _steady_state_summary(result):
                       f"{result['injection_rate_total']:.4g} T-units/s (see note below)"))
     rows += _phase_ss_rows(1, "no UV", p1)
     rows += _phase_ss_rows(2, "UV on", p2)
+    ach_note = _ach_source_note(result)
     rows += [
-        ("Reduction", f"{result['reduction_pct']:.1f}%"),
+        ("Reduction", f"{result['reduction_pct']:.1f}%{ach_note}"),
         ("eACH_uv, steady-state CFD-fit (nominal ventilation ACH)",
          f"{result['eACH_uv_steady_state']:.4g} /hr"),
     ]
     if result.get("ventilation_ach_measured") is not None:
         rows.append(("Ventilation ACH (measured from Phase 1)",
-                      f"{result['ventilation_ach_measured']:.4g} /hr"))
+                      f"{result['ventilation_ach_measured']:.4g} /hr{ach_note}"))
         rows.append(("eACH_uv, steady-state CFD-fit (measured ventilation ACH)",
-                      f"{result['eACH_uv_steady_state_corrected']:.4g} /hr"))
+                      f"{result['eACH_uv_steady_state_corrected']:.4g} /hr{ach_note}"))
     rows += _monitoring_summary_rows(result.get("monitoring"))
     return [html.Div([html.Span(k + ": ", className="text-muted"), html.Span(v)], className="mb-1")
             for k, v in rows] + _result_notes(result)
