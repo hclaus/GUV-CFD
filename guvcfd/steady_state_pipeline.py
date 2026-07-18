@@ -227,6 +227,18 @@ def _run_phase(case_dir, case_dir_wsl, n_iterations, write_interval, window_frac
             # pre-chunking behavior exactly: phase 1's final directory
             # gets cleaned by the caller since only phase 2's matters for
             # standalone ParaView viewing; phase 2's is deliberately kept).
+            #
+            # This chunk may have written its OWN intermediate snapshots
+            # too (at write_interval, e.g. a 500-iteration chunk with
+            # write_interval=100 writes 100/200/300/400/500) - only the
+            # last (`latest`) is the true final state; the others carry
+            # chunk-LOCAL labels that don't match the real cumulative
+            # iteration count (misleading if left around - "100" could
+            # really be iteration 1600) and must be removed, not kept.
+            run_wsl_or_raise(
+                f'for d in [0-9]*/; do [ "$d" = "0/" ] || [ "$d" = "{latest}/" ] || rm -rf "$d"; done',
+                case_dir_wsl, "clearing this chunk's other intermediate snapshots",
+            )
             if latest != str(total_run):
                 run_wsl_or_raise(f"mv {latest} {total_run}", case_dir_wsl,
                                   "renaming final chunk's time directory")
