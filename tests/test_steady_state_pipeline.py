@@ -63,6 +63,6 @@ def test_point_phase_summary_matches_room_summary_windowing():
     T = np.concatenate([np.zeros(80), np.full(20, 2.0)])  # jump partway through
     point = _point_phase_summary((t, T), window_frac=0.15)
     assert point["T_ss"] == 2.0  # trailing window is entirely post-jump
-    assert point["T_ss_std"] == 0.0
+    assert point["T_ss_std"] < 1e-9  # ~0 (detrended fit leaves tiny float noise on exactly-flat data)
     assert point["t_seconds"] == t.tolist()
     assert point["volAverage_T"] == T.tolist()

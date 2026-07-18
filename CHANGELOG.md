@@ -1,5 +1,37 @@
 # Changelog
 
+## 2026-07-18 — Detrended CV reporting; exponential extrapolation for T_ss
+
+While reviewing the validated run's numbers, checked whether the reported
+windowed CV was measuring genuine noise/fluctuation or was partly
+contaminated by a still-slowly-changing mean. It was: fitting a linear
+trend to phase 1's trailing window found the drift over the window
+(2.2% of the mean) was 3.4x the raw std - most of the reported "0.64%
+CV" was systematic drift, not noise. Comparing window widths (5%/10%/15%)
+showed the windowed *mean* itself kept shifting with window width too
+(1.960 -> 1.954 -> 1.946), confirming none of them had reached a truly
+flat plateau within this run's (deliberately reduced, for validation
+speed) iteration budget.
+
+- New `decay_analysis.windowed_stats_detrended()`: same trailing-window
+  mean as `windowed_stats()`, but std/CV are computed from the residual
+  after removing a linear trend fit to the window - isolates genuine
+  fluctuation from a still-drifting average. Now what `T_ss_std`/`T_ss_cv`
+  actually report (room and monitoring-point summaries both). Plateau/
+  convergence detection is deliberately unaffected - `check_plateau_windowed`
+  still uses the raw (non-detrended) statistic.
+- New `decay_analysis.fit_asymptotic_value()`: fits `T(n) = T∞ - A·e^(-n/τ)`
+  (single-exponential approach to equilibrium - the natural shape of
+  SIMPLE's outer-iteration convergence) over the trailing half of the
+  live series, and extrapolates to the true n→∞ value. A windowed average
+  is provably biased whenever the curve hasn't fully flattened within the
+  given iteration budget; on the validated run's phase 1, every windowed
+  average tried (5%-15%) was ~3% below this fit's `T∞` (2.026), despite
+  an excellent fit (0.04% residual). Reported as **"Extrapolated T∞"**
+  alongside the existing windowed `T_ss` (both shown - not a replacement),
+  `None` when the fit doesn't converge or the data isn't well-described by
+  a single exponential (treated as "unavailable," not an error).
+
 ## 2026-07-18 — Validate ceiling-diffuser fix; T under-relaxation; consolidate plateau check
 
 Re-ran the originally-failing project (`patient_ward_4B1_v5`) end-to-end

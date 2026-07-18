@@ -7,7 +7,10 @@ instantaneous mixing.
 """
 import json
 import re
+import warnings
+
 import numpy as np
+from scipy.optimize import curve_fit, OptimizeWarning
 
 
 def read_vol_average_dat(path):
@@ -112,6 +115,99 @@ def windowed_stats(t, T, frac=0.15):
     cv = (std / mean) if mean else None
     window_span = float(t[-1] - t[-n])
     return mean, std, cv, n, window_span
+
+
+def windowed_stats_detrended(t, T, frac=0.15):
+    """Same shape/window as windowed_stats() (mean, std, cv, n, window_span)
+    but std/cv are computed from the RESIDUAL after removing a linear
+    trend fit to the window, not the raw spread around the mean.
+
+    A run that's still slowly converging (not yet truly flat) has a
+    trailing window whose mean is itself drifting - raw std/CV conflates
+    that systematic drift with genuine fluctuation/noise, and can look
+    "tight" even while the average is still climbing several percent
+    (confirmed on a real run: 0.64% raw CV, but detrending showed most of
+    that was a 2.2%-of-mean drift over the window, not noise - residual
+    CV was only 0.07%). The residual CV isolates the part that actually
+    indicates instability/fluctuation, which is what's worth reporting to
+    a user trying to judge "is this noisy."
+
+    Needs at least 3 points to have any residual degrees of freedom left
+    after fitting slope+intercept (a line fits exactly 2 points with zero
+    residual - meaningless, not "no noise") - falls back to the plain
+    mean-relative std for n<=2, same as windowed_stats().
+
+    This does NOT affect plateau/convergence detection (see
+    check_plateau_windowed, which intentionally still uses the raw,
+    non-detrended CV) - only what gets reported as "how noisy is this."
+    """
+    T = np.asarray(T, dtype=float)
+    t = np.asarray(t, dtype=float)
+    n = max(2, round(len(T) * frac))
+    tail_T = T[-n:]
+    tail_t = t[-n:]
+    mean = float(tail_T.mean())
+    if n > 2:
+        slope, intercept = np.polyfit(tail_t, tail_T, 1)
+        residuals = tail_T - (slope * tail_t + intercept)
+        std = float(residuals.std(ddof=2))
+    else:
+        std = float(tail_T.std(ddof=1))
+    cv = (std / mean) if mean else None
+    window_span = float(t[-1] - t[-n])
+    return mean, std, cv, n, window_span
+
+
+def fit_asymptotic_value(t, T, fit_frac=0.5):
+    """Extrapolate a still-converging curve to its true n->infinity value,
+    by fitting T(n) = Tinf - A*exp(-n/tau) (a single-exponential approach
+    to equilibrium - the natural shape of SIMPLE's outer-iteration
+    convergence, and of a genuine physical relaxation toward steady
+    state) over the trailing `fit_frac` fraction of the series, rather
+    than averaging a window (which is provably biased low/high whenever
+    the curve hasn't fully flattened within the given iteration budget -
+    confirmed on a real run: last-sample and every windowed average
+    tried were all ~3% off this fit's Tinf, despite an excellent,
+    near-pure-noise fit residual of 0.04% of Tinf).
+
+    Returns a dict {Tinf, A, tau, fit_std, fit_cv} on success, or None if
+    the fit fails to converge (e.g. too little data, or the curve isn't
+    well-described by a single exponential - genuinely oscillating/
+    unstable data, or a curve that hasn't started bending toward an
+    asymptote yet) - callers should treat None as "extrapolation not
+    available," not an error, and fall back to the windowed average alone.
+    """
+    T = np.asarray(T, dtype=float)
+    t = np.asarray(t, dtype=float)
+    n = len(T)
+    if n < 10:
+        return None
+    start = int(n * (1 - fit_frac))
+    tf = t[start:] - t[start]
+    Tf = T[start:]
+
+    def model(n_, Tinf, A, tau):
+        return Tinf - A * np.exp(-n_ / tau)
+
+    p0 = [Tf[-1], Tf[-1] - Tf[0], max((tf[-1] - tf[0]) / 3, 1.0)]
+    try:
+        with warnings.catch_warnings():
+            # A flat/degenerate window (e.g. A~0, no real exponential
+            # shape) legitimately can't get a meaningful covariance
+            # estimate - expected and already handled below via the
+            # residual-based fit_cv, not via pcov, so this is noise, not
+            # a real problem to surface.
+            warnings.filterwarnings("ignore", category=OptimizeWarning)
+            popt, _ = curve_fit(model, tf, Tf, p0=p0, maxfev=20000)
+    except (RuntimeError, ValueError):
+        return None
+    Tinf, A, tau = (float(v) for v in popt)
+    if tau <= 0 or not np.isfinite(Tinf):
+        return None
+    residuals = Tf - model(tf, *popt)
+    fit_std = float(residuals.std())
+    fit_cv = (fit_std / Tinf) if Tinf else None
+    return {"Tinf": Tinf, "A": A, "tau": tau, "fit_std": fit_std, "fit_cv": fit_cv}
 
 
 def write_results_summary(case_dir, out_path, ventilation_ach, well_mixed_eACH_mean,

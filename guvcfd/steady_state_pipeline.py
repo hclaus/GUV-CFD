@@ -19,7 +19,10 @@ from .contaminant_source import (
     write_source_topo_set_dict, compute_source_strength, source_Su, source_fvoptions_entry,
     write_fvoptions_file,
 )
-from .decay_analysis import read_vol_average_dat, check_plateau_windowed, windowed_stats
+from .decay_analysis import (
+    read_vol_average_dat, check_plateau_windowed, windowed_stats,
+    windowed_stats_detrended, fit_asymptotic_value,
+)
 from .initial_fields import restore_boundary_conditions, resolve_inlet_velocity
 from .mesh_gen import opening_center, opening_half_extents
 from .monitoring import write_vol_average_dict, live_vol_average_functions
@@ -168,18 +171,37 @@ def _run_phase(case_dir, case_dir_wsl, n_iterations, write_interval, window_frac
 
 
 def _room_phase_summary(live_room, window_frac, converged, iterations, sparse_t, sparse_T, log_fn):
-    """Room-wide phase1/phase2 entry: T_ss is now the trailing-window mean
-    of the live per-iteration series (not the single last sample) - see
-    windowed_stats. `decay_curve`/`live` (sparse postProcess read / dense
-    per-iteration read) are both kept as-is for result_figures.py.
+    """Room-wide phase1/phase2 entry: T_ss is the trailing-window mean of
+    the live per-iteration series (not the single last sample) - see
+    windowed_stats. T_ss_std/T_ss_cv are the DETRENDED version
+    (windowed_stats_detrended) - a raw window std/CV conflates genuine
+    fluctuation with a still-slowly-changing average, which isn't what a
+    user checking "is this noisy" wants (see CHANGELOG); plateau/
+    convergence detection is unaffected, still on the raw statistic (see
+    check_plateau_windowed). Also attempts an exponential-approach
+    extrapolation to the true n->infinity value (fit_asymptotic_value) -
+    a windowed average is provably biased whenever the curve hasn't fully
+    flattened within the run's iteration budget, confirmed on a real run
+    (windowed averages at multiple window widths were all ~3% off a
+    well-fit extrapolation). None when the fit doesn't converge/isn't
+    available - not an error, just "couldn't extrapolate this one."
+    `decay_curve`/`live` (sparse postProcess read / dense per-iteration
+    read) are both kept as-is for result_figures.py.
     """
     live_t, live_T = live_room
-    mean, std, cv, n, span = windowed_stats(live_t, live_T, frac=window_frac)
+    mean, _, _, n, span = windowed_stats(live_t, live_T, frac=window_frac)
+    _, std, cv, _, _ = windowed_stats_detrended(live_t, live_T, frac=window_frac)
     cv_text = f"{cv * 100:.1f}%" if cv is not None else "n/a"
-    log_fn(f"  Moving average (last {span:.4g} iterations, n={n}): {mean:.4g} (CV={cv_text})")
+    log_fn(f"  Moving average (last {span:.4g} iterations, n={n}): {mean:.4g} (residual CV={cv_text})")
+    extrap = fit_asymptotic_value(live_t, live_T)
+    if extrap is not None:
+        log_fn(f"  Extrapolated T-infinity (exponential-approach fit): {extrap['Tinf']:.4g} "
+               f"(tau={extrap['tau']:.4g} iterations, fit CV={extrap['fit_cv'] * 100:.2f}%)")
     return {
         "T_ss": mean, "T_ss_std": std, "T_ss_cv": cv, "T_ss_window_span": span,
         "T_ss_window_n": n, "T_ss_window_frac": window_frac,
+        "T_inf_extrapolated": extrap["Tinf"] if extrap else None,
+        "T_inf_extrapolation_detail": extrap,
         "converged": converged, "iterations": iterations,
         "decay_curve": {"t": sparse_t.tolist(), "T": sparse_T.tolist()},
         "live": {"t": live_t.tolist(), "T": live_T.tolist()},
@@ -193,7 +215,8 @@ def _point_phase_summary(live_point, window_frac):
     (misnomer for steady-state's pseudo-iteration t, kept for continuity).
     """
     t, T = live_point
-    mean, std, cv, n, span = windowed_stats(t, T, frac=window_frac)
+    mean, _, _, n, span = windowed_stats(t, T, frac=window_frac)
+    _, std, cv, _, _ = windowed_stats_detrended(t, T, frac=window_frac)
     return {
         "T_ss": mean, "T_ss_std": std, "T_ss_cv": cv, "T_ss_window_span": span,
         "T_ss_window_n": n, "T_ss_window_frac": window_frac,

@@ -3,7 +3,10 @@ import math
 
 import numpy as np
 
-from guvcfd.decay_analysis import compute_effective_eACH, windowed_stats, write_results_summary, check_plateau_windowed
+from guvcfd.decay_analysis import (
+    compute_effective_eACH, windowed_stats, write_results_summary, check_plateau_windowed,
+    windowed_stats_detrended, fit_asymptotic_value,
+)
 
 
 def _synthetic_decay(lambda_per_s, t_max=1000, dt=10, T0=1.0):
@@ -155,3 +158,81 @@ def test_check_plateau_windowed_none_cv_never_converges():
     converged, cv = check_plateau_windowed(t, T, frac=1.0, rel_tol=0.01)
     assert converged is False
     assert cv is None
+
+
+def test_windowed_stats_detrended_flat_series_matches_raw():
+    t = list(range(100))
+    T = [5.0] * 100
+    mean, std, cv, n, span = windowed_stats_detrended(t, T, frac=0.15)
+    assert mean == 5.0
+    assert std == 0.0
+    assert cv == 0.0
+
+
+def test_windowed_stats_detrended_removes_a_pure_linear_trend():
+    # A perfectly linear ramp has zero noise once detrended, even though
+    # its raw std/CV (spread around the mean) is large.
+    t = list(range(100))
+    T = [float(i) for i in t]
+    mean_raw, std_raw, cv_raw, _, _ = windowed_stats(t, T, frac=0.15)
+    mean_det, std_det, cv_det, _, _ = windowed_stats_detrended(t, T, frac=0.15)
+    assert mean_raw == mean_det  # mean itself is unaffected by detrending
+    assert std_det < std_raw / 100  # essentially zero vs. a real raw spread
+    assert cv_det < cv_raw / 100
+
+
+def test_windowed_stats_detrended_noise_plus_trend_isolates_the_noise():
+    # Real-run-like case: a window that's both slowly rising AND noisy.
+    # Detrended CV should be much smaller than raw CV, since most of the
+    # raw spread is the (real, but non-noise) drift, not fluctuation.
+    import random
+    random.seed(2)
+    t = list(range(1000))
+    T = [1.0 + 0.0005 * i + random.uniform(-0.002, 0.002) for i in t]
+    _, std_raw, cv_raw, _, _ = windowed_stats(t, T, frac=0.15)
+    _, std_det, cv_det, _, _ = windowed_stats_detrended(t, T, frac=0.15)
+    assert cv_det < cv_raw
+    assert std_det > 0  # real noise still present, not zeroed out entirely
+
+
+def test_windowed_stats_detrended_falls_back_to_raw_for_two_points():
+    t = [0, 1, 2]
+    T = [1.0, 2.0, 3.0]
+    mean, std, cv, n, span = windowed_stats_detrended(t, T, frac=0.15)
+    assert n == 2
+    assert mean == 2.5
+    assert std > 0  # can't detrend 2 points meaningfully - falls back to raw
+
+
+def test_fit_asymptotic_value_recovers_known_exponential_approach():
+    # Synthetic data with a KNOWN true asymptote - the fit should recover
+    # it closely, and the last raw sample should visibly undershoot it
+    # (the whole point of extrapolating rather than just reading/averaging
+    # the tail).
+    true_Tinf, true_A, true_tau = 2.0, 0.5, 200.0
+    t = np.arange(0, 1000, 2, dtype=float)
+    T = true_Tinf - true_A * np.exp(-t / true_tau)
+    result = fit_asymptotic_value(t, T)
+    assert result is not None
+    assert abs(result["Tinf"] - true_Tinf) < 0.01
+    assert abs(result["tau"] - true_tau) / true_tau < 0.05
+    assert T[-1] < result["Tinf"]  # last sample still below the true asymptote
+
+
+def test_fit_asymptotic_value_none_for_too_little_data():
+    result = fit_asymptotic_value([0, 1, 2], [1.0, 1.5, 1.8])
+    assert result is None
+
+
+def test_fit_asymptotic_value_none_for_pure_noise():
+    # No underlying exponential shape at all - the fit shouldn't fabricate
+    # a confident extrapolation from noise.
+    import random
+    random.seed(3)
+    t = list(range(200))
+    T = [random.uniform(-1, 1) for _ in t]
+    result = fit_asymptotic_value(t, T)
+    # Either fails to converge (None) or, if it does converge, the fit
+    # quality must be poor (large fit_cv) rather than falsely confident.
+    if result is not None:
+        assert result["fit_cv"] is None or abs(result["fit_cv"]) > 0.5
