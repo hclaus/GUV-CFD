@@ -5,7 +5,7 @@ import numpy as np
 
 from guvcfd.decay_analysis import (
     compute_effective_eACH, windowed_stats, write_results_summary, check_plateau_windowed,
-    windowed_stats_detrended, fit_asymptotic_value,
+    windowed_stats_detrended, fit_asymptotic_value, check_t_infinity_stability,
 )
 
 
@@ -236,3 +236,41 @@ def test_fit_asymptotic_value_none_for_pure_noise():
     # quality must be poor (large fit_cv) rather than falsely confident.
     if result is not None:
         assert result["fit_cv"] is None or abs(result["fit_cv"]) > 0.5
+
+
+def test_t_infinity_stability_needs_full_streak():
+    assert check_t_infinity_stability([2.0, 2.0], rel_tol=0.02, streak=3) is False
+
+
+def test_t_infinity_stability_true_for_tight_agreement():
+    history = [1.6, 3.6, 2.5, 2.11, 1.99, 1.99, 2.02]
+    assert check_t_infinity_stability(history, rel_tol=0.02, streak=3) is True
+
+
+def test_t_infinity_stability_false_while_still_moving():
+    history = [1.6, 3.6, 2.5, 2.11]
+    assert check_t_infinity_stability(history, rel_tol=0.02, streak=3) is False
+
+
+def test_t_infinity_stability_none_in_recent_window_blocks_stop():
+    # A single failed fit within the trailing window must reset the streak
+    # - can't confirm stability from a gap in the data.
+    history = [2.0, 2.0, None, 2.0]
+    assert check_t_infinity_stability(history, rel_tol=0.02, streak=3) is False
+
+
+def test_t_infinity_stability_ignores_older_history_outside_streak():
+    # A wildly different value earlier in history shouldn't block a stop
+    # once the most recent `streak` values have settled.
+    history = [100.0, 2.0, 2.0, 2.0]
+    assert check_t_infinity_stability(history, rel_tol=0.02, streak=3) is True
+
+
+def test_t_infinity_stability_respects_custom_streak():
+    history = [2.0, 2.0]
+    assert check_t_infinity_stability(history, rel_tol=0.02, streak=2) is True
+
+
+def test_t_infinity_stability_zero_mean_never_stable():
+    history = [1.0, -1.0, 0.0]
+    assert check_t_infinity_stability(history, rel_tol=0.02, streak=3) is False

@@ -22,6 +22,9 @@ def test_run_steady_state_scenario_still_accepts_advanced_settings_params():
     assert params["plateau_rel_tol"].default == 0.01
     assert params["window_frac"].default == 0.15
     assert "plateau_window" not in params  # replaced - plateau check now uses window_frac too
+    assert params["t_inf_check_interval"].default is None
+    assert params["t_inf_rel_tol"].default is None  # disabled by default - opt-in
+    assert params["t_inf_streak"].default == 3
 
 
 def test_room_phase_summary_uses_windowed_mean_not_last_point():

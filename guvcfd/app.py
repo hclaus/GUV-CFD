@@ -781,6 +781,13 @@ def _run_steady_state(guv_path, case_dir, room, settings):
         cell_size=adv["mesh-cell-size"], nbins=adv["uv-zone-bins"],
         source_size=adv["source-zone-size"],
         plateau_rel_tol=adv["plateau-rel-tol"] / 100.0,
+        # 500-iteration check interval: the value backtested against a
+        # real run (see check_t_infinity_stability's docstring) - only
+        # meaningful when t_inf_rel_tol is actually set below, since
+        # _run_phase defaults check_interval to the whole phase (a no-op
+        # single chunk) otherwise.
+        t_inf_check_interval=500 if adv["t-infinity-early-stop-enabled"] else None,
+        t_inf_rel_tol=(adv["t-infinity-rel-tol"] / 100.0) if adv["t-infinity-early-stop-enabled"] else None,
         fan_entry=fan_entry, monitoring_points=_gather_monitoring_points(settings),
         patches_to_monitor=patches_to_monitor,
         log_fn=_run_log, should_stop=_should_stop, solver_log_fn=_track_solver_time,
@@ -904,6 +911,25 @@ def _labeled(label, component, help_text=None):
     if help_text:
         children.append(html.Div(help_text, className="form-text small"))
     return html.Div(children, className="mb-2")
+
+
+def _settings_checkbox_field(field_id, label, tooltip, value):
+    """Same visual row as _settings_field, but for a boolean toggle
+    (dbc.Checkbox) instead of a numeric input - both expose a plain
+    "value" property, so the generic _SETTINGS_FIELD_IDS/_KEYS-driven
+    save/load/reset machinery (a simple zip + json.dump/load, which
+    round-trips bool exactly as well as float) needs no special-casing
+    to include this alongside the numeric fields.
+    """
+    icon_id = f"{field_id}-info"
+    return dbc.Row([
+        dbc.Col(html.Div([
+            html.Span(label, className="small"),
+            html.Span(" ⓘ", id=icon_id, className="text-muted", style={"cursor": "help"}),
+            dbc.Tooltip(tooltip, target=icon_id, placement="top"),
+        ]), width=8),
+        dbc.Col(dbc.Checkbox(id=field_id, value=value), width=4, className="text-end"),
+    ], align="center", className="mb-2 gx-2")
 
 
 def _settings_field(field_id, label, tooltip, unit, value):
@@ -1378,6 +1404,36 @@ settings_modal = dbc.Modal(
                     "perfectly well-behaved. Lower this first if a steady-state run's T grows "
                     "or oscillates without bound instead of settling toward equilibrium.",
                     "", _adv_defaults["scalar-relaxation"],
+                ),
+                html.Hr(className="my-2"),
+                html.Div("Steady-state early stopping (experimental)",
+                          className="small fw-bold text-uppercase mb-1"),
+                html.Div(
+                    "Each steady-state phase (Phase 1/Phase 2) can stop before its full configured "
+                    "iteration budget once its extrapolated true steady-state value (\"Extrapolated "
+                    "T∞\" - see the report/Analysis tab) has stopped changing across several checks, "
+                    "instead of always running to completion. Purely an early exit — the configured "
+                    "iteration count remains a hard upper bound either way, so this can only save "
+                    "time, never make a run longer or change its final answer once T∞ genuinely has "
+                    "settled. Backtested against a real run: 1% tolerance barely saved anything, "
+                    "2-3% saved a real ~35% of the run without looking fragile (same stop point "
+                    "across that whole range) — start around 2% and loosen further only if it's "
+                    "still too conservative for your cases.",
+                    className="small text-muted mb-2",
+                ),
+                _settings_checkbox_field(
+                    "settings-t-infinity-early-stop-enabled", "Enable T∞ early stopping",
+                    "Off by default - this is a new, not-yet-widely-validated mechanism. Turn on "
+                    "once you've compared a couple of early-stopped runs against full runs on your "
+                    "own projects and trust it.",
+                    _adv_defaults["t-infinity-early-stop-enabled"],
+                ),
+                _settings_field(
+                    "settings-t-infinity-rel-tol", "T∞ stability tolerance",
+                    "How much 3 consecutive T∞ estimates (500 iterations apart) may differ from "
+                    "each other before the phase counts as settled and stops early. Only takes "
+                    "effect when the checkbox above is on.",
+                    "%", _adv_defaults["t-infinity-rel-tol"],
                 ),
                 html.Hr(className="my-2"),
                 html.Div("Decay-mode solver timing", className="small fw-bold text-uppercase mb-1"),
@@ -1896,6 +1952,7 @@ def _open_help_modal(*_clicks):
 _SETTINGS_FIELD_IDS = [
     "settings-flow-rel-tol", "settings-flow-max-iterations", "settings-plateau-rel-tol",
     "settings-momentum-relaxation", "settings-scalar-relaxation",
+    "settings-t-infinity-early-stop-enabled", "settings-t-infinity-rel-tol",
     "settings-pimple-delta-t", "settings-mesh-cell-size",
     "settings-uv-zone-bins", "settings-source-zone-size",
 ]
@@ -1904,6 +1961,7 @@ _SETTINGS_FIELD_IDS = [
 _SETTINGS_FIELD_KEYS = [
     "flow-rel-tol", "flow-max-iterations", "plateau-rel-tol",
     "momentum-relaxation", "scalar-relaxation",
+    "t-infinity-early-stop-enabled", "t-infinity-rel-tol",
     "pimple-delta-t", "mesh-cell-size", "uv-zone-bins", "source-zone-size",
 ]
 

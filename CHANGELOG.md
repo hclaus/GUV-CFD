@@ -1,5 +1,43 @@
 # Changelog
 
+## 2026-07-18 — T-infinity early stopping for steady-state phases (experimental, opt-in)
+
+Backtested whether the T∞ extrapolation could double as a stop criterion,
+not just a reporting number: on the real validated run, T∞ locked onto
+its final value (~2.02-2.03) by ~40% of the run's iteration budget and
+barely moved for the remaining 60% - while the windowed average never
+truly flattened even at 100%. A proper backtest of the actual proposed
+algorithm (checking every 500 iterations, requiring 3 consecutive
+estimates within tolerance) confirmed a real, non-fragile saving: 1%
+tolerance only saved 18%, but 2-3% consistently saved ~36% (identical
+stop point across that whole range - a good sign, not a fragile
+hair-trigger single value).
+
+- New `decay_analysis.check_t_infinity_stability(history, rel_tol, streak)`:
+  true once the last `streak` T∞ estimates are mutually within `rel_tol`
+  of each other (a *group spread* check, not pairwise consecutive-step
+  comparison - the latter has a blind spot for slow monotonic drift,
+  where every individual step can look "small enough" while the estimate
+  keeps moving cumulatively).
+- `steady_state_pipeline._run_phase` now runs each phase in chunks
+  (default 500 iterations) instead of one single `simpleFoam` call,
+  re-fitting T∞ from the accumulated live series after each chunk and
+  stopping early once stable - mirrors `run_pipeline.converge_flow_field`'s
+  already-proven chunked-continuation pattern (copy fields back to `0/`,
+  clean time dirs between chunks). The configured iteration budget
+  remains a hard upper bound regardless - if T∞ never stabilizes,
+  behavior is unchanged from before this feature existed. The live
+  per-iteration series is now accumulated in Python across chunks (with
+  a cumulative-iteration offset) rather than trusted to persist in
+  OpenFOAM's own postProcessing output across the chunk-cleanup boundary -
+  also removes the separate final `postProcess -dict system/volAverageDict`
+  pass entirely, replaced by downsampling the already-available dense
+  live series (result_figures.py already preferred the dense series over
+  this sparse one wherever both existed).
+- New Settings fields (off by default - opt-in until validated live):
+  **"Enable T∞ early stopping"** and **"T∞ stability tolerance"**
+  (default 2%, with the backtest numbers above in its help text).
+
 ## 2026-07-18 — Surface Extrapolated T∞ in report/Analysis tab; derive ACH from it
 
 - `.docx` report and Analysis tab now show a **"Phase N extrapolated T∞

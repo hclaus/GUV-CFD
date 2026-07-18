@@ -21,7 +21,7 @@ from .contaminant_source import (
 )
 from .decay_analysis import (
     read_vol_average_dat, check_plateau_windowed, windowed_stats,
-    windowed_stats_detrended, fit_asymptotic_value,
+    windowed_stats_detrended, fit_asymptotic_value, check_t_infinity_stability,
 )
 from .initial_fields import restore_boundary_conditions, resolve_inlet_velocity
 from .mesh_gen import opening_center, opening_half_extents
@@ -101,8 +101,40 @@ def _copy_latest_to_zero(case_dir_wsl, latest, include_T, log_fn):
 
 def _run_phase(case_dir, case_dir_wsl, n_iterations, write_interval, window_frac, plateau_rel_tol,
                 log_fn, should_stop=None, solver_log_fn=None, live_monitoring_zones=(),
-                live_patches=()):
-    set_control_dict_time(case_dir, end_time=n_iterations, write_interval=write_interval, delta_t=1)
+                live_patches=(), check_interval=None, t_inf_rel_tol=None, t_inf_streak=3):
+    """Run simpleFoam for n_iterations, tracking the room-wide (and any
+    monitoring-point) volAverage(T) live, every iteration.
+
+    check_interval/t_inf_rel_tol/t_inf_streak: optional early-stop via
+    T-infinity extrapolation stability (see decay_analysis.
+    fit_asymptotic_value/check_t_infinity_stability). When t_inf_rel_tol
+    is given, the phase runs in chunks of check_interval iterations
+    (each a fresh simpleFoam invocation starting from whatever 0/ holds -
+    same "run a chunk, copy converged fields back to 0/, clean time dirs"
+    pattern already proven in run_pipeline.converge_flow_field), re-fitting
+    the extrapolated T-infinity from the accumulated live series after
+    each chunk, and stopping once t_inf_streak consecutive estimates
+    agree within t_inf_rel_tol - rather than always running the full
+    n_iterations budget. Purely an early exit: n_iterations remains the
+    hard upper bound regardless (if T-infinity never stabilizes,
+    behavior is unchanged from before this feature existed).
+    t_inf_rel_tol=None (the default) disables this entirely -
+    check_interval then defaults to n_iterations, i.e. one chunk, the
+    original single-shot behavior.
+
+    Since fields get copied back to 0/ and time dirs cleaned after every
+    chunk (to keep a long, potentially-many-chunk run's case directory
+    lightweight), there's no lasting on-disk history to postProcess
+    against at the end - the live per-iteration series (accumulated in
+    Python across chunks, each chunk's own local time labels offset by
+    the iteration count already run) is the only source of truth, for
+    both the T-infinity fit and the returned decay_curve (downsampled
+    from it at write_interval cadence, replacing the old separate
+    `postProcess -dict system/volAverageDict` pass entirely - result_figures.py
+    already prefers "live" over "decay_curve" wherever both exist, so
+    this is a safe, compatible substitution).
+    """
+    check_interval = check_interval or n_iterations
     _clean_time_dirs(case_dir_wsl)
 
     # Live (every-iteration) volAverage tracking - splice into controlDict's
@@ -122,52 +154,107 @@ def _run_phase(case_dir, case_dir_wsl, n_iterations, write_interval, window_frac
             field="T", patches=live_patches, monitoring_zones=live_monitoring_zones)
         _, n_open, n_close = splice_into_functions_block(case_dir, block)
         assert n_open == n_close, f"Brace mismatch after live-volAverage splice: {n_open} vs {n_close}"
-    else:
-        # The set_control_dict_time() call above sweeps writeInterval
-        # everywhere in the file, including inside these live blocks
-        # (left over from an earlier phase) - re-pin them to 1 without
-        # touching the main solve's own writeInterval.
+
+    accumulated = {"room": ([], [])}
+    for zone in live_monitoring_zones:
+        accumulated[zone] = ([], [])
+    tinf_history = []
+    total_run = 0
+
+    while total_run < n_iterations:
+        chunk_size = min(check_interval, n_iterations - total_run)
+        set_control_dict_time(case_dir, end_time=chunk_size, write_interval=write_interval, delta_t=1)
+        # set_control_dict_time's sweep above touches every writeInterval
+        # in the file, including these live blocks (left over from an
+        # earlier chunk/phase) - re-pin them to 1 without touching the
+        # main solve's own writeInterval.
         for name in live_block_names:
             set_function_write_interval(case_dir, name, 1)
 
-    log_fn(f"Running simpleFoam ({n_iterations} iterations, writing every {write_interval})...")
-    r = run_wsl_streaming(
-        "simpleFoam 2>&1 | tee log.simpleFoam", case_dir_wsl,
-        on_line=solver_log_fn or log_fn, should_stop=should_stop, kill_pattern="simpleFoam",
-    )
-    if should_stop is not None and should_stop():
-        raise StoppedByUser("Stopped during simpleFoam phase.")
-    if r.returncode != 0 or "FOAM FATAL" in r.stdout or "Floating Point Exception" in r.stdout:
-        tail = "\n".join(r.stdout.splitlines()[-25:]) or "(no output captured)"
-        raise RuntimeError(f"simpleFoam failed (exit {r.returncode}):\n{tail}")
+        log_fn(f"Running simpleFoam ({total_run + 1}-{total_run + chunk_size} of {n_iterations} "
+               f"iterations, writing every {write_interval})...")
+        r = run_wsl_streaming(
+            "simpleFoam 2>&1 | tee log.simpleFoam", case_dir_wsl,
+            on_line=solver_log_fn or log_fn, should_stop=should_stop, kill_pattern="simpleFoam",
+        )
+        if should_stop is not None and should_stop():
+            raise StoppedByUser("Stopped during simpleFoam phase.")
+        if r.returncode != 0 or "FOAM FATAL" in r.stdout or "Floating Point Exception" in r.stdout:
+            tail = "\n".join(r.stdout.splitlines()[-25:]) or "(no output captured)"
+            raise RuntimeError(f"simpleFoam failed (exit {r.returncode}):\n{tail}")
 
-    r = run_wsl_or_raise(
-        "ls -d [0-9]*/ 2>/dev/null | sed 's#/##' | sort -n | tail -1",
-        case_dir_wsl, "listing time directories",
-    )
-    latest = r.stdout.strip()
-    if not latest or latest == "0":
-        raise RuntimeError(f"simpleFoam did not write any new time directory (found: {latest!r})")
+        r = run_wsl_or_raise(
+            "ls -d [0-9]*/ 2>/dev/null | sed 's#/##' | sort -n | tail -1",
+            case_dir_wsl, "listing time directories",
+        )
+        latest = r.stdout.strip()
+        if not latest or latest == "0":
+            raise RuntimeError(f"simpleFoam did not write any new time directory (found: {latest!r})")
 
-    # The live function object already wrote its own
-    # postProcessing/*Live/<startTime>/ files during the solve above - read
-    # those back *before* wiping postProcessing/ for the postProcess pass,
-    # since postProcess doesn't touch (or need) them.
-    live_curves = {"room": read_vol_average_dat(
-        f"{case_dir}/postProcessing/volAverageLive1/0/volFieldValue.dat")}
-    for zone in live_monitoring_zones:
-        live_curves[zone] = read_vol_average_dat(
-            f"{case_dir}/postProcessing/monitor_{zone}Live/0/volFieldValue.dat")
+        # This chunk's own live tracking - every chunk starts fresh at
+        # time-label "0" (startFrom/startTime are never changed in this
+        # pipeline), so its own postProcessing output only covers this
+        # chunk's iterations - offset by total_run before appending, to
+        # build one continuous global series across chunks.
+        chunk_t, chunk_T = read_vol_average_dat(f"{case_dir}/postProcessing/volAverageLive1/0/volFieldValue.dat")
+        acc_t, acc_T = accumulated["room"]
+        acc_t.extend((chunk_t + total_run).tolist())
+        acc_T.extend(chunk_T.tolist())
+        for zone in live_monitoring_zones:
+            zt, zT = read_vol_average_dat(f"{case_dir}/postProcessing/monitor_{zone}Live/0/volFieldValue.dat")
+            azt, azT = accumulated[zone]
+            azt.extend((zt + total_run).tolist())
+            azT.extend(zT.tolist())
 
-    run_wsl_or_raise("rm -rf postProcessing", case_dir_wsl, "clearing stale postProcessing")
-    run_wsl_or_raise("postProcess -dict system/volAverageDict", case_dir_wsl, "postProcess volAverage")
-    t, T = read_vol_average_dat(f"{case_dir}/postProcessing/volAverage1/0/volFieldValue.dat")
+        total_run += chunk_size
+
+        stop_early = False
+        if t_inf_rel_tol is not None and total_run < n_iterations:
+            fit = fit_asymptotic_value(np.array(acc_t), np.array(acc_T))
+            tinf_history.append(fit["Tinf"] if fit else None)
+            if check_t_infinity_stability(tinf_history, rel_tol=t_inf_rel_tol, streak=t_inf_streak):
+                log_fn(f"  T-infinity stable ({t_inf_streak}x within {t_inf_rel_tol:.0%}) - "
+                       f"stopping early at {total_run}/{n_iterations} iterations.")
+                stop_early = True
+
+        if stop_early or total_run >= n_iterations:
+            # Final chunk - leave its own directory in place (renamed to
+            # its true CUMULATIVE iteration count; each chunk's own
+            # OpenFOAM-assigned directory name restarts from 1, see
+            # docstring) rather than copying-back-and-cleaning like every
+            # earlier chunk needed for continuation. The caller decides
+            # whether to keep or clean this final directory (mirrors the
+            # pre-chunking behavior exactly: phase 1's final directory
+            # gets cleaned by the caller since only phase 2's matters for
+            # standalone ParaView viewing; phase 2's is deliberately kept).
+            if latest != str(total_run):
+                run_wsl_or_raise(f"mv {latest} {total_run}", case_dir_wsl,
+                                  "renaming final chunk's time directory")
+            run_wsl_or_raise("rm -rf postProcessing", case_dir_wsl, "clearing this chunk's postProcessing")
+            break
+
+        log_fn(f"  Copying fields from {latest}/ to 0/ so the next chunk continues from here...")
+        _copy_latest_to_zero(case_dir_wsl, latest, include_T=True, log_fn=log_fn)
+        run_wsl_or_raise("rm -rf postProcessing", case_dir_wsl, "clearing this chunk's postProcessing")
+        _clean_time_dirs(case_dir_wsl)
+
+    live_curves = {zone: (np.array(vals[0]), np.array(vals[1])) for zone, vals in accumulated.items()}
     live_t, live_T = live_curves["room"]
+
+    # Sparse ("decay_curve") series for result_figures.py's fallback/older-
+    # results-file path - downsampled from the dense live series rather
+    # than a separate OpenFOAM postProcess call (see docstring).
+    stride = max(1, int(write_interval))
+    sparse_t, sparse_T = live_t[::stride], live_T[::stride]
+    if len(live_t) and (len(sparse_t) == 0 or sparse_t[-1] != live_t[-1]):
+        sparse_t = np.append(sparse_t, live_t[-1])
+        sparse_T = np.append(sparse_T, live_T[-1])
+
     converged, cv = check_plateau_windowed(live_t, live_T, frac=window_frac, rel_tol=plateau_rel_tol)
     cv_text = f"{cv * 100:.2f}%" if cv is not None else "n/a"
-    log_fn(f"  Stopped at time {latest}. T_ss={T[-1]:.4g} (trailing-{window_frac:.0%} CV={cv_text}, "
+    log_fn(f"  Stopped at time {total_run}. T_ss={live_T[-1]:.4g} (trailing-{window_frac:.0%} CV={cv_text}, "
            f"{'plateaued' if converged else 'NOT YET PLATEAUED - consider more iterations'})")
-    return latest, t, T, converged, live_curves
+    return str(total_run), sparse_t, sparse_T, converged, live_curves
 
 
 def _room_phase_summary(live_room, window_frac, converged, iterations, sparse_t, sparse_T, log_fn):
@@ -235,12 +322,20 @@ def run_steady_state_scenario(case_dir, room_x, room_y, room_z, ach, Z, nbins=25
                                phase1_iterations=8000, phase1_write_interval=200,
                                phase2_iterations=3000, phase2_write_interval=100,
                                plateau_rel_tol=0.01, window_frac=0.15,
+                               t_inf_check_interval=None, t_inf_rel_tol=None, t_inf_streak=3,
                                fan_entry=None, monitoring_points=None,
                                patches_to_monitor=("outlet",), log_fn=print, should_stop=None,
                                solver_log_fn=None):
     """Run both phases of a continuous-source steady-state scenario against
     an already-converged case (mesh + flow + fluenceRate/kUV must already
     exist - see run_pipeline.setup_case()). Returns a summary dict.
+
+    t_inf_check_interval/t_inf_rel_tol/t_inf_streak: optional early-stop
+    for both phases via T-infinity extrapolation stability (see
+    _run_phase/decay_analysis.check_t_infinity_stability) - t_inf_rel_tol
+    is None by default (disabled; each phase always runs its full
+    phaseN_iterations budget, today's behavior). GUI-exposed as a
+    cross-project "advanced" setting (Settings menu, right of File).
 
     fan_entry: pre-built fvOptions entry text (see fan.fan_fvoptions_entry())
     if a mixing fan should stay active through both phases, same "always
@@ -347,8 +442,14 @@ def run_steady_state_scenario(case_dir, room_x, room_y, room_z, ach, Z, nbins=25
         window_frac, plateau_rel_tol, log_fn, should_stop=should_stop,
         solver_log_fn=solver_log_fn, live_monitoring_zones=live_zone_names,
         live_patches=patches_to_monitor,
+        check_interval=t_inf_check_interval, t_inf_rel_tol=t_inf_rel_tol, t_inf_streak=t_inf_streak,
     )
     summary["phase1"] = _room_phase_summary(live1["room"], window_frac, converged1, latest1, t1, T1, log_fn)
+    # _run_phase leaves its final chunk's own time directory in place
+    # (renamed to latest1, its true cumulative iteration count) rather
+    # than cleaning it itself - phase 1's own final state isn't meant for
+    # standalone ParaView viewing (unlike phase 2's, kept below), so the
+    # caller copies it into 0/ and cleans it away here.
     _copy_latest_to_zero(case_dir_wsl, latest1, include_T=True, log_fn=log_fn)
     _clean_time_dirs(case_dir_wsl)
 
@@ -365,6 +466,7 @@ def run_steady_state_scenario(case_dir, room_x, room_y, room_z, ach, Z, nbins=25
         window_frac, plateau_rel_tol, log_fn, should_stop=should_stop,
         solver_log_fn=solver_log_fn, live_monitoring_zones=live_zone_names,
         live_patches=patches_to_monitor,
+        check_interval=t_inf_check_interval, t_inf_rel_tol=t_inf_rel_tol, t_inf_streak=t_inf_streak,
     )
     summary["phase2"] = _room_phase_summary(live2["room"], window_frac, converged2, latest2, t2, T2, log_fn)
     if monitoring_points:
@@ -375,6 +477,10 @@ def run_steady_state_scenario(case_dir, room_x, room_y, room_z, ach, Z, nbins=25
             }
             for p in monitoring_points
         }
+    # Unlike phase 1, phase 2's final time directory is deliberately KEPT
+    # (not cleaned) - it's the scenario's true final state, and a real
+    # numbered directory (not just "0/") is what lets ParaView show it as
+    # a proper timestep rather than the only entry in its time list.
     _copy_latest_to_zero(case_dir_wsl, latest2, include_T=True, log_fn=log_fn)
 
     lambda_vent = ach / 3600.0

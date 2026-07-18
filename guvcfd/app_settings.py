@@ -22,6 +22,8 @@ ADVANCED_SETTINGS_DEFAULTS = {
     "source-zone-size": 0.30,  # meters
     "momentum-relaxation": 0.7,  # SIMPLE under-relaxation for U/(k|omega)
     "scalar-relaxation": 0.7,    # SIMPLE under-relaxation for T
+    "t-infinity-early-stop-enabled": False,  # opt-in - see steady_state_pipeline._run_phase
+    "t-infinity-rel-tol": 2.0,   # % - T-infinity stability tolerance (see check_t_infinity_stability)
 }
 
 
