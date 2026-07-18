@@ -1,4 +1,8 @@
-from guvcfd.mesh_gen import _opening_box, opening_center, topo_set_dict, create_patch_dict, write_mesh_dicts
+import math
+
+from guvcfd.mesh_gen import (
+    _opening_box, opening_center, opening_half_extents, topo_set_dict, create_patch_dict, write_mesh_dicts,
+)
 
 _ROOM = (3.2, 4.8, 2.57)  # Lx, Ly, Lz
 
@@ -141,3 +145,27 @@ def test_opening_center_uses_the_same_snapped_box_as_write_mesh_dicts():
     assert center_unsnapped == (2.0, 1.5, 2.7)
     assert abs(abs(center_snapped[0] - 2.0) - 0.05) < 1e-9  # shifted by half a cell in x
     assert abs(center_snapped[1] - 1.5) < 1e-9  # y needed no shift (even cell count)
+
+
+def test_opening_half_extents_matches_nominal_size_when_already_grid_aligned():
+    hw, hh = opening_half_extents("ceiling", 4.0, 3.0, 2.7, (0.5, 0.5), (0.4, 0.4), cell_size=0.1)
+    assert math.isclose(hw, 0.2, abs_tol=1e-9)
+    assert math.isclose(hh, 0.2, abs_tol=1e-9)
+
+
+def test_opening_half_extents_reflects_the_same_snapped_box_as_opening_center():
+    # 0.6 x 0.3 opening on xMax (the real project's failing-then-fixed
+    # geometry) - half-extents should be the TRUE physical half-width/
+    # half-height of whatever box actually got carved, matching
+    # _opening_box exactly (not just the nominal size/2).
+    lo, hi = _opening_box("xMax", 4.0, 3.0, 2.7, (0.3, 0.8), (0.6, 0.3), cell_size=0.1, eps=0.0)
+    hw, hh = opening_half_extents("xMax", 4.0, 3.0, 2.7, (0.3, 0.8), (0.6, 0.3), cell_size=0.1)
+    # xMax's in-plane axes are (a1=1/y, a2=2/z) - see _WALL_SPECS.
+    assert math.isclose(hw, (hi[1] - lo[1]) / 2, abs_tol=1e-9)
+    assert math.isclose(hh, (hi[2] - lo[2]) / 2, abs_tol=1e-9)
+
+
+def test_opening_half_extents_no_snap_matches_nominal_size_exactly():
+    hw, hh = opening_half_extents("frontWall", 4.0, 3.0, 2.7, (0.5, 0.5), (0.5, 0.2))
+    assert math.isclose(hw, 0.25, abs_tol=1e-9)
+    assert math.isclose(hh, 0.1, abs_tol=1e-9)

@@ -77,60 +77,174 @@ def test_field_file_content_with_both_second_openings_stays_valid_dict_shape():
         assert f"    {patch}\n    {{" in content
 
 
-def test_radial_velocities_point_outward_and_preserve_magnitude():
-    # A ceiling opening centered at (2, 1.5, 2.7), faces spread around it.
+def test_radial_velocities_preserve_magnitude_and_spread_apart():
+    # A ceiling opening centered at (2, 1.5, 2.7), half_extents=(0.3,0.3),
+    # 3 faces exactly at that half-extent (r_norm=1 - full surface_angle_deg
+    # tilt, no tapering effect to account for here).
     opening_center = (2.0, 1.5, 2.7)
+    half_extents = (0.3, 0.3)
     face_centers = [
         (2.3, 1.5, 2.7),   # +x of center
         (2.0, 1.8, 2.7),   # +y of center
         (1.7, 1.5, 2.7),   # -x of center
     ]
     v_mag = 0.5
-    velocities = compute_radial_inlet_velocities(face_centers, opening_center, "ceiling", v_mag)
+    velocities = compute_radial_inlet_velocities(face_centers, opening_center, "ceiling", v_mag, half_extents)
 
     assert len(velocities) == 3
     for v in velocities:
         assert math.isclose(math.sqrt(sum(c * c for c in v)), v_mag, rel_tol=1e-9)
 
-    vx0, vy0, vz0 = velocities[0]
-    assert vx0 > 0  # spreads away from center in +x
-    assert math.isclose(vy0, 0.0, abs_tol=1e-9)
-    vx1, vy1, vz1 = velocities[1]
-    assert vy1 > 0  # spreads away from center in +y
-    vx2, vy2, vz2 = velocities[2]
-    assert vx2 < 0  # spreads away from center in -x
-
-    # ceiling's inward normal is (0,0,-1) - every face should get the same
-    # small downward (negative z) tilt into the room.
+    # All 3 faces are at the opening's half-extent -> all at "the edge"
+    # (r_norm=1) -> every one gets the same, full surface_angle_deg tilt.
     for v in velocities:
         assert v[2] < 0
         assert math.isclose(v[2], -v_mag * math.sin(math.radians(15)), rel_tol=1e-6)
 
+    # The 3 directions should be mutually distinct (spread apart), not
+    # collapsed onto the same or opposite vectors.
+    for i in range(3):
+        for j in range(i + 1, 3):
+            diff = math.sqrt(sum((a - b) ** 2 for a, b in zip(velocities[i], velocities[j])))
+            assert diff > 1e-6
+
 
 def test_radial_velocities_generalize_to_a_side_wall():
-    # xMin's in-plane axes are (y,z), inward normal (1,0,0) - a face
-    # offset only in y from the opening center should have zero
-    # z-component and a positive x-component (tilted into the room).
+    # xMin's in-plane axes are (y,z), inward normal (1,0,0). A single face
+    # exactly at its declared half-extent (r_norm=1, full tilt).
     opening_center = (0.0, 1.5, 1.2)
+    half_extents = (0.3, 0.3)
     face_centers = [(0.0, 1.8, 1.2)]
     v_mag = 0.3
-    v = compute_radial_inlet_velocities(face_centers, opening_center, "xMin", v_mag)[0]
+    v = compute_radial_inlet_velocities(face_centers, opening_center, "xMin", v_mag, half_extents)[0]
     assert math.isclose(math.sqrt(sum(c * c for c in v)), v_mag, rel_tol=1e-9)
-    assert v[1] > 0  # spreads toward +y, away from center
-    assert math.isclose(v[2], 0.0, abs_tol=1e-9)  # no z offset given, no z spread
     assert v[0] > 0  # tilted into the room along xMin's inward normal (+x)
+    assert math.isclose(v[0], v_mag * math.sin(math.radians(15)), rel_tol=1e-6)
+
+
+def test_radial_velocities_taper_toward_center_angle_near_the_opening_center():
+    # A face near the opening's center should get mostly the center_angle
+    # (straight into the room, little radial spread); a face at the
+    # opening's outer edge should get mostly surface_angle (strong radial
+    # spread) - this is the fix for the near-center singularity (see
+    # docstring): two faces immediately straddling the center no longer
+    # differ by anywhere near full magnitude, because neither pushes hard
+    # radially right there.
+    opening_center = (2.0, 1.5, 2.7)
+    half_extents = (0.3, 0.3)
+    near_center = (2.02, 1.5, 2.7)   # r=0.02 -> r_norm=0.0667
+    at_edge = (2.3, 1.5, 2.7)        # r=0.3 -> r_norm=1 (at the true edge)
+    v_mag = 0.5
+    v_near, v_edge = compute_radial_inlet_velocities(
+        [near_center, at_edge], opening_center, "ceiling", v_mag, half_extents)
+
+    # normal (z, tilt) component: near-center face should be much closer
+    # to center_angle_deg=90 (i.e. |z| close to v_mag), edge face close to
+    # surface_angle_deg=15 (i.e. |z| close to v_mag*sin(15)).
+    assert abs(v_near[2]) > abs(v_edge[2])
+    assert math.isclose(v_edge[2], -v_mag * math.sin(math.radians(15)), rel_tol=1e-6)
+
+    # in-plane (radial) component: near-center face should be much smaller
+    # than the edge face's.
+    in_plane_near = math.sqrt(v_near[0] ** 2 + v_near[1] ** 2)
+    in_plane_edge = math.sqrt(v_edge[0] ** 2 + v_edge[1] ** 2)
+    assert in_plane_near < in_plane_edge
+
+    # Both still preserve exact magnitude v_mag regardless of tilt blend.
+    assert math.isclose(math.sqrt(sum(c * c for c in v_near)), v_mag, rel_tol=1e-9)
+    assert math.isclose(math.sqrt(sum(c * c for c in v_edge)), v_mag, rel_tol=1e-9)
+
+
+def test_radial_velocities_cover_full_circle_uniformly():
+    # 8 faces evenly spaced around a circle, opening's half_extents equal
+    # in both axes (a "square" opening) - a uniform scale factor doesn't
+    # distort angles, so an already-uniform circular input stays uniform.
+    opening_center = (2.0, 1.5, 2.7)
+    half_extents = (0.3, 0.3)
+    r = 0.3
+    face_centers = [
+        (2.0 + r * math.cos(math.radians(a)), 1.5 + r * math.sin(math.radians(a)), 2.7)
+        for a in range(0, 360, 45)
+    ]
+    v_mag = 0.4
+    velocities = compute_radial_inlet_velocities(face_centers, opening_center, "ceiling", v_mag, half_extents)
+    angles = sorted(math.degrees(math.atan2(v[1], v[0])) % 360 for v in velocities)
+    gaps = [(angles[(i + 1) % 8] - angles[i]) % 360 for i in range(8)]
+    for gap in gaps:
+        assert math.isclose(gap, 45.0, abs_tol=1e-6)
+
+
+def test_radial_velocities_any_midline_face_is_exactly_cardinal():
+    # The shape-normalized angle formula (docstring point 2) means ANY
+    # face on the opening's actual midline gets an exact cardinal
+    # direction - not just one arbitrarily-chosen face, unlike the
+    # discrete "sort and redistribute" scheme this replaced. Elongated,
+    # non-square opening (0.6 x 0.3) so hw != hh matters.
+    opening_center = (2.0, 1.5, 2.7)
+    half_extents = (0.3, 0.15)
+    # 3 different faces, all on the z=const (dz=0) midline, at different
+    # distances from center - every one should point purely in +/-x.
+    face_centers = [(2.05, 1.5, 2.7), (2.15, 1.5, 2.7), (1.9, 1.5, 2.7)]
+    v_mag = 0.4
+    velocities = compute_radial_inlet_velocities(face_centers, opening_center, "ceiling", v_mag, half_extents)
+    for fc, v in zip(face_centers, velocities):
+        in_plane_y = v[1]
+        assert math.isclose(in_plane_y, 0.0, abs_tol=1e-9)
+        expected_sign = 1 if fc[0] > opening_center[0] else -1
+        assert (v[0] > 0) == (expected_sign > 0)
+
+
+def test_radial_velocities_adjacent_grid_faces_no_longer_flip_near_180_degrees():
+    # Regression test for the real failure this fix addresses: on an
+    # even-width rectangular grid, two faces immediately straddling the
+    # opening's exact center used to get assigned near-opposite
+    # directions (a velocity discontinuity that destabilized a real
+    # steady-state UV-decay solve). Reproduces the failing project's
+    # actual opening size (0.6 x 0.3 m at cell_size=0.1 m -> 6x3 grid),
+    # using the opening's TRUE physical half-extents (0.3, 0.15) - not the
+    # mesh's own sampled face-position extremes, which under-reach the
+    # true edge by half a cell.
+    cell = 0.1
+    w, h = 0.6, 0.3
+    cy, cz = 1.2, 2.4
+    half_extents = (w / 2, h / 2)
+    ys = [cy - w / 2 + cell / 2 + i * cell for i in range(6)]
+    zs = [cz - h / 2 + cell / 2 + i * cell for i in range(3)]
+    face_centers = [(0.0, y, z) for z in zs for y in ys]
+    v_mag = 0.278
+
+    velocities = compute_radial_inlet_velocities(face_centers, (0.0, cy, cz), "xMax", v_mag, half_extents)
+
+    n_y, n_z = 6, 3
+    max_diff = 0.0
+    for iz in range(n_z):
+        for iy in range(n_y):
+            idx = iz * n_y + iy
+            for diy, diz in ((1, 0), (0, 1)):
+                jy, jz = iy + diy, iz + diz
+                if jy < n_y and jz < n_z:
+                    jdx = jz * n_y + jy
+                    diff = math.sqrt(sum((a - b) ** 2 for a, b in zip(velocities[idx], velocities[jdx])))
+                    max_diff = max(max_diff, diff)
+
+    # Old (pre-fix) model's worst adjacent-face jump on this exact opening
+    # was 0.537 (out of a theoretical max of 2*v_mag=0.556 - i.e. almost a
+    # full 180 degree flip). This fix (true-extent Euclidean taper +
+    # shape-normalized angle) measured 0.233 - verify it stays well below
+    # the old value, with margin for float noise.
+    assert max_diff < 0.3
 
 
 def test_radial_velocity_falls_back_to_normal_when_face_is_at_center():
     # A degenerate case: face center coincides exactly with the opening
     # center - no radial direction is defined, must not divide by zero.
-    v = compute_radial_inlet_velocities([(1.0, 1.0, 1.0)], (1.0, 1.0, 1.0), "floor", 0.4)[0]
+    v = compute_radial_inlet_velocities([(1.0, 1.0, 1.0)], (1.0, 1.0, 1.0), "floor", 0.4, (0.3, 0.3))[0]
     assert v == pytest.approx(tuple(0.4 * d for d in WALL_INFLOW_DIRECTION["floor"]))
 
 
 def test_radial_velocities_return_plain_floats_not_numpy():
     # Must be JSON-serializable once stored in results.json/summary dicts.
-    v = compute_radial_inlet_velocities([(2.3, 1.5, 2.7)], (2.0, 1.5, 2.7), "ceiling", 0.5)[0]
+    v = compute_radial_inlet_velocities([(2.3, 1.5, 2.7)], (2.0, 1.5, 2.7), "ceiling", 0.5, (0.3, 0.3))[0]
     assert all(isinstance(c, float) for c in v)
 
 
@@ -147,7 +261,8 @@ def test_resolve_ceiling_reads_face_centers_and_computes_radial(monkeypatch):
         return [(0.3, 1.5, 2.7), (-0.3, 1.5, 2.7)]
 
     monkeypatch.setattr(initial_fields, "read_patch_face_centers", fake_read_patch_face_centers)
-    result = resolve_inlet_velocity("case123", "inlet", "ceiling", (0, 1.5, 2.7), 0.5, diffuser_type="ceiling")
+    result = resolve_inlet_velocity("case123", "inlet", "ceiling", (0, 1.5, 2.7), 0.5, diffuser_type="ceiling",
+                                     half_extents=(0.3, 0.3))
 
     assert calls == [("case123", "inlet")]
     assert len(result) == 2

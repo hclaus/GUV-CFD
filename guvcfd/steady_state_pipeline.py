@@ -21,7 +21,7 @@ from .contaminant_source import (
 )
 from .decay_analysis import read_vol_average_dat, check_plateau, windowed_stats
 from .initial_fields import restore_boundary_conditions, resolve_inlet_velocity
-from .mesh_gen import opening_center
+from .mesh_gen import opening_center, opening_half_extents
 from .monitoring import write_vol_average_dict, live_vol_average_functions
 from .monitoring_points import write_monitoring_topo_set_dict, zone_name
 from .splice import (
@@ -297,11 +297,17 @@ def run_steady_state_scenario(case_dir, room_x, room_y, room_z, ach, Z, nbins=25
     if inlet_diffuser_type == "ceiling":
         v_mag = float(np.linalg.norm(inlet_velocity))
         center = opening_center(inlet_wall, room_x, room_y, room_z, inlet_center, inlet_size, cell_size=cell_size)
-        inlet_velocity = resolve_inlet_velocity(case_dir, "inlet", inlet_wall, center, v_mag, "ceiling")
+        extents = opening_half_extents(inlet_wall, room_x, room_y, room_z, inlet_center, inlet_size,
+                                        cell_size=cell_size)
+        inlet_velocity = resolve_inlet_velocity(case_dir, "inlet", inlet_wall, center, v_mag, "ceiling",
+                                                 half_extents=extents)
     if inlet2_diffuser_type == "ceiling" and inlet2_velocity is not None:
         v_mag2 = float(np.linalg.norm(inlet2_velocity))
         center2 = opening_center(inlet2_wall, room_x, room_y, room_z, inlet2_center, inlet2_size, cell_size=cell_size)
-        inlet2_velocity = resolve_inlet_velocity(case_dir, "inlet2", inlet2_wall, center2, v_mag2, "ceiling")
+        extents2 = opening_half_extents(inlet2_wall, room_x, room_y, room_z, inlet2_center, inlet2_size,
+                                         cell_size=cell_size)
+        inlet2_velocity = resolve_inlet_velocity(case_dir, "inlet2", inlet2_wall, center2, v_mag2, "ceiling",
+                                                  half_extents=extents2)
 
     # --- Phase 1: source only, no UV ---
     log_fn("=== Phase 1: source only (no UV) ===")

@@ -19,7 +19,7 @@ from .fluence import compute_fluence_at_points, compute_inactivation_rate, compu
 from .initial_fields import (
     write_initial_fields, compute_inlet_velocity, restore_boundary_conditions, resolve_inlet_velocity,
 )
-from .mesh_gen import write_mesh_dicts, write_map_fields_dict, opening_center
+from .mesh_gen import write_mesh_dicts, write_map_fields_dict, opening_center, opening_half_extents
 from .monitoring import write_vol_average_dict
 from .splice import (
     splice_fv_options_into_control_dict,
@@ -292,7 +292,8 @@ def setup_case(guv_path, case_dir, template_case_dir=None, cell_size=0.1, Z=2.0,
                inlet2_diffuser_type="direct",
                outlet2_wall=None, outlet2_center=None, outlet2_size=None,
                converge_flow=True, simple_foam_iterations=500, flow_convergence_method="simple",
-               flow_rel_tol=0.01, pimple_end_time=120, pimple_write_interval=10, pimple_delta_t=0.5,
+               flow_rel_tol=0.01, flow_max_iterations=20000,
+               pimple_end_time=120, pimple_write_interval=10, pimple_delta_t=0.5,
                fan_speed=None, fan_center=None, fan_direction=(0, 0, -1),
                fan_disk_radius=0.6, fan_disk_thickness=0.2, fan_height=None,
                log_fn=print, should_stop=None, solver_log_fn=None):
@@ -320,6 +321,12 @@ def setup_case(guv_path, case_dir, template_case_dir=None, cell_size=0.1, Z=2.0,
     converge_flow: if True, run simpleFoam (see converge_flow_field()) to get
     a genuinely converged flow field for this mesh, rather than trusting
     mapFields' interpolated guess as-is.
+
+    flow_max_iterations: hard cap on total simpleFoam/pimpleFoam iterations
+    during flow convergence (see converge_flow_field's own docstring for
+    what happens when this is hit without converging) - GUI-exposed as a
+    cross-project "advanced" default (Settings menu, right of File), like
+    flow_rel_tol/cell_size/nbins above.
 
     pimple_end_time/pimple_write_interval: the transient UV-decay run's
     simulated duration [s] and write cadence [s] - GUI-exposed per-project
@@ -417,13 +424,17 @@ def setup_case(guv_path, case_dir, template_case_dir=None, cell_size=0.1, Z=2.0,
     inlet_velocity = resolve_inlet_velocity(
         case_dir, "inlet", inlet_wall,
         opening_center(inlet_wall, room.x, room.y, room.z, inlet_center, inlet_size, cell_size=cell_size),
-        v_mag, diffuser_type=inlet_diffuser_type)
+        v_mag, diffuser_type=inlet_diffuser_type,
+        half_extents=opening_half_extents(inlet_wall, room.x, room.y, room.z, inlet_center, inlet_size,
+                                           cell_size=cell_size))
     inlet2_velocity = None
     if inlet2_wall is not None:
         inlet2_velocity = resolve_inlet_velocity(
             case_dir, "inlet2", inlet2_wall,
             opening_center(inlet2_wall, room.x, room.y, room.z, inlet2_center, inlet2_size, cell_size=cell_size),
-            v_mag, diffuser_type=inlet2_diffuser_type)
+            v_mag, diffuser_type=inlet2_diffuser_type,
+            half_extents=opening_half_extents(inlet2_wall, room.x, room.y, room.z, inlet2_center, inlet2_size,
+                                               cell_size=cell_size))
     log_fn(f"Writing initial fields (0/{{U,p,k,omega,nut,T}}), ACH={ach} -> "
            f"inlet velocity magnitude {v_mag:.4g} m/s ({inlet_diffuser_type})"
            + (f", inlet2 ({inlet2_diffuser_type})" if inlet2_velocity else "")
@@ -460,7 +471,7 @@ def setup_case(guv_path, case_dir, template_case_dir=None, cell_size=0.1, Z=2.0,
                f"{simple_foam_iterations} iterations)...")
         converge_flow_field(case_dir, n_iterations=simple_foam_iterations, fan_entry=fan_entry,
                              log_fn=log_fn, should_stop=should_stop, method=flow_convergence_method,
-                             rel_tol=flow_rel_tol, solver_log_fn=solver_log_fn)
+                             rel_tol=flow_rel_tol, max_iterations=flow_max_iterations, solver_log_fn=solver_log_fn)
         if should_stop is not None and should_stop():
             raise StoppedByUser("Stopped after flow convergence.")
         log_fn("  restoring our own boundary conditions again (simpleFoam's mesh-derived "

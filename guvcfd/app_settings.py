@@ -14,6 +14,7 @@ ADVANCED_SETTINGS_PATH = Path(__file__).resolve().parent.parent / "advanced_sett
 # functions themselves take; divide by 100 at the call site.
 ADVANCED_SETTINGS_DEFAULTS = {
     "flow-rel-tol": 1.0,       # % - converge_flow_field's rel_tol
+    "flow-max-iterations": 20000,  # hard cap on total flow-convergence iterations
     "plateau-rel-tol": 1.0,    # % - steady-state phase plateau rel_tol
     "plateau-window": 5,       # samples
     "pimple-delta-t": 0.5,     # seconds - decay solver time step

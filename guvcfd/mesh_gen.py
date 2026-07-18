@@ -127,6 +127,27 @@ def opening_center(wall, Lx, Ly, Lz, center_frac, size, cell_size=None):
     return tuple((l + h) / 2 for l, h in zip(lo, hi))
 
 
+def opening_half_extents(wall, Lx, Ly, Lz, center_frac, size, cell_size=None):
+    """The opening's true (half_width, half_height) in its wall's two
+    in-plane dimensions, in (a1, a2) axis order (see _WALL_SPECS) - from
+    the same snapped box opening_center() derives its center from, so
+    callers get the *actual* carved half-extents (which can differ
+    slightly from the nominal `size` once grid-snapped) rather than
+    reconstructing size/2 by hand and risking it drifting out of sync.
+
+    Used by initial_fields.compute_radial_inlet_velocities to normalize
+    each face's offset by the opening's real physical shape (stretching a
+    rectangular opening into a unit circle before taking its angle) -
+    using the true half-extents here, not just the mesh's own sampled
+    face-position extremes, matters because mesh faces are inset by half
+    a cell from the true physical edge, so inferring "how close to the
+    edge is this face" from sampled data alone underestimates it.
+    """
+    lo, hi = _opening_box(wall, Lx, Ly, Lz, center_frac, size, cell_size=cell_size)
+    _, _, (a1, a2) = _WALL_SPECS[wall]
+    return (hi[a1] - lo[a1]) / 2, (hi[a2] - lo[a2]) / 2
+
+
 def _face_set_action(name, box):
     (x0, y0, z0), (x1, y1, z1) = box
     box_str = f"({x0:.6g} {y0:.6g} {z0:.6g}) ({x1:.6g} {y1:.6g} {z1:.6g})"

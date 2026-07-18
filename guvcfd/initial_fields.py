@@ -76,12 +76,31 @@ _WALL_IN_PLANE_AXES = {
 }
 
 
-def compute_radial_inlet_velocities(face_centers, opening_center, wall, v_mag, surface_angle_deg=15):
+def _in_plane_basis(wall):
+    """(ref1, ref2): world-axis-aligned unit vectors spanning the wall's
+    tangent plane, in the SAME (a1, a2) order as mesh_gen._WALL_SPECS/
+    opening_half_extents - e.g. ref1 along a1, ref2 along a2. Deriving
+    this directly from the shared (a1, a2) convention (rather than
+    independently, e.g. via an arbitrary seed vector + cross product)
+    matters: an independently-derived basis can end up axis-*swapped*
+    relative to mesh_gen's for some walls (confirmed for xMax/xMin) even
+    though both are individually valid orthonormal bases - silently
+    applying opening_half_extents' (half_w, half_h) to the wrong axis."""
+    a1, a2 = _WALL_IN_PLANE_AXES[wall]
+    ref1, ref2 = np.zeros(3), np.zeros(3)
+    ref1[a1] = 1.0
+    ref2[a2] = 1.0
+    return ref1, ref2
+
+
+def compute_radial_inlet_velocities(face_centers, opening_center, wall, v_mag, half_extents,
+                                     surface_angle_deg=15, center_angle_deg=90):
     """Per-face velocity vectors [m/s] for a surface-attached (ceiling/wall)
     diffuser: air spreads radially outward from the opening's center,
     along the plane of the mounting wall (Coanda-effect ceiling
-    attachment), tilted `surface_angle_deg` down into the room - instead
-    of every face sharing one "direct jet" vector straight into the room.
+    attachment), tilted toward `surface_angle_deg` down into the room near
+    the opening's edge - instead of every face sharing one "direct jet"
+    vector straight into the room.
 
     Validated in practice (Srebric & Chen 2002, HVAC&R Research) for
     round/square ceiling, vortex, and grille diffusers - not for
@@ -90,27 +109,88 @@ def compute_radial_inlet_velocities(face_centers, opening_center, wall, v_mag, s
 
     face_centers: (N,3) array/list, e.g. from case_io.read_patch_face_centers.
     opening_center: (x,y,z) of the opening's own center (not the room's).
+    half_extents: (half_width, half_height) of the opening's TRUE physical
+    size (see mesh_gen.opening_half_extents) in the wall's (a1, a2)
+    in-plane axis order - not derived from face_centers' own sampled
+    extent, which under-reaches the true edge by half a cell (mesh faces
+    are inset from the physical boundary).
     v_mag: same magnitude on every face (total flow rate conserved,
     uniform-mesh faces are similar size).
+
+    Directions are NOT simply each face's own literal (face_center -
+    opening_center) offset, normalized - that seemingly obvious approach
+    has real problems, confirmed against a real failing case:
+
+    (1) It's singular at the opening's exact center (direction undefined
+    at r=0, rotating through the full circle in an arbitrarily small
+    neighborhood around it), so two faces immediately straddling the
+    center - completely ordinary on a mesh whose face count happens to be
+    even along an axis - get assigned near-opposite directions despite
+    being physically adjacent: a velocity discontinuity sharp enough to
+    destabilize the downstream scalar transport solve. This is genuine
+    physics near a real diffuser's exact center too (radial spread really
+    does reverse crossing straight through it) - but a real diffuser also
+    has a solid physical hub/vane structure right at that center, not an
+    open-air discontinuity, so nothing pushes hard in either direction
+    right there. Modeled here by blending each face's tilt from
+    `center_angle_deg` (90 degrees - straight into the room, no radial
+    component at all) at r=0 up to `surface_angle_deg` (mostly radial
+    spread) at the opening's outer edge, rather than a single fixed angle
+    everywhere - faces near the center get a small, gentle nudge in
+    whichever direction rather than a full-strength push, so neighbors
+    straddling the center no longer differ by anywhere near full
+    magnitude, while faces near the edge keep the originally-validated
+    momentum-method radial spread. r=0..1 is measured in the opening's own
+    *shape-normalized* coordinates (each in-plane axis divided by its own
+    half-extent) rather than raw distance, so an elongated rectangular
+    opening still reaches full spread at its (nearer) short edge, not only
+    at its long edge.
+
+    (2) It makes covered angles entirely dependent on the mesh's discrete
+    face layout - an even-width grid, for instance, never puts a face
+    exactly on a cardinal axis, so no face ever points straight out, which
+    looks (and is) wrong for a diffuser meant to push air uniformly in
+    *every* direction, not just wherever the mesh happened to sample.
+    Fixed by computing each face's angle from the SAME shape-normalized
+    coordinates used for the radial taper above (stretching a rectangular
+    opening into a unit circle before taking its angle) instead of the
+    raw, mesh-dependent offset - this is a purely local, continuous
+    per-face formula (no need to know about any other face), and any face
+    sitting exactly on the opening's actual midline (not just one
+    arbitrarily-chosen mesh face) comes out exactly cardinal.
 
     Returns a list of (vx,vy,vz), same order as `face_centers`.
     """
     normal = np.array(WALL_INFLOW_DIRECTION[wall], dtype=float)
     center = np.array(opening_center, dtype=float)
-    angle = math.radians(surface_angle_deg)
+    ref1, ref2 = _in_plane_basis(wall)
+    hw, hh = half_extents
+
+    face_centers = np.asarray(face_centers, dtype=float)
+    n = len(face_centers)
+    deltas = face_centers - center
+    in_plane = deltas - np.outer(deltas @ normal, normal)
+    # Shape-normalized coordinates: stretch the opening's actual rectangle
+    # into a unit circle (u,v in [-1,1]) before measuring angle/radius, so
+    # both the angle and the center->edge taper respect the opening's own
+    # aspect ratio instead of raw (mesh- and shape-dependent) distance.
+    u = (in_plane @ ref1) / hw if hw > 0 else in_plane @ ref1 * 0
+    v = (in_plane @ ref2) / hh if hh > 0 else in_plane @ ref2 * 0
+    r = np.sqrt(u ** 2 + v ** 2)
+    at_center = r < 1e-9
+
     velocities = []
-    for fc in np.asarray(face_centers, dtype=float):
-        delta = fc - center
-        in_plane = delta - np.dot(delta, normal) * normal
-        norm = np.linalg.norm(in_plane)
-        if norm < 1e-9:
+    for i in range(n):
+        if at_center[i]:
             # face center coincides with the opening center (e.g. a
             # degenerate/point-like opening) - no radial direction to
             # take, fall back to straight into the room.
             direction = normal
         else:
-            radial = in_plane / norm
-            direction = radial * math.cos(angle) + normal * math.sin(angle)
+            r_norm = min(r[i], 1.0)  # 0 at center, 1 at (or beyond) the true edge
+            tilt = math.radians(center_angle_deg - (center_angle_deg - surface_angle_deg) * r_norm)
+            radial = (u[i] * ref1 + v[i] * ref2) / r[i]
+            direction = radial * math.cos(tilt) + normal * math.sin(tilt)
         # float(...) - not np.float64 - so this list is directly
         # JSON-serializable once it lands in a results.json/summary dict,
         # same as every other plain-tuple velocity in this codebase.
@@ -118,11 +198,16 @@ def compute_radial_inlet_velocities(face_centers, opening_center, wall, v_mag, s
     return velocities
 
 
-def resolve_inlet_velocity(case_dir, patch_name, wall, opening_center, v_mag, diffuser_type="direct"):
+def resolve_inlet_velocity(case_dir, patch_name, wall, opening_center, v_mag, diffuser_type="direct",
+                            half_extents=None):
     """The inlet velocity to use for `patch_name`'s U boundary condition -
     a plain (vx,vy,vz) tuple ("direct jet", today's only behavior) or a
     per-face list of tuples ("ceiling"/surface-attached diffuser - see
     compute_radial_inlet_velocities).
+
+    half_extents: required for diffuser_type="ceiling" - see
+    mesh_gen.opening_half_extents (the opening's true physical
+    half-width/half-height, in the wall's (a1, a2) axis order).
 
     Stateless and cheap (a local polyMesh file parse, no WSL round-trip) -
     a caller that needs this at multiple points in a run (the initial
@@ -134,7 +219,7 @@ def resolve_inlet_velocity(case_dir, patch_name, wall, opening_center, v_mag, di
         return tuple(v_mag * d for d in WALL_INFLOW_DIRECTION[wall])
     if diffuser_type == "ceiling":
         face_centers = read_patch_face_centers(case_dir, patch_name)
-        return compute_radial_inlet_velocities(face_centers, opening_center, wall, v_mag)
+        return compute_radial_inlet_velocities(face_centers, opening_center, wall, v_mag, half_extents)
     raise ValueError(f"Unknown diffuser_type: {diffuser_type!r} (expected 'direct' or 'ceiling')")
 
 

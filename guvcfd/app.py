@@ -539,7 +539,7 @@ def _run_decay(guv_path, case_dir, room, settings):
         pimple_write_interval=settings["pimple-write-interval"],
         pimple_delta_t=adv["pimple-delta-t"],
         cell_size=adv["mesh-cell-size"], nbins=adv["uv-zone-bins"],
-        flow_rel_tol=adv["flow-rel-tol"] / 100.0,
+        flow_rel_tol=adv["flow-rel-tol"] / 100.0, flow_max_iterations=adv["flow-max-iterations"],
         log_fn=_run_log, should_stop=_should_stop, solver_log_fn=_track_solver_time,
         **_fan_kwargs(settings),
         **_second_opening_kwargs(settings, "inlet2", room),
@@ -724,7 +724,7 @@ def _run_steady_state(guv_path, case_dir, room, settings):
         outlet_center=_opening_center_frac(settings, "outlet", room),
         outlet_size=(settings["outlet-size-w"], settings["outlet-size-h"]),
         cell_size=adv["mesh-cell-size"], nbins=adv["uv-zone-bins"],
-        flow_rel_tol=adv["flow-rel-tol"] / 100.0,
+        flow_rel_tol=adv["flow-rel-tol"] / 100.0, flow_max_iterations=adv["flow-max-iterations"],
         log_fn=_run_log, should_stop=_should_stop, solver_log_fn=_track_solver_time,
         **fan_kwargs,
         **_second_opening_kwargs(settings, "inlet2", room),
@@ -965,10 +965,12 @@ def _opening_controls(prefix, default_wall, is_inlet=True):
     if is_inlet:
         controls.append(_labeled("Diffuser type", dcc.Dropdown(
             id=f"{prefix}-diffuser-type", options=DIFFUSER_TYPE_OPTIONS,
-            value="ceiling", clearable=False),
+            value="direct", clearable=False),
             help_text="Direct jet: a single beam straight into the room. Surface-attached: "
                       "spreads radially along the wall/ceiling like a real diffuser - "
-                      "validated for round/square ceiling, vortex, and grille types."))
+                      "validated for round/square ceiling, vortex, and grille types. "
+                      "Currently opt-in while a numerical instability with certain opening "
+                      "sizes/geometries is being root-caused - see CHANGELOG."))
     return controls
 
 
@@ -1325,6 +1327,15 @@ settings_modal = dbc.Modal(
                     "this tolerance avoids burning iterations chasing that noise. Lower = stricter "
                     "and slower; higher = looser and faster.",
                     "%", _adv_defaults["flow-rel-tol"],
+                ),
+                _settings_field(
+                    "settings-flow-max-iterations", "Flow convergence max iterations",
+                    "Hard cap on total simpleFoam/pimpleFoam iterations spent trying to converge "
+                    "the flow field before giving up (or accepting a bounded oscillation - see "
+                    "the run log). Raise this if a case genuinely needs more iterations to settle; "
+                    "lower it to fail fast instead of burning a long time on a case that won't "
+                    "converge.",
+                    "iterations", _adv_defaults["flow-max-iterations"],
                 ),
                 _settings_field(
                     "settings-plateau-rel-tol", "Steady-state plateau tolerance",
@@ -1855,14 +1866,14 @@ def _open_help_modal(*_clicks):
 
 
 _SETTINGS_FIELD_IDS = [
-    "settings-flow-rel-tol", "settings-plateau-rel-tol", "settings-plateau-window",
-    "settings-pimple-delta-t", "settings-mesh-cell-size", "settings-uv-zone-bins",
-    "settings-source-zone-size",
+    "settings-flow-rel-tol", "settings-flow-max-iterations", "settings-plateau-rel-tol",
+    "settings-plateau-window", "settings-pimple-delta-t", "settings-mesh-cell-size",
+    "settings-uv-zone-bins", "settings-source-zone-size",
 ]
 # Same order as _SETTINGS_FIELD_IDS - maps each GUI field to its
 # app_settings.py storage key (see ADVANCED_SETTINGS_DEFAULTS).
 _SETTINGS_FIELD_KEYS = [
-    "flow-rel-tol", "plateau-rel-tol", "plateau-window",
+    "flow-rel-tol", "flow-max-iterations", "plateau-rel-tol", "plateau-window",
     "pimple-delta-t", "mesh-cell-size", "uv-zone-bins", "source-zone-size",
 ]
 
@@ -1929,7 +1940,7 @@ _NEW_FIELD_DEFAULTS = {
     "outlet2-y-input": 2.0, "outlet2-z-input": 1.5,
     "outlet2-size-w": 0.3, "outlet2-size-h": 0.3,
     "t-ss-window-frac": 0.15,
-    "inlet-diffuser-type": "ceiling", "inlet2-diffuser-type": "ceiling",
+    "inlet-diffuser-type": "direct", "inlet2-diffuser-type": "direct",
 }
 
 

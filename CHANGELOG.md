@@ -1,5 +1,78 @@
 # Changelog
 
+## 2026-07-18 — Fix ceiling-diffuser instability; revert to opt-in
+
+A real steady-state run (`patient_ward_4B1_v5`, 0.6x0.3m ceiling-diffuser
+inlets on a 3.2x4.8x2.57m room) diverged catastrophically: `T` grew
+without bound (`phase2 T_ss` reached `6e+263`) partway through Phase 1,
+producing garbage results (`eACH_uv_steady_state = -6.0`) without ever
+raising an error. An isolation re-run of the identical project with
+`inlet_diffuser_type="direct"` completed cleanly (`T_ss` 0.95/0.14,
+`eACH_uv` 33.6/hr - all physically sane), confirming the divergence was
+specific to the ceiling-diffuser BC, not a pre-existing issue with this
+room's geometry.
+
+Root cause: `compute_radial_inlet_velocities()`'s per-face direction was
+simply each face's own literal `(face_center - opening_center)` offset,
+normalized - a real problem, not just an edge case, for two reasons:
+
+- **Singular at the exact center.** Direction is undefined at r=0 and
+  rotates through the full circle in an arbitrarily small neighborhood
+  around it. Any mesh with an even face count along an axis puts two
+  faces immediately straddling that center - completely ordinary, not a
+  contrived case - and they got assigned near-opposite directions (0.537
+  m/s apart out of a possible 0.556 m/s, on the failing project's actual
+  opening) despite being physically adjacent cells. That velocity
+  discontinuity destabilized the downstream scalar transport solve.
+- **Grid-layout-dependent coverage.** Which angles get covered depended
+  entirely on the mesh's discrete face positions - an even-width grid
+  never puts a face exactly on a cardinal axis, so no face ever pointed
+  straight out, which both looks wrong and doesn't match a diffuser
+  meant to push air uniformly through the *whole* compass.
+
+Fix, in `initial_fields.compute_radial_inlet_velocities()` (went through
+two iterations - see below for the final design):
+
+- **Shape-normalized angle.** Each face's offset from the opening center
+  is divided per-axis by the opening's own true half-width/half-height
+  (`mesh_gen.opening_half_extents()`, a new helper deriving it from the
+  same snapped box `opening_center()` uses) before its polar angle is
+  measured - stretching a rectangular opening into a unit circle. This is
+  a purely local, continuous per-face formula (no global sort/rank step
+  needed): any face sitting exactly on the opening's real midline comes
+  out exactly cardinal, not just one arbitrarily-chosen mesh face.
+  (An intermediate version instead sorted all faces by raw angle and
+  redistributed evenly around the circle - it fixed cardinal-direction
+  coverage but couldn't reduce the worst adjacent-face jump, since two
+  faces genuinely straddling the center stay maximally far apart in
+  sorted order no matter how angles are redistributed. Superseded by this
+  shape-normalized approach.)
+- **Radius-based tilt taper**, in the same shape-normalized coordinates.
+  New `center_angle_deg=90` parameter: tilt blends from straight-into-
+  the-room (90°, no radial component) at the opening's exact center up
+  to `surface_angle_deg=15` (strong radial spread) at its true physical
+  edge - a real diffuser has a solid hub at its center, not an open-air
+  discontinuity, so nothing should push hard in either direction right
+  there. Using the *true* half-extents (not the mesh's own sampled face
+  extremes, which under-reach the real edge by half a cell) matters here:
+  using sampled extremes instead measured a worse 0.329 m/s worst-case
+  jump on the failing project's actual opening; true extents + Euclidean
+  radius measured 0.233 m/s, down from the original 0.537 m/s (a real,
+  if partial, reduction) - every face still gets exactly `v_mag`
+  magnitude regardless of the tilt blend.
+- Investigated raising `surface_angle_deg` above 15° as an additional,
+  independent lever (steeper tilt = smaller in-plane component
+  everywhere = smaller worst-case jump, trading off against the
+  originally-intended strong radial/surface-hugging spread): 20°→0.219,
+  25°→0.204, real but modest further reduction. Left at 15° for now
+  pending a decision on that tradeoff.
+
+**Default reverted to `direct`** (both the GUI dropdown and
+`_NEW_FIELD_DEFAULTS`) until this fix is re-validated against a real,
+long steady-state run of the originally-failing project - the taper
+reduces but hasn't yet been proven to eliminate the instability.
+`ceiling` remains available as an opt-in.
+
 ## 2026-07-17 — Surface-attached ceiling/wall diffuser inlet, mesh-grid alignment fix
 
 The inlet boundary condition used to be a single uniform vector straight
