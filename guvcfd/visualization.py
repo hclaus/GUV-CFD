@@ -296,4 +296,11 @@ def plot_case(room, inlet_wall="xMin", inlet_center=(0.5, 0.85), inlet_size=(0.3
     for p in (monitoring_points or []):
         size = p["cells_per_side"] * cell_size
         fig = _add_monitoring_point(fig, (p["x"], p["y"], p["z"]), size, p.get("name") or "monitor")
+    # RoomPlotter's default camera (inherited from guv_calcs) sits in the
+    # +x/+y octant, so the (xmax, ymax) corner faces the viewer and the
+    # (0, 0) origin corner is hidden around the back - flip to the -x/-y
+    # octant instead (same magnitude/elevation as plotly's own default
+    # eye=(1.25, 1.25, 1.25), just mirrored in x/y) so (0, 0) is the near,
+    # front-facing corner.
+    fig.update_layout(scene_camera=dict(eye=dict(x=-1.5, y=-1.5, z=1.25)))
     return fig

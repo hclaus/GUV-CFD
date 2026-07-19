@@ -27,6 +27,17 @@ def test_plot_case_without_monitoring_points_has_no_monitor_traces():
     assert not any("monitor" in tag for tag in tags)
 
 
+def test_plot_case_camera_faces_the_origin_corner():
+    # The default (inherited from guv_calcs' RoomPlotter) puts the camera
+    # in the +x/+y octant, so the (xmax, ymax) corner faces the viewer and
+    # the (0, 0) origin corner is hidden around the back - plot_case flips
+    # this so (0, 0) is the near, front-facing corner instead.
+    room = _load_room()
+    fig = plot_case(room)
+    eye = fig.layout.scene.camera.eye
+    assert eye.x < 0 and eye.y < 0
+
+
 def test_plot_case_draws_one_box_and_label_per_monitoring_point():
     room = _load_room()
     points = [
