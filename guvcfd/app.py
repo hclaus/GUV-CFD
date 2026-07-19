@@ -1279,12 +1279,14 @@ def _steady_state_summary(result):
     rows += _phase_ss_rows(1, "no UV", p1)
     rows += _phase_ss_rows(2, "UV on", p2)
     ach_note = _ach_source_note(result)
+    has_corrected = result.get("ventilation_ach_measured") is not None
+    nominal_label = ("eACH_uv, steady-state CFD-fit (assumes nominal design ACH"
+                      + (" - see measured-ACH row below for the corrected value)" if has_corrected else ")"))
     rows += [
         ("Reduction", f"{result['reduction_pct']:.1f}%{ach_note}"),
-        ("eACH_uv, steady-state CFD-fit (nominal ventilation ACH)",
-         f"{result['eACH_uv_steady_state']:.4g} /hr{ach_note}"),
+        (nominal_label, f"{result['eACH_uv_steady_state']:.4g} /hr{ach_note}"),
     ]
-    if result.get("ventilation_ach_measured") is not None:
+    if has_corrected:
         rows.append(("Effective ventilation ACH (well-mixed-equivalent, from Phase 1)",
                       f"{result['ventilation_ach_measured']:.4g} /hr{ach_note}"))
         rows.append(("eACH_uv, steady-state CFD-fit (measured ventilation ACH)",

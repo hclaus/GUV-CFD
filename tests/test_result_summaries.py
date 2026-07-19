@@ -76,6 +76,26 @@ def test_steady_state_summary_corrected_row_names_the_correction():
     assert "eACH_uv, steady-state CFD-fit (measured ventilation ACH)" in text
 
 
+def test_steady_state_summary_nominal_row_points_at_corrected_row_when_present():
+    # The "nominal" eACH_uv row plugs in the design ACH, not a measured
+    # one - when a measured/corrected row also exists, its label must say
+    # so explicitly (this assumption is often wrong - see the measured
+    # row), not just say "nominal ventilation ACH" as if that were a
+    # trustworthy result on its own.
+    result = dict(_STEADY_STATE_RESULT)
+    result["ventilation_ach_measured"] = 2.55
+    result["eACH_uv_steady_state_corrected"] = 18.1
+    text = _all_text(_steady_state_summary(result))
+    assert "assumes nominal design ACH" in text
+    assert "see measured-ACH row below" in text
+
+
+def test_steady_state_summary_nominal_row_label_is_plain_when_no_corrected_row():
+    text = _all_text(_steady_state_summary(_STEADY_STATE_RESULT))
+    assert "assumes nominal design ACH)" in text
+    assert "see measured-ACH row below" not in text
+
+
 def test_steady_state_summary_shows_moving_average_and_cv_when_present():
     result = dict(_STEADY_STATE_RESULT)
     result["phase1"] = dict(result["phase1"], T_ss_std=0.003, T_ss_cv=0.012, T_ss_window_span=1234)
