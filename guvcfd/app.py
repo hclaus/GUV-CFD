@@ -29,7 +29,7 @@ from . import help_content
 from .initial_fields import compute_inlet_velocities
 from .monitoring_points import compute_monitoring_results, mixing_uniformity_note
 from .paraview_launch import launch_paraview
-from .report import generate_report_docx, T_FIELD_NOTE, _phase_ss_rows, _ach_source_note
+from .report import generate_report_docx, T_FIELD_NOTE, EFFECTIVE_ACH_NOTE, _phase_ss_rows, _ach_source_note
 from .result_figures import steady_state_figure, decay_figure
 from .run_pipeline import setup_case
 from .splice import set_control_dict_start_from, set_control_dict_time
@@ -1258,6 +1258,8 @@ def _result_notes(result):
     after the kv rows on both summary tabs.
     """
     notes = [T_FIELD_NOTE]
+    if "phase1" in result and result.get("ventilation_ach_measured") is not None:
+        notes.append(EFFECTIVE_ACH_NOTE)
     uniformity = mixing_uniformity_note(result)
     if uniformity:
         notes.append(uniformity)
@@ -1279,10 +1281,10 @@ def _steady_state_summary(result):
     rows += [
         ("Reduction", f"{result['reduction_pct']:.1f}%{ach_note}"),
         ("eACH_uv, steady-state CFD-fit (nominal ventilation ACH)",
-         f"{result['eACH_uv_steady_state']:.4g} /hr"),
+         f"{result['eACH_uv_steady_state']:.4g} /hr{ach_note}"),
     ]
     if result.get("ventilation_ach_measured") is not None:
-        rows.append(("Ventilation ACH (measured from Phase 1)",
+        rows.append(("Effective ventilation ACH (well-mixed-equivalent, from Phase 1)",
                       f"{result['ventilation_ach_measured']:.4g} /hr{ach_note}"))
         rows.append(("eACH_uv, steady-state CFD-fit (measured ventilation ACH)",
                       f"{result['eACH_uv_steady_state_corrected']:.4g} /hr{ach_note}"))

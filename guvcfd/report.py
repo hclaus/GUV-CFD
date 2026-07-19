@@ -59,6 +59,26 @@ T_FIELD_NOTE = (
     "unit-agnostic and just tracks relative concentration."
 )
 
+# Shown alongside the "measured/effective ventilation ACH" rows below so the
+# number isn't mistaken for a claim that less air is being delivered - the
+# inlet flow rate is fixed at the nominal ACH by the boundary condition
+# itself (mass conservation guarantees it all exits through the outlet).
+# This metric instead reflects how well that air mixes into the room: it's
+# derived from Phase 1's room-AVERAGE steady-state concentration under a
+# known source rate, which only equals the true flow rate if the room is
+# perfectly mixed. Imperfect mixing (e.g. inlet/outlet short-circuiting,
+# common when both are on the same wall) makes the room-average
+# concentration build up higher than a well-mixed room would show for the
+# same true flow rate, so this "effective" ACH reads lower than nominal.
+EFFECTIVE_ACH_NOTE = (
+    "Note: the effective/measured ventilation ACH above is not the airflow "
+    "rate delivered by the inlet - that's fixed at the nominal design ACH "
+    "by the boundary condition. It's the well-mixed-equivalent rate implied "
+    "by Phase 1's room-average steady-state concentration, and reads lower "
+    "than nominal when the room mixes imperfectly (e.g. inlet/outlet "
+    "short-circuiting on the same wall)."
+)
+
 _ROW_LABELS_ROOM = [
     ("Room dimensions", lambda r, s: f"{r.x:.3g} x {r.y:.3g} x {r.z:.3g} {r.units}"),
     ("Lamps", lambda r, s: str(len(r.lamps))),
@@ -177,7 +197,7 @@ def _phase_ss_rows(phase_num, uv_note, phase):
 # nominal design value - see steady_state_pipeline.compute_corrected_eACH_uv's
 # docstring. Only present when Phase 1/2 both produced a usable T_ss.
 _ROW_LABELS_RESULTS_STEADY_STATE_MEASURED = [
-    ("CFD measured Mechanical Ventilation ACH (determined from Phase 1)",
+    ("Effective ventilation ACH (well-mixed-equivalent, from Phase 1)",
      lambda res: f"{res['ventilation_ach_measured']:.4g} /hr{_ach_source_note(res)}"),
     ("CFD measured eACH_uv",
      lambda res: f"{res['eACH_uv_steady_state_corrected']:.4g} /hr{_ach_source_note(res)}"),
@@ -427,6 +447,8 @@ def _write_report_docx(doc_out_path, case_dir, guv_path, settings, results, room
             rows += [(label, fn(results)) for label, fn in _ROW_LABELS_RESULTS_STEADY_STATE_MEASURED]
         rows.append(("Total ACH in room (ACH+eACH_uv)", _total_ach_row(results)))
         _add_kv_table(doc, rows)
+        if results.get("ventilation_ach_measured") is not None:
+            doc.add_paragraph().add_run(EFFECTIVE_ACH_NOTE).italic = True
     else:
         _add_kv_table(doc, [(label, fn(results)) for label, fn in _ROW_LABELS_RESULTS_DECAY])
         if results.get("ventilation_ach_measured") is not None:

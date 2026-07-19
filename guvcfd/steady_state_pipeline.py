@@ -48,6 +48,17 @@ def compute_corrected_eACH_uv(T_ss1, T_ss2, Su, source_volume, room_volume):
         lambda_vent_actual = G / (room_volume * T_ss1)
                             = lambda_vent_nominal * (target_T_ss / T_ss1)
 
+    Caveat: T_ss1 here is the room-AVERAGE steady-state concentration, so
+    this formula implicitly assumes a well-mixed room (average concentration
+    == outlet concentration). It is NOT a measurement of the inlet's
+    delivered flow rate - that's fixed at lambda_vent_nominal by the
+    boundary condition itself, independent of mixing. If the room mixes
+    imperfectly (e.g. inlet/outlet short-circuiting on the same wall), the
+    room average builds up higher than a well-mixed room would for the same
+    true flow rate, so lambda_vent_actual reads *below* lambda_vent_nominal
+    even though the actual delivered ACH hasn't changed. Treat this as a
+    ventilation-effectiveness metric, not a flow-rate measurement.
+
     Returns (ventilation_ach_measured, eACH_uv_corrected), or (None, None)
     if T_ss1/T_ss2 aren't usable (zero/falsy).
     """

@@ -428,7 +428,7 @@ def test_steady_state_results_table_has_theoretical_and_total_ach_rows(tmp_path)
     text = _table_text(doc)
     assert "Theoretical eACH_uv, steady-state (well mixed ventilation eACH = Z*Eavg)" in text
     assert "15.2" in text  # eACH_uv_well_mixed
-    assert "CFD measured Mechanical Ventilation ACH (determined from Phase 1)" in text
+    assert "Effective ventilation ACH (well-mixed-equivalent, from Phase 1)" in text
     assert "CFD measured eACH_uv" in text
     assert "eACH_uv, steady-state CFD-fit (nominal ventilation ACH)" not in text  # dropped row
     total_row = next(row for row in text.split("\n") if row.startswith("Total ACH in room"))
