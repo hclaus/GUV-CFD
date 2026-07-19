@@ -1,5 +1,42 @@
 # Changelog
 
+## 2026-07-19 — Scenario Runs: batch Z x ACH sweep
+
+New "Scenario Runs" tab: sweeps a steady-state project's current setup
+over a comma-separated Z list x a comma-separated ACH list (full cross-
+product), one subfolder per combination directly under the project
+directory, plus a trimmed `{project}_{Z}_{ACH}_report.json` per
+combination collected flat in the project directory for easy comparison
+without opening every subfolder.
+
+- New `guvcfd/scenario_runs.py`: pure pipeline-level orchestration module
+  (no dependency on app.py/Dash - importable/testable standalone), built
+  entirely on existing `run_pipeline.setup_case()`/`steady_state_pipeline.
+  run_steady_state_scenario()` calls rather than duplicating their logic.
+- Key optimization: ACH changes the mesh's inlet velocity (the flow field
+  must reconverge), but Z only affects the UV dose calculation *after*
+  flow convergence - fluenceRate is purely geometric, and turning kUV
+  into cellZones is pure Python/file-IO, no OpenFOAM subprocess call. So
+  the flow field is converged once per distinct ACH value and reused
+  (via a WSL-side `cp -r`) for every Z at that ACH - only the ACH-major
+  outer loop pays for a full mesh + flow convergence. Confirmed via
+  `steady_state_pipeline._uv_fvoptions_entries`'s own docstring that
+  `bin_decay_rates` is deterministic given `(k_values, nbins)`, so the
+  cellZones this reuse path writes is guaranteed to match what
+  `run_steady_state_scenario()` derives from the same kUV field later -
+  setup_case()'s own initial fvOptions write is never actually used for
+  steady-state scenarios in the first place (both phases rebuild it
+  fresh from `0/kUV`), so the reuse path skips it entirely.
+- A failed combination is logged and skipped - the sweep continues to
+  the rest rather than aborting. Stop aborts the remaining queue between
+  (not within) combinations, same `should_stop()`/`StoppedByUser`
+  pattern every other pipeline entry point already uses.
+- Deliberately its own `_scenario_state`/log/poll, not a reuse of the
+  existing single-run `_run_state` - so a sweep and a normal Run never
+  cross wires (the Processing tab's Stop button must never abort a
+  sweep, and vice versa).
+- v1 scope: steady-state projects only (decay-mode sweeps not supported).
+
 ## 2026-07-19 — Redesigned steady-state .docx "Results" section (user-approved table + real footnotes)
 
 Replaced the plain kv-table steady-state Results section with a fixed,

@@ -32,6 +32,7 @@ from .paraview_launch import launch_paraview
 from .report import generate_report_docx, T_FIELD_NOTE, EFFECTIVE_ACH_NOTE, _phase_ss_rows, _ach_source_note
 from .result_figures import steady_state_figure, decay_figure
 from .run_pipeline import setup_case
+from . import scenario_runs
 from .splice import set_control_dict_start_from, set_control_dict_time
 from .steady_state_pipeline import run_steady_state_scenario
 from .ventilation_control import run_ventilation_only_control
@@ -145,6 +146,25 @@ def _sanitize_folder_name(name):
     return name or "case"
 
 
+def _parse_number_list(text):
+    """"2, 6, 6.5" -> [2.0, 6.0, 6.5]; [] for empty/whitespace-only input.
+    Raises ValueError (with the offending token) on anything that doesn't
+    parse as a number - callers turn that into a user-facing message.
+    """
+    if not text or not text.strip():
+        return []
+    values = []
+    for part in text.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            values.append(float(part))
+        except ValueError:
+            raise ValueError(f"'{part}' is not a number")
+    return values
+
+
 def _fresh_case_dir(guv_path):
     """A new, never-colliding project-directory default under $FOAM_RUN,
     named after the loaded .guv file. Always points at a subfolder (never
@@ -171,6 +191,28 @@ _run_state = {
     "steps": [], "step_status": {}, "markers": [],
     "current_time": None, "start_time": None, "stop_requested": False,
 }
+
+# Scenario Runs (Z x ACH sweep) state - deliberately its own dict rather
+# than reusing _run_state, so a sweep and a normal single Run never cross
+# wires (e.g. the Processing tab's Stop button must never abort a sweep,
+# and vice versa). "results" is keyed by (z, ach) -> {"status": "done"/
+# "error", "detail": trimmed result dict or an error message}.
+_scenario_state = {
+    "status": "idle", "log": [], "combos": [], "results": {},
+    "start_time": None, "stop_requested": False,
+}
+
+
+def _scenario_log(msg):
+    msg = str(msg)
+    log = _scenario_state["log"]
+    log.append(msg)
+    if len(log) > _MAX_LOG_LINES:
+        del log[: len(log) - _MAX_LOG_LINES]
+
+
+def _scenario_should_stop():
+    return _scenario_state.get("stop_requested", False)
 
 # Checklist shown on the Processing tab, and the log-line substrings that
 # advance it - reuses the log_fn messages the pipeline already emits rather
@@ -1212,6 +1254,48 @@ processing_tab = dbc.Row([
     ], width=8),
 ], className="mt-3")
 
+# Scenario Runs: sweep the currently-configured steady-state project over
+# a comma-separated Z list x ACH list (full cross-product), one subfolder
+# per combination directly under the project's case-dir - see
+# scenario_runs.py. Every other Project Setup field (inlet/outlet/fan/
+# monitoring/iterations) is reused unchanged from whatever's currently
+# configured there; only z-value/ach vary per combination.
+scenario_tab = dbc.Row([
+    dbc.Col([
+        html.Div(
+            "Runs the current project's steady-state setup once per Z x ACH "
+            "combination (every Z with every ACH), each into its own subfolder "
+            "under the project directory. The flow field is converged once per "
+            "distinct ACH and reused for every Z at that ACH, so a longer Z list "
+            "at a fixed ACH is much cheaper than it looks.",
+            className="small text-muted mb-3",
+        ),
+        _labeled("Z values (comma-separated)",
+                 dcc.Input(id="scenario-z-values", type="text", placeholder="e.g. 2, 6",
+                           className="form-control form-control-sm")),
+        _labeled("ACH values (comma-separated)",
+                 dcc.Input(id="scenario-ach-values", type="text", placeholder="e.g. 3, 6",
+                           className="form-control form-control-sm mt-2")),
+        html.Div(id="scenario-combo-count", className="small text-muted mt-2 mb-3"),
+        dbc.Button("Run Sweep", id="scenario-run-btn", color="success", className="w-100 mb-2"),
+        dbc.Button("Stop Sweep", id="scenario-stop-btn", color="danger", size="sm",
+                    className="mb-2", disabled=True),
+        html.Div(id="scenario-validation-msg", className="small text-danger mb-2"),
+        html.Div(id="scenario-status-text", className="fs-6 fw-semibold mb-2"),
+        dcc.Interval(id="scenario-poll", interval=2000, n_intervals=0, disabled=True),
+    ], width=4),
+    dbc.Col([
+        html.Div("Combinations", className="small fw-semibold text-uppercase mb-1"),
+        html.Div(id="scenario-progress-table"),
+        html.Div("Log", className="small fw-semibold text-uppercase mb-1 mt-3"),
+        html.Pre(id="scenario-log", className="small", style={
+            "height": "40vh", "overflowY": "auto", "fontSize": "11px",
+            "background": "rgba(127,127,127,0.08)", "padding": "8px",
+            "border": "1px solid rgba(127,127,127,0.3)", "whiteSpace": "pre-wrap",
+        }),
+    ], width=8),
+], className="mt-3")
+
 def _empty_analysis_figure():
     return go.Figure(layout=dict(
         annotations=[dict(text="Load a results.json to see analysis (or finish a run - it loads automatically)",
@@ -1572,6 +1656,7 @@ app.layout = dbc.Container([
     dbc.Tabs([
         dbc.Tab(project_setup_tab, label="Project Setup", tab_id="project-setup"),
         dbc.Tab(processing_tab, label="Processing", tab_id="processing"),
+        dbc.Tab(scenario_tab, label="Scenario Runs", tab_id="scenario-runs"),
         dbc.Tab(analysis_tab, label="Analysis of Results", tab_id="analysis"),
     ], active_tab="project-setup", className="mb-3", id="main-tabs"),
 ], fluid=True)
@@ -2148,6 +2233,37 @@ def _launch_run(sim_type, guv_path, case_dir, room, settings):
     thread.start()
 
 
+def _scenario_sweep_thread(guv_path, settings_path, project_dir, room, settings, adv, z_values, ach_values):
+    def on_combo_done(z, ach, status, detail):
+        _scenario_state["results"][(z, ach)] = {"status": status, "detail": detail}
+
+    try:
+        scenario_runs.run_sweep(
+            guv_path, settings_path, project_dir, room, settings, adv,
+            z_values, ach_values, log_fn=_scenario_log, should_stop=_scenario_should_stop,
+            on_combo_done=on_combo_done,
+        )
+        _scenario_state["status"] = "done"
+    except StoppedByUser as e:
+        _scenario_log(f"Stopped: {e}")
+        _scenario_state["status"] = "stopped"
+    except Exception as e:
+        _scenario_log(f"ERROR: {e}")
+        _scenario_state["status"] = "error"
+
+
+def _launch_scenario_sweep(guv_path, settings_path, project_dir, room, settings, adv, z_values, ach_values):
+    combos = scenario_runs.sweep_combinations(z_values, ach_values)
+    _scenario_state.update(status="running", log=[], combos=combos, results={},
+                            start_time=time.time(), stop_requested=False)
+    thread = threading.Thread(
+        target=_scenario_sweep_thread,
+        args=(guv_path, settings_path, project_dir, room, settings, adv, z_values, ach_values),
+        daemon=True,
+    )
+    thread.start()
+
+
 @app.callback(
     Output("run-btn", "disabled"),
     Output("continue-btn", "disabled", allow_duplicate=True),
@@ -2274,6 +2390,133 @@ def _stop_run(n_clicks):
         _run_state["stop_requested"] = True
         _run_log("Stop requested - waiting for the current step to exit...")
     return (dash.no_update,)
+
+
+@app.callback(
+    Output("scenario-combo-count", "children"),
+    Input("scenario-z-values", "value"),
+    Input("scenario-ach-values", "value"),
+)
+def _update_scenario_combo_count(z_text, ach_text):
+    try:
+        z_values = _parse_number_list(z_text)
+        ach_values = _parse_number_list(ach_text)
+    except ValueError as e:
+        return f"Can't parse: {e}"
+    if not z_values or not ach_values:
+        return "Enter at least one Z value and one ACH value."
+    n = len(scenario_runs.sweep_combinations(z_values, ach_values))
+    return f"{n} combination{'s' if n != 1 else ''} ({len(z_values)} Z x {len(ach_values)} ACH)."
+
+
+@app.callback(
+    Output("scenario-run-btn", "disabled"),
+    Output("scenario-stop-btn", "disabled"),
+    Output("scenario-poll", "disabled"),
+    Output("scenario-validation-msg", "children"),
+    Output("main-tabs", "active_tab", allow_duplicate=True),
+    Input("scenario-run-btn", "n_clicks"),
+    State("scenario-z-values", "value"),
+    State("scenario-ach-values", "value"),
+    [State(fid, "value") for fid in SETTINGS_FIELDS],
+    prevent_initial_call=True,
+)
+def _start_scenario_sweep(n_clicks, z_text, ach_text, *values):
+    if _scenario_state["status"] == "running":
+        return True, False, False, dash.no_update, dash.no_update
+
+    room = _loaded["room"]
+    guv_path = _loaded["path"]
+    if room is None or guv_path is None:
+        return (False, True, True, "No .guv project loaded - use File > Open Project or "
+                "Load .guv file first.", dash.no_update)
+
+    settings = dict(zip(SETTINGS_FIELDS, values))
+    if settings.get("sim-type") != "steady_state":
+        return (False, True, True, "Scenario Runs only supports steady-state projects "
+                "(set Simulation type to Steady State on the Project Setup tab).", dash.no_update)
+    if not settings.get("case-dir"):
+        return False, True, True, "Set an OpenFOAM project directory first.", dash.no_update
+
+    try:
+        z_values = _parse_number_list(z_text)
+        ach_values = _parse_number_list(ach_text)
+    except ValueError as e:
+        return False, True, True, f"Can't parse Z/ACH list: {e}", dash.no_update
+    if not z_values or not ach_values:
+        return False, True, True, "Enter at least one Z value and one ACH value.", dash.no_update
+
+    missing = _validate_settings(settings)
+    if missing:
+        return (False, True, True,
+                "Missing required value(s) - fill these in on Project Setup before running: "
+                + ", ".join(missing) + ".", dash.no_update)
+
+    adv = load_advanced_settings()
+    _launch_scenario_sweep(guv_path, _loaded.get("settings_path"), settings["case-dir"],
+                            room, settings, adv, z_values, ach_values)
+    return True, False, False, "", "scenario-runs"
+
+
+@app.callback(
+    Output("scenario-log", "children", allow_duplicate=True),
+    Input("scenario-stop-btn", "n_clicks"),
+    prevent_initial_call=True,
+)
+def _stop_scenario_sweep(n_clicks):
+    if _scenario_state["status"] == "running":
+        _scenario_state["stop_requested"] = True
+        _scenario_log("Stop requested - the sweep will stop before its next combination...")
+    return (dash.no_update,)
+
+
+def _scenario_progress_table():
+    combos = _scenario_state["combos"]
+    if not combos:
+        return html.Div("No sweep run yet.", className="small text-muted")
+    results = _scenario_state["results"]
+    header = html.Tr([html.Th("Z"), html.Th("ACH"), html.Th("Status"), html.Th("Reduction"), html.Th("eACH_uv")])
+    rows = [header]
+    for z, ach in combos:
+        entry = results.get((z, ach))
+        if entry is None:
+            status, reduction, eACH = "pending", "", ""
+        elif entry["status"] == "done":
+            detail = entry["detail"]
+            status = "done"
+            reduction = f"{detail['reduction_pct']:.1f}%"
+            eACH = f"{detail['eACH_uv_steady_state']:.4g} /hr"
+        else:
+            status, reduction, eACH = f"error: {entry['detail']}", "", ""
+        rows.append(html.Tr([html.Td(z), html.Td(ach), html.Td(status), html.Td(reduction), html.Td(eACH)]))
+    return dbc.Table(rows, bordered=False, hover=True, size="sm", className="small")
+
+
+@app.callback(
+    Output("scenario-log", "children"),
+    Output("scenario-status-text", "children"),
+    Output("scenario-progress-table", "children"),
+    Output("scenario-poll", "disabled", allow_duplicate=True),
+    Output("scenario-run-btn", "disabled", allow_duplicate=True),
+    Output("scenario-stop-btn", "disabled", allow_duplicate=True),
+    Input("scenario-poll", "n_intervals"),
+    prevent_initial_call=True,
+)
+def _poll_scenario(n_intervals):
+    status = _scenario_state["status"]
+    log_text = "\n".join(_scenario_state["log"][-300:])
+    n_done = sum(1 for r in _scenario_state["results"].values() if r["status"] == "done")
+    n_error = sum(1 for r in _scenario_state["results"].values() if r["status"] == "error")
+    n_total = len(_scenario_state["combos"])
+    status_text = {
+        "running": f"Running... ({n_done + n_error}/{n_total} combinations done)",
+        "done": f"Finished. {n_done}/{n_total} succeeded, {n_error} failed.",
+        "error": "Failed - see log below.",
+        "stopped": f"Stopped. {n_done}/{n_total} succeeded, {n_error} failed.",
+    }.get(status, "")
+    still_running = status == "running"
+    return (log_text, status_text, _scenario_progress_table(),
+            not still_running, still_running, not still_running)
 
 
 def _render_checklist():
