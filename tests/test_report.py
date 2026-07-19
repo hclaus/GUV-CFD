@@ -82,17 +82,18 @@ def test_steady_state_report_does_not_crash_on_decay_only_fields(tmp_path):
         for row in table.rows:
             all_text += "\n" + "\t".join(c.text for c in row.cells)
     assert "74.7%" in all_text
-    assert "15.2" in all_text  # eACH_uv_well_mixed (the old eACH_uv_steady_state CFD-fit row was dropped)
+    assert "15.2" in all_text  # eACH_uv_well_mixed ("Calculated eACH" row)
+    assert "17.73" in all_text  # eACH_uv_steady_state ("Simple CFD measured eACHCFD_s" row)
     assert "12.34" in all_text  # average fluence rate
     assert len(doc.inline_shapes) == 2  # room preview + phase-timeline curve pictures embedded
 
 
-def test_steady_state_report_shows_moving_average_and_cv_when_present(tmp_path):
+def test_steady_state_report_shows_windowed_stats_when_present(tmp_path):
     case_dir = str(tmp_path)
     (tmp_path / "run_settings.json").write_text(json.dumps(_REAL_SETTINGS))
     results = dict(_STEADY_STATE_RESULTS)
-    results["phase1"] = dict(results["phase1"], T_ss_std=0.003, T_ss_cv=0.012, T_ss_window_span=1234)
-    results["phase2"] = dict(results["phase2"], T_ss_std=0.0009, T_ss_cv=0.14, T_ss_window_span=456)
+    results["phase1"] = dict(results["phase1"], T_ss_cv=0.012, T_ss_window_frac=0.15)
+    results["phase2"] = dict(results["phase2"], T_ss_cv=0.14, T_ss_window_span=456)
     (tmp_path / "results.json").write_text(json.dumps(results))
     out_path = str(tmp_path / "out.docx")
 
@@ -101,15 +102,18 @@ def test_steady_state_report_shows_moving_average_and_cv_when_present(tmp_path):
     from docx import Document
     doc = Document(out_path)
     text = _table_text(doc)
-    assert "Phase 1 moving average (no UV, last 1234 iterations)" in text
-    assert "Phase 1 CV (no UV, last 1234 iterations)" in text
+    assert "Steady state T, calculated from  moving average (15% of last results)" in text
+    assert "CV (15% of last results)" in text
     assert "1.2%" in text
-    assert "Phase 2 moving average (UV on, last 456 iterations)" in text
+    assert "Steady State TSS2, calculated from moving average (last 456 iterations)" in text
+    assert "CV (last 456 iterations)" in text
     assert "14.0%" in text
-    assert "Phase 1 T_ss (no UV)" not in text
 
 
-def test_steady_state_report_falls_back_to_plain_t_ss_when_window_fields_absent(tmp_path):
+def test_steady_state_report_uses_generic_window_phrase_when_window_fields_absent(tmp_path):
+    # Older results.json predating live-volAverage tracking has no
+    # T_ss_window_frac/_span - the label must still read sensibly (not
+    # leave the template's own literal "<...>" placeholder in the output).
     case_dir = str(tmp_path)
     (tmp_path / "run_settings.json").write_text(json.dumps(_REAL_SETTINGS))
     (tmp_path / "results.json").write_text(json.dumps(_STEADY_STATE_RESULTS))
@@ -120,9 +124,10 @@ def test_steady_state_report_falls_back_to_plain_t_ss_when_window_fields_absent(
     from docx import Document
     doc = Document(out_path)
     text = _table_text(doc)
-    assert "Phase 1 T_ss (no UV)" in text
-    assert "Phase 2 T_ss (UV on)" in text
-    assert "moving average" not in text
+    assert "a trailing window of results" in text  # phase 1 fallback phrase
+    assert "a trailing window" in text  # phase 2 fallback phrase
+    assert "0.2548" in text  # phase 1 T_ss still shown
+    assert "0.0644" in text  # phase 2 T_ss still shown
 
 
 def test_decay_report_shows_fluence_mean(tmp_path):
@@ -196,7 +201,7 @@ def test_steady_state_report_recomputes_injection_rate_for_old_runs(tmp_path):
         for row in table.rows:
             all_text += "\n" + "\t".join(c.text for c in row.cells)
     assert f"{expected_G:.4g}" in all_text
-    injection_row = next(row for row in all_text.split("\n") if row.startswith("Source injection rate"))
+    injection_row = next(row for row in all_text.split("\n") if "Source injection rate" in row)
     assert "n/a" not in injection_row  # the real number, not the "no injection_rate_total" fallback
 
 
@@ -219,8 +224,7 @@ def test_steady_state_report_recomputes_theoretical_each_uv_for_old_runs(tmp_pat
     from docx import Document
     doc = Document(out_path)
     text = _table_text(doc)
-    theoretical_row = next(row for row in text.split("\n")
-                            if row.startswith("Theoretical eACH_uv"))
+    theoretical_row = next(row for row in text.split("\n") if row.startswith("Calculated eACH"))
     assert f"{expected:.4g}" in theoretical_row
 
 
@@ -297,6 +301,13 @@ def _table_text(doc):
         for row in table.rows:
             text += "\n" + "\t".join(c.text for c in row.cells)
     return text
+
+
+def _results_table(doc):
+    # The results-table template has a fixed 24 rows - doc.tables[0]/[-1]
+    # aren't reliable once other sections (metadata, Room Setup, optional
+    # Monitoring Results) are relocated around it in the final document.
+    return next(t for t in doc.tables if len(t.rows) == 24)
 
 
 def test_report_shows_recorded_simulation_date_and_elapsed_time(tmp_path):
@@ -412,7 +423,7 @@ def test_room_setup_shows_z_units_and_second_opening_and_injection_and_monitorin
     assert "Monitoring point: Patient" in text
 
 
-def test_steady_state_results_table_has_theoretical_and_total_ach_rows(tmp_path):
+def test_steady_state_results_table_has_calculated_and_total_ach_rows(tmp_path):
     case_dir = str(tmp_path)
     (tmp_path / "run_settings.json").write_text(json.dumps(_REAL_SETTINGS))
     results = dict(_STEADY_STATE_RESULTS)
@@ -426,11 +437,16 @@ def test_steady_state_results_table_has_theoretical_and_total_ach_rows(tmp_path)
     from docx import Document
     doc = Document(out_path)
     text = _table_text(doc)
-    assert "Theoretical eACH_uv, steady-state (well mixed ventilation eACH = Z*Eavg)" in text
+    assert "Calculated eACH" in text
     assert "15.2" in text  # eACH_uv_well_mixed
-    assert "Effective ventilation ACH (well-mixed-equivalent, from Phase 1)" in text
-    assert "CFD measured eACH_uv" in text
-    assert "eACH_uv, steady-state CFD-fit (nominal ventilation ACH)" not in text  # dropped row
+    assert "Effective pathogen (mechanical) ACHeff" in text
+    assert "2.55" in text
+    assert "Room ventilation pathogen removal efficacy EACHeff" in text
+    assert f"{2.55 / _REAL_SETTINGS['ach'] * 100:.1f}%" in text
+    assert "True CFD measured eACHCFD" in text
+    assert "18.1" in text
+    assert "Simple CFD measured eACHCFD_s" in text
+    assert "17.73" in text  # eACH_uv_steady_state
     total_row = next(row for row in text.split("\n") if row.startswith("Total ACH in room"))
     assert f"{2.55 + 18.1:.4g}" in total_row
 
@@ -448,6 +464,98 @@ def test_steady_state_results_table_total_ach_falls_back_to_na(tmp_path):
     text = _table_text(doc)
     total_row = next(row for row in text.split("\n") if row.startswith("Total ACH in room"))
     assert total_row.strip().endswith("n/a")
+
+
+def test_steady_state_results_table_uvgi_effectiveness_rows_match(tmp_path):
+    # "True" and "Simple" UVGI Effectiveness are algebraically forced to be
+    # the same number (both reduce to 1 - T_ss2/T_ss1 regardless of which
+    # ACH basis feeds them) - see the chat discussion when this format was
+    # approved. Must show the same value in both rows, not a fabricated
+    # "True" figure.
+    case_dir = str(tmp_path)
+    (tmp_path / "run_settings.json").write_text(json.dumps(_REAL_SETTINGS))
+    (tmp_path / "results.json").write_text(json.dumps(_STEADY_STATE_RESULTS))
+    out_path = str(tmp_path / "out.docx")
+
+    generate_report_docx(case_dir, out_path)
+
+    from docx import Document
+    doc = Document(out_path)
+    table = _results_table(doc)
+    assert table.rows[22].cells[1].text == "74.7%"
+    assert table.rows[23].cells[1].text == "74.7%"
+
+
+def test_steady_state_results_table_achieff_label_notes_ach_source(tmp_path):
+    case_dir = str(tmp_path)
+    (tmp_path / "run_settings.json").write_text(json.dumps(_REAL_SETTINGS))
+    results = dict(_STEADY_STATE_RESULTS)
+    results["ventilation_ach_measured"] = 2.55
+    results["eACH_uv_steady_state_corrected"] = 18.1
+    results["ach_source"] = "extrapolated_T_infinity"
+    (tmp_path / "results.json").write_text(json.dumps(results))
+    out_path = str(tmp_path / "out.docx")
+
+    generate_report_docx(case_dir, out_path)
+
+    from docx import Document
+    doc = Document(out_path)
+    table = _results_table(doc)
+    assert table.rows[16].cells[0].text == "Effective pathogen (mechanical) ACHeff (using extrapolated T∞)"
+
+
+def test_steady_state_results_table_extrapolation_row_shows_na_when_unavailable(tmp_path):
+    # Phase 1/2 in _STEADY_STATE_RESULTS have no T_inf_extrapolated (the
+    # fit never ran/converged) - row 9/13 must say so explicitly rather
+    # than showing a stale or blank cell.
+    case_dir = str(tmp_path)
+    (tmp_path / "run_settings.json").write_text(json.dumps(_REAL_SETTINGS))
+    (tmp_path / "results.json").write_text(json.dumps(_STEADY_STATE_RESULTS))
+    out_path = str(tmp_path / "out.docx")
+
+    generate_report_docx(case_dir, out_path)
+
+    from docx import Document
+    doc = Document(out_path)
+    table = _results_table(doc)
+    assert table.rows[9].cells[1].text == "n/a (extrapolation unavailable)"
+    assert table.rows[13].cells[1].text == "n/a (extrapolation unavailable)"
+
+
+def test_steady_state_results_table_footnotes_are_filled_with_correct_style(tmp_path):
+    # The filled-in footnote text must land in a normal-styled run, not
+    # the small-superscript run that carries the footnote's own auto-number
+    # marker (w:footnoteRef) - overwriting that run's text was the original
+    # font-size bug caught during review of the manually-generated sample.
+    import zipfile
+    from lxml import etree
+
+    case_dir = str(tmp_path)
+    (tmp_path / "run_settings.json").write_text(json.dumps(_REAL_SETTINGS))
+    results = dict(_STEADY_STATE_RESULTS)
+    results["phase1"] = dict(results["phase1"], live={"t": list(range(8000)), "T": [0.0] * 8000})
+    results["phase2"] = dict(results["phase2"], live={"t": list(range(4000)), "T": [0.0] * 4000})
+    (tmp_path / "results.json").write_text(json.dumps(results))
+    out_path = str(tmp_path / "out.docx")
+
+    generate_report_docx(case_dir, out_path)
+
+    W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    ns = {"w": W}
+    with zipfile.ZipFile(out_path) as z:
+        footnotes_xml = etree.fromstring(z.read("word/footnotes.xml"))
+
+    for fid, expect_n in (("4", 4000), ("5", 2000)):
+        footnote = next(fn for fn in footnotes_xml.findall("w:footnote", ns)
+                         if fn.get(f"{{{W}}}id") == fid)
+        runs = footnote.findall(".//w:r", ns)
+        marker_run = next(r for r in runs if r.find(f"{{{W}}}footnoteRef") is not None)
+        assert marker_run.find(f"{{{W}}}t") is None  # marker run's text untouched
+        text_run = next(r for r in runs if r.find(f"{{{W}}}footnoteRef") is None
+                         and r.find(f"{{{W}}}t") is not None and r.find(f"{{{W}}}t").text)
+        style = text_run.find(f".//{{{W}}}rStyle")
+        assert style is None  # normal style, not FootnoteReference (small/superscript)
+        assert f"{expect_n} simulation points" in text_run.find(f"{{{W}}}t").text
 
 
 def test_monitoring_results_heading_renamed(tmp_path):

@@ -1,5 +1,46 @@
 # Changelog
 
+## 2026-07-19 — Redesigned steady-state .docx "Results" section (user-approved table + real footnotes)
+
+Replaced the plain kv-table steady-state Results section with a fixed,
+hand-designed 24-row table format (approved after review of a
+manually-filled sample) that reports pathogen-ACH ("effective"/measured
+ventilation effectiveness) alongside the nominal air-ACH figures nearly
+every published GUV paper reports, with real Word footnotes explaining
+each derived quantity's equation instead of burying that in prose.
+
+- New `guvcfd/templates/results_table_template.docx`: the approved table
+  (row order/wording/footnotes) with `"<...>"` placeholders - the single
+  source of truth for this format's layout going forward. `report.py`
+  only ever fills numbers into it, never restructures it.
+- `_write_report_docx` now seeds the whole document from this template
+  for steady-state runs (its Results heading/T-note/table start out at
+  the top) and relocates everything built afterwards (title, Room Setup,
+  Case Setup) to precede it (`_relocate_after`) - decay-mode reports are
+  unaffected, still built from a blank `Document()`.
+- Real Word footnotes can't be edited through python-docx's public API
+  (`word/footnotes.xml` loads as opaque bytes, not a live XML tree) - so
+  footnote text is patched as a post-save step directly against the
+  saved file's zip (`_patch_results_table_footnotes`). Caught during
+  review: the footnote's own auto-number marker run (`w:footnoteRef`,
+  styled small/superscript) is a different element than the body-side
+  `w:footnoteReference` pointer - excluding only the latter treated the
+  marker as "the first text run" and the replacement text inherited its
+  small superscript style.
+- New derived metric: "Room ventilation pathogen removal efficacy
+  EACHeff" = `ventilation_ach_measured / ach × 100` - the room's measured
+  ventilation effectiveness as a fraction of the nominal design ACH.
+- "True" and "Simple" UVGI Effectiveness rows: algebraically forced to
+  the same value regardless of which ACH basis (nominal vs. measured)
+  feeds the eACH_uv/ACHeff pair (both reduce to `1 - T_ss2/T_ss1`) - both
+  rows show that one number rather than a fabricated distinct "True"
+  figure.
+- Dropped the now-dead `_ROW_LABELS_RESULTS_STEADY_STATE_{BEFORE_PHASES,
+  AFTER_PHASES,MEASURED}` row-label lists (superseded by the template);
+  `_phase_ss_rows`/`_ach_source_note` are unaffected (still used by
+  app.py's Analysis tab, a separate live-UI display this change doesn't
+  touch).
+
 ## 2026-07-18 — Keep all time steps for ParaView (opt-in) + fix stale case-directory reuse
 
 A completed steady-state run only ever left `0/` and the final time

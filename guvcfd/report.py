@@ -4,11 +4,14 @@ lamps), and the key result numbers - for sharing outside the GUI itself.
 """
 import json
 import tempfile
+import zipfile
 from datetime import datetime
 from pathlib import Path
 
 from docx import Document
+from docx.oxml.ns import qn
 from docx.shared import Inches
+from lxml import etree
 from guv_calcs import Project
 
 from .contaminant_source import compute_source_strength
@@ -126,15 +129,6 @@ _ROW_LABELS_RESULTS_DECAY_CORRECTED = [
                  if res.get("mixing_efficiency_corrected") is not None else "n/a"),
 ]
 
-_ROW_LABELS_RESULTS_STEADY_STATE_BEFORE_PHASES = [
-    ("Average fluence rate", lambda res: f"{res['fluence_mean']:.4g} µW/cm²"
-                                          if res.get("fluence_mean") is not None else "n/a"),
-    ("Target well-mixed steady-state T", lambda res: f"{res.get('target_T_ss', '?')}"),
-    ("Source injection rate (total, room-wide)",
-     lambda res: f"{res['injection_rate_total']:.4g} T-units/s (see T note below)"
-                 if res.get("injection_rate_total") is not None else "n/a"),
-]
-
 def _ach_source_note(res):
     """Appended to Reduction/measured-ACH rows: whether these were derived
     from the extrapolated T-infinity (see decay_analysis.fit_asymptotic_value)
@@ -148,14 +142,6 @@ def _ach_source_note(res):
     if source == "windowed_average":
         return " (using windowed average - T∞ extrapolation unavailable)"
     return ""
-
-
-_ROW_LABELS_RESULTS_STEADY_STATE_AFTER_PHASES = [
-    ("Reduction", lambda res: f"{res['reduction_pct']:.1f}%{_ach_source_note(res)}"),
-    ("Theoretical eACH_uv, steady-state (well mixed ventilation eACH = Z*Eavg)",
-     lambda res: f"{res['eACH_uv_well_mixed']:.4g} /hr"
-                 if res.get("eACH_uv_well_mixed") is not None else "n/a"),
-]
 
 
 def _phase_ss_rows(phase_num, uv_note, phase):
@@ -192,24 +178,238 @@ def _phase_ss_rows(phase_num, uv_note, phase):
                       f"{Tinf:.4g}{fit_cv_text}"))
     return rows
 
-# Ventilation ACH is *measured* here (derived for free from Phase 1's own
-# mass balance, no separate control run needed) instead of assumed at its
-# nominal design value - see steady_state_pipeline.compute_corrected_eACH_uv's
-# docstring. Only present when Phase 1/2 both produced a usable T_ss.
-_ROW_LABELS_RESULTS_STEADY_STATE_MEASURED = [
-    ("Effective ventilation ACH (well-mixed-equivalent, from Phase 1)",
-     lambda res: f"{res['ventilation_ach_measured']:.4g} /hr{_ach_source_note(res)}"),
-    ("CFD measured eACH_uv",
-     lambda res: f"{res['eACH_uv_steady_state_corrected']:.4g} /hr{_ach_source_note(res)}"),
-]
-
-
 def _total_ach_row(results):
     ach = results.get("ventilation_ach_measured")
     eACH_uv = results.get("eACH_uv_steady_state_corrected")
     if ach is None or eACH_uv is None:
         return "n/a"
     return f"{ach + eACH_uv:.4g} /hr"
+
+
+# The approved, hand-designed steady-state "Results" table format (see
+# CHANGELOG) - a fixed 24-row/2-col table with real Word footnotes
+# explaining each derived quantity's equation. The row layout/wording/
+# footnotes themselves live in the bundled template docx
+# (templates/results_table_template.docx, with "<...>" placeholders for
+# this module to fill); this module only ever fills numbers into it, never
+# restructures it.
+_RESULTS_TABLE_TEMPLATE_PATH = Path(__file__).resolve().parent / "templates" / "results_table_template.docx"
+
+
+def _results_table_cell_values(results, settings):
+    """(row, col) -> replacement text for every cell in the results-table
+    template that needs a real number. Cells not in this dict are left as
+    the template shipped them (section headers, static labels). Missing
+    source data (older results.json, or a phase whose T-infinity fit never
+    converged) degrades to an explicit "n/a" rather than a stale/blank cell.
+    """
+    p1, p2 = results.get("phase1") or {}, results.get("phase2") or {}
+    ach, z = settings.get("ach"), settings.get("z-value")
+    values = {}
+
+    if results.get("fluence_mean") is not None:
+        values[(1, 1)] = f"{results['fluence_mean']:.4g} µW/cm²"
+    if z is not None:
+        values[(2, 1)] = str(z)
+    values[(3, 1)] = f"{results.get('target_T_ss', '?')}"
+    if results.get("injection_rate_total") is not None:
+        values[(4, 1)] = f"{results['injection_rate_total']:.4g} "
+    if results.get("eACH_uv_well_mixed") is not None:
+        values[(5, 1)] = f"{results['eACH_uv_well_mixed']:.4g} /hr"
+
+    # Labels are always rewritten (never left as the template's own "<...>"
+    # placeholder), falling back to a window-size-agnostic phrase for
+    # older results.json files that predate T_ss_window_frac/_span.
+    frac1 = p1.get("T_ss_window_frac")
+    frac1_desc = f"{frac1 * 100:.0f}% of last results" if frac1 is not None else "a trailing window of results"
+    values[(7, 0)] = f"Steady state T, calculated from  moving average ({frac1_desc})"
+    values[(8, 0)] = f"CV ({frac1_desc})"
+    if p1.get("T_ss") is not None:
+        plateau = "plateaued" if p1.get("converged") else "NOT plateaued"
+        values[(7, 1)] = f"{p1['T_ss']:.4g} ({plateau})"
+    if p1.get("T_ss_cv") is not None:
+        values[(8, 1)] = f"{p1['T_ss_cv'] * 100:.1f}%"
+    if p1.get("T_inf_extrapolated") is not None:
+        fit_cv = (p1.get("T_inf_extrapolation_detail") or {}).get("fit_cv")
+        fit_cv_text = f", fit CV={fit_cv * 100:.2f}%" if fit_cv is not None else ""
+        values[(9, 1)] = f"{p1['T_inf_extrapolated']:.4g}{fit_cv_text}"
+    else:
+        values[(9, 1)] = "n/a (extrapolation unavailable)"
+
+    span2 = p2.get("T_ss_window_span")
+    window2_desc = f"last {int(span2)} iterations" if span2 is not None else "a trailing window"
+    values[(11, 0)] = f"Steady State TSS2, calculated from moving average ({window2_desc})"
+    values[(12, 0)] = f"CV ({window2_desc})"
+    if p2.get("T_ss") is not None:
+        values[(11, 1)] = f"{p2['T_ss']:.4g} "
+    if p2.get("T_ss_cv") is not None:
+        values[(12, 1)] = f"{p2['T_ss_cv'] * 100:.1f}%"
+    if p2.get("T_inf_extrapolated") is not None:
+        fit_cv = (p2.get("T_inf_extrapolation_detail") or {}).get("fit_cv")
+        fit_cv_text = f", fit CV={fit_cv * 100:.2f}%" if fit_cv is not None else ""
+        values[(13, 1)] = f"{p2['T_inf_extrapolated']:.4g}{fit_cv_text}"
+    else:
+        values[(13, 1)] = "n/a (extrapolation unavailable)"
+
+    if results.get("reduction_pct") is not None:
+        values[(15, 1)] = f"{results['reduction_pct']:.1f}% "
+    ach_measured = results.get("ventilation_ach_measured")
+    if ach_measured is not None:
+        values[(16, 0)] = f"Effective pathogen (mechanical) ACHeff{_ach_source_note(results)}"
+        values[(16, 1)] = f"{ach_measured:.4g} /hr "
+    if ach_measured is not None and ach:
+        values[(17, 1)] = f"{ach_measured / ach * 100:.1f}%"
+    if results.get("eACH_uv_steady_state_corrected") is not None:
+        values[(18, 1)] = f"{results['eACH_uv_steady_state_corrected']:.4g} /hr "
+    if results.get("eACH_uv_steady_state") is not None:
+        values[(19, 1)] = f"{results['eACH_uv_steady_state']:.4g} /hr"
+    values[(20, 1)] = _total_ach_row(results)
+    if results.get("reduction_pct") is not None:
+        # "True" and "Simple" UVGI effectiveness are algebraically
+        # identical regardless of which ACH basis feeds the eACH_uv/ACHeff
+        # pair (both always reduce to 1 - T_ss2/T_ss1) - approved as
+        # showing the same number in both rows rather than inventing a
+        # divergent "True" formula that isn't actually there.
+        values[(22, 1)] = f"{results['reduction_pct']:.1f}%"
+        values[(23, 1)] = f"{results['reduction_pct']:.1f}%"
+    return values
+
+
+def _results_table_footnote_texts(results):
+    """Footnote id -> replacement text, for the footnotes whose "<...>"
+    equation/point-count placeholders this module fills. Only ids 1, 2, 4,
+    5, 6, 7, 9, 10 are touched - 3, 8, 11, 12 were already complete in the
+    approved template and are left exactly as shipped.
+    """
+    p1_n = len((results.get("phase1") or {}).get("live", {}).get("t", []))
+    p2_n = len((results.get("phase2") or {}).get("live", {}).get("t", []))
+    fit1_n = p1_n - int(p1_n * 0.5)
+    fit2_n = p2_n - int(p2_n * 0.5)
+    return {
+        "1": (" Calculated based on given ACH and target well mixed steady state T with equation "
+              "Tinj = V × (ACH/3600) × target_T_ss. If more than one injection source is "
+              "given, the amount is equally divided by the quantity of sources"),
+        "2": " Assuming well mixed condition eACH = Z*Eavg × 3.6 (unit conversion factor)",
+        "4": (f" Extrapolated based on {fit1_n} simulation points (trailing 50% of Phase 1's "
+              "iteration history) with equation TSS1∞ = TSS1 − A·exp(−n/τ), "
+              "fit by nonlinear regression. T is the room average"),
+        "5": (f" Extrapolated based on {fit2_n} simulation points (trailing 50% of Phase 2's "
+              "iteration history) with equation TSS2∞ = TSS2 − A·exp(−n/τ), "
+              "fit by nonlinear regression. T is the room average"),
+        "6": (" Based on average T and sum of mechanical ACH and UV based eACH Using extrapolated "
+              "T∞, calculated with equation reduction = (1 − TSS2∞/TSS1∞) × 100%"),
+        "7": (" In not well mixed conditions the actual pathogen removal will be different than the "
+              "mechanical air exchange rate (ACH). This value ACHeff is calculated from the simulated "
+              "T values over time of phase 1 (no UV) by approximating the data of T(t) to equation "
+              "ACHeff = (Tinj / (V × TSS1∞)) × 3600"),
+        "9": (" Based on true mechanical ventilation ACHeff (using extrapolated T∞) calculated "
+              "with equation eACHCFD = ACHeff × (TSS1∞/TSS2∞ − 1)"),
+        "10": (" Based on rated ventilation ACH (and using extrapolated T∞) calculated with "
+               "equation eACHCFD_s = eACHCFD / EACHeff"),
+    }
+
+
+def _set_paragraph_text(paragraph, new_text):
+    """Replace a paragraph's visible text with new_text, leaving any
+    footnoteReference run (and its exact position/formatting) untouched.
+    """
+    runs = list(paragraph.runs)
+    text_runs = [run for run in runs if run._r.find(qn("w:footnoteReference")) is None]
+    if not text_runs:
+        return
+    text_runs[0].text = new_text
+    for run in text_runs[1:]:
+        run.text = ""
+
+
+def _fill_results_table(table, results, settings):
+    """Fill the approved results-table template's table cells with real
+    numbers, in place. Footnote text (word/footnotes.xml) can't be edited
+    this way - python-docx doesn't parse that part into a live XML tree
+    (see _patch_results_table_footnotes, applied post-save instead).
+
+    Takes the actual Table object (captured by the caller right after
+    loading the template, while it was still the document's only table) -
+    not doc.tables[0], which re-resolves by body position and would
+    silently pick up whatever table now sits first after other sections
+    (metadata, Room Setup, ...) get relocated in front of it.
+    """
+    for (row, col), text in _results_table_cell_values(results, settings).items():
+        _set_paragraph_text(table.rows[row].cells[col].paragraphs[0], text)
+
+
+def _patch_results_table_footnotes(doc_out_path, results):
+    """Fill the "<...>" equation/count placeholders in the results table's
+    real Word footnotes. Must run on an already-saved .docx (python-docx
+    only exposes footnotes.xml as opaque bytes, not a live XML tree - see
+    _fill_results_table), so this reopens the file as a zip, patches just
+    that one part, and rewrites the zip.
+
+    Marker-run trap: a footnote's own auto-number (w:footnoteRef, styled
+    small/superscript via the FootnoteReference character style) is a
+    *different* element than w:footnoteReference (the body-side pointer
+    into a footnote) - excluding only the latter treats the number marker
+    itself as "the first text run" and its replacement text inherits the
+    marker's small superscript style. Both must be excluded.
+    """
+    W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    ns = {"w": W}
+    footnote_values = _results_table_footnote_texts(results)
+
+    with zipfile.ZipFile(doc_out_path) as zin:
+        contents = {name: zin.read(name) for name in zin.namelist()}
+
+    footnotes_xml = etree.fromstring(contents["word/footnotes.xml"])
+    for footnote in footnotes_xml.findall("w:footnote", ns):
+        fid = footnote.get(f"{{{W}}}id")
+        if fid not in footnote_values:
+            continue
+        runs = footnote.findall(".//w:r", ns)
+        text_runs = [
+            r for r in runs
+            if r.find(f"{{{W}}}footnoteRef") is None and r.find(f"{{{W}}}footnoteReference") is None
+        ]
+        if not text_runs:
+            continue
+        t = text_runs[0].find(f"{{{W}}}t")
+        if t is None:
+            t = etree.SubElement(text_runs[0], f"{{{W}}}t")
+        t.text = footnote_values[fid]
+        t.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
+        for r in text_runs[1:]:
+            tt = r.find(f"{{{W}}}t")
+            if tt is not None:
+                tt.text = ""
+    contents["word/footnotes.xml"] = etree.tostring(
+        footnotes_xml, xml_declaration=True, encoding="UTF-8", standalone=True)
+
+    with zipfile.ZipFile(doc_out_path, "w", zipfile.ZIP_DEFLATED) as zout:
+        for name, data in contents.items():
+            zout.writestr(name, data)
+
+
+def _relocate_after(doc, after_element, before_element):
+    """Move every body element currently AFTER after_element to just
+    before before_element instead, preserving relative order (skips the
+    trailing w:sectPr, which must stay last). Content added via the normal
+    python-docx API always lands at the end of the body - when the
+    document was seeded from the results-table template (so its Results
+    heading/note/table start out already present, at the very top), this
+    moves everything built afterwards (title, room setup, case setup) back
+    in front of that template content instead, restoring the usual
+    top-to-bottom report order.
+    """
+    body = doc.element.body
+    to_move, found = [], False
+    for child in list(body):
+        if found:
+            if child.tag == qn("w:sectPr"):
+                break
+            to_move.append(child)
+        elif child is after_element:
+            found = True
+    for element in to_move:
+        before_element.addprevious(element)
 
 
 def _monitoring_rows(monitoring):
@@ -407,7 +607,22 @@ def generate_report_docx(case_dir, out_path):
 
 def _write_report_docx(doc_out_path, case_dir, guv_path, settings, results, room,
                         image_path, curve_image_path):
-    doc = Document()
+    # Steady-state reports are seeded from the approved results-table
+    # template (real Word footnotes; see _RESULTS_TABLE_TEMPLATE_PATH)
+    # instead of a blank Document() - its Results heading/T-note/table
+    # start out at the very TOP of the body, so everything built below
+    # gets relocated in front of them just before saving (_relocate_after)
+    # to restore normal top-to-bottom report order. Decay reports are
+    # unaffected - built from a blank document exactly as before.
+    is_steady_state = "phase1" in results
+    doc = Document(str(_RESULTS_TABLE_TEMPLATE_PATH)) if is_steady_state else Document()
+    results_anchor = doc.paragraphs[0]._p if is_steady_state else None
+    # Captured now, while the template's results table is still the
+    # document's only table - doc.tables[0] would re-resolve by body
+    # position later and silently pick up a different table once other
+    # sections get relocated in front of it (see _fill_results_table).
+    results_table = doc.tables[0] if is_steady_state else None
+
     doc.add_heading("GUV-CFD Simulation Report", level=1)
     doc.add_paragraph(f"Illuminate room design file: {guv_path}")
     doc.add_paragraph(f"CFD Project file: {settings.get('settings_path') or 'n/a'}")
@@ -436,26 +651,24 @@ def _write_report_docx(doc_out_path, case_dir, guv_path, settings, results, room
     doc.add_heading("Case Setup", level=2)
     doc.add_picture(str(image_path), width=Inches(6.0))
 
-    doc.add_heading("Results", level=2)
-    doc.add_paragraph().add_run(T_FIELD_NOTE).italic = True
-    if "phase1" in results:
-        rows = [(label, fn(results)) for label, fn in _ROW_LABELS_RESULTS_STEADY_STATE_BEFORE_PHASES]
-        rows += _phase_ss_rows(1, "no UV", results["phase1"])
-        rows += _phase_ss_rows(2, "UV on", results["phase2"])
-        rows += [(label, fn(results)) for label, fn in _ROW_LABELS_RESULTS_STEADY_STATE_AFTER_PHASES]
-        if results.get("ventilation_ach_measured") is not None:
-            rows += [(label, fn(results)) for label, fn in _ROW_LABELS_RESULTS_STEADY_STATE_MEASURED]
-        rows.append(("Total ACH in room (ACH+eACH_uv)", _total_ach_row(results)))
-        _add_kv_table(doc, rows)
+    if is_steady_state:
+        # Relocate everything built so far (title/metadata, Room Setup,
+        # Case Setup) to in front of the template's Results heading/note/
+        # table - see _write_report_docx's opening comment.
+        _relocate_after(doc, results_table._tbl, results_anchor)
+        _fill_results_table(results_table, results, settings)
+        if curve_image_path is not None:
+            doc.add_picture(str(curve_image_path), width=Inches(6.0))
         if results.get("ventilation_ach_measured") is not None:
             doc.add_paragraph().add_run(EFFECTIVE_ACH_NOTE).italic = True
     else:
+        doc.add_heading("Results", level=2)
+        doc.add_paragraph().add_run(T_FIELD_NOTE).italic = True
         _add_kv_table(doc, [(label, fn(results)) for label, fn in _ROW_LABELS_RESULTS_DECAY])
         if results.get("ventilation_ach_measured") is not None:
             _add_kv_table(doc, [(label, fn(results)) for label, fn in _ROW_LABELS_RESULTS_DECAY_CORRECTED])
-
-    if curve_image_path is not None:
-        doc.add_picture(str(curve_image_path), width=Inches(6.0))
+        if curve_image_path is not None:
+            doc.add_picture(str(curve_image_path), width=Inches(6.0))
 
     monitoring_rows = _monitoring_rows(results.get("monitoring"))
     if monitoring_rows:
@@ -467,3 +680,9 @@ def _write_report_docx(doc_out_path, case_dir, guv_path, settings, results, room
         doc.add_paragraph().add_run(uniformity_note).italic = True
 
     doc.save(doc_out_path)
+    if is_steady_state:
+        # word/footnotes.xml isn't reachable as a live XML tree through
+        # python-docx (see _patch_results_table_footnotes) - has to be
+        # patched as a post-save step against the file that was just
+        # written, not the in-memory Document.
+        _patch_results_table_footnotes(doc_out_path, results)
