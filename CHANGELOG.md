@@ -1,5 +1,28 @@
 # Changelog
 
+## 2026-07-18 — Keep all time steps for ParaView (opt-in) + fix stale case-directory reuse
+
+A completed steady-state run only ever left `0/` and the final time
+directory on disk (every intermediate `write_interval` snapshot gets
+cleaned up along the way - see the T-infinity early-stopping entry
+below) - fine for the report/plots, but it meant ParaView could only
+show the start and end, never an animated build-up/decay.
+
+- New opt-in Settings field **"Keep all time steps for ParaView"**
+  (off by default). When on, `steady_state_pipeline._run_phase` renames
+  each chunk's snapshot directories to their true cumulative iteration
+  count (via new `_rename_chunk_time_dirs`) instead of deleting them,
+  and phase 2 is offset by phase 1's iteration count so both phases
+  share one continuous, collision-free numbering instead of each
+  restarting at 1.
+- Fixed: confirming "overwrite" on an already-populated case directory
+  didn't actually clear anything first - `setup_case()` only overwrites
+  specific known files by name, so stale numbered time directories,
+  `postProcessing/`, `results.json`, and solver logs from an earlier
+  (possibly differently-configured, or interrupted) run could linger
+  and get mixed in with the new one. New `case_io.clear_stale_run_output()`
+  now runs before every confirmed overwrite.
+
 ## 2026-07-18 — T-infinity early stopping for steady-state phases (experimental, opt-in)
 
 Backtested whether the T∞ extrapolation could double as a stop criterion,

@@ -1,5 +1,8 @@
 """Read/write OpenFOAM ASCII field files for the fluence-mapping pipeline."""
 import re
+import shutil
+from pathlib import Path
+
 import numpy as np
 
 
@@ -27,6 +30,37 @@ def read_cell_centers(case_dir, time_dir="0"):
     cy = read_openfoam_scalar_field(f"{base}/Cy")
     cz = read_openfoam_scalar_field(f"{base}/Cz")
     return np.column_stack([cx, cy, cz])
+
+
+def clear_stale_run_output(case_dir):
+    """Remove every trace of a previous run from case_dir before starting a
+    fresh one: numbered time-step directories (all but "0"), postProcessing/,
+    results.json, and solver logs.
+
+    setup_case() and the solve pipelines only ever overwrite specific known
+    files by name (0/ field files, system/ templates, etc. - see
+    run_pipeline.setup_case's `mkdir(exist_ok=True)` + selective template
+    copy) - they never clear the directory first. Without this, confirming
+    "overwrite" on an already-populated case directory (app._confirm_overwrite_run)
+    leaves stale artifacts from an earlier - possibly differently configured,
+    or interrupted - run sitting alongside the new one instead of being
+    replaced, e.g. old numbered snapshot directories the new run's own
+    mid-pipeline cleanup only clears if it happens to run far enough to
+    reach that step.
+    """
+    base = Path(case_dir)
+    if not base.exists():
+        return
+    for child in base.iterdir():
+        if child.is_dir() and child.name != "0" and re.fullmatch(r"\d+(\.\d+)?", child.name):
+            shutil.rmtree(child, ignore_errors=True)
+    postprocessing = base / "postProcessing"
+    if postprocessing.exists():
+        shutil.rmtree(postprocessing, ignore_errors=True)
+    for name in ("results.json", "log.simpleFoam", "log.pimpleFoam", "log.blockMesh"):
+        f = base / name
+        if f.exists():
+            f.unlink()
 
 
 def read_boundary_patch_names(case_dir):

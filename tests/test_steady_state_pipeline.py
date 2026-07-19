@@ -2,7 +2,10 @@ import inspect
 
 import numpy as np
 
-from guvcfd.steady_state_pipeline import _point_phase_summary, _room_phase_summary, run_steady_state_scenario
+import guvcfd.steady_state_pipeline as ssp
+from guvcfd.steady_state_pipeline import (
+    _point_phase_summary, _rename_chunk_time_dirs, _room_phase_summary, run_steady_state_scenario,
+)
 
 
 def _log(msg):
@@ -25,6 +28,27 @@ def test_run_steady_state_scenario_still_accepts_advanced_settings_params():
     assert params["t_inf_check_interval"].default is None
     assert params["t_inf_rel_tol"].default is None  # disabled by default - opt-in
     assert params["t_inf_streak"].default == 3
+    assert params["keep_all_timesteps"].default is False  # opt-in - off keeps case dirs small
+
+
+def test_rename_chunk_time_dirs_is_noop_at_zero_offset(monkeypatch):
+    # The very first chunk of phase 1 has offset=0 - renaming "100" to
+    # "100" would be a needless (and on some shells error-prone, "same
+    # file") no-op, so this should skip the WSL round-trip entirely.
+    calls = []
+    monkeypatch.setattr(ssp, "run_wsl_or_raise", lambda cmd, *a, **k: calls.append(cmd))
+    _rename_chunk_time_dirs("/some/case", 0)
+    assert calls == []
+
+
+def test_rename_chunk_time_dirs_shifts_by_offset(monkeypatch):
+    calls = []
+    monkeypatch.setattr(ssp, "run_wsl_or_raise", lambda cmd, *a, **k: calls.append(cmd))
+    _rename_chunk_time_dirs("/some/case", 1500)
+    assert len(calls) == 1
+    cmd = calls[0]
+    assert "1500" in cmd
+    assert '"$d" = "0/"' in cmd  # never renames the initial-state directory
 
 
 def test_room_phase_summary_uses_windowed_mean_not_last_point():

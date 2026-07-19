@@ -21,7 +21,7 @@ from dash import Input, Output, State, dcc, html
 from guv_calcs import Project
 
 from .app_settings import ADVANCED_SETTINGS_DEFAULTS, load_advanced_settings, save_advanced_settings
-from .case_io import read_cell_centers
+from .case_io import clear_stale_run_output, read_cell_centers
 from .decay_analysis import write_results_summary
 from .fan import fan_fvoptions_entry
 from .fluence import compute_fluence_at_points, compute_inactivation_rate, compute_well_mixed_eACH
@@ -788,6 +788,7 @@ def _run_steady_state(guv_path, case_dir, room, settings):
         # single chunk) otherwise.
         t_inf_check_interval=500 if adv["t-infinity-early-stop-enabled"] else None,
         t_inf_rel_tol=(adv["t-infinity-rel-tol"] / 100.0) if adv["t-infinity-early-stop-enabled"] else None,
+        keep_all_timesteps=adv["keep-all-timesteps"],
         fan_entry=fan_entry, monitoring_points=_gather_monitoring_points(settings),
         patches_to_monitor=patches_to_monitor,
         log_fn=_run_log, should_stop=_should_stop, solver_log_fn=_track_solver_time,
@@ -1438,6 +1439,24 @@ settings_modal = dbc.Modal(
                     "%", _adv_defaults["t-infinity-rel-tol"],
                 ),
                 html.Hr(className="my-2"),
+                html.Div("Steady-state time-step retention", className="small fw-bold text-uppercase mb-1"),
+                html.Div(
+                    "By default, a steady-state run only keeps its initial (0/) and final field "
+                    "state on disk once each phase finishes — every intermediate write_interval "
+                    "snapshot along the way gets cleared, so ParaView can only show the start and "
+                    "end, not an animated progression. Turn this on to keep every snapshot instead "
+                    "(renamed to one continuous iteration count spanning Phase 1 then Phase 2, so "
+                    "ParaView's time slider plays through the whole run). Uses more disk space per "
+                    "run — off by default.",
+                    className="small text-muted mb-2",
+                ),
+                _settings_checkbox_field(
+                    "settings-keep-all-timesteps", "Keep all time steps for ParaView",
+                    "Off by default to keep case directories small. Turn on before a run if you "
+                    "want to review the transient build-up/decay in ParaView afterward.",
+                    _adv_defaults["keep-all-timesteps"],
+                ),
+                html.Hr(className="my-2"),
                 html.Div("Decay-mode solver timing", className="small fw-bold text-uppercase mb-1"),
                 html.Div(
                     "Only affects decay-mode runs (steady-state uses its own iteration counts, "
@@ -1955,6 +1974,7 @@ _SETTINGS_FIELD_IDS = [
     "settings-flow-rel-tol", "settings-flow-max-iterations", "settings-plateau-rel-tol",
     "settings-momentum-relaxation", "settings-scalar-relaxation",
     "settings-t-infinity-early-stop-enabled", "settings-t-infinity-rel-tol",
+    "settings-keep-all-timesteps",
     "settings-pimple-delta-t", "settings-mesh-cell-size",
     "settings-uv-zone-bins", "settings-source-zone-size",
 ]
@@ -1964,6 +1984,7 @@ _SETTINGS_FIELD_KEYS = [
     "flow-rel-tol", "flow-max-iterations", "plateau-rel-tol",
     "momentum-relaxation", "scalar-relaxation",
     "t-infinity-early-stop-enabled", "t-infinity-rel-tol",
+    "keep-all-timesteps",
     "pimple-delta-t", "mesh-cell-size", "uv-zone-bins", "source-zone-size",
 ]
 
@@ -2184,6 +2205,7 @@ def _start_run(n_clicks, *values):
 def _confirm_overwrite_run(submit_n_clicks):
     if not _pending_run.get("case_dir"):
         return dash.no_update, dash.no_update, dash.no_update, dash.no_update
+    clear_stale_run_output(_pending_run["case_dir"])
     _launch_run(_pending_run["sim_type"], _pending_run["guv_path"], _pending_run["case_dir"],
                 _pending_run["room"], _pending_run["settings"])
     _pending_run.update(sim_type=None, guv_path=None, case_dir=None, room=None, settings=None)

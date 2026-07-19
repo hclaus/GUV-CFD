@@ -100,6 +100,27 @@ def _clean_time_dirs(case_dir_wsl):
     )
 
 
+def _rename_chunk_time_dirs(case_dir_wsl, offset):
+    """Rename this chunk's own write_interval snapshot directories (locally
+    numbered 1..chunk_size by OpenFOAM, since every chunk starts fresh at
+    time "0") to their true cumulative iteration count, instead of deleting
+    them - used when the user opts into keeping every intermediate
+    snapshot (Settings: "keep all time steps") for ParaView playback. Must
+    run right after a chunk finishes and before the next chunk's simpleFoam
+    invocation starts, so the next chunk's own local numbering (which also
+    restarts small) never collides with a previous chunk's renamed range.
+    """
+    if offset == 0:
+        return
+    cmd = (
+        'for d in [0-9]*/; do [ "$d" = "0/" ] || '
+        '{ n="${d%/}"; mv "$d" "$((n + OFFSET))"; }; done'
+    ).replace("OFFSET", str(offset))
+    run_wsl_or_raise(
+        cmd, case_dir_wsl, "renaming this chunk's time directories to cumulative iteration counts",
+    )
+
+
 def _copy_latest_to_zero(case_dir_wsl, latest, include_T, log_fn):
     fields = "U p k omega nut phi" + (" T" if include_T else "")
     r = run_wsl_or_raise(f"ls {latest}/", case_dir_wsl, "listing converged fields")
@@ -112,9 +133,20 @@ def _copy_latest_to_zero(case_dir_wsl, latest, include_T, log_fn):
 
 def _run_phase(case_dir, case_dir_wsl, n_iterations, write_interval, window_frac, plateau_rel_tol,
                 log_fn, should_stop=None, solver_log_fn=None, live_monitoring_zones=(),
-                live_patches=(), check_interval=None, t_inf_rel_tol=None, t_inf_streak=3):
+                live_patches=(), check_interval=None, t_inf_rel_tol=None, t_inf_streak=3,
+                keep_all_timesteps=False, iteration_offset=0):
     """Run simpleFoam for n_iterations, tracking the room-wide (and any
     monitoring-point) volAverage(T) live, every iteration.
+
+    keep_all_timesteps: if True, every write_interval snapshot directory is
+    kept (renamed to its true cumulative iteration count) instead of being
+    deleted between/after chunks - lets ParaView play back the whole run,
+    not just the initial/final states. iteration_offset shifts the renamed
+    numbers by however many iterations already ran in an earlier phase
+    (e.g. phase 2 passes phase 1's final iteration count), so a caller
+    running multiple phases back-to-back in the same case directory gets
+    one continuous, collision-free numbering instead of both phases
+    starting their directory names back at 1.
 
     check_interval/t_inf_rel_tol/t_inf_streak: optional early-stop via
     T-infinity extrapolation stability (see decay_analysis.
@@ -146,7 +178,8 @@ def _run_phase(case_dir, case_dir_wsl, n_iterations, write_interval, window_frac
     this is a safe, compatible substitution).
     """
     check_interval = check_interval or n_iterations
-    _clean_time_dirs(case_dir_wsl)
+    if not keep_all_timesteps:
+        _clean_time_dirs(case_dir_wsl)
 
     # Live (every-iteration) volAverage tracking - splice into controlDict's
     # functions{} block, alongside whatever's already there (e.g.
@@ -218,6 +251,7 @@ def _run_phase(case_dir, case_dir_wsl, n_iterations, write_interval, window_frac
             azT.extend(zT.tolist())
 
         total_run += chunk_size
+        chunk_start = total_run - chunk_size
 
         stop_early = False
         if t_inf_rel_tol is not None and total_run < n_iterations:
@@ -245,21 +279,29 @@ def _run_phase(case_dir, case_dir_wsl, n_iterations, write_interval, window_frac
             # last (`latest`) is the true final state; the others carry
             # chunk-LOCAL labels that don't match the real cumulative
             # iteration count (misleading if left around - "100" could
-            # really be iteration 1600) and must be removed, not kept.
-            run_wsl_or_raise(
-                f'for d in [0-9]*/; do [ "$d" = "0/" ] || [ "$d" = "{latest}/" ] || rm -rf "$d"; done',
-                case_dir_wsl, "clearing this chunk's other intermediate snapshots",
-            )
-            if latest != str(total_run):
-                run_wsl_or_raise(f"mv {latest} {total_run}", case_dir_wsl,
-                                  "renaming final chunk's time directory")
+            # really be iteration 1600) and must be removed, not kept -
+            # unless keep_all_timesteps opted into preserving them (renamed
+            # to their true cumulative count) instead.
+            if keep_all_timesteps:
+                _rename_chunk_time_dirs(case_dir_wsl, iteration_offset + chunk_start)
+            else:
+                run_wsl_or_raise(
+                    f'for d in [0-9]*/; do [ "$d" = "0/" ] || [ "$d" = "{latest}/" ] || rm -rf "$d"; done',
+                    case_dir_wsl, "clearing this chunk's other intermediate snapshots",
+                )
+                if latest != str(total_run):
+                    run_wsl_or_raise(f"mv {latest} {total_run}", case_dir_wsl,
+                                      "renaming final chunk's time directory")
             run_wsl_or_raise("rm -rf postProcessing", case_dir_wsl, "clearing this chunk's postProcessing")
             break
 
         log_fn(f"  Copying fields from {latest}/ to 0/ so the next chunk continues from here...")
         _copy_latest_to_zero(case_dir_wsl, latest, include_T=True, log_fn=log_fn)
         run_wsl_or_raise("rm -rf postProcessing", case_dir_wsl, "clearing this chunk's postProcessing")
-        _clean_time_dirs(case_dir_wsl)
+        if keep_all_timesteps:
+            _rename_chunk_time_dirs(case_dir_wsl, iteration_offset + chunk_start)
+        else:
+            _clean_time_dirs(case_dir_wsl)
 
     live_curves = {zone: (np.array(vals[0]), np.array(vals[1])) for zone, vals in accumulated.items()}
     live_t, live_T = live_curves["room"]
@@ -277,7 +319,14 @@ def _run_phase(case_dir, case_dir_wsl, n_iterations, write_interval, window_frac
     cv_text = f"{cv * 100:.2f}%" if cv is not None else "n/a"
     log_fn(f"  Stopped at time {total_run}. T_ss={live_T[-1]:.4g} (trailing-{window_frac:.0%} CV={cv_text}, "
            f"{'plateaued' if converged else 'NOT YET PLATEAUED - consider more iterations'})")
-    return str(total_run), sparse_t, sparse_T, converged, live_curves
+    # The on-disk final directory's name: this phase's own iteration count
+    # (total_run) unless keep_all_timesteps shifted it by iteration_offset
+    # (see _rename_chunk_time_dirs) - callers doing further I/O against the
+    # final directory (e.g. _copy_latest_to_zero) need this, while anything
+    # just reporting "how many iterations did this phase run" wants the
+    # unshifted total_run instead (returned separately).
+    latest = str(total_run + iteration_offset) if keep_all_timesteps else str(total_run)
+    return latest, total_run, sparse_t, sparse_T, converged, live_curves
 
 
 def _room_phase_summary(live_room, window_frac, converged, iterations, sparse_t, sparse_T, log_fn):
@@ -346,6 +395,7 @@ def run_steady_state_scenario(case_dir, room_x, room_y, room_z, ach, Z, nbins=25
                                phase2_iterations=3000, phase2_write_interval=100,
                                plateau_rel_tol=0.01, window_frac=0.15,
                                t_inf_check_interval=None, t_inf_rel_tol=None, t_inf_streak=3,
+                               keep_all_timesteps=False,
                                fan_entry=None, monitoring_points=None,
                                patches_to_monitor=("outlet",), log_fn=print, should_stop=None,
                                solver_log_fn=None):
@@ -359,6 +409,13 @@ def run_steady_state_scenario(case_dir, room_x, room_y, room_z, ach, Z, nbins=25
     is None by default (disabled; each phase always runs its full
     phaseN_iterations budget, today's behavior). GUI-exposed as a
     cross-project "advanced" setting (Settings menu, right of File).
+
+    keep_all_timesteps: if True, every write_interval snapshot from both
+    phases is kept on disk (renamed to one continuous, collision-free
+    cumulative iteration count spanning phase 1 then phase 2) instead of
+    being deleted down to just the initial/final state - lets ParaView
+    play back the whole run. Off by default: a long/fine-grained run can
+    leave a lot of snapshot directories behind, so this is opt-in.
 
     fan_entry: pre-built fvOptions entry text (see fan.fan_fvoptions_entry())
     if a mixing fan should stay active through both phases, same "always
@@ -460,21 +517,26 @@ def run_steady_state_scenario(case_dir, room_x, room_y, room_z, ach, Z, nbins=25
     restore_boundary_conditions(case_dir, inlet_velocity=inlet_velocity, T_initial=0,
                                  inlet2_velocity=inlet2_velocity, has_outlet2=has_outlet2)
 
-    latest1, t1, T1, converged1, live1 = _run_phase(
+    latest1, iters1, t1, T1, converged1, live1 = _run_phase(
         case_dir, case_dir_wsl, phase1_iterations, phase1_write_interval,
         window_frac, plateau_rel_tol, log_fn, should_stop=should_stop,
         solver_log_fn=solver_log_fn, live_monitoring_zones=live_zone_names,
         live_patches=patches_to_monitor,
         check_interval=t_inf_check_interval, t_inf_rel_tol=t_inf_rel_tol, t_inf_streak=t_inf_streak,
+        keep_all_timesteps=keep_all_timesteps,
     )
-    summary["phase1"] = _room_phase_summary(live1["room"], window_frac, converged1, latest1, t1, T1, log_fn)
+    summary["phase1"] = _room_phase_summary(live1["room"], window_frac, converged1, iters1, t1, T1, log_fn)
     # _run_phase leaves its final chunk's own time directory in place
-    # (renamed to latest1, its true cumulative iteration count) rather
-    # than cleaning it itself - phase 1's own final state isn't meant for
+    # (named latest1, its true cumulative iteration count) rather than
+    # cleaning it itself - phase 1's own final state isn't meant for
     # standalone ParaView viewing (unlike phase 2's, kept below), so the
-    # caller copies it into 0/ and cleans it away here.
+    # caller copies it into 0/ and, normally, cleans it away here. With
+    # keep_all_timesteps, every phase-1 snapshot stays instead (phase 2's
+    # _run_phase call below is offset by iters1 so its own directory names
+    # continue the same numbering rather than colliding with phase 1's).
     _copy_latest_to_zero(case_dir_wsl, latest1, include_T=True, log_fn=log_fn)
-    _clean_time_dirs(case_dir_wsl)
+    if not keep_all_timesteps:
+        _clean_time_dirs(case_dir_wsl)
 
     # --- Phase 2: source + UV ---
     log_fn("=== Phase 2: source + UV ===")
@@ -484,14 +546,15 @@ def run_steady_state_scenario(case_dir, room_x, room_y, room_z, ach, Z, nbins=25
     _, n_open, n_close = splice_fv_options_into_control_dict(case_dir)
     assert n_open == n_close, f"Brace mismatch: {n_open} vs {n_close}"
 
-    latest2, t2, T2, converged2, live2 = _run_phase(
+    latest2, iters2, t2, T2, converged2, live2 = _run_phase(
         case_dir, case_dir_wsl, phase2_iterations, phase2_write_interval,
         window_frac, plateau_rel_tol, log_fn, should_stop=should_stop,
         solver_log_fn=solver_log_fn, live_monitoring_zones=live_zone_names,
         live_patches=patches_to_monitor,
         check_interval=t_inf_check_interval, t_inf_rel_tol=t_inf_rel_tol, t_inf_streak=t_inf_streak,
+        keep_all_timesteps=keep_all_timesteps, iteration_offset=iters1,
     )
-    summary["phase2"] = _room_phase_summary(live2["room"], window_frac, converged2, latest2, t2, T2, log_fn)
+    summary["phase2"] = _room_phase_summary(live2["room"], window_frac, converged2, iters2, t2, T2, log_fn)
     if monitoring_points:
         summary["monitoring"] = {
             p["name"]: {

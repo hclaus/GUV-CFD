@@ -1,6 +1,6 @@
 import pytest
 
-from guvcfd.case_io import read_patch_face_centers
+from guvcfd.case_io import clear_stale_run_output, read_patch_face_centers
 
 _POINTS = """FoamFile
 {
@@ -123,3 +123,29 @@ def test_face_count_mismatch_asserts(tmp_path):
     case_dir = _write_polymesh(tmp_path, _boundary(n_faces=5, start_face=0))
     with pytest.raises(AssertionError):
         read_patch_face_centers(case_dir, "inlet")
+
+
+def _make_stale_case(tmp_path):
+    case_dir = tmp_path / "case"
+    for name in ("0", "100", "500", "2000"):
+        (case_dir / name).mkdir(parents=True)
+    (case_dir / "0" / "U").write_text("initial field")
+    (case_dir / "2000" / "U").write_text("final field")
+    (case_dir / "postProcessing" / "volAverageLive1").mkdir(parents=True)
+    (case_dir / "results.json").write_text("{}")
+    (case_dir / "log.simpleFoam").write_text("log")
+    (case_dir / "constant").mkdir()
+    (case_dir / "system").mkdir()
+    return case_dir
+
+
+def test_clear_stale_run_output_removes_old_timesteps_and_artifacts(tmp_path):
+    case_dir = _make_stale_case(tmp_path)
+    clear_stale_run_output(str(case_dir))
+    remaining = {p.name for p in case_dir.iterdir()}
+    assert remaining == {"0", "constant", "system"}
+    assert (case_dir / "0" / "U").exists()  # initial state untouched
+
+
+def test_clear_stale_run_output_on_missing_dir_is_a_noop(tmp_path):
+    clear_stale_run_output(str(tmp_path / "does-not-exist"))  # must not raise
