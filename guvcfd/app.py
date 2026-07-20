@@ -2242,6 +2242,13 @@ def _scenario_sweep_thread(guv_path, settings_path, project_dir, room, settings,
             guv_path, settings_path, project_dir, room, settings, adv,
             z_values, ach_values, log_fn=_scenario_log, should_stop=_scenario_should_stop,
             on_combo_done=on_combo_done,
+            # Without this, _run_phase()'s on_line=solver_log_fn or log_fn
+            # falls back to log_fn - every raw per-iteration solver line
+            # (residuals, "Time = N" banners) would flood the scenario
+            # log. Mirrors _run_steady_state's use of _track_solver_time,
+            # but scenario runs don't have a single "current time" to
+            # track (many combinations interleave), so this just discards.
+            solver_log_fn=lambda line: None,
         )
         _scenario_state["status"] = "done"
     except StoppedByUser as e:

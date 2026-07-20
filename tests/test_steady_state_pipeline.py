@@ -4,8 +4,31 @@ import numpy as np
 
 import guvcfd.steady_state_pipeline as ssp
 from guvcfd.steady_state_pipeline import (
-    _point_phase_summary, _rename_chunk_time_dirs, _room_phase_summary, run_steady_state_scenario,
+    _chunk_write_interval, _point_phase_summary, _rename_chunk_time_dirs, _room_phase_summary,
+    run_steady_state_scenario,
 )
+
+
+def test_chunk_write_interval_unaffected_by_full_size_chunks():
+    # Normal case: chunk_size >= write_interval - no-op, at least one
+    # write lands within the chunk already.
+    assert _chunk_write_interval(100, 500) == 100
+    assert _chunk_write_interval(100, 100) == 100
+
+
+def test_chunk_write_interval_clamps_for_short_final_chunk():
+    # Regression: a T-infinity early-stop chunk's remainder (e.g. 84
+    # iterations left after several 500-iteration chunks) can be shorter
+    # than the phase's normal write_interval (e.g. 100) - controlDict's
+    # writeControl is "adjustableRunTime" (never touched by
+    # set_control_dict_time, which only rewrites values), which does NOT
+    # force a write at endTime the way "timeStep" mode would, so without
+    # this clamp no time directory ever appears and _run_phase()'s "did a
+    # new time directory show up" check incorrectly fails a run that
+    # actually completed fine. Confirmed against a real failure: Scenario
+    # Runs sweep, Z=3/ACH=1.5, phase2 endTime=84 with write_interval=100
+    # produced "simpleFoam did not write any new time directory (found: '0')".
+    assert _chunk_write_interval(100, 84) == 84
 
 
 def _log(msg):

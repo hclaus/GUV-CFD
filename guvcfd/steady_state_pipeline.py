@@ -121,6 +121,25 @@ def _rename_chunk_time_dirs(case_dir_wsl, offset):
     )
 
 
+def _chunk_write_interval(write_interval, chunk_size):
+    """write_interval must not exceed this chunk's own duration, or no
+    snapshot ever lands within it and the post-chunk "did a new time
+    directory appear" check fails a run that actually completed fine.
+
+    controlDict's writeControl is "adjustableRunTime" (set once, in the
+    template - set_control_dict_time() only ever rewrites endTime/
+    writeInterval/deltaT's *values*, never writeControl itself) - unlike
+    "timeStep" mode, this does not force a write at endTime, so a chunk
+    shorter than the phase's normal write_interval writes nothing at all
+    otherwise. Only matters for a short final/remainder chunk - normal
+    full-size chunks are unaffected (chunk_size >= write_interval, so
+    this is a no-op then). The T-infinity early-stop feature is what
+    actually produces short final chunks in practice (whatever's left
+    after dividing n_iterations into check_interval-sized pieces).
+    """
+    return min(write_interval, chunk_size)
+
+
 def _copy_latest_to_zero(case_dir_wsl, latest, include_T, log_fn):
     fields = "U p k omega nut phi" + (" T" if include_T else "")
     r = run_wsl_or_raise(f"ls {latest}/", case_dir_wsl, "listing converged fields")
@@ -207,7 +226,8 @@ def _run_phase(case_dir, case_dir_wsl, n_iterations, write_interval, window_frac
 
     while total_run < n_iterations:
         chunk_size = min(check_interval, n_iterations - total_run)
-        set_control_dict_time(case_dir, end_time=chunk_size, write_interval=write_interval, delta_t=1)
+        set_control_dict_time(case_dir, end_time=chunk_size,
+                               write_interval=_chunk_write_interval(write_interval, chunk_size), delta_t=1)
         # set_control_dict_time's sweep above touches every writeInterval
         # in the file, including these live blocks (left over from an
         # earlier chunk/phase) - re-pin them to 1 without touching the
