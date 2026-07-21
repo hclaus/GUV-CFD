@@ -440,6 +440,14 @@ _MESH_AFFECTING_FIELDS = [
 
 
 def _save_run_settings(case_dir, settings, guv_path=None):
+    # Now called BEFORE setup_case() runs (see _run_decay/_run_steady_state)
+    # so a run that fails or pauses before finishing still leaves this on
+    # disk - which means it can no longer rely on setup_case()'s own
+    # Path(case_dir).mkdir() having already run first, for a case directory
+    # that's never been used before (confirmed as a real regression: a
+    # brand-new case dir raised FileNotFoundError here instead of ever
+    # reaching setup_case() at all).
+    Path(case_dir).mkdir(parents=True, exist_ok=True)
     data = {k: settings.get(k) for k in _MESH_AFFECTING_FIELDS}
     # guv_path is provenance for report generation (reloading the Room to
     # render a preview image) - not compared by _settings_mismatch, which
