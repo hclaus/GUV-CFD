@@ -17,7 +17,7 @@ from .case_io import read_openfoam_scalar_field
 from .cellzones import bin_decay_rates
 from .contaminant_source import (
     write_source_topo_set_dict, compute_source_strength, source_Su, source_fvoptions_entry,
-    write_fvoptions_file,
+    write_fvoptions_file, check_mass_balance,
 )
 from .decay_analysis import (
     read_vol_average_dat, check_plateau_windowed, windowed_stats,
@@ -415,13 +415,21 @@ def run_steady_state_scenario(case_dir, room_x, room_y, room_z, ach, Z, nbins=25
                                phase2_iterations=3000, phase2_write_interval=100,
                                plateau_rel_tol=0.01, window_frac=0.15,
                                t_inf_check_interval=None, t_inf_rel_tol=None, t_inf_streak=3,
-                               keep_all_timesteps=False,
+                               keep_all_timesteps=False, mass_balance_tol=0.10,
                                fan_entry=None, monitoring_points=None,
                                patches_to_monitor=("outlet",), log_fn=print, should_stop=None,
                                solver_log_fn=None):
     """Run both phases of a continuous-source steady-state scenario against
     an already-converged case (mesh + flow + fluenceRate/kUV must already
     exist - see run_pipeline.setup_case()). Returns a summary dict.
+
+    mass_balance_tol: fractional tolerance for Phase 1's mass-balance check
+    (contaminant_source.check_mass_balance) - compares the actual outlet
+    removal rate against the known injection rate G, a curve-fitting-free
+    convergence signal (at true steady state they must match exactly).
+    Phase-1-only: Phase 2 also removes T via the UV sink cellZones, not
+    just advective outflow, so the same simple injection=removal identity
+    doesn't hold there (see check_mass_balance's docstring).
 
     t_inf_check_interval/t_inf_rel_tol/t_inf_streak: optional early-stop
     for both phases via T-infinity extrapolation stability (see
@@ -534,7 +542,18 @@ def run_steady_state_scenario(case_dir, room_x, room_y, room_z, ach, Z, nbins=25
     write_fvoptions_file(case_dir, [source_entry] + fan_entries)
     _, n_open, n_close = splice_fv_options_into_control_dict(case_dir)
     assert n_open == n_close, f"Brace mismatch: {n_open} vs {n_close}"
-    restore_boundary_conditions(case_dir, inlet_velocity=inlet_velocity, T_initial=0,
+    # Warm-start T at target_T_ss rather than 0: this is a linear system (T
+    # doesn't feed back into U/p), so the final steady state doesn't depend
+    # on the initial condition at all - only how many iterations it takes to
+    # get there does. target_T_ss is exactly what the source strength was
+    # calibrated to reach under the idealized well-mixed assumption (see
+    # compute_source_strength), so it's a good guess to start near rather
+    # than the full climb from 0 - confirmed on a real case that starting
+    # near the eventual answer reaches a tight, guard-passing plateau in a
+    # small fraction of the iterations a T=0 start needed for the same
+    # curve. Phase 2 already does the equivalent right thing (starts from
+    # Phase 1's own converged T); this brings Phase 1 in line with that.
+    restore_boundary_conditions(case_dir, inlet_velocity=inlet_velocity, T_initial=target_T_ss,
                                  inlet2_velocity=inlet2_velocity, has_outlet2=has_outlet2)
 
     latest1, iters1, t1, T1, converged1, live1 = _run_phase(
@@ -546,6 +565,8 @@ def run_steady_state_scenario(case_dir, room_x, room_y, room_z, ach, Z, nbins=25
         keep_all_timesteps=keep_all_timesteps,
     )
     summary["phase1"] = _room_phase_summary(live1["room"], window_frac, converged1, iters1, t1, T1, log_fn)
+    summary["phase1"]["mass_balance"] = check_mass_balance(
+        case_dir, patches_to_monitor, G, tol=mass_balance_tol, log_fn=log_fn)
     # _run_phase leaves its final chunk's own time directory in place
     # (named latest1, its true cumulative iteration count) rather than
     # cleaning it itself - phase 1's own final state isn't meant for

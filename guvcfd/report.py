@@ -471,6 +471,50 @@ def _room_setup_rows(room, settings):
     return rows
 
 
+def _trust_status_rows(results):
+    """Plain-language rows summarizing whether this run's flow field,
+    ventilation delivery, and (for steady-state runs) Phase 1 mass balance
+    are trustworthy - kept as separate rows, not one blended verdict,
+    because they check genuinely different things and can disagree: a
+    perfectly-converged-looking contaminant curve can still be riding on a
+    flow field that never itself converged (only accepted via bounded
+    oscillation), and neither of those says whether the mesh/BCs are even
+    delivering the intended ventilation rate at all - confirmed directly
+    on a real case where all of flow-convergence and T-plateau looked fine
+    while the inlet was silently delivering only ~38% of its target flow.
+    Missing/None fields (older result files, or flow convergence skipped)
+    are reported as "not available" rather than guessed at.
+    """
+    rows = []
+
+    flow_converged = results.get("flow_converged")
+    if flow_converged is None:
+        rows.append(("Flow field", "Not available (older run, or flow convergence was skipped)"))
+    elif flow_converged:
+        rows.append(("Flow field", "Converged (flow-convergence tolerance satisfied)"))
+    else:
+        rows.append(("Flow field", "Accepted via bounded oscillation - never fully converged "
+                                    "(common for a jet/fan impinging on a wall or floor; see "
+                                    "Advanced Settings > Flow oscillation acceptance)"))
+
+    ach = results.get("ach_delivery")
+    if ach is None:
+        rows.append(("Ventilation delivery", "Not checked (older run)"))
+    else:
+        verdict = "OK" if ach["within_tolerance"] else "MISMATCH - do not trust downstream results"
+        rows.append(("Ventilation delivery", f"{ach['measured_ach']:.3g}/hr measured vs "
+                                              f"{ach['nominal_ach']:.3g}/hr nominal "
+                                              f"({ach['ratio']:.0%}) - {verdict}"))
+
+    mass_balance = results.get("phase1", {}).get("mass_balance") if "phase1" in results else None
+    if mass_balance is not None:
+        verdict = "balanced" if mass_balance["within_tolerance"] else "NOT balanced - Phase 1 may not be converged"
+        rows.append(("Phase 1 mass balance", f"outlet removal / injection = {mass_balance['ratio']:.0%} "
+                                              f"- {verdict}"))
+
+    return rows
+
+
 def _add_kv_table(doc, rows):
     table = doc.add_table(rows=0, cols=2)
     table.style = "Light Grid Accent 1"
@@ -650,6 +694,11 @@ def _write_report_docx(doc_out_path, case_dir, guv_path, settings, results, room
 
     doc.add_heading("Case Setup", level=2)
     doc.add_picture(str(image_path), width=Inches(6.0))
+
+    trust_rows = _trust_status_rows(results)
+    if trust_rows:
+        doc.add_heading("Convergence & Trust", level=2)
+        _add_kv_table(doc, trust_rows)
 
     if is_steady_state:
         # Relocate everything built so far (title/metadata, Room Setup,

@@ -3,7 +3,7 @@ import time
 
 import pytest
 
-from guvcfd.report import generate_report_docx, _format_elapsed, _run_timing
+from guvcfd.report import generate_report_docx, _format_elapsed, _run_timing, _trust_status_rows
 
 
 @pytest.fixture(autouse=True)
@@ -650,3 +650,67 @@ def test_decay_report_embeds_decay_curve_picture(tmp_path):
     from docx import Document
     doc = Document(out_path)
     assert len(doc.inline_shapes) == 2  # case-setup preview + decay-curve picture
+
+
+def test_trust_status_rows_flow_converged_and_ach_ok():
+    rows = _trust_status_rows({
+        "flow_converged": True,
+        "ach_delivery": {"measured_ach": 1.48, "nominal_ach": 1.5, "ratio": 0.987, "within_tolerance": True},
+    })
+    labels = dict(rows)
+    assert "Converged" in labels["Flow field"]
+    assert "OK" in labels["Ventilation delivery"]
+
+
+def test_trust_status_rows_flow_accepted_via_oscillation():
+    rows = _trust_status_rows({"flow_converged": False, "ach_delivery": None})
+    labels = dict(rows)
+    assert "Accepted via bounded oscillation" in labels["Flow field"]
+    assert labels["Ventilation delivery"] == "Not checked (older run)"
+
+
+def test_trust_status_rows_flags_ach_mismatch():
+    rows = _trust_status_rows({
+        "flow_converged": True,
+        "ach_delivery": {"measured_ach": 0.57, "nominal_ach": 1.5, "ratio": 0.38, "within_tolerance": False},
+    })
+    labels = dict(rows)
+    assert "MISMATCH" in labels["Ventilation delivery"]
+
+
+def test_trust_status_rows_missing_fields_report_not_available():
+    rows = _trust_status_rows({})
+    labels = dict(rows)
+    assert labels["Flow field"] == "Not available (older run, or flow convergence was skipped)"
+    assert labels["Ventilation delivery"] == "Not checked (older run)"
+    assert "Phase 1 mass balance" not in labels
+
+
+def test_trust_status_rows_includes_phase1_mass_balance_when_present():
+    rows = _trust_status_rows({
+        "phase1": {"mass_balance": {"ratio": 0.73, "within_tolerance": False}},
+    })
+    labels = dict(rows)
+    assert "NOT balanced" in labels["Phase 1 mass balance"]
+
+
+def test_trust_status_rows_reported_in_generated_docx(tmp_path):
+    case_dir = str(tmp_path)
+    (tmp_path / "run_settings.json").write_text(json.dumps(_REAL_SETTINGS))
+    decay_results = {
+        "ventilation_ach": 3.0, "eACH_uv_well_mixed": 10.27, "eACH_uv_effective": 8.97,
+        "mixing_efficiency": 0.873, "total_ach_effective": 11.97,
+        "decay_curve": {"t_seconds": [0, 10], "volAverage_T": [1.0, 0.9]},
+        "fluence_mean": 5.678,
+        "flow_converged": False,
+        "ach_delivery": {"measured_ach": 0.57, "nominal_ach": 1.5, "ratio": 0.38, "within_tolerance": False},
+    }
+    (tmp_path / "results.json").write_text(json.dumps(decay_results))
+    out_path = str(tmp_path / "out.docx")
+
+    generate_report_docx(case_dir, out_path)
+
+    from docx import Document
+    doc = Document(out_path)
+    full_text = "\n".join(p.text for p in doc.paragraphs)
+    assert "Convergence & Trust" in full_text

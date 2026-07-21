@@ -1,6 +1,10 @@
 import inspect
+from types import SimpleNamespace
 
-from guvcfd.run_pipeline import _is_stable_oscillation, converge_flow_field, setup_case
+import guvcfd.run_pipeline as run_pipeline
+from guvcfd.run_pipeline import (
+    _is_stable_oscillation, check_ach_delivery, converge_flow_field, setup_case,
+)
 
 
 def test_flow_convergence_default_tolerance_is_one_percent():
@@ -68,3 +72,81 @@ def test_growth_just_over_tolerance_is_rejected():
     older = [0.0, 0.10]        # amplitude 0.10
     newer = [0.0, 0.1501]      # amplitude just over 1.5x
     assert not _is_stable_oscillation(older + newer, window=2, growth_tol=1.5)
+
+
+def test_converge_flow_field_returns_converged_flag():
+    # Regression guard: setup_case() unpacks (latest_time, converged) - if
+    # this ever goes back to a bare string return, that unpacking silently
+    # breaks (or worse, silently mis-assigns) rather than erroring loudly.
+    src = inspect.getsource(converge_flow_field)
+    assert "return str(total_run), converged" in src
+
+
+def _fake_wsl_result(stdout):
+    return SimpleNamespace(stdout=stdout, returncode=0)
+
+
+def test_check_ach_delivery_within_tolerance(monkeypatch, tmp_path):
+    written = {}
+
+    def fake_run_wsl_or_raise(cmd, cwd_wsl, step_name):
+        written["cmd"] = cmd
+        return _fake_wsl_result("sum(outlet) of phi = 0.0273193")
+
+    monkeypatch.setattr(run_pipeline, "_run_wsl_or_raise", fake_run_wsl_or_raise)
+    monkeypatch.setattr(run_pipeline, "_run_wsl", lambda cmd, cwd_wsl: _fake_wsl_result(""))
+
+    (tmp_path / "system").mkdir()
+    result = check_ach_delivery(str(tmp_path), room_volume=64.8, ach=1.5, tol=0.10, log_fn=lambda *a: None)
+
+    # nominal = 1.5 * 64.8 / 3600 = 0.027; measured 0.0273193 -> ratio ~1.012
+    assert result["within_tolerance"] is True
+    assert result["nominal_flow_rate"] == 1.5 * 64.8 / 3600.0
+    assert abs(result["measured_flow_rate"] - 0.0273193) < 1e-9
+    assert (tmp_path / "system" / "flowRateDict").exists()
+
+
+def test_check_ach_delivery_outside_tolerance_flags_it(monkeypatch, tmp_path):
+    def fake_run_wsl_or_raise(cmd, cwd_wsl, step_name):
+        # Reproduces the real under-delivering-diffuser case: only ~38% of
+        # nominal actually leaves through the outlet.
+        return _fake_wsl_result("sum(outlet) of phi = 0.0103496")
+
+    monkeypatch.setattr(run_pipeline, "_run_wsl_or_raise", fake_run_wsl_or_raise)
+    monkeypatch.setattr(run_pipeline, "_run_wsl", lambda cmd, cwd_wsl: _fake_wsl_result(""))
+
+    (tmp_path / "system").mkdir()
+    logged = []
+    result = check_ach_delivery(str(tmp_path), room_volume=64.8, ach=1.5, tol=0.10, log_fn=logged.append)
+
+    assert result["within_tolerance"] is False
+    assert result["ratio"] < 0.9
+    assert any("WARNING" in line for line in logged)
+
+
+def test_check_ach_delivery_sums_multiple_outlet_patches(monkeypatch, tmp_path):
+    def fake_run_wsl_or_raise(cmd, cwd_wsl, step_name):
+        return _fake_wsl_result(
+            "sum(outlet) of phi = 0.015\nsum(outlet2) of phi = 0.012"
+        )
+
+    monkeypatch.setattr(run_pipeline, "_run_wsl_or_raise", fake_run_wsl_or_raise)
+    monkeypatch.setattr(run_pipeline, "_run_wsl", lambda cmd, cwd_wsl: _fake_wsl_result(""))
+
+    (tmp_path / "system").mkdir()
+    result = check_ach_delivery(str(tmp_path), room_volume=64.8, ach=1.5,
+                                 outlet_patches=("outlet", "outlet2"), tol=0.10, log_fn=lambda *a: None)
+    assert abs(result["measured_flow_rate"] - 0.027) < 1e-9
+
+
+def test_check_ach_delivery_raises_on_unparseable_output(monkeypatch, tmp_path):
+    monkeypatch.setattr(run_pipeline, "_run_wsl_or_raise",
+                         lambda cmd, cwd_wsl, step_name: _fake_wsl_result("nothing useful here"))
+    monkeypatch.setattr(run_pipeline, "_run_wsl", lambda cmd, cwd_wsl: _fake_wsl_result(""))
+
+    (tmp_path / "system").mkdir()
+    try:
+        check_ach_delivery(str(tmp_path), room_volume=64.8, ach=1.5, log_fn=lambda *a: None)
+        assert False, "expected RuntimeError"
+    except RuntimeError:
+        pass

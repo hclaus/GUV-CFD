@@ -582,6 +582,8 @@ def _run_decay(guv_path, case_dir, room, settings):
         pimple_delta_t=adv["pimple-delta-t"],
         cell_size=adv["mesh-cell-size"], nbins=adv["uv-zone-bins"],
         flow_rel_tol=adv["flow-rel-tol"] / 100.0, flow_max_iterations=adv["flow-max-iterations"],
+        oscillation_window=adv["oscillation-window"], oscillation_growth_tol=adv["oscillation-growth-tol"],
+        ach_delivery_tol=adv["ach-delivery-tol"] / 100.0,
         momentum_relaxation=adv["momentum-relaxation"], scalar_relaxation=adv["scalar-relaxation"],
         log_fn=_run_log, should_stop=_should_stop, solver_log_fn=_track_solver_time,
         **_fan_kwargs(settings),
@@ -614,7 +616,11 @@ def _run_decay(guv_path, case_dir, room, settings):
     _run_log("Writing results summary...")
     results = write_results_summary(
         case_dir, f"{case_dir}/results.json", settings["ach"],
-        summary["eACH_uv_well_mixed_mean"], extra={"n_lamps": summary["n_lamps"], "fluence_mean": summary["fluence_mean"]},
+        summary["eACH_uv_well_mixed_mean"],
+        extra={
+            "n_lamps": summary["n_lamps"], "fluence_mean": summary["fluence_mean"],
+            "flow_converged": summary.get("flow_converged"), "ach_delivery": summary.get("ach_delivery"),
+        },
     )
 
     if settings.get("no-uv-control-enable"):
@@ -768,6 +774,8 @@ def _run_steady_state(guv_path, case_dir, room, settings):
         outlet_size=(settings["outlet-size-w"], settings["outlet-size-h"]),
         cell_size=adv["mesh-cell-size"], nbins=adv["uv-zone-bins"],
         flow_rel_tol=adv["flow-rel-tol"] / 100.0, flow_max_iterations=adv["flow-max-iterations"],
+        oscillation_window=adv["oscillation-window"], oscillation_growth_tol=adv["oscillation-growth-tol"],
+        ach_delivery_tol=adv["ach-delivery-tol"] / 100.0,
         momentum_relaxation=adv["momentum-relaxation"], scalar_relaxation=adv["scalar-relaxation"],
         log_fn=_run_log, should_stop=_should_stop, solver_log_fn=_track_solver_time,
         **fan_kwargs,
@@ -823,6 +831,7 @@ def _run_steady_state(guv_path, case_dir, room, settings):
         cell_size=adv["mesh-cell-size"], nbins=adv["uv-zone-bins"],
         source_size=adv["source-zone-size"],
         plateau_rel_tol=adv["plateau-rel-tol"] / 100.0,
+        mass_balance_tol=adv["mass-balance-tol"] / 100.0,
         # 500-iteration check interval: the value backtested against a
         # real run (see check_t_infinity_stability's docstring) - only
         # meaningful when t_inf_rel_tol is actually set below, since
@@ -837,6 +846,14 @@ def _run_steady_state(guv_path, case_dir, room, settings):
     )
     result["fluence_mean"] = summary["fluence_mean"]
     result["eACH_uv_well_mixed"] = summary.get("eACH_uv_well_mixed_mean")
+    # Flow/ACH-delivery trust status - computed once during setup_case(),
+    # carried into this scenario's own results.json so a report/GUI badge
+    # can reflect them alongside phase1/phase2's own T-convergence status
+    # (see steady_state_pipeline.check_mass_balance) without re-deriving
+    # anything - these three are deliberately kept as separate signals
+    # (see the flow-vs-T trust-status discussion), not blended into one.
+    result["flow_converged"] = summary.get("flow_converged")
+    result["ach_delivery"] = summary.get("ach_delivery")
     with open(f"{case_dir}/results.json", "w") as f:
         json.dump(result, f, indent=2)
     _complete_all_steps()
@@ -1455,6 +1472,63 @@ settings_modal = dbc.Modal(
                     "converge.",
                     "iterations", _adv_defaults["flow-max-iterations"],
                 ),
+                html.Hr(className="my-2"),
+                html.Div("Flow oscillation acceptance", className="small fw-bold text-uppercase mb-1"),
+                html.Div(
+                    "Many room-ventilation flows (a jet or mixing fan impinging on a wall, floor, or "
+                    "another jet) never truly satisfy the flow convergence tolerance above - they "
+                    "settle into a genuinely oscillating, bounded pattern instead (real unsteady "
+                    "turbulence, not a numerical problem). Rather than running forever (or up to the "
+                    "max iterations above) chasing a residual that will never go flat, the flow field "
+                    "gets ACCEPTED once its own oscillation stops growing or drifting - these two "
+                    "settings control how that decision is made. Verified empirically that "
+                    "downstream results (T_ss, eACH_uv) are insensitive to exactly which point in "
+                    "the oscillation the field gets accepted at.",
+                    className="small text-muted mb-2",
+                ),
+                _settings_field(
+                    "settings-oscillation-window", "Oscillation check window",
+                    "How many convergence-check chunks (each of size \"Flow convergence tolerance\"'s "
+                    "own check interval) are compared against the same number of chunks before them "
+                    "to decide whether the oscillation has stopped growing. Needs at least 2x this "
+                    "many chunks of history before it can accept anything - raising it demands more "
+                    "evidence (slower to accept, more confident when it does); lowering it accepts "
+                    "sooner but on thinner evidence.",
+                    "chunks", _adv_defaults["oscillation-window"],
+                ),
+                _settings_field(
+                    "settings-oscillation-growth-tol", "Oscillation growth tolerance",
+                    "How much the oscillation's amplitude (swing between its high and low points) is "
+                    "allowed to grow in the most recent window compared to the window before it, and "
+                    "still count as \"bounded\" rather than \"still getting worse.\" 1.5 means the "
+                    "recent swing may be up to 50% larger than before and still be accepted. Lower = "
+                    "stricter (only accepts a truly flat-amplitude oscillation); higher = looser "
+                    "(tolerates a still-growing oscillation before giving up).",
+                    "x", _adv_defaults["oscillation-growth-tol"],
+                ),
+                html.Hr(className="my-2"),
+                html.Div("Ventilation delivery check", className="small fw-bold text-uppercase mb-1"),
+                html.Div(
+                    "Right after flow convergence, the actual volumetric flow rate leaving through "
+                    "the outlet(s) is measured directly (summing the solved flux field) and compared "
+                    "against the nominal ACH target - independent of whether the flow itself "
+                    "converged or was only accepted via the oscillation check above. This exists "
+                    "because a diffuser's velocity model can silently under- or over-deliver its "
+                    "intended flow rate while every other check (flow residuals, T plateau) looks "
+                    "completely normal - confirmed on a real case where a \"ceiling\" diffuser "
+                    "delivered only ~38% of its nominal target despite a perfectly ordinary-looking "
+                    "flow log. If this check fails, every downstream number (T_ss, eACH_uv, mixing "
+                    "efficiency) is being computed against the wrong effective ACH - fix the inlet/"
+                    "outlet geometry or diffuser type before trusting anything past this point.",
+                    className="small text-muted mb-2",
+                ),
+                _settings_field(
+                    "settings-ach-delivery-tol", "ACH delivery tolerance",
+                    "How far the measured ventilation flow rate may differ from the nominal ACH "
+                    "target before this is flagged as a setup problem rather than ordinary numerical "
+                    "noise. Lower = stricter (flags smaller mismatches); higher = looser.",
+                    "%", _adv_defaults["ach-delivery-tol"],
+                ),
                 _settings_field(
                     "settings-plateau-rel-tol", "Steady-state plateau tolerance",
                     "The trailing-window coefficient of variation (CV) below which a steady-state "
@@ -1463,6 +1537,19 @@ settings_modal = dbc.Modal(
                     "actual result are always checking the same thing. Lower = stricter (demands a "
                     "flatter tail before declaring convergence); higher = looser.",
                     "%", _adv_defaults["plateau-rel-tol"],
+                ),
+                _settings_field(
+                    "settings-mass-balance-tol", "Mass balance tolerance (Phase 1)",
+                    "Phase 1's contaminant source has a known injection rate G; at a true steady "
+                    "state, whatever leaves through the outlet(s) must equal G exactly, so comparing "
+                    "measured outlet removal to G is a convergence check that needs no curve-fitting "
+                    "or windowing assumptions at all - confirmed directly catching a still-climbing, "
+                    "not-yet-converged run (outlet removal read ~75% of injection while T was "
+                    "visibly still rising). This tolerance is how far apart they may be and still "
+                    "count as \"balanced.\" Lower = stricter; higher = looser. Not used for Phase 2 "
+                    "(UV also removes T via the sink zones themselves, not just outflow, so the "
+                    "same simple identity doesn't hold there).",
+                    "%", _adv_defaults["mass-balance-tol"],
                 ),
                 html.Hr(className="my-2"),
                 html.Div("Solver stability (under-relaxation)", className="small fw-bold text-uppercase mb-1"),
@@ -2058,7 +2145,9 @@ def _open_help_modal(*_clicks):
 
 
 _SETTINGS_FIELD_IDS = [
-    "settings-flow-rel-tol", "settings-flow-max-iterations", "settings-plateau-rel-tol",
+    "settings-flow-rel-tol", "settings-flow-max-iterations",
+    "settings-oscillation-window", "settings-oscillation-growth-tol", "settings-ach-delivery-tol",
+    "settings-plateau-rel-tol", "settings-mass-balance-tol",
     "settings-momentum-relaxation", "settings-scalar-relaxation",
     "settings-t-infinity-early-stop-enabled", "settings-t-infinity-rel-tol",
     "settings-keep-all-timesteps",
@@ -2068,7 +2157,9 @@ _SETTINGS_FIELD_IDS = [
 # Same order as _SETTINGS_FIELD_IDS - maps each GUI field to its
 # app_settings.py storage key (see ADVANCED_SETTINGS_DEFAULTS).
 _SETTINGS_FIELD_KEYS = [
-    "flow-rel-tol", "flow-max-iterations", "plateau-rel-tol",
+    "flow-rel-tol", "flow-max-iterations",
+    "oscillation-window", "oscillation-growth-tol", "ach-delivery-tol",
+    "plateau-rel-tol", "mass-balance-tol",
     "momentum-relaxation", "scalar-relaxation",
     "t-infinity-early-stop-enabled", "t-infinity-rel-tol",
     "keep-all-timesteps",

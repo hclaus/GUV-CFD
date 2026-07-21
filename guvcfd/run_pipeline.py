@@ -5,6 +5,7 @@ fvOptions binning, and fvOptions splicing - given just a .guv project and a
 target case directory. Everything else this package's modules do piecewise
 via manual WSL shell-outs, this ties into one command.
 """
+import re
 import shutil
 from pathlib import Path
 
@@ -281,7 +282,104 @@ def converge_flow_field(case_dir, n_iterations=500, fan_entry=None, log_fn=print
            "the stale p data in place under the expected filename.")
     _run_wsl("rm -rf postProcessing", case_dir_wsl)
 
-    return str(total_run)
+    return str(total_run), converged
+
+
+def _flow_rate_dict(patches):
+    lines = [
+        "FoamFile", "{", "    version     2.0;", "    format      ascii;",
+        "    class       dictionary;", "    object      flowRateDict;", "}", "",
+        "functions", "{",
+        "    readPhi", "    {",
+        "        type            readFields;",
+        '        libs            ("libfieldFunctionObjects.so");',
+        "        fields          (phi);",
+        "        executeControl  timeStep;",
+        "        executeInterval 1;",
+        "    }", "",
+    ]
+    for patch in patches:
+        lines += [
+            f"    {patch}FlowRate", "    {",
+            "        type            surfaceFieldValue;",
+            '        libs            ("libfieldFunctionObjects.so");',
+            "        fields          (phi);",
+            "        operation       sum;",
+            "        regionType      patch;",
+            f"        name            {patch};",
+            "        executeControl  timeStep;",
+            "        executeInterval 1;",
+            "        writeControl    timeStep;",
+            "        writeInterval   1;",
+            "        writeFields     false;",
+            "    }", "",
+        ]
+    lines += ["}", ""]
+    return "\n".join(lines)
+
+
+def check_ach_delivery(case_dir, room_volume, ach, outlet_patches=("outlet",), tol=0.10, log_fn=print):
+    """Measure the CFD's actual delivered ventilation flow rate (summing the
+    solved flux field `phi` over the outlet patch/es) and compare it against
+    the nominal ACH target - independent of, and a precondition for trusting,
+    anything the later contaminant/UV phases report.
+
+    This exists because a diffuser's velocity-direction model can silently
+    under- (or over-) deliver its intended flow rate while looking completely
+    normal in every flow-convergence log: a "ceiling" diffuser giving every
+    face the same 3D speed but tilting most of it tangentially (Coanda
+    spread) delivered only ~38% of its nominal target on a real case, even
+    though the flow field itself looked unremarkable - residuals plateaued
+    the same way a healthy, correctly-flowing case's would. No amount of
+    flow-residual or T-plateau checking downstream would ever catch this;
+    only measuring the actual delivered flow rate does. Cheap - reads
+    already-solved fields, no new solve needed (confirmed: a few seconds).
+
+    outlet_patches: sum flow across all of them (e.g. ("outlet", "outlet2")
+    when a 2nd outlet is enabled) - net ventilation flow is what leaves via
+    the outlet(s), regardless of how many inlets fed it.
+
+    Returns a dict: {measured_flow_rate, nominal_flow_rate, measured_ach,
+    nominal_ach, ratio, within_tolerance, tol}. ratio = measured/nominal;
+    within_tolerance is True iff ratio is within [1-tol, 1+tol].
+    """
+    case_dir_wsl = _wsl_path(case_dir)
+    flow_rate_dict_path = f"{case_dir}/system/flowRateDict"
+    with open(flow_rate_dict_path, "w") as f:
+        f.write(_flow_rate_dict(outlet_patches))
+
+    r = _run_wsl_or_raise("postProcess -dict system/flowRateDict -latestTime", case_dir_wsl,
+                           "measuring delivered ACH (outlet flow rate)")
+    _run_wsl("rm -rf postProcessing", case_dir_wsl)
+
+    measured_flow_rate = 0.0
+    for patch in outlet_patches:
+        m = re.search(rf"sum\({patch}\) of phi = ([\-0-9.eE+]+)", r.stdout)
+        if not m:
+            raise RuntimeError(
+                f"Could not parse outlet flow rate for patch {patch!r} from postProcess output:\n{r.stdout}")
+        measured_flow_rate += abs(float(m.group(1)))
+
+    nominal_flow_rate = ach * room_volume / 3600.0
+    ratio = measured_flow_rate / nominal_flow_rate if nominal_flow_rate else float("inf")
+    measured_ach = measured_flow_rate * 3600.0 / room_volume if room_volume else 0.0
+    within_tolerance = (1 - tol) <= ratio <= (1 + tol)
+
+    if within_tolerance:
+        log_fn(f"ACH delivery check: measured {measured_ach:.4g} /hr vs nominal {ach:.4g} /hr "
+               f"(ratio {ratio:.2%}) - within +/-{tol:.0%} tolerance, OK.")
+    else:
+        log_fn(f"ACH delivery check WARNING: measured {measured_ach:.4g} /hr vs nominal {ach:.4g} /hr "
+               f"(ratio {ratio:.2%}) - OUTSIDE +/-{tol:.0%} tolerance. The mesh/BCs are not delivering "
+               f"the intended ventilation rate - every downstream result (T_ss, eACH_uv, mixing "
+               f"efficiency) will be computed against the WRONG effective ACH until this is fixed "
+               f"(check inlet/outlet geometry, diffuser type, or opening size).")
+
+    return {
+        "measured_flow_rate": measured_flow_rate, "nominal_flow_rate": nominal_flow_rate,
+        "measured_ach": measured_ach, "nominal_ach": ach, "ratio": ratio,
+        "within_tolerance": within_tolerance, "tol": tol,
+    }
 
 
 def setup_case(guv_path, case_dir, template_case_dir=None, cell_size=0.1, Z=2.0, nbins=25,
@@ -294,6 +392,7 @@ def setup_case(guv_path, case_dir, template_case_dir=None, cell_size=0.1, Z=2.0,
                outlet2_wall=None, outlet2_center=None, outlet2_size=None,
                converge_flow=True, simple_foam_iterations=500, flow_convergence_method="simple",
                flow_rel_tol=0.01, flow_max_iterations=20000,
+               oscillation_window=6, oscillation_growth_tol=1.5, ach_delivery_tol=0.10,
                momentum_relaxation=None, scalar_relaxation=None,
                pimple_end_time=120, pimple_write_interval=10, pimple_delta_t=0.5,
                fan_speed=None, fan_center=None, fan_direction=(0, 0, -1),
@@ -329,6 +428,24 @@ def setup_case(guv_path, case_dir, template_case_dir=None, cell_size=0.1, Z=2.0,
     what happens when this is hit without converging) - GUI-exposed as a
     cross-project "advanced" default (Settings menu, right of File), like
     flow_rel_tol/cell_size/nbins above.
+
+    oscillation_window/oscillation_growth_tol: passed straight through to
+    converge_flow_field's _is_stable_oscillation check (see its own
+    docstring) - the decision that lets a persistently-oscillating flow
+    (a jet/fan impinging on a wall or floor, common in these room-
+    ventilation cases) get ACCEPTED as "good enough to proceed" rather than
+    raising, once bounded and not still growing/drifting. Previously
+    hardcoded with no GUI visibility at all - now a cross-project
+    "advanced" default like the others.
+
+    ach_delivery_tol: fractional tolerance (0.10 = 10%) for
+    check_ach_delivery(), run right after flow convergence - independent of
+    whether the flow itself converged or was accepted via oscillation, this
+    checks whether the mesh/BCs are actually delivering the intended `ach`
+    at all. A flow-residual or T-plateau check downstream would never catch
+    a diffuser under/over-delivering its nominal flow rate (see
+    check_ach_delivery's docstring for the real case that motivated this).
+    GUI-exposed as a cross-project "advanced" default.
 
     momentum_relaxation/scalar_relaxation: SIMPLE under-relaxation factors
     for U/(k|omega) and T respectively (see splice.set_relaxation_factors)
@@ -479,15 +596,23 @@ def setup_case(guv_path, case_dir, template_case_dir=None, cell_size=0.1, Z=2.0,
     if converge_flow:
         log_fn(f"Converging flow field ({flow_convergence_method}, chunk size="
                f"{simple_foam_iterations} iterations)...")
-        converge_flow_field(case_dir, n_iterations=simple_foam_iterations, fan_entry=fan_entry,
-                             log_fn=log_fn, should_stop=should_stop, method=flow_convergence_method,
-                             rel_tol=flow_rel_tol, max_iterations=flow_max_iterations, solver_log_fn=solver_log_fn)
+        _, flow_converged = converge_flow_field(
+            case_dir, n_iterations=simple_foam_iterations, fan_entry=fan_entry,
+            log_fn=log_fn, should_stop=should_stop, method=flow_convergence_method,
+            rel_tol=flow_rel_tol, max_iterations=flow_max_iterations,
+            oscillation_window=oscillation_window, oscillation_growth_tol=oscillation_growth_tol,
+            solver_log_fn=solver_log_fn)
+        summary["flow_converged"] = flow_converged
         if should_stop is not None and should_stop():
             raise StoppedByUser("Stopped after flow convergence.")
         log_fn("  restoring our own boundary conditions again (simpleFoam's mesh-derived "
                "boundary values aren't necessarily our fixedValue settings either)...")
         restore_boundary_conditions(case_dir, inlet_velocity=inlet_velocity, inlet2_velocity=inlet2_velocity,
                                      has_outlet2=has_outlet2)
+
+        outlet_patches = ("outlet", "outlet2") if has_outlet2 else ("outlet",)
+        summary["ach_delivery"] = check_ach_delivery(
+            case_dir, room_volume, ach, outlet_patches=outlet_patches, tol=ach_delivery_tol, log_fn=log_fn)
 
     log_fn("Computing fluence rate at cell centers...")
     points = read_cell_centers(case_dir, "0")

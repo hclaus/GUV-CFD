@@ -25,6 +25,10 @@ ADVANCED_SETTINGS_DEFAULTS = {
     "t-infinity-early-stop-enabled": False,  # opt-in - see steady_state_pipeline._run_phase
     "t-infinity-rel-tol": 2.0,   # % - T-infinity stability tolerance (see check_t_infinity_stability)
     "keep-all-timesteps": False,  # opt-in - see steady_state_pipeline.run_steady_state_scenario
+    "oscillation-window": 6,        # chunks - run_pipeline._is_stable_oscillation
+    "oscillation-growth-tol": 1.5,  # ratio - run_pipeline._is_stable_oscillation
+    "ach-delivery-tol": 10.0,   # % - run_pipeline.check_ach_delivery
+    "mass-balance-tol": 10.0,   # % - contaminant_source.check_mass_balance (steady-state Phase 1)
 }
 
 
