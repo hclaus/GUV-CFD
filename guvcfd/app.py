@@ -1751,7 +1751,10 @@ settings_modal = dbc.Modal(
                     "settings-t-infinity-early-stop-enabled", "Enable T∞ early stopping",
                     "Off by default - this is a new, not-yet-widely-validated mechanism. Turn on "
                     "once you've compared a couple of early-stopped runs against full runs on your "
-                    "own projects and trust it.",
+                    "own projects and trust it. Currently cannot be combined with \"Keep all time "
+                    "steps for ParaView\" below - a real directory-naming bug was found in that "
+                    "combination (since fixed, but blocked here as a precaution until it's proven "
+                    "out further).",
                     _adv_defaults["t-infinity-early-stop-enabled"],
                 ),
                 _settings_field(
@@ -1776,7 +1779,9 @@ settings_modal = dbc.Modal(
                 _settings_checkbox_field(
                     "settings-keep-all-timesteps", "Keep all time steps for ParaView",
                     "Off by default to keep case directories small. Turn on before a run if you "
-                    "want to review the transient build-up/decay in ParaView afterward.",
+                    "want to review the transient build-up/decay in ParaView afterward. Currently "
+                    "cannot be combined with \"Enable T∞ early stopping\" above - see that "
+                    "checkbox's note.",
                     _adv_defaults["keep-all-timesteps"],
                 ),
                 html.Hr(className="my-2"),
@@ -2359,6 +2364,18 @@ def _reset_settings_modal(_n):
 )
 def _save_settings(_n, *values):
     settings = dict(zip(_SETTINGS_FIELD_KEYS, values))
+    # Defense-in-depth, kept even after fixing the actual bug this guarded
+    # against (steady_state_pipeline._rename_chunk_time_dirs used to rename
+    # every numbered directory on disk, not just the current chunk's own -
+    # confirmed corrupting a real case directory when both these were on
+    # together). The two features are independent, and now-fixed, so this
+    # block is deliberately conservative rather than load-bearing - remove
+    # it once the fix has enough runs behind it to trust the combination.
+    if settings.get("t-infinity-early-stop-enabled") and settings.get("keep-all-timesteps"):
+        return ('Not saved - "Enable T∞ early stopping" and "Keep all time steps for ParaView" '
+                "can't both be on at once (a directory-naming bug was found in this combination; "
+                "it's since been fixed, but this block is left in as a precaution for now). "
+                "Turn one off before saving.")
     save_advanced_settings(settings)
     return "Saved."
 

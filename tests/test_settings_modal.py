@@ -83,3 +83,29 @@ def test_flow_decision_iterations_suggestion_floors_at_one_chunk():
     # evidenced) - still suggest at least one more chunk, not zero/negative.
     diagnostic = {"chunk_size": 500, "chunks_needed_for_oscillation_check": 12, "chunks_available": 20}
     assert _flow_decision_iterations_suggestion(diagnostic) == 500
+
+
+def test_save_settings_rejects_t_infinity_and_keep_all_timesteps_together(_isolated_settings_file):
+    # Defense-in-depth for the real directory-naming corruption this
+    # combination caused (see steady_state_pipeline._rename_chunk_time_dirs) -
+    # kept even after fixing the root cause. Must refuse to save, not
+    # silently accept it.
+    new_values = [ADVANCED_SETTINGS_DEFAULTS[k] for k in _SETTINGS_FIELD_KEYS]
+    new_values[_SETTINGS_FIELD_KEYS.index("t-infinity-early-stop-enabled")] = True
+    new_values[_SETTINGS_FIELD_KEYS.index("keep-all-timesteps")] = True
+
+    status = _save_settings(1, *new_values)
+
+    assert "Not saved" in status
+    assert not _isolated_settings_file.exists()
+
+
+def test_save_settings_allows_either_one_alone(_isolated_settings_file):
+    new_values = [ADVANCED_SETTINGS_DEFAULTS[k] for k in _SETTINGS_FIELD_KEYS]
+    new_values[_SETTINGS_FIELD_KEYS.index("t-infinity-early-stop-enabled")] = True
+    new_values[_SETTINGS_FIELD_KEYS.index("keep-all-timesteps")] = False
+
+    status = _save_settings(1, *new_values)
+
+    assert status == "Saved."
+    assert _isolated_settings_file.exists()

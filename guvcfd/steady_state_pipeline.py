@@ -100,25 +100,54 @@ def _clean_time_dirs(case_dir_wsl):
     )
 
 
-def _rename_chunk_time_dirs(case_dir_wsl, offset):
-    """Rename this chunk's own write_interval snapshot directories (locally
-    numbered 1..chunk_size by OpenFOAM, since every chunk starts fresh at
-    time "0") to their true cumulative iteration count, instead of deleting
-    them - used when the user opts into keeping every intermediate
-    snapshot (Settings: "keep all time steps") for ParaView playback. Must
-    run right after a chunk finishes and before the next chunk's simpleFoam
-    invocation starts, so the next chunk's own local numbering (which also
-    restarts small) never collides with a previous chunk's renamed range.
+def _rename_chunk_time_dirs(case_dir_wsl, offset, dir_names):
+    """Rename EXACTLY `dir_names` (this chunk's own new write_interval
+    snapshots - see _run_phase, which computes this as the directory-
+    listing diff from immediately before to immediately after the chunk's
+    own simpleFoam invocation) to their true cumulative iteration count
+    (name + offset), instead of deleting them - used when the user opts
+    into keeping every intermediate snapshot (Settings: "keep all time
+    steps") for ParaView playback.
+
+    Previously this renamed every "[0-9]*/" directory found on disk via a
+    single shell glob, regardless of whether THIS chunk created it. With
+    keep_all_timesteps=True (which deliberately never cleans old
+    directories between chunks), that silently re-renamed already-
+    correctly-renamed directories from EARLIER chunks on every subsequent
+    chunk, compounding their offsets on top of each other - confirmed on a
+    real run: directory names inflated to 160,000+ despite the run only
+    ever reaching ~12,700 iterations - and could even nest one directory
+    inside another when a rename target happened to already exist (mv's
+    own behavior for an existing directory destination), corrupting the
+    case directory badly enough to crash a later step expecting a flat,
+    correctly-named time directory.
+
+    Passing the exact set of names this chunk itself created sidesteps
+    both failure modes: each chunk's own true cumulative range
+    [chunk_start+1, chunk_start+chunk_size] is disjoint from every other
+    chunk's by construction (chunk_start only ever advances by chunk_size),
+    so a rename target here can never collide with an existing directory,
+    regardless of how many earlier chunks were kept around.
     """
-    if offset == 0:
+    if offset == 0 or not dir_names:
         return
-    cmd = (
-        'for d in [0-9]*/; do [ "$d" = "0/" ] || '
-        '{ n="${d%/}"; mv "$d" "$((n + OFFSET))"; }; done'
-    ).replace("OFFSET", str(offset))
+    names = " ".join(sorted(dir_names, key=int))
+    cmd = f'for d in {names}; do mv "$d" "$((d + {offset}))"; done'
     run_wsl_or_raise(
         cmd, case_dir_wsl, "renaming this chunk's time directories to cumulative iteration counts",
     )
+
+
+def _list_time_dirs(case_dir_wsl):
+    """The current set of numbered time directory names (excluding "0"),
+    as plain strings - the before/after snapshots _run_phase diffs to find
+    exactly which directories a chunk's own simpleFoam invocation created.
+    """
+    r = run_wsl_or_raise(
+        'ls -d [0-9]*/ 2>/dev/null | sed \'s#/##\' | grep -v "^0$" || true',
+        case_dir_wsl, "listing existing time directories",
+    )
+    return set(r.stdout.split())
 
 
 def _chunk_write_interval(write_interval, chunk_size):
@@ -223,6 +252,7 @@ def _run_phase(case_dir, case_dir_wsl, n_iterations, write_interval, window_frac
         accumulated[zone] = ([], [])
     tinf_history = []
     total_run = 0
+    final_dir_name = None
 
     while total_run < n_iterations:
         chunk_size = min(check_interval, n_iterations - total_run)
@@ -234,6 +264,12 @@ def _run_phase(case_dir, case_dir_wsl, n_iterations, write_interval, window_frac
         # main solve's own writeInterval.
         for name in live_block_names:
             set_function_write_interval(case_dir, name, 1)
+
+        # Snapshot before this chunk's own solve, so the directories it
+        # creates can be identified exactly (by diff) rather than guessed
+        # at from a numeric range - see _rename_chunk_time_dirs' docstring
+        # for the corruption this fixes.
+        dirs_before = _list_time_dirs(case_dir_wsl)
 
         log_fn(f"Running simpleFoam ({total_run + 1}-{total_run + chunk_size} of {n_iterations} "
                f"iterations, writing every {write_interval})...")
@@ -247,13 +283,11 @@ def _run_phase(case_dir, case_dir_wsl, n_iterations, write_interval, window_frac
             tail = "\n".join(r.stdout.splitlines()[-25:]) or "(no output captured)"
             raise RuntimeError(f"simpleFoam failed (exit {r.returncode}):\n{tail}")
 
-        r = run_wsl_or_raise(
-            "ls -d [0-9]*/ 2>/dev/null | sed 's#/##' | sort -n | tail -1",
-            case_dir_wsl, "listing time directories",
-        )
-        latest = r.stdout.strip()
-        if not latest or latest == "0":
-            raise RuntimeError(f"simpleFoam did not write any new time directory (found: {latest!r})")
+        dirs_after = _list_time_dirs(case_dir_wsl)
+        new_dirs = dirs_after - dirs_before
+        if not new_dirs:
+            raise RuntimeError("simpleFoam did not write any new time directory")
+        latest = max(new_dirs, key=int)
 
         # This chunk's own live tracking - every chunk starts fresh at
         # time-label "0" (startFrom/startTime are never changed in this
@@ -303,7 +337,15 @@ def _run_phase(case_dir, case_dir_wsl, n_iterations, write_interval, window_frac
             # unless keep_all_timesteps opted into preserving them (renamed
             # to their true cumulative count) instead.
             if keep_all_timesteps:
-                _rename_chunk_time_dirs(case_dir_wsl, iteration_offset + chunk_start)
+                offset = iteration_offset + chunk_start
+                _rename_chunk_time_dirs(case_dir_wsl, offset, new_dirs)
+                # The true final directory name after renaming - NOT
+                # necessarily total_run + iteration_offset (that assumes a
+                # snapshot landed exactly at chunk_size, which adjustableRunTime
+                # writeControl doesn't guarantee - confirmed as a real bug:
+                # this mismatch is what caused a later step to fail looking
+                # for a directory that was never actually written).
+                final_dir_name = str(int(latest) + offset)
             else:
                 run_wsl_or_raise(
                     f'for d in [0-9]*/; do [ "$d" = "0/" ] || [ "$d" = "{latest}/" ] || rm -rf "$d"; done',
@@ -312,6 +354,7 @@ def _run_phase(case_dir, case_dir_wsl, n_iterations, write_interval, window_frac
                 if latest != str(total_run):
                     run_wsl_or_raise(f"mv {latest} {total_run}", case_dir_wsl,
                                       "renaming final chunk's time directory")
+                final_dir_name = str(total_run)
             run_wsl_or_raise("rm -rf postProcessing", case_dir_wsl, "clearing this chunk's postProcessing")
             break
 
@@ -319,7 +362,7 @@ def _run_phase(case_dir, case_dir_wsl, n_iterations, write_interval, window_frac
         _copy_latest_to_zero(case_dir_wsl, latest, include_T=True, log_fn=log_fn)
         run_wsl_or_raise("rm -rf postProcessing", case_dir_wsl, "clearing this chunk's postProcessing")
         if keep_all_timesteps:
-            _rename_chunk_time_dirs(case_dir_wsl, iteration_offset + chunk_start)
+            _rename_chunk_time_dirs(case_dir_wsl, iteration_offset + chunk_start, new_dirs)
         else:
             _clean_time_dirs(case_dir_wsl)
 
@@ -339,14 +382,16 @@ def _run_phase(case_dir, case_dir_wsl, n_iterations, write_interval, window_frac
     cv_text = f"{cv * 100:.2f}%" if cv is not None else "n/a"
     log_fn(f"  Stopped at time {total_run}. T_ss={live_T[-1]:.4g} (trailing-{window_frac:.0%} CV={cv_text}, "
            f"{'plateaued' if converged else 'NOT YET PLATEAUED - consider more iterations'})")
-    # The on-disk final directory's name: this phase's own iteration count
-    # (total_run) unless keep_all_timesteps shifted it by iteration_offset
-    # (see _rename_chunk_time_dirs) - callers doing further I/O against the
-    # final directory (e.g. _copy_latest_to_zero) need this, while anything
-    # just reporting "how many iterations did this phase run" wants the
-    # unshifted total_run instead (returned separately).
-    latest = str(total_run + iteration_offset) if keep_all_timesteps else str(total_run)
-    return latest, total_run, sparse_t, sparse_T, converged, live_curves
+    # The on-disk final directory's actual name (set inside the loop's
+    # final-chunk branch, from what renaming truly produced - NOT assumed
+    # from total_run + iteration_offset, which isn't guaranteed to be a
+    # directory that was ever actually written, see the loop body) -
+    # callers doing further I/O against the final directory (e.g.
+    # _copy_latest_to_zero) need this, while anything just reporting "how
+    # many iterations did this phase run" wants the unshifted total_run
+    # instead (returned separately).
+    assert final_dir_name is not None, "loop must run at least one chunk (n_iterations > 0)"
+    return final_dir_name, total_run, sparse_t, sparse_T, converged, live_curves
 
 
 def _room_phase_summary(live_room, window_frac, converged, iterations, sparse_t, sparse_T, log_fn):

@@ -4,8 +4,8 @@ import numpy as np
 
 import guvcfd.steady_state_pipeline as ssp
 from guvcfd.steady_state_pipeline import (
-    _chunk_write_interval, _point_phase_summary, _rename_chunk_time_dirs, _room_phase_summary,
-    run_steady_state_scenario,
+    _chunk_write_interval, _list_time_dirs, _point_phase_summary, _rename_chunk_time_dirs,
+    _room_phase_summary, run_steady_state_scenario,
 )
 
 
@@ -60,18 +60,40 @@ def test_rename_chunk_time_dirs_is_noop_at_zero_offset(monkeypatch):
     # file") no-op, so this should skip the WSL round-trip entirely.
     calls = []
     monkeypatch.setattr(ssp, "run_wsl_or_raise", lambda cmd, *a, **k: calls.append(cmd))
-    _rename_chunk_time_dirs("/some/case", 0)
+    _rename_chunk_time_dirs("/some/case", 0, {"200", "400"})
     assert calls == []
 
 
-def test_rename_chunk_time_dirs_shifts_by_offset(monkeypatch):
+def test_rename_chunk_time_dirs_is_noop_with_no_dir_names(monkeypatch):
     calls = []
     monkeypatch.setattr(ssp, "run_wsl_or_raise", lambda cmd, *a, **k: calls.append(cmd))
-    _rename_chunk_time_dirs("/some/case", 1500)
+    _rename_chunk_time_dirs("/some/case", 1500, set())
+    assert calls == []
+
+
+def test_rename_chunk_time_dirs_shifts_only_the_given_names(monkeypatch):
+    # Regression guard for the real corruption this fixes: renaming must
+    # touch EXACTLY the given directories, never a blanket "every numbered
+    # directory on disk" glob - otherwise, with keep_all_timesteps=True
+    # (which never cleans old directories between chunks), an already-
+    # renamed directory from an earlier chunk gets shifted again on every
+    # subsequent chunk, compounding its offset (confirmed on a real run:
+    # directory names inflated to 160,000+ despite the run only reaching
+    # ~12,700 iterations).
+    calls = []
+    monkeypatch.setattr(ssp, "run_wsl_or_raise", lambda cmd, *a, **k: calls.append(cmd))
+    _rename_chunk_time_dirs("/some/case", 1500, {"200", "400"})
     assert len(calls) == 1
     cmd = calls[0]
     assert "1500" in cmd
-    assert '"$d" = "0/"' in cmd  # never renames the initial-state directory
+    assert "200" in cmd and "400" in cmd
+    assert "[0-9]*" not in cmd  # no blanket glob - only the exact names given
+
+
+def test_list_time_dirs_excludes_zero(monkeypatch):
+    monkeypatch.setattr(ssp, "run_wsl_or_raise",
+                         lambda cmd, *a, **k: type("R", (), {"stdout": "200\n400\n"})())
+    assert _list_time_dirs("/some/case") == {"200", "400"}
 
 
 def test_room_phase_summary_uses_windowed_mean_not_last_point():
