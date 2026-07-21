@@ -114,8 +114,12 @@ def compute_radial_inlet_velocities(face_centers, opening_center, wall, v_mag, h
     in-plane axis order - not derived from face_centers' own sampled
     extent, which under-reaches the true edge by half a cell (mesh faces
     are inset from the physical boundary).
-    v_mag: same magnitude on every face (total flow rate conserved,
-    uniform-mesh faces are similar size).
+    v_mag: the target NET volumetric flow rate through the patch, divided
+    by its area (i.e. what a "direct" jet at this magnitude would deliver) -
+    NOT the per-face speed. Per-face speed is solved for internally (see
+    below) so that the integrated normal-direction flow actually equals
+    v_mag * area, since only each face's normal component contributes to
+    volumetric throughflow, not its full 3D speed.
 
     Directions are NOT simply each face's own literal (face_center -
     opening_center) offset, normalized - that seemingly obvious approach
@@ -160,6 +164,23 @@ def compute_radial_inlet_velocities(face_centers, opening_center, wall, v_mag, h
     arbitrarily-chosen mesh face) comes out exactly cardinal.
 
     Returns a list of (vx,vy,vz), same order as `face_centers`.
+
+    Net-flow-rate correction: giving every face the same 3D speed does NOT
+    conserve the patch's net volumetric flow rate, despite equal-area faces -
+    only each face's *normal* component (v_mag_per_face * sin(tilt)) pushes
+    fluid through the patch; the rest is tangential (Coanda) spread that
+    contributes nothing to throughflow. tilt itself varies per face (90 deg,
+    fully normal, at the opening's center down to `surface_angle_deg` at its
+    edge), so a uniform per-face speed under-delivers the intended flow rate
+    by whatever the area-averaged sin(tilt) works out to - confirmed on a
+    real case where the CFD-measured net flow was only ~38% of the nominal
+    ACH-derived target, closely matching this pattern's own average
+    sin(tilt). Corrected below by first computing the tilt-driven direction
+    field at unit speed, then rescaling every face's speed by the inverse of
+    the mean normal component so the area-averaged normal component (and
+    therefore, for equal-area faces, the integrated flow rate) comes out to
+    exactly v_mag * area - i.e. what a "direct" jet at this v_mag would
+    deliver, matching compute_inlet_velocity's own ACH-to-velocity contract.
     """
     normal = np.array(WALL_INFLOW_DIRECTION[wall], dtype=float)
     center = np.array(opening_center, dtype=float)
@@ -179,7 +200,8 @@ def compute_radial_inlet_velocities(face_centers, opening_center, wall, v_mag, h
     r = np.sqrt(u ** 2 + v ** 2)
     at_center = r < 1e-9
 
-    velocities = []
+    directions = []
+    normal_components = []
     for i in range(n):
         if at_center[i]:
             # face center coincides with the opening center (e.g. a
@@ -191,11 +213,18 @@ def compute_radial_inlet_velocities(face_centers, opening_center, wall, v_mag, h
             tilt = math.radians(center_angle_deg - (center_angle_deg - surface_angle_deg) * r_norm)
             radial = (u[i] * ref1 + v[i] * ref2) / r[i]
             direction = radial * math.cos(tilt) + normal * math.sin(tilt)
-        # float(...) - not np.float64 - so this list is directly
-        # JSON-serializable once it lands in a results.json/summary dict,
-        # same as every other plain-tuple velocity in this codebase.
-        velocities.append(tuple(float(v) for v in v_mag * direction))
-    return velocities
+        directions.append(direction)
+        normal_components.append(float(direction @ normal))
+
+    mean_normal_component = sum(normal_components) / n
+    # Equal-area faces (uniform mesh, same assumption this module's docs
+    # already rely on elsewhere) - the area-weighted and plain mean coincide.
+    scale = v_mag / mean_normal_component if mean_normal_component > 1e-9 else v_mag
+
+    # float(...) - not np.float64 - so this list is directly
+    # JSON-serializable once it lands in a results.json/summary dict,
+    # same as every other plain-tuple velocity in this codebase.
+    return [tuple(float(v) for v in scale * direction) for direction in directions]
 
 
 def resolve_inlet_velocity(case_dir, patch_name, wall, opening_center, v_mag, diffuser_type="direct",

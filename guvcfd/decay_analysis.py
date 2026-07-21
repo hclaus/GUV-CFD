@@ -176,6 +176,22 @@ def fit_asymptotic_value(t, T, fit_frac=0.5):
     unstable data, or a curve that hasn't started bending toward an
     asymptote yet) - callers should treat None as "extrapolation not
     available," not an error, and fall back to the windowed average alone.
+
+    Rejects (returns None) whenever the fitted tau is >= the data span it
+    was fitted on (tf[-1] - tf[0]). This is a self-consistency check, not
+    an external threshold: a well-constrained single-exponential fit needs
+    to have "seen" at least on the order of one of its own time constants
+    of real curvature, or the fit is extrapolating from data that's still
+    essentially linear/uncurved - the reported tau/Tinf can then come out
+    wildly wrong even though curve_fit "succeeds" and the residual looks
+    small (confirmed directly: a 32-point fit on a still-early room-
+    ventilation T-buildup curve returned tau~38500 against a ~1550-sample
+    fit span - the fit's own timescale was ~25x longer than the window
+    used to produce it, and the "converged" Tinf was 6x too high). No
+    fixed n/duration threshold can catch this in general (the right
+    threshold depends on the case's own real timescale, which is exactly
+    what's unknown before a trustworthy fit exists) - comparing tau against
+    its own fit span sidesteps that circularity.
     """
     T = np.asarray(T, dtype=float)
     t = np.asarray(t, dtype=float)
@@ -203,6 +219,9 @@ def fit_asymptotic_value(t, T, fit_frac=0.5):
         return None
     Tinf, A, tau = (float(v) for v in popt)
     if tau <= 0 or not np.isfinite(Tinf):
+        return None
+    fit_span = float(tf[-1] - tf[0])
+    if tau >= fit_span:
         return None
     residuals = Tf - model(tf, *popt)
     fit_std = float(residuals.std())

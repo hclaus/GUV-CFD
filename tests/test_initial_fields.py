@@ -92,14 +92,19 @@ def test_radial_velocities_preserve_magnitude_and_spread_apart():
     velocities = compute_radial_inlet_velocities(face_centers, opening_center, "ceiling", v_mag, half_extents)
 
     assert len(velocities) == 3
-    for v in velocities:
-        assert math.isclose(math.sqrt(sum(c * c for c in v)), v_mag, rel_tol=1e-9)
-
     # All 3 faces are at the opening's half-extent -> all at "the edge"
-    # (r_norm=1) -> every one gets the same, full surface_angle_deg tilt.
+    # (r_norm=1) -> every one gets the same, full surface_angle_deg tilt, so
+    # the net-flow-rate correction (see docstring) scales every face's speed
+    # up by the same factor 1/sin(15 deg) - each face's speed is no longer
+    # v_mag, but its NORMAL component is (uniformly, since all 3 share one
+    # tilt): v[2] comes out to exactly -v_mag, not -v_mag*sin(15).
+    expected_speed = v_mag / math.sin(math.radians(15))
+    for v in velocities:
+        assert math.isclose(math.sqrt(sum(c * c for c in v)), expected_speed, rel_tol=1e-9)
+
     for v in velocities:
         assert v[2] < 0
-        assert math.isclose(v[2], -v_mag * math.sin(math.radians(15)), rel_tol=1e-6)
+        assert math.isclose(v[2], -v_mag, rel_tol=1e-6)
 
     # The 3 directions should be mutually distinct (spread apart), not
     # collapsed onto the same or opposite vectors.
@@ -117,9 +122,13 @@ def test_radial_velocities_generalize_to_a_side_wall():
     face_centers = [(0.0, 1.8, 1.2)]
     v_mag = 0.3
     v = compute_radial_inlet_velocities(face_centers, opening_center, "xMin", v_mag, half_extents)[0]
-    assert math.isclose(math.sqrt(sum(c * c for c in v)), v_mag, rel_tol=1e-9)
+    # Single face -> it alone determines the mean normal component used for
+    # the net-flow-rate correction (see docstring), so its own normal (x)
+    # component is corrected to come out to exactly v_mag, not v_mag*sin(15).
+    expected_speed = v_mag / math.sin(math.radians(15))
+    assert math.isclose(math.sqrt(sum(c * c for c in v)), expected_speed, rel_tol=1e-9)
     assert v[0] > 0  # tilted into the room along xMin's inward normal (+x)
-    assert math.isclose(v[0], v_mag * math.sin(math.radians(15)), rel_tol=1e-6)
+    assert math.isclose(v[0], v_mag, rel_tol=1e-6)
 
 
 def test_radial_velocities_taper_toward_center_angle_near_the_opening_center():
@@ -139,10 +148,11 @@ def test_radial_velocities_taper_toward_center_angle_near_the_opening_center():
         [near_center, at_edge], opening_center, "ceiling", v_mag, half_extents)
 
     # normal (z, tilt) component: near-center face should be much closer
-    # to center_angle_deg=90 (i.e. |z| close to v_mag), edge face close to
-    # surface_angle_deg=15 (i.e. |z| close to v_mag*sin(15)).
+    # to center_angle_deg=90 (i.e. |z| close to its own speed), edge face
+    # close to surface_angle_deg=15 (i.e. |z| much smaller than its speed) -
+    # this relative ordering is unaffected by the net-flow-rate correction
+    # (see docstring), a uniform scale applied to both faces alike.
     assert abs(v_near[2]) > abs(v_edge[2])
-    assert math.isclose(v_edge[2], -v_mag * math.sin(math.radians(15)), rel_tol=1e-6)
 
     # in-plane (radial) component: near-center face should be much smaller
     # than the edge face's.
@@ -150,9 +160,11 @@ def test_radial_velocities_taper_toward_center_angle_near_the_opening_center():
     in_plane_edge = math.sqrt(v_edge[0] ** 2 + v_edge[1] ** 2)
     assert in_plane_near < in_plane_edge
 
-    # Both still preserve exact magnitude v_mag regardless of tilt blend.
-    assert math.isclose(math.sqrt(sum(c * c for c in v_near)), v_mag, rel_tol=1e-9)
-    assert math.isclose(math.sqrt(sum(c * c for c in v_edge)), v_mag, rel_tol=1e-9)
+    # The two faces no longer each preserve v_mag as their own speed (that
+    # was the pre-fix, flow-rate-violating behavior) - instead the mean of
+    # their normal components comes out to v_mag, which is exactly what
+    # the net-flow-rate correction guarantees (equal-area faces).
+    assert math.isclose((abs(v_near[2]) + abs(v_edge[2])) / 2, v_mag, rel_tol=1e-6)
 
 
 def test_radial_velocities_cover_full_circle_uniformly():
@@ -217,9 +229,11 @@ def test_radial_velocities_adjacent_grid_faces_no_longer_flip_near_180_degrees()
 
     n_y, n_z = 6, 3
     max_diff = 0.0
+    max_speed = 0.0
     for iz in range(n_z):
         for iy in range(n_y):
             idx = iz * n_y + iy
+            max_speed = max(max_speed, math.sqrt(sum(c * c for c in velocities[idx])))
             for diy, diz in ((1, 0), (0, 1)):
                 jy, jz = iy + diy, iz + diz
                 if jy < n_y and jz < n_z:
@@ -229,10 +243,14 @@ def test_radial_velocities_adjacent_grid_faces_no_longer_flip_near_180_degrees()
 
     # Old (pre-fix) model's worst adjacent-face jump on this exact opening
     # was 0.537 (out of a theoretical max of 2*v_mag=0.556 - i.e. almost a
-    # full 180 degree flip). This fix (true-extent Euclidean taper +
-    # shape-normalized angle) measured 0.233 - verify it stays well below
-    # the old value, with margin for float noise.
-    assert max_diff < 0.3
+    # full 180 degree flip) - a smoothness ratio (jump / max face speed) of
+    # ~0.838. This fix (true-extent Euclidean taper + shape-normalized
+    # angle) keeps that same ratio (it's scale-invariant - the net-flow-rate
+    # correction just uniformly rescales every face's speed, see docstring),
+    # measured ~0.839 here too. Assert against max_speed (not a hardcoded
+    # v_mag-based constant, since per-face speed is no longer v_mag) with
+    # comfortable margin below a full flip (ratio -> 2).
+    assert max_diff < 0.9 * max_speed
 
 
 def test_radial_velocity_falls_back_to_normal_when_face_is_at_center():
@@ -266,8 +284,14 @@ def test_resolve_ceiling_reads_face_centers_and_computes_radial(monkeypatch):
 
     assert calls == [("case123", "inlet")]
     assert len(result) == 2
+    # Both faces are symmetric about the opening center (same r_norm=1,
+    # same tilt) -> net-flow-rate correction (see
+    # compute_radial_inlet_velocities' docstring) scales each face's speed
+    # up by 1/sin(15 deg) so their (equal, shared) normal component comes
+    # out to exactly v_mag=0.5.
+    expected_speed = 0.5 / math.sin(math.radians(15))
     for v in result:
-        assert math.isclose(math.sqrt(sum(c * c for c in v)), 0.5, rel_tol=1e-9)
+        assert math.isclose(math.sqrt(sum(c * c for c in v)), expected_speed, rel_tol=1e-9)
 
 
 def test_resolve_rejects_unknown_diffuser_type():
