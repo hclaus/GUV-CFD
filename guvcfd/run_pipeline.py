@@ -5,6 +5,7 @@ fvOptions binning, and fvOptions splicing - given just a .guv project and a
 target case directory. Everything else this package's modules do piecewise
 via manual WSL shell-outs, this ties into one command.
 """
+import json
 import re
 import shutil
 from pathlib import Path
@@ -39,6 +40,136 @@ from .wsl_utils import (
 )
 
 
+class FlowConvergenceUndecided(Exception):
+    """Raised by converge_flow_field() when max_iterations is exhausted
+    without a clear verdict (neither "converged" nor "accepted bounded
+    oscillation") - deliberately NOT a bare RuntimeError: this is an
+    expected outcome that needs a human decision, not a crash. Carries
+    everything a caller needs to present that decision (see `diagnostic`)
+    and to resume (via continue_flow_convergence()) without redoing any
+    of the expensive mesh/flow-field work already on disk.
+
+    Distinct from a genuine solver failure (FOAM FATAL, non-zero exit,
+    StoppedByUser) - those still raise RuntimeError/StoppedByUser as
+    before, since there's nothing a "continue more iterations" choice
+    could do about an actual crash.
+    """
+
+    def __init__(self, message, diagnostic, total_iterations):
+        super().__init__(message)
+        self.diagnostic = diagnostic
+        self.total_iterations = total_iterations
+
+
+def _history_path(case_dir):
+    return f"{case_dir}/flow_convergence_history.json"
+
+
+def _load_history(case_dir):
+    """The persisted per-chunk volAverage(check_field) history from a prior
+    converge_flow_field()/continue_flow_convergence() call in this case
+    directory, or [] if there isn't one (a fresh case, or one that never
+    got far enough to write it). Persisted (not just kept in memory, as
+    before) specifically so a run that stops - for any reason, including
+    the process itself going away - leaves enough on disk to (a) diagnose
+    what actually happened and (b) resume without losing the oscillation-
+    acceptance check's accumulated evidence.
+    """
+    path = _history_path(case_dir)
+    if not Path(path).exists():
+        return []
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return []
+
+
+def _save_history(case_dir, history):
+    with open(_history_path(case_dir), "w") as f:
+        json.dump(history, f, indent=2)
+
+
+def _oscillation_diagnostic(history, window, growth_tol, rel_tol, n_iterations, check_field):
+    """Best-effort analysis of whatever chunk history actually exists,
+    regardless of whether there's enough of it for the formal bounded-
+    oscillation check (_is_stable_oscillation) to reach a verdict - the
+    real problem this fixes: that check silently returning False for
+    "not enough evidence yet" and for "genuinely still growing" look
+    identical from the outside otherwise, and conflating them produced a
+    real, misleading failure (see FlowConvergenceUndecided's docstring
+    motivation - a run capped at 10 chunks with oscillation_window=6
+    needed 12 to ever be evaluated, and never was, despite an error
+    message implying it had been).
+
+    Returns a dict with the raw numbers a caller needs to build its own
+    decision UI, plus a `summary` plain-language string.
+    """
+    values = [h["value"] for h in history]
+    chunks_available = len(values)
+    chunks_needed = 2 * window
+    insufficient_history = chunks_available < chunks_needed
+
+    bounded = None
+    trend = "not enough data yet"
+    if chunks_available >= 2:
+        half = chunks_available // 2
+        older_mean = sum(values[:half]) / half
+        newer_mean = sum(values[half:]) / (chunks_available - half)
+        # Guard divide-by-zero for a field that's genuinely averaging to 0.
+        rel_drift = abs(newer_mean - older_mean) / abs(older_mean) if older_mean else abs(newer_mean - older_mean)
+        if rel_drift <= max(rel_tol, 0.02):
+            trend = "flat"
+        elif newer_mean > older_mean:
+            trend = "still rising"
+        else:
+            trend = "still falling"
+    if not insufficient_history:
+        bounded = _is_stable_oscillation(values, window, growth_tol)
+
+    last_rel_change = None
+    if len(values) >= 2 and values[-2]:
+        last_rel_change = abs(values[-1] - values[-2]) / abs(values[-2])
+
+    if insufficient_history:
+        summary = (
+            f"Not enough chunk history yet to tell whether this is a stable, bounded "
+            f"oscillation (needs {chunks_needed} chunks of evidence, only {chunks_available} "
+            f"available) - this is NOT the same as having checked and found it unstable. "
+            f"The trend so far is {trend}."
+        )
+    elif bounded:
+        summary = (
+            f"Enough history to check ({chunks_available} chunks), and it looks like a "
+            f"stable, bounded oscillation - not growing or drifting further. Downstream "
+            f"results are typically insensitive to exactly which point in the cycle gets "
+            f"used, so accepting this as-is is usually reasonable."
+        )
+    else:
+        summary = (
+            f"Enough history to check ({chunks_available} chunks), and the amplitude is "
+            f"still GROWING or drifting rather than settling - trend: {trend}. This looks "
+            f"like a genuine non-convergence issue, not just an oscillating-but-stable flow; "
+            f"accepting it as-is is not recommended."
+        )
+
+    return {
+        "chunks_available": chunks_available,
+        "chunks_needed_for_oscillation_check": chunks_needed,
+        "insufficient_history": insufficient_history,
+        "bounded": bounded,
+        "trend": trend,
+        "last_chunk_rel_change": last_rel_change,
+        "rel_tol": rel_tol,
+        "oscillation_window": window,
+        "oscillation_growth_tol": growth_tol,
+        "chunk_size": n_iterations,
+        "check_field": check_field,
+        "recent_values": values[-chunks_needed:] if chunks_available else [],
+        "summary": summary,
+    }
+
+
 def _is_stable_oscillation(history, window, growth_tol):
     """True if the last `window` chunk values oscillate within a range that
     isn't growing (or drifting) compared to the `window` chunks before that -
@@ -64,7 +195,7 @@ def _is_stable_oscillation(history, window, growth_tol):
 def converge_flow_field(case_dir, n_iterations=500, fan_entry=None, log_fn=print,
                          max_iterations=20000, check_field="p", rel_tol=0.01, should_stop=None,
                          method="simple", oscillation_window=6, oscillation_growth_tol=1.5,
-                         solver_log_fn=None):
+                         solver_log_fn=None, resume=False):
     """Run simpleFoam to actually converge the flow field on this mesh,
     starting from whatever is in 0/ (e.g. a mapFields warm start), then copy
     the result back into 0/ so it becomes pimpleFoam's starting point.
@@ -106,21 +237,41 @@ def converge_flow_field(case_dir, n_iterations=500, fan_entry=None, log_fn=print
     that never plateaus.
 
     If max_iterations is reached without converging, this doesn't
-    unconditionally raise: some flows (e.g. a fan jet impinging directly on a
+    unconditionally fail: some flows (e.g. a fan jet impinging directly on a
     wall/floor) are genuinely, persistently unsteady and will never satisfy
     rel_tol no matter how long simpleFoam runs - that's real turbulence, not
     a numerical tuning problem. So the last 2*oscillation_window chunks are
     checked for *bounded* oscillation (see _is_stable_oscillation): if the
     swing in volAverage(check_field) over the most recent oscillation_window
     chunks isn't growing (nor drifting) relative to the oscillation_window
-    chunks before that, the field is accepted as-is rather than raising.
-    This was verified empirically (not just assumed): two flow-field
-    snapshots frozen 500 iterations apart during exactly this kind of bounded
-    oscillation produced eACH_uv_effective within ~2% of each other, so which
-    point in the cycle the field gets frozen at doesn't meaningfully affect
-    the downstream scalar-decay result. Only raises if the field is still
-    trending/growing (a real non-convergence problem) or if there isn't
-    enough chunk history yet to tell the two cases apart.
+    chunks before that, the field is accepted as-is. This was verified
+    empirically (not just assumed): two flow-field snapshots frozen 500
+    iterations apart during exactly this kind of bounded oscillation
+    produced eACH_uv_effective within ~2% of each other, so which point in
+    the cycle the field gets frozen at doesn't meaningfully affect the
+    downstream scalar-decay result.
+
+    If neither converged nor accepted (still trending/growing, OR there
+    isn't yet enough chunk history to tell the two cases apart -
+    genuinely different situations that used to be conflated into the same
+    unconditional failure, see FlowConvergenceUndecided's docstring), this
+    raises FlowConvergenceUndecided rather than a bare RuntimeError - an
+    expected outcome needing a human decision (continue further, or accept
+    as-is), not a crash. A genuine solver failure (FOAM FATAL, non-zero
+    exit) still raises RuntimeError as before.
+
+    resume: True to continue a case directory whose flow convergence
+    previously stopped without a verdict (typically after catching
+    FlowConvergenceUndecided and choosing "continue" - see
+    continue_flow_convergence()) - loads the persisted chunk history from
+    disk instead of starting a fresh one (so the oscillation-acceptance
+    check keeps whatever evidence already accumulated, rather than its
+    2*oscillation_window-chunk clock restarting from zero), and skips
+    potentialFoam (which would overwrite the existing, already-developed p
+    field with a fresh irrotational guess - actively counterproductive for
+    a warm continuation, unlike a genuine cold start). Everything else
+    (fvOptions, SIMPLE{} block, LTS switch) is idempotent and safe to redo
+    on a resume, so isn't skipped.
 
     method: "simple" (default) runs simpleFoam under plain SIMPLE/SIMPLEC.
     "lts" runs pimpleFoam under Local Time Stepping (ddtSchemes.default =
@@ -165,24 +316,37 @@ def converge_flow_field(case_dir, n_iterations=500, fan_entry=None, log_fn=print
                "for pseudo-transient flow convergence via pimpleFoam...")
         set_lts_ddt_scheme(case_dir, True)
 
-    log_fn("Running potentialFoam for a better initial guess than uniform-zero "
-           "(cheap inviscid/irrotational solve, skips most of the 'spin up from "
-           "nothing' phase simpleFoam would otherwise need)...")
-    r = _run_wsl("potentialFoam -writep", case_dir_wsl)
-    if r.returncode != 0:
-        log_fn(f"  potentialFoam failed (exit {r.returncode}) - continuing from the "
-                f"uniform-zero initial guess instead, this is an optimization, not "
-                f"a requirement:\n{(r.stdout + r.stderr)[-1500:]}")
+    if resume:
+        log_fn("Resuming: skipping potentialFoam (would overwrite the existing, "
+               "already-developed flow field with a fresh irrotational guess - only "
+               "wanted for a genuine cold start)...")
     else:
-        log_fn("  potentialFoam initial guess written.")
+        log_fn("Running potentialFoam for a better initial guess than uniform-zero "
+               "(cheap inviscid/irrotational solve, skips most of the 'spin up from "
+               "nothing' phase simpleFoam would otherwise need)...")
+        r = _run_wsl("potentialFoam -writep", case_dir_wsl)
+        if r.returncode != 0:
+            log_fn(f"  potentialFoam failed (exit {r.returncode}) - continuing from the "
+                    f"uniform-zero initial guess instead, this is an optimization, not "
+                    f"a requirement:\n{(r.stdout + r.stderr)[-1500:]}")
+        else:
+            log_fn("  potentialFoam initial guess written.")
 
     log_fn(f"Writing flow-convergence monitor (room volume-average {check_field})...")
     write_vol_average_dict(case_dir, field=check_field, patches=())
 
-    prev_avg = None
-    total_run = 0
+    if resume:
+        history = _load_history(case_dir)
+        total_run = history[-1]["iteration"] if history else 0
+        prev_avg = history[-1]["value"] if history else None
+        log_fn(f"Resuming from {total_run} iterations total, with {len(history)} chunks of "
+               f"persisted history...")
+    else:
+        history = []
+        total_run = 0
+        prev_avg = None
+        _save_history(case_dir, history)
     converged = False
-    history = []
 
     try:
         while total_run < max_iterations:
@@ -224,7 +388,8 @@ def converge_flow_field(case_dir, n_iterations=500, fan_entry=None, log_fn=print
             else:
                 log_fn(f"  [{total_run} iterations total] volAverage({check_field}) = {cur_avg:.6g} (first chunk)")
             prev_avg = cur_avg
-            history.append(cur_avg)
+            history.append({"iteration": total_run, "value": cur_avg})
+            _save_history(case_dir, history)
 
             log_fn(f"  Copying fields from {latest}/ to 0/ (excluding T - that's our fresh UV-decay "
                    f"starting condition, not a flow quantity) so the next chunk continues from here...")
@@ -243,14 +408,15 @@ def converge_flow_field(case_dir, n_iterations=500, fan_entry=None, log_fn=print
 
         accepted_oscillation = False
         if not converged:
-            accepted_oscillation = _is_stable_oscillation(history, oscillation_window, oscillation_growth_tol)
+            values = [h["value"] for h in history]
+            accepted_oscillation = _is_stable_oscillation(values, oscillation_window, oscillation_growth_tol)
             if not accepted_oscillation:
-                raise RuntimeError(
-                    f"Flow field did not converge within {max_iterations} iterations "
-                    f"(volAverage({check_field}) still changing more than {rel_tol * 100:.2g}% "
-                    f"per {n_iterations}-iteration chunk, and not settling into a bounded "
-                    f"oscillation either) - the mesh/BCs may need attention, or max_iterations "
-                    f"needs raising for this case."
+                diagnostic = _oscillation_diagnostic(
+                    history, oscillation_window, oscillation_growth_tol, rel_tol, n_iterations, check_field)
+                raise FlowConvergenceUndecided(
+                    f"Flow field did not converge within {total_run} iterations, and there's no clear "
+                    f"verdict on whether it's a stable bounded oscillation either: {diagnostic['summary']}",
+                    diagnostic=diagnostic, total_iterations=total_run,
                 )
     finally:
         if method == "lts":
@@ -283,6 +449,32 @@ def converge_flow_field(case_dir, n_iterations=500, fan_entry=None, log_fn=print
     _run_wsl("rm -rf postProcessing", case_dir_wsl)
 
     return str(total_run), converged
+
+
+def continue_flow_convergence(case_dir, additional_iterations, n_iterations=500, fan_entry=None,
+                               log_fn=print, should_stop=None, method="simple", rel_tol=0.01,
+                               oscillation_window=6, oscillation_growth_tol=1.5, solver_log_fn=None):
+    """Resume a case directory whose flow convergence previously stopped
+    without a verdict (a caller caught FlowConvergenceUndecided and the
+    user chose "continue") - runs `additional_iterations` more on top of
+    whatever's already been done, reusing the existing mesh/fields/
+    fvOptions on disk untouched (no mesh regeneration, no potentialFoam
+    reset - see converge_flow_field's resume=True docstring).
+
+    May raise FlowConvergenceUndecided again if `additional_iterations`
+    still isn't enough to reach a verdict - exactly like a fresh attempt
+    would, just picking up from the accumulated history instead of
+    starting over. That's expected, not a bug: the caller should present
+    the same decision again (continue further, or accept).
+    """
+    history = _load_history(case_dir)
+    already_run = history[-1]["iteration"] if history else 0
+    return converge_flow_field(
+        case_dir, n_iterations=n_iterations, fan_entry=fan_entry, log_fn=log_fn,
+        max_iterations=already_run + additional_iterations, rel_tol=rel_tol, should_stop=should_stop,
+        method=method, oscillation_window=oscillation_window, oscillation_growth_tol=oscillation_growth_tol,
+        solver_log_fn=solver_log_fn, resume=True,
+    )
 
 
 def _flow_rate_dict(patches):
@@ -614,6 +806,22 @@ def setup_case(guv_path, case_dir, template_case_dir=None, cell_size=0.1, Z=2.0,
         summary["ach_delivery"] = check_ach_delivery(
             case_dir, room_volume, ach, outlet_patches=outlet_patches, tol=ach_delivery_tol, log_fn=log_fn)
 
+    return _finish_case_setup(case_dir, room, Z, nbins, source_field, fan_entry,
+                               pimple_end_time, pimple_write_interval, pimple_delta_t, log_fn, summary)
+
+
+def _finish_case_setup(case_dir, room, Z, nbins, source_field, fan_entry,
+                        pimple_end_time, pimple_write_interval, pimple_delta_t, log_fn, summary):
+    """Everything setup_case() does after flow convergence is resolved
+    (converged, accepted, or explicitly overridden by the user) - factored
+    out so resume_case_setup() can reach the exact same steps after
+    resolving a previously-undecided flow convergence, without repeating
+    (or having to keep in sync by hand) mesh generation, initial-field
+    writing, or the flow-convergence call itself.
+    """
+    case_dir_wsl = _wsl_path(case_dir)
+    ach = summary.get("ach")
+
     log_fn("Computing fluence rate at cell centers...")
     points = read_cell_centers(case_dir, "0")
     values = compute_fluence_at_points(room, points)
@@ -666,3 +874,112 @@ def setup_case(guv_path, case_dir, template_case_dir=None, cell_size=0.1, Z=2.0,
 
     log_fn("Case setup complete.")
     return summary
+
+
+def resume_case_setup(case_dir, guv_path, decision, ach, Z, nbins=25, source_field="T",
+                       inlet_wall="xMin", inlet_center=(0.5, 0.85), inlet_size=(0.3, 0.3),
+                       inlet_diffuser_type="direct",
+                       inlet2_wall=None, inlet2_center=None, inlet2_size=None,
+                       inlet2_diffuser_type="direct", outlet2_wall=None,
+                       cell_size=0.1, additional_iterations=None,
+                       simple_foam_iterations=500, flow_convergence_method="simple",
+                       flow_rel_tol=0.01, oscillation_window=6, oscillation_growth_tol=1.5,
+                       ach_delivery_tol=0.10,
+                       pimple_end_time=120, pimple_write_interval=10, pimple_delta_t=0.5,
+                       fan_speed=None, fan_direction=(0, 0, -1),
+                       log_fn=print, should_stop=None, solver_log_fn=None):
+    """Resume a case directory whose flow convergence previously raised
+    FlowConvergenceUndecided - reuses the existing mesh, 0/ fields, and
+    constant/fvOptions on disk exactly as setup_case() left them; does NOT
+    redo mesh generation, initial-field writing, or mapFields.
+
+    decision: "continue" (run `additional_iterations` more via
+    continue_flow_convergence() - may raise FlowConvergenceUndecided again
+    if still undecided, exactly like a fresh attempt would, in which case
+    the caller should present the same decision again) or "accept" (treat
+    the current 0/ state as good enough - an explicit, informed user
+    override of the automatic acceptance heuristic, logged as such rather
+    than silently equated with it).
+
+    Every parameter here is one already recorded in run_settings.json
+    (_MESH_AFFECTING_FIELDS) or a cross-project "advanced" default - the
+    caller (app.py) is expected to have already validated the current GUI
+    settings against run_settings.json (see app._settings_mismatch, the
+    same check the existing "Continue to longer duration" feature uses)
+    before calling this, so a resume can never silently apply different
+    mesh/BC values than what's actually built on disk.
+    """
+    if decision not in ("continue", "accept"):
+        raise ValueError(f"Unknown decision {decision!r} (expected 'continue' or 'accept')")
+
+    project = Project.load(guv_path)
+    room = next(iter(project.rooms.values()))
+    summary = {"room": (room.x, room.y, room.z, str(room.units)), "n_lamps": len(room.lamps), "ach": ach}
+
+    fan_entry = None
+    if fan_speed is not None:
+        fan_entry = fan_fvoptions_entry(fan_speed, direction=fan_direction)
+        summary["fan"] = {"speed": fan_speed, "direction": fan_direction}
+
+    room_volume = room.x * room.y * room.z
+    openings = [(inlet_wall, inlet_size[0] * inlet_size[1])]
+    if inlet2_wall is not None:
+        openings.append((inlet2_wall, inlet2_size[0] * inlet2_size[1]))
+    v_mag = compute_inlet_velocity(ach, room_volume, sum(a for _, a in openings))
+    inlet_velocity = resolve_inlet_velocity(
+        case_dir, "inlet", inlet_wall,
+        opening_center(inlet_wall, room.x, room.y, room.z, inlet_center, inlet_size, cell_size=cell_size),
+        v_mag, diffuser_type=inlet_diffuser_type,
+        half_extents=opening_half_extents(inlet_wall, room.x, room.y, room.z, inlet_center, inlet_size,
+                                           cell_size=cell_size))
+    inlet2_velocity = None
+    if inlet2_wall is not None:
+        inlet2_velocity = resolve_inlet_velocity(
+            case_dir, "inlet2", inlet2_wall,
+            opening_center(inlet2_wall, room.x, room.y, room.z, inlet2_center, inlet2_size, cell_size=cell_size),
+            v_mag, diffuser_type=inlet2_diffuser_type,
+            half_extents=opening_half_extents(inlet2_wall, room.x, room.y, room.z, inlet2_center, inlet2_size,
+                                               cell_size=cell_size))
+    summary["inlet_velocity"] = inlet_velocity
+    if inlet2_velocity:
+        summary["inlet2_velocity"] = inlet2_velocity
+    has_outlet2 = outlet2_wall is not None
+
+    if decision == "continue":
+        if additional_iterations is None:
+            raise ValueError("additional_iterations is required when decision='continue'")
+        log_fn(f"Resuming flow convergence for {additional_iterations} more iterations...")
+        _, flow_converged = continue_flow_convergence(
+            case_dir, additional_iterations, n_iterations=simple_foam_iterations, fan_entry=fan_entry,
+            log_fn=log_fn, should_stop=should_stop, method=flow_convergence_method, rel_tol=flow_rel_tol,
+            oscillation_window=oscillation_window, oscillation_growth_tol=oscillation_growth_tol,
+            solver_log_fn=solver_log_fn)
+        summary["flow_converged"] = flow_converged
+    else:
+        log_fn("Accepting current flow field state as-is (explicit user override, not the automatic "
+               "bounded-oscillation heuristic) - proceeding without further flow iteration.")
+        summary["flow_converged"] = False
+        summary["flow_accepted_by_user"] = True
+        # converge_flow_field() only re-enables scalarTransport1 and restores
+        # volAverageDict to track T when it reaches a verdict on its own -
+        # since "accept" skips calling it again, that cleanup needs doing
+        # here instead, or the later scalarTransport-based fluence/UV phases
+        # would silently run with T-transport still disabled.
+        set_function_object_enabled(case_dir, "scalarTransport1", True)
+        write_vol_average_dict(case_dir)
+        _run_wsl("rm -rf postProcessing", _wsl_path(case_dir))
+
+    if should_stop is not None and should_stop():
+        raise StoppedByUser("Stopped after resuming flow convergence.")
+
+    log_fn("  restoring our own boundary conditions again (simpleFoam's mesh-derived "
+           "boundary values aren't necessarily our fixedValue settings either)...")
+    restore_boundary_conditions(case_dir, inlet_velocity=inlet_velocity, inlet2_velocity=inlet2_velocity,
+                                 has_outlet2=has_outlet2)
+
+    outlet_patches = ("outlet", "outlet2") if has_outlet2 else ("outlet",)
+    summary["ach_delivery"] = check_ach_delivery(
+        case_dir, room_volume, ach, outlet_patches=outlet_patches, tol=ach_delivery_tol, log_fn=log_fn)
+
+    return _finish_case_setup(case_dir, room, Z, nbins, source_field, fan_entry,
+                               pimple_end_time, pimple_write_interval, pimple_delta_t, log_fn, summary)

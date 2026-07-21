@@ -3,7 +3,8 @@ from types import SimpleNamespace
 
 import guvcfd.run_pipeline as run_pipeline
 from guvcfd.run_pipeline import (
-    _is_stable_oscillation, check_ach_delivery, converge_flow_field, setup_case,
+    FlowConvergenceUndecided, _is_stable_oscillation, _load_history, _oscillation_diagnostic, _save_history,
+    check_ach_delivery, continue_flow_convergence, converge_flow_field, resume_case_setup, setup_case,
 )
 
 
@@ -149,4 +150,163 @@ def test_check_ach_delivery_raises_on_unparseable_output(monkeypatch, tmp_path):
         check_ach_delivery(str(tmp_path), room_volume=64.8, ach=1.5, log_fn=lambda *a: None)
         assert False, "expected RuntimeError"
     except RuntimeError:
+        pass
+
+
+# --- Persisted chunk history + FlowConvergenceUndecided diagnostics ---
+
+def test_history_round_trips_through_disk(tmp_path):
+    history = [{"iteration": 500, "value": 0.01}, {"iteration": 1000, "value": 0.012}]
+    _save_history(str(tmp_path), history)
+    assert _load_history(str(tmp_path)) == history
+
+
+def test_history_missing_file_returns_empty_list(tmp_path):
+    assert _load_history(str(tmp_path)) == []
+
+
+def test_history_corrupted_file_returns_empty_list_not_crash(tmp_path):
+    (tmp_path / "flow_convergence_history.json").write_text("{not valid json")
+    assert _load_history(str(tmp_path)) == []
+
+
+def _hist(values, start_iter=500, step=500):
+    return [{"iteration": start_iter + i * step, "value": v} for i, v in enumerate(values)]
+
+
+def test_oscillation_diagnostic_flags_insufficient_history():
+    # Exactly the real failure this fixes: 10 chunks of history, window=6
+    # needs 12 - must say "not enough evidence", not claim a verdict.
+    history = _hist([0.15] * 10)
+    diag = _oscillation_diagnostic(history, window=6, growth_tol=1.5, rel_tol=0.02,
+                                    n_iterations=500, check_field="p")
+    assert diag["insufficient_history"] is True
+    assert diag["bounded"] is None
+    assert diag["chunks_available"] == 10
+    assert diag["chunks_needed_for_oscillation_check"] == 12
+    assert "Not enough chunk history" in diag["summary"]
+    assert "NOT the same as having checked" in diag["summary"]
+
+
+def test_oscillation_diagnostic_recognizes_bounded_oscillation_with_enough_history():
+    older = [0.010, 0.030, 0.012, 0.028, 0.011, 0.031]
+    newer = [0.012, 0.029, 0.010, 0.032, 0.013, 0.027]
+    history = _hist(older + newer)
+    diag = _oscillation_diagnostic(history, window=6, growth_tol=1.5, rel_tol=0.02,
+                                    n_iterations=500, check_field="p")
+    assert diag["insufficient_history"] is False
+    assert diag["bounded"] is True
+    assert "stable, bounded oscillation" in diag["summary"]
+
+
+def test_oscillation_diagnostic_flags_genuine_growth():
+    older = [0.0100, 0.0110, 0.0105, 0.0108, 0.0102, 0.0107]
+    newer = [0.0050, 0.0500, 0.0010, 0.0800, 0.0005, 0.1200]
+    history = _hist(older + newer)
+    diag = _oscillation_diagnostic(history, window=6, growth_tol=1.5, rel_tol=0.02,
+                                    n_iterations=500, check_field="p")
+    assert diag["insufficient_history"] is False
+    assert diag["bounded"] is False
+    assert "not recommended" in diag["summary"]
+
+
+def test_converge_flow_field_raises_flow_convergence_undecided_not_runtime_error(monkeypatch, tmp_path):
+    # With max_iterations capped below 2*oscillation_window*n_iterations,
+    # the acceptance check can never be reached - must raise
+    # FlowConvergenceUndecided (with real diagnostic data attached), not a
+    # bare, unstructured RuntimeError.
+    call_count = {"n": 0}
+
+    def fake_run_wsl(cmd, cwd_wsl):
+        return SimpleNamespace(stdout="", stderr="", returncode=0)
+
+    def fake_run_wsl_or_raise(cmd, cwd_wsl, step_name):
+        if "ls -d" in cmd:
+            call_count["n"] += 1
+            return SimpleNamespace(stdout=str(call_count["n"] * 500), returncode=0)
+        if "ls " in cmd and "grep" in cmd:
+            return SimpleNamespace(stdout="U p k omega nut phi", returncode=0)
+        return SimpleNamespace(stdout="", returncode=0)
+
+    def fake_run_wsl_streaming(cmd, cwd_wsl, on_line=None, should_stop=None, kill_pattern=None):
+        return SimpleNamespace(stdout="", returncode=0)
+
+    monkeypatch.setattr(run_pipeline, "_run_wsl", fake_run_wsl)
+    monkeypatch.setattr(run_pipeline, "_run_wsl_or_raise", fake_run_wsl_or_raise)
+    monkeypatch.setattr(run_pipeline, "_run_wsl_streaming", fake_run_wsl_streaming)
+    # Alternates each chunk (~50% relative change every time) - large
+    # enough that it never satisfies rel_tol on its own, but with only 10
+    # chunks total (below the 12 the window=6 oscillation check needs),
+    # there still isn't enough evidence to call it a stable oscillation.
+    read_calls = {"n": 0}
+
+    def fake_read_vol_average(path):
+        read_calls["n"] += 1
+        return [0], [0.10 if read_calls["n"] % 2 else 0.20]
+
+    monkeypatch.setattr(run_pipeline, "read_vol_average_dat", fake_read_vol_average)
+    # Local (non-WSL) file manipulation this test isn't exercising - only
+    # the chunk-loop/verdict logic below matters here.
+    monkeypatch.setattr(run_pipeline, "set_function_object_enabled", lambda *a, **k: None)
+    monkeypatch.setattr(run_pipeline, "ensure_simple_fvsolution", lambda *a, **k: None)
+    monkeypatch.setattr(run_pipeline, "write_fvoptions_file", lambda *a, **k: None)
+    monkeypatch.setattr(run_pipeline, "set_control_dict_time", lambda *a, **k: None)
+    monkeypatch.setattr(run_pipeline, "write_vol_average_dict", lambda *a, **k: None)
+
+    try:
+        converge_flow_field(str(tmp_path), n_iterations=500, max_iterations=5000,
+                             oscillation_window=6, log_fn=lambda *a: None)
+        assert False, "expected FlowConvergenceUndecided"
+    except FlowConvergenceUndecided as e:
+        assert e.total_iterations == 5000
+        assert e.diagnostic["insufficient_history"] is True
+        assert e.diagnostic["chunks_available"] == 10
+        assert e.diagnostic["chunks_needed_for_oscillation_check"] == 12
+    # And the history must have survived to disk for a later resume.
+    assert len(_load_history(str(tmp_path))) == 10
+
+
+def test_continue_flow_convergence_extends_max_iterations_from_persisted_history(monkeypatch, tmp_path):
+    _save_history(str(tmp_path), _hist([0.15] * 10))  # last iteration = 5000
+
+    captured = {}
+
+    def fake_converge_flow_field(case_dir, **kwargs):
+        captured.update(kwargs)
+        return ("6500", True)
+
+    monkeypatch.setattr(run_pipeline, "converge_flow_field", fake_converge_flow_field)
+    result = continue_flow_convergence(str(tmp_path), additional_iterations=1500, n_iterations=500,
+                                        log_fn=lambda *a: None)
+    assert result == ("6500", True)
+    assert captured["max_iterations"] == 5000 + 1500
+    assert captured["resume"] is True
+
+
+def test_resume_case_setup_rejects_unknown_decision(tmp_path):
+    try:
+        resume_case_setup(str(tmp_path), "unused.guv", "sideways", ach=1.5, Z=2.0)
+        assert False, "expected ValueError"
+    except ValueError:
+        pass
+
+
+def test_resume_case_setup_continue_requires_additional_iterations(monkeypatch, tmp_path):
+    # Guards against a caller forgetting additional_iterations for
+    # decision="continue" silently doing nothing useful.
+    class _FakeRoom:
+        x, y, z, units, lamps = 4.0, 6.0, 2.7, "meters", []
+
+    class _FakeProject:
+        rooms = {"a": _FakeRoom()}
+
+        @staticmethod
+        def load(path):
+            return _FakeProject()
+
+    monkeypatch.setattr(run_pipeline, "Project", _FakeProject)
+    try:
+        resume_case_setup(str(tmp_path), "unused.guv", "continue", ach=1.5, Z=2.0)
+        assert False, "expected ValueError"
+    except ValueError:
         pass

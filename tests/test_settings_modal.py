@@ -5,6 +5,7 @@ import pytest
 from guvcfd import app_settings
 from guvcfd.app import (
     _SETTINGS_FIELD_IDS, _SETTINGS_FIELD_KEYS,
+    _flow_decision_iterations_suggestion,
     _populate_settings_modal, _reset_settings_modal, _save_settings, _toggle_settings_modal,
 )
 from guvcfd.app_settings import ADVANCED_SETTINGS_DEFAULTS
@@ -67,3 +68,18 @@ def test_save_then_populate_round_trips(_isolated_settings_file):
     populated = _populate_settings_modal(1)
 
     assert populated[_SETTINGS_FIELD_KEYS.index("momentum-relaxation")] == 0.5
+
+
+def test_flow_decision_iterations_suggestion_targets_missing_history():
+    # Real failure case: 10/12 chunks available, chunk size 500 - should
+    # suggest exactly enough more chunks (2 x 500) to reach the 12 the
+    # oscillation-acceptance check needs, not an arbitrary number.
+    diagnostic = {"chunk_size": 500, "chunks_needed_for_oscillation_check": 12, "chunks_available": 10}
+    assert _flow_decision_iterations_suggestion(diagnostic) == 1000
+
+
+def test_flow_decision_iterations_suggestion_floors_at_one_chunk():
+    # Already had enough evidence (genuinely still growing, not under-
+    # evidenced) - still suggest at least one more chunk, not zero/negative.
+    diagnostic = {"chunk_size": 500, "chunks_needed_for_oscillation_check": 12, "chunks_available": 20}
+    assert _flow_decision_iterations_suggestion(diagnostic) == 500

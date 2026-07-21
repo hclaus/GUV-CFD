@@ -31,7 +31,7 @@ from .monitoring_points import compute_monitoring_results, mixing_uniformity_not
 from .paraview_launch import launch_paraview
 from .report import generate_report_docx, T_FIELD_NOTE, EFFECTIVE_ACH_NOTE, _phase_ss_rows, _ach_source_note
 from .result_figures import steady_state_figure, decay_figure
-from .run_pipeline import setup_case
+from .run_pipeline import setup_case, resume_case_setup, FlowConvergenceUndecided
 from . import scenario_runs
 from .splice import set_control_dict_start_from, set_control_dict_time
 from .steady_state_pipeline import run_steady_state_scenario
@@ -190,6 +190,12 @@ _run_state = {
     "status": "idle", "log": [], "case_dir": None, "sim_type": None,
     "steps": [], "step_status": {}, "markers": [],
     "current_time": None, "start_time": None, "stop_requested": False,
+    # Set only when status == "awaiting_decision" (see FlowConvergenceUndecided/
+    # _run_pipeline_thread) - everything the Processing tab's decision panel
+    # needs to display the diagnostic and everything a Continue/Accept button
+    # needs to resume (see _resume_pipeline_thread), without re-deriving
+    # anything from the (possibly since-changed) GUI form fields.
+    "decision": None,
 }
 
 # Scenario Runs (Z x ACH sweep) state - deliberately its own dict rather
@@ -567,6 +573,13 @@ def _gather_monitoring_points(settings):
 
 def _run_decay(guv_path, case_dir, room, settings):
     adv = load_advanced_settings()
+    # Recorded BEFORE setup_case() runs (not after) so that if flow
+    # convergence stops without a verdict (FlowConvergenceUndecided) or the
+    # run fails for any other reason, what was actually requested still
+    # survives on disk - both for a resume (resume_case_setup needs the
+    # SAME mesh-affecting settings _run_decay used) and for Continue's own
+    # mismatch check, which previously silently assumed success.
+    _save_run_settings(case_dir, settings, guv_path=guv_path)
     summary = setup_case(
         guv_path, case_dir, template_case_dir=TEMPLATE_CASE_DIR,
         Z=settings["z-value"], ach=settings["ach"],
@@ -592,12 +605,18 @@ def _run_decay(guv_path, case_dir, room, settings):
     )
     if _should_stop():
         raise StoppedByUser("Stopped after case setup.")
+    _finish_decay(case_dir, room, settings, summary)
 
-    # Record what the mesh/flow field were actually built with, regardless
-    # of whether pimpleFoam below succeeds - Continue compares against this,
-    # not against whatever the GUI happens to show later.
-    _save_run_settings(case_dir, settings, guv_path=guv_path)
 
+def _finish_decay(case_dir, room, settings, summary):
+    """Everything _run_decay() does after setup_case() returns a summary -
+    factored out so the flow-convergence-decision resume path (see
+    _resume_pipeline_thread) can reach the exact same steps after
+    resume_case_setup() resolves a previously-undecided flow convergence,
+    without repeating (or having to keep in sync by hand) the pimpleFoam
+    run/results-writing/monitoring logic below.
+    """
+    adv = load_advanced_settings()
     case_dir_wsl = wsl_path(case_dir)
     _run_log(f"Running pimpleFoam to {settings['pimple-end-time']}s (this can take a while)...")
     r = run_wsl_streaming(
@@ -761,6 +780,9 @@ def _run_steady_state(guv_path, case_dir, room, settings):
     adv = load_advanced_settings()
     fan_kwargs = _fan_kwargs(settings)
 
+    # Recorded BEFORE setup_case() runs - see _run_decay's identical comment.
+    _save_run_settings(case_dir, settings, guv_path=guv_path)
+
     _run_log("=== Setting up mesh, flow field, and UV zones ===")
     summary = setup_case(
         guv_path, case_dir, template_case_dir=TEMPLATE_CASE_DIR,
@@ -784,11 +806,19 @@ def _run_steady_state(guv_path, case_dir, room, settings):
     )
     if _should_stop():
         raise StoppedByUser("Stopped after case setup.")
+    _finish_steady_state(case_dir, room, settings, summary)
 
-    # Same record _run_decay writes - Continue's settings-mismatch check and
-    # the .docx report generator both need it regardless of scenario type.
-    _save_run_settings(case_dir, settings, guv_path=guv_path)
 
+def _finish_steady_state(case_dir, room, settings, summary):
+    """Everything _run_steady_state() does after setup_case() returns a
+    summary - factored out so the flow-convergence-decision resume path
+    (see _resume_pipeline_thread) can reach the exact same steps after
+    resume_case_setup() resolves a previously-undecided flow convergence,
+    without repeating (or having to keep in sync by hand) the Phase 1/
+    Phase 2 orchestration below.
+    """
+    adv = load_advanced_settings()
+    fan_kwargs = _fan_kwargs(settings)
     fan_entry = None
     if settings["fan-enable"]:
         fan_entry = fan_fvoptions_entry(settings["fan-speed"], direction=fan_kwargs["fan_direction"])
@@ -879,6 +909,24 @@ def _record_run_timing(case_dir, started_at, elapsed_seconds):
         json.dump(results, f, indent=2)
 
 
+def _handle_flow_convergence_undecided(e, sim_type, guv_path, case_dir, room, settings, started_at, start):
+    """Shared by _run_pipeline_thread and _resume_pipeline_thread (a
+    "continue N more iterations" attempt can perfectly well land on
+    FlowConvergenceUndecided again, exactly like a fresh attempt would -
+    same handling either way: never a dead-end error, always a decision
+    with real data behind it (see the diagnostic dict's own docstring in
+    run_pipeline._oscillation_diagnostic).
+    """
+    _run_log(f"Flow convergence paused after {e.total_iterations} iterations - awaiting your decision. "
+             f"{e.diagnostic['summary']}")
+    _run_state["status"] = "awaiting_decision"
+    _run_state["decision"] = {
+        "sim_type": sim_type, "guv_path": guv_path, "case_dir": case_dir, "room": room, "settings": settings,
+        "diagnostic": e.diagnostic, "total_iterations": e.total_iterations,
+        "started_at": started_at, "start": start,
+    }
+
+
 def _run_pipeline_thread(sim_type, guv_path, case_dir, room, settings):
     started_at = datetime.now()
     start = time.time()
@@ -892,6 +940,66 @@ def _run_pipeline_thread(sim_type, guv_path, case_dir, room, settings):
     except StoppedByUser as e:
         _run_log(f"Stopped: {e}")
         _run_state["status"] = "stopped"
+    except FlowConvergenceUndecided as e:
+        _handle_flow_convergence_undecided(e, sim_type, guv_path, case_dir, room, settings, started_at, start)
+    except Exception as e:
+        _run_log(f"ERROR: {e}")
+        _run_state["status"] = "error"
+
+
+def _resume_pipeline_thread(action, additional_iterations):
+    """Runs after the user clicks Continue/Accept on the Processing tab's
+    decision panel (see FlowConvergenceUndecided/_run_pipeline_thread) -
+    resumes flow convergence (or accepts it as-is) via resume_case_setup(),
+    then falls through to the exact same _finish_decay/_finish_steady_state
+    logic a normal run would have reached, using the settings/room recorded
+    at the moment flow convergence first paused (not whatever the GUI form
+    happens to show now - the button click already re-validated those
+    against run_settings.json before launching this thread, see
+    _start_flow_decision's _settings_mismatch check).
+    """
+    decision = _run_state["decision"]
+    sim_type, guv_path, case_dir = decision["sim_type"], decision["guv_path"], decision["case_dir"]
+    room, settings = decision["room"], decision["settings"]
+    started_at, start = decision["started_at"], decision["start"]
+    adv = load_advanced_settings()
+    fan_kwargs = _fan_kwargs(settings)
+    has_inlet2 = bool(settings.get("inlet2-enable"))
+    has_outlet2 = bool(settings.get("outlet2-enable"))
+
+    try:
+        summary = resume_case_setup(
+            case_dir, guv_path, action,
+            ach=settings["ach"], Z=settings["z-value"], nbins=adv["uv-zone-bins"],
+            inlet_wall=settings["inlet-wall"], inlet_center=_opening_center_frac(settings, "inlet", room),
+            inlet_size=(settings["inlet-size-w"], settings["inlet-size-h"]),
+            inlet_diffuser_type=settings.get("inlet-diffuser-type", "direct"),
+            inlet2_wall=settings["inlet2-wall"] if has_inlet2 else None,
+            inlet2_center=_opening_center_frac(settings, "inlet2", room) if has_inlet2 else None,
+            inlet2_size=(settings["inlet2-size-w"], settings["inlet2-size-h"]) if has_inlet2 else None,
+            inlet2_diffuser_type=settings.get("inlet2-diffuser-type", "direct") if has_inlet2 else "direct",
+            outlet2_wall=settings["outlet2-wall"] if has_outlet2 else None,
+            cell_size=adv["mesh-cell-size"], additional_iterations=additional_iterations,
+            flow_rel_tol=adv["flow-rel-tol"] / 100.0,
+            oscillation_window=adv["oscillation-window"], oscillation_growth_tol=adv["oscillation-growth-tol"],
+            ach_delivery_tol=adv["ach-delivery-tol"] / 100.0,
+            pimple_end_time=settings.get("pimple-end-time", 120),
+            pimple_write_interval=settings.get("pimple-write-interval", 10),
+            pimple_delta_t=adv["pimple-delta-t"],
+            fan_speed=fan_kwargs.get("fan_speed"), fan_direction=fan_kwargs.get("fan_direction", (0, 0, -1)),
+            log_fn=_run_log, should_stop=_should_stop, solver_log_fn=_track_solver_time,
+        )
+        if sim_type == "decay":
+            _finish_decay(case_dir, room, settings, summary)
+        else:
+            _finish_steady_state(case_dir, room, settings, summary)
+        _run_state["status"] = "done"
+        _record_run_timing(case_dir, started_at, time.time() - start)
+    except StoppedByUser as e:
+        _run_log(f"Stopped: {e}")
+        _run_state["status"] = "stopped"
+    except FlowConvergenceUndecided as e:
+        _handle_flow_convergence_undecided(e, sim_type, guv_path, case_dir, room, settings, started_at, start)
     except Exception as e:
         _run_log(f"ERROR: {e}")
         _run_state["status"] = "error"
@@ -1252,24 +1360,54 @@ def _checklist_item(step):
     return html.Li("☐ " + step, className="text-muted")
 
 
-processing_tab = dbc.Row([
-    dbc.Col([
-        html.Div(id="run-status-text", className="fs-5 fw-semibold mb-2"),
-        html.Div(id="run-elapsed", className="small text-muted"),
-        html.Div(id="run-current-time", className="small text-muted mb-3"),
-        dbc.Button("Stop", id="stop-btn", color="danger", size="sm", className="mb-4", disabled=True),
-        html.Div("Steps", className="small fw-semibold text-uppercase mb-1"),
-        html.Ul([_checklist_item(s) for s in DECAY_STEPS], id="run-checklist", className="list-unstyled small"),
-    ], width=4),
-    dbc.Col([
-        html.Div("Log", className="small fw-semibold text-uppercase mb-1"),
-        html.Pre(id="run-log", className="small", style={
-            "height": "72vh", "overflowY": "auto", "fontSize": "11px",
-            "background": "rgba(127,127,127,0.08)", "padding": "8px",
-            "border": "1px solid rgba(127,127,127,0.3)", "whiteSpace": "pre-wrap",
-        }),
-    ], width=8),
-], className="mt-3")
+# Flow-convergence decision panel: shown only while _run_state["status"] ==
+# "awaiting_decision" (see FlowConvergenceUndecided/_handle_flow_convergence_
+# undecided) - a run that hit its iteration budget without a clear verdict
+# stops HERE, on the Processing tab where the user is already watching it,
+# with the actual diagnostic numbers and three concrete next actions -
+# never a dead-end error with no button to press. Hidden (style, toggled by
+# _poll_run) rather than removed from the layout, so its own Input/Button
+# ids always exist for Dash's callback graph regardless of current status.
+flow_decision_panel = dbc.Alert(
+    [
+        html.Div("Flow convergence needs a decision", className="fw-bold mb-2"),
+        html.Div(id="flow-decision-text", className="small mb-3", style={"whiteSpace": "pre-wrap"}),
+        dbc.Row([
+            dbc.Col(dcc.Input(id="flow-decision-iterations", type="number", min=100, step=100,
+                               className="form-control form-control-sm"), width=3),
+            dbc.Col(dbc.Button("Continue this many more iterations", id="flow-decision-continue-btn",
+                                color="primary", size="sm", className="w-100"), width="auto"),
+            dbc.Col(dbc.Button("Accept current state and proceed", id="flow-decision-accept-btn",
+                                color="warning", size="sm", className="w-100"), width="auto"),
+            dbc.Col(dbc.Button("Stop (leave as-is, decide later)", id="flow-decision-stop-btn",
+                                color="secondary", size="sm", outline=True, className="w-100"), width="auto"),
+        ], className="g-2 align-items-center"),
+    ],
+    id="flow-decision-panel", color="light", className="mb-3", style={"display": "none"},
+)
+
+processing_tab = html.Div([
+    flow_decision_panel,
+    dbc.Row([
+        dbc.Col([
+            html.Div(id="run-status-text", className="fs-5 fw-semibold mb-2"),
+            html.Div(id="run-elapsed", className="small text-muted"),
+            html.Div(id="run-current-time", className="small text-muted mb-3"),
+            dbc.Button("Stop", id="stop-btn", color="danger", size="sm", className="mb-4", disabled=True),
+            html.Div("Steps", className="small fw-semibold text-uppercase mb-1"),
+            html.Ul([_checklist_item(s) for s in DECAY_STEPS], id="run-checklist",
+                    className="list-unstyled small"),
+        ], width=4),
+        dbc.Col([
+            html.Div("Log", className="small fw-semibold text-uppercase mb-1"),
+            html.Pre(id="run-log", className="small", style={
+                "height": "72vh", "overflowY": "auto", "fontSize": "11px",
+                "background": "rgba(127,127,127,0.08)", "padding": "8px",
+                "border": "1px solid rgba(127,127,127,0.3)", "whiteSpace": "pre-wrap",
+            }),
+        ], width=8),
+    ], className="mt-3"),
+])
 
 # Scenario Runs: sweep the currently-configured steady-state project over
 # a comma-separated Z list x ACH list (full cross-product), one subfolder
@@ -1465,11 +1603,15 @@ settings_modal = dbc.Modal(
                 ),
                 _settings_field(
                     "settings-flow-max-iterations", "Flow convergence max iterations",
-                    "Hard cap on total simpleFoam/pimpleFoam iterations spent trying to converge "
-                    "the flow field before giving up (or accepting a bounded oscillation - see "
-                    "the run log). Raise this if a case genuinely needs more iterations to settle; "
-                    "lower it to fail fast instead of burning a long time on a case that won't "
-                    "converge.",
+                    "Budget of simpleFoam/pimpleFoam iterations spent trying to converge the flow "
+                    "field before pausing to ask what to do next (continue further, or accept the "
+                    "current state - see the Processing tab if this happens). Lowering this does "
+                    "NOT make a case fail faster and safely - it just means you'll be asked sooner, "
+                    "possibly before the oscillation-acceptance check below even has enough evidence "
+                    "to tell a stable oscillation from a genuinely still-growing one (it needs "
+                    "2 x \"Oscillation check window\" chunks of history - if this budget runs out "
+                    "before that, you won't get the automatic accept-if-bounded shortcut, only the "
+                    "manual choice). Nothing is lost either way - progress is saved and resumable.",
                     "iterations", _adv_defaults["flow-max-iterations"],
                 ),
                 html.Hr(className="my-2"),
@@ -2478,6 +2620,89 @@ def _start_continue(n_clicks, case_dir, sim_type, end_time, write_interval, *mes
     return True, True, False, "", "processing"
 
 
+def _start_flow_decision(action, additional_iterations, mesh_values):
+    """Shared by the Continue/Accept buttons on the flow-decision panel
+    (see FlowConvergenceUndecided) - validates the same way the existing
+    "Continue to longer duration" button does (_settings_mismatch against
+    run_settings.json, since resume_case_setup() reuses the mesh/BCs on
+    disk as-is and would silently ignore any GUI changes made since the
+    pause), then launches _resume_pipeline_thread.
+    """
+    if _run_state["status"] != "awaiting_decision" or not _run_state.get("decision"):
+        return dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update
+
+    case_dir = _run_state["decision"]["case_dir"]
+    mismatches = _settings_mismatch(case_dir, dict(zip(_MESH_AFFECTING_FIELDS, mesh_values)))
+    if mismatches:
+        changed = "; ".join(f"{field} was {prior}, now {current}" for field, prior, current in mismatches)
+        return (dash.no_update, False, False, True,
+                f"These settings differ from the run currently on disk, and resuming won't apply "
+                f"them (it only continues flow convergence - mesh/BCs are reused as-is): {changed}. "
+                f"Run a full simulation instead if you want these changes to take effect.",
+                dash.no_update)
+
+    if action == "continue":
+        if not additional_iterations or additional_iterations <= 0:
+            return (dash.no_update, False, False, True,
+                    "Enter a positive number of iterations to continue.", dash.no_update)
+        _run_log(f"Continuing flow convergence for {additional_iterations} more iterations "
+                 f"(user decision)...")
+    else:
+        _run_log("Accepting current flow field state as-is (user decision) and continuing...")
+
+    _run_state["status"] = "running"
+    thread = threading.Thread(target=_resume_pipeline_thread, args=(action, additional_iterations), daemon=True)
+    thread.start()
+    return {"display": "none"}, True, True, False, "", "processing"
+
+
+@app.callback(
+    Output("flow-decision-panel", "style", allow_duplicate=True),
+    Output("run-btn", "disabled", allow_duplicate=True),
+    Output("continue-btn", "disabled", allow_duplicate=True),
+    Output("run-poll", "disabled", allow_duplicate=True),
+    Output("run-validation-msg", "children", allow_duplicate=True),
+    Output("main-tabs", "active_tab", allow_duplicate=True),
+    Input("flow-decision-continue-btn", "n_clicks"),
+    State("flow-decision-iterations", "value"),
+    [State(fid, "value") for fid in _MESH_AFFECTING_FIELDS],
+    prevent_initial_call=True,
+)
+def _start_flow_decision_continue(n_clicks, additional_iterations, *mesh_values):
+    return _start_flow_decision("continue", additional_iterations, mesh_values)
+
+
+@app.callback(
+    Output("flow-decision-panel", "style", allow_duplicate=True),
+    Output("run-btn", "disabled", allow_duplicate=True),
+    Output("continue-btn", "disabled", allow_duplicate=True),
+    Output("run-poll", "disabled", allow_duplicate=True),
+    Output("run-validation-msg", "children", allow_duplicate=True),
+    Output("main-tabs", "active_tab", allow_duplicate=True),
+    Input("flow-decision-accept-btn", "n_clicks"),
+    [State(fid, "value") for fid in _MESH_AFFECTING_FIELDS],
+    prevent_initial_call=True,
+)
+def _start_flow_decision_accept(n_clicks, *mesh_values):
+    return _start_flow_decision("accept", None, mesh_values)
+
+
+@app.callback(
+    Output("flow-decision-panel", "style", allow_duplicate=True),
+    Output("run-status-text", "children", allow_duplicate=True),
+    Input("flow-decision-stop-btn", "n_clicks"),
+    prevent_initial_call=True,
+)
+def _stop_flow_decision(n_clicks):
+    if _run_state["status"] != "awaiting_decision":
+        return dash.no_update, dash.no_update
+    _run_log("Stopped at your request - the case directory is untouched, exactly as it was when "
+             "flow convergence paused. Come back to it any time via Continue; nothing is lost.")
+    _run_state["status"] = "stopped"
+    _run_state["decision"] = None
+    return {"display": "none"}, "Stopped (flow-convergence decision deferred)."
+
+
 @app.callback(
     Output("run-log", "children", allow_duplicate=True),
     Input("stop-btn", "n_clicks"),
@@ -2686,6 +2911,19 @@ def _solver_eta_text():
     return f"Expected finish of this step in {_format_mmss((target - cur_val) / rate)}"
 
 
+def _flow_decision_iterations_suggestion(diagnostic):
+    """A reasonable default for the "continue this many more iterations"
+    input - enough additional chunks to reach the oscillation-acceptance
+    check's own evidence requirement, or one more chunk if that requirement
+    was already met (genuinely still growing, not just under-evidenced -
+    see _oscillation_diagnostic) and the user wants to see if it settles.
+    Just a starting suggestion, not a hard-coded answer - always editable.
+    """
+    chunk_size = diagnostic["chunk_size"]
+    missing_chunks = diagnostic["chunks_needed_for_oscillation_check"] - diagnostic["chunks_available"]
+    return max(chunk_size, missing_chunks * chunk_size)
+
+
 @app.callback(
     Output("run-log", "children"),
     Output("run-status-text", "children"),
@@ -2698,6 +2936,9 @@ def _solver_eta_text():
     Output("run-current-time", "children"),
     Output("results-data", "data", allow_duplicate=True),
     Output("results-case-dir", "data", allow_duplicate=True),
+    Output("flow-decision-panel", "style"),
+    Output("flow-decision-text", "children"),
+    Output("flow-decision-iterations", "value"),
     Input("run-poll", "n_intervals"),
     prevent_initial_call=True,
 )
@@ -2707,6 +2948,11 @@ def _poll_run(n_intervals):
     status_text = {
         "running": "Running...",
         "done": "Finished.",
+        # Deliberately NOT lumped in with "error" - this is an expected
+        # pause awaiting a real choice, not a crash, and the whole point
+        # of this status existing is that a user should never have to
+        # wonder which one they're looking at (see FlowConvergenceUndecided).
+        "awaiting_decision": "Paused - awaiting your decision (see panel above). Not an error, not hung.",
         "error": "Failed - see log below.",
         "stopped": "Stopped.",
     }.get(status, "")
@@ -2732,8 +2978,28 @@ def _poll_run(n_intervals):
         except Exception:
             results_data = dash.no_update
 
+    decision = _run_state.get("decision")
+    if status == "awaiting_decision" and decision:
+        diagnostic = decision["diagnostic"]
+        panel_style = {"display": "block"}
+        panel_text = (
+            f"Stopped after {decision['total_iterations']} iterations. {diagnostic['summary']}\n\n"
+            f"Chunks available: {diagnostic['chunks_available']} "
+            f"(need {diagnostic['chunks_needed_for_oscillation_check']} to check for a stable "
+            f"oscillation) | trend: {diagnostic['trend']} | last chunk change: "
+            + (f"{diagnostic['last_chunk_rel_change'] * 100:.3g}%"
+               if diagnostic['last_chunk_rel_change'] is not None else "n/a")
+            + f" (target <= {diagnostic['rel_tol'] * 100:.2g}%)"
+        )
+        panel_iterations = _flow_decision_iterations_suggestion(diagnostic)
+    else:
+        panel_style = {"display": "none"}
+        panel_text = dash.no_update
+        panel_iterations = dash.no_update
+
     return (log_text, status_text, still_running, still_running, not still_running, not still_running,
-            _render_checklist(), elapsed, cur_time_text, results_data, results_case_dir)
+            _render_checklist(), elapsed, cur_time_text, results_data, results_case_dir,
+            panel_style, panel_text, panel_iterations)
 
 
 @app.callback(
