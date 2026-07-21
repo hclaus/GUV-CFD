@@ -4,7 +4,8 @@ from types import SimpleNamespace
 import guvcfd.run_pipeline as run_pipeline
 from guvcfd.run_pipeline import (
     FlowConvergenceUndecided, _is_stable_oscillation, _load_history, _oscillation_diagnostic, _save_history,
-    check_ach_delivery, continue_flow_convergence, converge_flow_field, resume_case_setup, setup_case,
+    case_awaiting_flow_decision, check_ach_delivery, continue_flow_convergence, converge_flow_field,
+    resume_case_setup, setup_case,
 )
 
 
@@ -310,3 +311,26 @@ def test_resume_case_setup_continue_requires_additional_iterations(monkeypatch, 
         assert False, "expected ValueError"
     except ValueError:
         pass
+
+
+# --- case_awaiting_flow_decision: resuming from a FRESH server session ---
+
+def test_case_awaiting_flow_decision_none_when_no_history(tmp_path):
+    assert case_awaiting_flow_decision(str(tmp_path)) is None
+
+
+def test_case_awaiting_flow_decision_detects_a_paused_case(tmp_path):
+    _save_history(str(tmp_path), _hist([0.15] * 10))  # 10 chunks, no verdict, no fluenceRate written
+    result = case_awaiting_flow_decision(str(tmp_path), oscillation_window=6)
+    assert result is not None
+    assert result["total_iterations"] == 5000
+    assert result["diagnostic"]["insufficient_history"] is True
+
+
+def test_case_awaiting_flow_decision_none_once_resolved(tmp_path):
+    # Same history, but fluenceRate exists - _finish_case_setup already ran,
+    # so this case is NOT stuck, regardless of how the history itself looks.
+    _save_history(str(tmp_path), _hist([0.15] * 10))
+    (tmp_path / "0").mkdir()
+    (tmp_path / "0" / "fluenceRate").write_text("resolved")
+    assert case_awaiting_flow_decision(str(tmp_path)) is None

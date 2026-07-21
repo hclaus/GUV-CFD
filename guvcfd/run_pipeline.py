@@ -477,6 +477,39 @@ def continue_flow_convergence(case_dir, additional_iterations, n_iterations=500,
     )
 
 
+def case_awaiting_flow_decision(case_dir, oscillation_window=6, oscillation_growth_tol=1.5,
+                                 rel_tol=0.01, n_iterations=500, check_field="p"):
+    """Whether `case_dir` has flow-convergence chunk history on disk but
+    never reached a resolved verdict (converged, accepted, or an explicit
+    user override via resume_case_setup) - lets a resume be offered even
+    from a FRESH server process/session with no memory of the original
+    run pausing (previously the only way to resume was within the exact
+    same server process that caught FlowConvergenceUndecided - a real gap,
+    since restarting the server, or coming back to a case days later, are
+    completely normal things to do).
+
+    Recognized by: chunk history exists (flow convergence was attempted),
+    but 0/fluenceRate doesn't (only written by _finish_case_setup, which
+    only runs once flow convergence is actually resolved one way or
+    another) - i.e. this case got partway through setup_case() and never
+    finished. A case that completed normally has both a full history AND
+    fluenceRate, so this correctly returns None for it, not a false
+    "pending decision".
+
+    Returns {"diagnostic": ..., "total_iterations": ...} (same shape
+    FlowConvergenceUndecided carries) if there's something to resume, or
+    None if there's no history, or it's already past this stage.
+    """
+    history = _load_history(case_dir)
+    if not history:
+        return None
+    if Path(f"{case_dir}/0/fluenceRate").exists():
+        return None
+    diagnostic = _oscillation_diagnostic(
+        history, oscillation_window, oscillation_growth_tol, rel_tol, n_iterations, check_field)
+    return {"diagnostic": diagnostic, "total_iterations": history[-1]["iteration"]}
+
+
 def _flow_rate_dict(patches):
     lines = [
         "FoamFile", "{", "    version     2.0;", "    format      ascii;",

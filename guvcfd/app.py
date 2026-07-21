@@ -31,7 +31,7 @@ from .monitoring_points import compute_monitoring_results, mixing_uniformity_not
 from .paraview_launch import launch_paraview
 from .report import generate_report_docx, T_FIELD_NOTE, EFFECTIVE_ACH_NOTE, _phase_ss_rows, _ach_source_note
 from .result_figures import steady_state_figure, decay_figure
-from .run_pipeline import setup_case, resume_case_setup, FlowConvergenceUndecided
+from .run_pipeline import setup_case, resume_case_setup, case_awaiting_flow_decision, FlowConvergenceUndecided
 from . import scenario_runs
 from .splice import set_control_dict_start_from, set_control_dict_time
 from .steady_state_pipeline import run_steady_state_scenario
@@ -2539,6 +2539,31 @@ def _start_run(n_clicks, *values):
         return (False, False, True,
                 "Missing required value(s) - fill these in before running: "
                 + ", ".join(missing) + ".", dash.no_update, False, dash.no_update)
+
+    # A case whose flow convergence paused (FlowConvergenceUndecided) and
+    # was never resolved - possibly in an earlier server session that no
+    # longer has any memory of it (the whole point of persisting chunk
+    # history to disk - see case_awaiting_flow_decision's docstring).
+    # Launching a fresh Run here would silently regenerate the mesh and
+    # destroy that paused progress - _case_dir_has_data() below wouldn't
+    # even catch this case (a paused flow convergence leaves no
+    # results.json and no leftover time directories, both cleaned up after
+    # every chunk), so this check must come first.
+    adv = load_advanced_settings()
+    pending = case_awaiting_flow_decision(
+        case_dir, oscillation_window=adv["oscillation-window"],
+        oscillation_growth_tol=adv["oscillation-growth-tol"], rel_tol=adv["flow-rel-tol"] / 100.0)
+    if pending:
+        _run_log(f"Found a paused flow convergence in {case_dir} from an earlier session "
+                 f"({pending['total_iterations']} iterations so far) - awaiting your decision "
+                 f"instead of starting a fresh run.")
+        _run_state["status"] = "awaiting_decision"
+        _run_state["decision"] = {
+            "sim_type": sim_type, "guv_path": guv_path, "case_dir": case_dir, "room": room,
+            "settings": settings, "diagnostic": pending["diagnostic"],
+            "total_iterations": pending["total_iterations"], "started_at": datetime.now(), "start": time.time(),
+        }
+        return True, True, False, "", "processing", False, dash.no_update
 
     if _case_dir_has_data(case_dir):
         _pending_run.update(sim_type=sim_type, guv_path=guv_path, case_dir=case_dir,
