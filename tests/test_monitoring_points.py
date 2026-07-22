@@ -105,12 +105,12 @@ def test_mixing_uniformity_note_flags_steady_state_scenario_deviation():
         "phase2": {"T_ss": 0.03959168},
         "monitoring": {
             "Patient": {
-                "phase1": {"volAverage_T": [0.0, 0.1957093]},
-                "phase2": {"volAverage_T": [0.1957093, 0.01215402]},
+                "phase1": {"T_ss": 0.1957093, "volAverage_T": [0.0, 0.1957093]},
+                "phase2": {"T_ss": 0.01215402, "volAverage_T": [0.1957093, 0.01215402]},
             },
             "exhaust": {
-                "phase1": {"volAverage_T": [0.0, 0.3078411]},
-                "phase2": {"volAverage_T": [0.3078411, 0.05844288]},
+                "phase1": {"T_ss": 0.3078411, "volAverage_T": [0.0, 0.3078411]},
+                "phase2": {"T_ss": 0.05844288, "volAverage_T": [0.3078411, 0.05844288]},
             },
         },
     }
@@ -118,3 +118,21 @@ def test_mixing_uniformity_note_flags_steady_state_scenario_deviation():
     assert note is not None
     assert "NOT well mixed" in note
     assert "Patient" in note and "exhaust" in note
+
+
+def test_mixing_uniformity_note_uses_windowed_t_ss_not_last_raw_sample():
+    # Regression guard: a noisy last iteration must not by itself flip the
+    # verdict - the room and the point's true (windowed) plateaus are
+    # identical here, but each curve's raw last sample is a noisy outlier
+    # that would (wrongly) suggest a large deviation if read directly.
+    result = {
+        "phase1": {"T_ss": 0.25},
+        "phase2": {"T_ss": 0.25},
+        "monitoring": {
+            "Patient": {
+                "phase1": {"T_ss": 0.25, "volAverage_T": [0.25, 0.25, 0.40]},
+                "phase2": {"T_ss": 0.25, "volAverage_T": [0.25, 0.25, 0.05]},
+            },
+        },
+    }
+    assert mixing_uniformity_note(result) is None

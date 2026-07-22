@@ -694,6 +694,20 @@ def run_steady_state_scenario(case_dir, room_x, room_y, room_z, ach, Z, nbins=25
         # _run_phase call below is offset by iters1 so its own directory names
         # continue the same numbering rather than colliding with phase 1's).
         _copy_latest_to_zero(case_dir_wsl, latest1, include_T=True, log_fn=log_fn)
+        # Phase 2 is about to overwrite 0/T with its own (source + UV)
+        # build-up state - keep a plain copy of Phase 1's converged field
+        # under its own name (not inside a time directory - a stray extra
+        # field there is otherwise harmless, but this keeps it unambiguous
+        # and out of the way of anything mesh/time-directory-based) so a
+        # spatial-uniformity analysis (see monitoring_points.
+        # mixing_uniformity_note) can later be run against ventilation-only
+        # mixing specifically, not conflated with Phase 2's highly non-
+        # uniform UV-dose pattern (confirmed on a real run: even after
+        # excluding the source cellZone and the most extreme 5% of cells,
+        # Phase 2's spatial CV was still 213% - Phase 1 alone is the only
+        # way to tell how much of that is ventilation mixing vs. UV dose).
+        run_wsl_or_raise("cp 0/T phase1_T.snapshot", case_dir_wsl,
+                          "saving Phase 1's final T field for later spatial-mixing analysis")
         if not keep_all_timesteps:
             _clean_time_dirs(case_dir_wsl)
 

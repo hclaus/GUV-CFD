@@ -248,8 +248,8 @@ def test_report_flags_non_uniform_mixing_when_monitoring_points_diverge(tmp_path
     results = dict(_STEADY_STATE_RESULTS)
     results["monitoring"] = {
         "Patient": {
-            "phase1": {"volAverage_T": [0.0, 0.1957]},
-            "phase2": {"volAverage_T": [0.1957, 0.0122]},
+            "phase1": {"T_ss": 0.1957, "volAverage_T": [0.0, 0.1957]},
+            "phase2": {"T_ss": 0.0122, "volAverage_T": [0.1957, 0.0122]},
         },
     }
     (tmp_path / "results.json").write_text(json.dumps(results))
@@ -564,8 +564,8 @@ def test_monitoring_results_heading_renamed(tmp_path):
     results = dict(_STEADY_STATE_RESULTS)
     results["monitoring"] = {
         "Patient": {
-            "phase1": {"volAverage_T": [0.0, 0.1957]},
-            "phase2": {"volAverage_T": [0.1957, 0.0122]},
+            "phase1": {"T_ss": 0.1957, "volAverage_T": [0.0, 0.1957]},
+            "phase2": {"T_ss": 0.0122, "volAverage_T": [0.1957, 0.0122]},
         },
     }
     (tmp_path / "results.json").write_text(json.dumps(results))

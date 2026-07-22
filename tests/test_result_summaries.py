@@ -166,8 +166,8 @@ def test_steady_state_summary_flags_non_uniform_mixing():
     result = dict(_STEADY_STATE_RESULT)
     result["monitoring"] = {
         "Patient": {
-            "phase1": {"volAverage_T": [0.0, 0.1957]},
-            "phase2": {"volAverage_T": [0.1957, 0.0122]},
+            "phase1": {"T_ss": 0.1957, "volAverage_T": [0.0, 0.1957]},
+            "phase2": {"T_ss": 0.0122, "volAverage_T": [0.1957, 0.0122]},
         },
     }
     text = _all_text(_steady_state_summary(result))

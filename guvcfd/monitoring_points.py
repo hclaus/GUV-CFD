@@ -211,10 +211,15 @@ def mixing_uniformity_note(result):
             if not room_val:
                 continue
             for name, data in monitoring.items():
-                curve = data[phase_key]["volAverage_T"]
-                if not curve:
+                # The trailing-window mean (same statistic room_val itself
+                # is - see steady_state_pipeline._point_phase_summary), not
+                # the single last raw iteration - a steady-state point's
+                # curve[-1] can swing well off its own true plateau on a
+                # turbulent run (see the live-volAverage validation), which
+                # would make this check's verdict itself mostly noise.
+                point_val = data[phase_key].get("T_ss")
+                if point_val is None:
                     continue
-                point_val = curve[-1]
                 deviations.append((name, phase_label, point_val, (point_val - room_val) / room_val))
     else:
         curve = (result.get("decay_curve") or {}).get("volAverage_T")
