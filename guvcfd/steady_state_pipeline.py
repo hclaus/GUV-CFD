@@ -10,7 +10,10 @@ computed, and cellZones/fvOptions containing the UV sink zones. This
 pipeline only adds the source cellZone and orchestrates the two phases -
 it doesn't redo mesh generation or flow convergence.
 """
+import json
 import re
+from pathlib import Path
+
 import numpy as np
 
 from .case_io import read_openfoam_scalar_field
@@ -448,6 +451,47 @@ def _point_phase_summary(live_point, window_frac):
     }
 
 
+def _phase1_checkpoint_path(case_dir):
+    return f"{case_dir}/phase1_checkpoint.json"
+
+
+def _write_phase1_checkpoint(case_dir, phase1_summary, phase1_monitoring, G, Su, source_volume,
+                              n_source_cells):
+    """Persist everything Phase 2 (and the final results summary) needs
+    from a just-completed Phase 1, so a run that stops anywhere after this
+    point - a crash, a bug in the bookkeeping that follows, or just
+    stopping the app - can resume straight into Phase 2 next time instead
+    of redoing Phase 1's own (often the more expensive) iteration budget.
+
+    This is the general form of a real recovery done by hand once already:
+    a run's Phase 1 had genuinely converged and plateaued, but a directory-
+    naming bug crashed the very next bookkeeping step, and reconstructing
+    G/Su/T_ss from logs and re-deriving the converged field from on-disk
+    timestamps was only possible because those values happened to still be
+    inferable - this checkpoint means that reconstruction is never needed
+    again; the real values are just read back.
+    """
+    data = {
+        "phase1_summary": phase1_summary, "phase1_monitoring": phase1_monitoring,
+        "G": G, "Su": Su, "source_volume": source_volume, "n_source_cells": n_source_cells,
+    }
+    with open(_phase1_checkpoint_path(case_dir), "w") as f:
+        json.dump(data, f, indent=2)
+
+
+def _read_phase1_checkpoint(case_dir):
+    path = _phase1_checkpoint_path(case_dir)
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+
+
+def _clear_phase1_checkpoint(case_dir):
+    Path(_phase1_checkpoint_path(case_dir)).unlink(missing_ok=True)
+
+
 def run_steady_state_scenario(case_dir, room_x, room_y, room_z, ach, Z, nbins=25,
                                source_center=None, source_size=0.3, target_T_ss=0.3,
                                cell_size=0.1, inlet_velocity=(0.278, 0, 0),
@@ -529,7 +573,8 @@ def run_steady_state_scenario(case_dir, room_x, room_y, room_z, ach, Z, nbins=25
     # of a post-hoc pass after each phase - topoSet is mesh-only (not
     # field-dependent), and the mesh is fixed for the rest of this
     # scenario, so the zones carved here stay valid for both phase 1 and
-    # phase 2's live function objects.
+    # phase 2's live function objects. Always redone (cheap, idempotent),
+    # even when resuming from a Phase 1 checkpoint below.
     live_zone_names = []
     if monitoring_points:
         write_monitoring_topo_set_dict(case_dir, monitoring_points, cell_size)
@@ -537,92 +582,128 @@ def run_steady_state_scenario(case_dir, room_x, room_y, room_z, ach, Z, nbins=25
                           "topoSet (monitoring zones)")
         live_zone_names = [zone_name(p["name"]) for p in monitoring_points]
 
-    log_fn(f"Carving source cellZone at {source_center}, size {source_size}...")
-    write_source_topo_set_dict(case_dir, source_center, source_size, cell_size=cell_size)
-    r = run_wsl_or_raise("topoSet -dict system/sourceTopoSetDict", case_dir_wsl, "topoSet (source zone)")
-    m = re.search(r"cellSet sourceZoneCells now size (\d+)", r.stdout)
-    if not m:
-        raise RuntimeError(f"Could not parse source cell count from topoSet output:\n{r.stdout}")
-    n_source_cells = int(m.group(1))
-    source_volume = n_source_cells * cell_size ** 3
-    log_fn(f"  {n_source_cells} cells, source_volume={source_volume:.4g} m^3")
+    checkpoint = _read_phase1_checkpoint(case_dir)
+    iters1 = 0
+    if checkpoint is not None:
+        # Phase 1 already ran and converged in an earlier attempt (see
+        # _write_phase1_checkpoint) - reuse its result instead of redoing
+        # potentially the more expensive of the two phases. 0/ already
+        # holds Phase 1's converged T field (copied there right after it
+        # finished, same as always), so this genuinely just continues -
+        # no source re-carving, no T reset, no re-running _run_phase.
+        log_fn("Found a Phase 1 checkpoint from an earlier attempt - skipping Phase 1 entirely and "
+               "resuming straight into Phase 2 with its already-converged state.")
+        G, Su = checkpoint["G"], checkpoint["Su"]
+        source_volume = checkpoint["source_volume"]
+        summary["source_Su"] = Su
+        summary["source_volume"] = source_volume
+        summary["injection_rate_total"] = G
+        summary["phase1"] = checkpoint["phase1_summary"]
+        phase1_monitoring = checkpoint["phase1_monitoring"]
+        iters1 = checkpoint["phase1_summary"]["iterations"]
+        source_entry = source_fvoptions_entry(Su)
+        fan_entries = [fan_entry] if fan_entry is not None else []
+    else:
+        log_fn(f"Carving source cellZone at {source_center}, size {source_size}...")
+        write_source_topo_set_dict(case_dir, source_center, source_size, cell_size=cell_size)
+        r = run_wsl_or_raise("topoSet -dict system/sourceTopoSetDict", case_dir_wsl, "topoSet (source zone)")
+        m = re.search(r"cellSet sourceZoneCells now size (\d+)", r.stdout)
+        if not m:
+            raise RuntimeError(f"Could not parse source cell count from topoSet output:\n{r.stdout}")
+        n_source_cells = int(m.group(1))
+        source_volume = n_source_cells * cell_size ** 3
+        log_fn(f"  {n_source_cells} cells, source_volume={source_volume:.4g} m^3")
 
-    G = compute_source_strength(room_volume, ach, target_T_ss)
-    Su = source_Su(G, source_volume)
-    summary["source_Su"] = Su
-    summary["source_volume"] = source_volume
-    # G is the total room-wide generation rate: T[amount]/m^3 * m^3/s = T[amount]/s
-    # (e.g. CFU/s if T represents CFU/m^3 - see the T-field note in the report).
-    summary["injection_rate_total"] = G
-    log_fn(f"  G={G:.4g}, Su={Su:.4g}")
+        G = compute_source_strength(room_volume, ach, target_T_ss)
+        Su = source_Su(G, source_volume)
+        summary["source_Su"] = Su
+        summary["source_volume"] = source_volume
+        # G is the total room-wide generation rate: T[amount]/m^3 * m^3/s = T[amount]/s
+        # (e.g. CFU/s if T represents CFU/m^3 - see the T-field note in the report).
+        summary["injection_rate_total"] = G
+        log_fn(f"  G={G:.4g}, Su={Su:.4g}")
 
-    source_entry = source_fvoptions_entry(Su)
-    fan_entries = [fan_entry] if fan_entry is not None else []
+        source_entry = source_fvoptions_entry(Su)
+        fan_entries = [fan_entry] if fan_entry is not None else []
 
-    # setup_case() already resolved "ceiling"-diffuser inlets into a
-    # per-face velocity list once; mapFields/flow-convergence's own
-    # restore_boundary_conditions() calls (inside setup_case()) may have
-    # since overwritten 0/U with that resolved value, but this scenario
-    # starts by explicitly rewriting boundary conditions again (T_initial=0
-    # for the steady-state build-up) - re-resolve the same way here rather
-    # than assuming the plain inlet_velocity tuple this function received
-    # is still the right BC value for a "ceiling" inlet.
-    if inlet_diffuser_type == "ceiling":
-        v_mag = float(np.linalg.norm(inlet_velocity))
-        center = opening_center(inlet_wall, room_x, room_y, room_z, inlet_center, inlet_size, cell_size=cell_size)
-        extents = opening_half_extents(inlet_wall, room_x, room_y, room_z, inlet_center, inlet_size,
-                                        cell_size=cell_size)
-        inlet_velocity = resolve_inlet_velocity(case_dir, "inlet", inlet_wall, center, v_mag, "ceiling",
-                                                 half_extents=extents)
-    if inlet2_diffuser_type == "ceiling" and inlet2_velocity is not None:
-        v_mag2 = float(np.linalg.norm(inlet2_velocity))
-        center2 = opening_center(inlet2_wall, room_x, room_y, room_z, inlet2_center, inlet2_size, cell_size=cell_size)
-        extents2 = opening_half_extents(inlet2_wall, room_x, room_y, room_z, inlet2_center, inlet2_size,
-                                         cell_size=cell_size)
-        inlet2_velocity = resolve_inlet_velocity(case_dir, "inlet2", inlet2_wall, center2, v_mag2, "ceiling",
-                                                  half_extents=extents2)
+        # setup_case() already resolved "ceiling"-diffuser inlets into a
+        # per-face velocity list once; mapFields/flow-convergence's own
+        # restore_boundary_conditions() calls (inside setup_case()) may have
+        # since overwritten 0/U with that resolved value, but this scenario
+        # starts by explicitly rewriting boundary conditions again (T_initial=0
+        # for the steady-state build-up) - re-resolve the same way here rather
+        # than assuming the plain inlet_velocity tuple this function received
+        # is still the right BC value for a "ceiling" inlet.
+        if inlet_diffuser_type == "ceiling":
+            v_mag = float(np.linalg.norm(inlet_velocity))
+            center = opening_center(inlet_wall, room_x, room_y, room_z, inlet_center, inlet_size,
+                                     cell_size=cell_size)
+            extents = opening_half_extents(inlet_wall, room_x, room_y, room_z, inlet_center, inlet_size,
+                                            cell_size=cell_size)
+            inlet_velocity = resolve_inlet_velocity(case_dir, "inlet", inlet_wall, center, v_mag, "ceiling",
+                                                     half_extents=extents)
+        if inlet2_diffuser_type == "ceiling" and inlet2_velocity is not None:
+            v_mag2 = float(np.linalg.norm(inlet2_velocity))
+            center2 = opening_center(inlet2_wall, room_x, room_y, room_z, inlet2_center, inlet2_size,
+                                      cell_size=cell_size)
+            extents2 = opening_half_extents(inlet2_wall, room_x, room_y, room_z, inlet2_center, inlet2_size,
+                                             cell_size=cell_size)
+            inlet2_velocity = resolve_inlet_velocity(case_dir, "inlet2", inlet2_wall, center2, v_mag2, "ceiling",
+                                                      half_extents=extents2)
 
-    # --- Phase 1: source only, no UV ---
-    log_fn("=== Phase 1: source only (no UV) ===")
-    write_fvoptions_file(case_dir, [source_entry] + fan_entries)
-    _, n_open, n_close = splice_fv_options_into_control_dict(case_dir)
-    assert n_open == n_close, f"Brace mismatch: {n_open} vs {n_close}"
-    # Warm-start T at target_T_ss rather than 0: this is a linear system (T
-    # doesn't feed back into U/p), so the final steady state doesn't depend
-    # on the initial condition at all - only how many iterations it takes to
-    # get there does. target_T_ss is exactly what the source strength was
-    # calibrated to reach under the idealized well-mixed assumption (see
-    # compute_source_strength), so it's a good guess to start near rather
-    # than the full climb from 0 - confirmed on a real case that starting
-    # near the eventual answer reaches a tight, guard-passing plateau in a
-    # small fraction of the iterations a T=0 start needed for the same
-    # curve. Phase 2 already does the equivalent right thing (starts from
-    # Phase 1's own converged T); this brings Phase 1 in line with that.
-    restore_boundary_conditions(case_dir, inlet_velocity=inlet_velocity, T_initial=target_T_ss,
-                                 inlet2_velocity=inlet2_velocity, has_outlet2=has_outlet2)
+        # --- Phase 1: source only, no UV ---
+        log_fn("=== Phase 1: source only (no UV) ===")
+        write_fvoptions_file(case_dir, [source_entry] + fan_entries)
+        _, n_open, n_close = splice_fv_options_into_control_dict(case_dir)
+        assert n_open == n_close, f"Brace mismatch: {n_open} vs {n_close}"
+        # Warm-start T at target_T_ss rather than 0: this is a linear system (T
+        # doesn't feed back into U/p), so the final steady state doesn't depend
+        # on the initial condition at all - only how many iterations it takes to
+        # get there does. target_T_ss is exactly what the source strength was
+        # calibrated to reach under the idealized well-mixed assumption (see
+        # compute_source_strength), so it's a good guess to start near rather
+        # than the full climb from 0 - confirmed on a real case that starting
+        # near the eventual answer reaches a tight, guard-passing plateau in a
+        # small fraction of the iterations a T=0 start needed for the same
+        # curve. Phase 2 already does the equivalent right thing (starts from
+        # Phase 1's own converged T); this brings Phase 1 in line with that.
+        restore_boundary_conditions(case_dir, inlet_velocity=inlet_velocity, T_initial=target_T_ss,
+                                     inlet2_velocity=inlet2_velocity, has_outlet2=has_outlet2)
 
-    latest1, iters1, t1, T1, converged1, live1 = _run_phase(
-        case_dir, case_dir_wsl, phase1_iterations, phase1_write_interval,
-        window_frac, plateau_rel_tol, log_fn, should_stop=should_stop,
-        solver_log_fn=solver_log_fn, live_monitoring_zones=live_zone_names,
-        live_patches=patches_to_monitor,
-        check_interval=t_inf_check_interval, t_inf_rel_tol=t_inf_rel_tol, t_inf_streak=t_inf_streak,
-        keep_all_timesteps=keep_all_timesteps,
-    )
-    summary["phase1"] = _room_phase_summary(live1["room"], window_frac, converged1, iters1, t1, T1, log_fn)
-    summary["phase1"]["mass_balance"] = check_mass_balance(
-        case_dir, patches_to_monitor, G, tol=mass_balance_tol, log_fn=log_fn)
-    # _run_phase leaves its final chunk's own time directory in place
-    # (named latest1, its true cumulative iteration count) rather than
-    # cleaning it itself - phase 1's own final state isn't meant for
-    # standalone ParaView viewing (unlike phase 2's, kept below), so the
-    # caller copies it into 0/ and, normally, cleans it away here. With
-    # keep_all_timesteps, every phase-1 snapshot stays instead (phase 2's
-    # _run_phase call below is offset by iters1 so its own directory names
-    # continue the same numbering rather than colliding with phase 1's).
-    _copy_latest_to_zero(case_dir_wsl, latest1, include_T=True, log_fn=log_fn)
-    if not keep_all_timesteps:
-        _clean_time_dirs(case_dir_wsl)
+        latest1, iters1, t1, T1, converged1, live1 = _run_phase(
+            case_dir, case_dir_wsl, phase1_iterations, phase1_write_interval,
+            window_frac, plateau_rel_tol, log_fn, should_stop=should_stop,
+            solver_log_fn=solver_log_fn, live_monitoring_zones=live_zone_names,
+            live_patches=patches_to_monitor,
+            check_interval=t_inf_check_interval, t_inf_rel_tol=t_inf_rel_tol, t_inf_streak=t_inf_streak,
+            keep_all_timesteps=keep_all_timesteps,
+        )
+        summary["phase1"] = _room_phase_summary(live1["room"], window_frac, converged1, iters1, t1, T1, log_fn)
+        summary["phase1"]["mass_balance"] = check_mass_balance(
+            case_dir, patches_to_monitor, G, tol=mass_balance_tol, log_fn=log_fn)
+        phase1_monitoring = {
+            p["name"]: _point_phase_summary(live1[zone_name(p["name"])], window_frac)
+            for p in (monitoring_points or [])
+        }
+        # _run_phase leaves its final chunk's own time directory in place
+        # (named latest1, its true cumulative iteration count) rather than
+        # cleaning it itself - phase 1's own final state isn't meant for
+        # standalone ParaView viewing (unlike phase 2's, kept below), so the
+        # caller copies it into 0/ and, normally, cleans it away here. With
+        # keep_all_timesteps, every phase-1 snapshot stays instead (phase 2's
+        # _run_phase call below is offset by iters1 so its own directory names
+        # continue the same numbering rather than colliding with phase 1's).
+        _copy_latest_to_zero(case_dir_wsl, latest1, include_T=True, log_fn=log_fn)
+        if not keep_all_timesteps:
+            _clean_time_dirs(case_dir_wsl)
+
+        # Phase 1 is done and its converged state is safely in 0/ - write
+        # the checkpoint now, before Phase 2 starts, so any failure from
+        # here on can resume without repeating Phase 1 (see this run's own
+        # real motivating case: Phase 1 converged fine, then an unrelated
+        # directory-naming bug crashed the very next step).
+        _write_phase1_checkpoint(case_dir, summary["phase1"], phase1_monitoring, G, Su, source_volume,
+                                  n_source_cells)
 
     # --- Phase 2: source + UV ---
     log_fn("=== Phase 2: source + UV ===")
@@ -644,7 +725,7 @@ def run_steady_state_scenario(case_dir, room_x, room_y, room_z, ach, Z, nbins=25
     if monitoring_points:
         summary["monitoring"] = {
             p["name"]: {
-                "phase1": _point_phase_summary(live1[zone_name(p["name"])], window_frac),
+                "phase1": phase1_monitoring[p["name"]],
                 "phase2": _point_phase_summary(live2[zone_name(p["name"])], window_frac),
             }
             for p in monitoring_points
@@ -695,6 +776,12 @@ def run_steady_state_scenario(case_dir, room_x, room_y, room_z, ach, Z, nbins=25
                f"corrected eACH_uv = {eACH_uv_corrected:.4g} /hr")
 
     run_wsl_or_raise("touch case.foam", case_dir_wsl, "touching case.foam")
+
+    # The scenario finished end-to-end - no longer anything to resume, so
+    # clear the checkpoint rather than leave a stale one sitting around
+    # (harmless if left, since a finished case dir has results.json/
+    # fluenceRate etc. too, but there's no reason to keep it either).
+    _clear_phase1_checkpoint(case_dir)
 
     log_fn("Steady-state scenario complete.")
     return summary
