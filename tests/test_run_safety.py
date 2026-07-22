@@ -5,9 +5,11 @@ from guvcfd.app import (
     _ALWAYS_REQUIRED_FIELDS, _FAN_REQUIRED_FIELDS, _STEADY_STATE_REQUIRED_FIELDS,
     _INLET2_REQUIRED_FIELDS, _OUTLET2_REQUIRED_FIELDS, _NEW_FIELD_DEFAULTS,
     _WALL_POSITION_DIMS,
-    _case_dir_has_data, _record_run_timing, _save_run_settings, _settings_mismatch,
-    _validate_settings, _MESH_AFFECTING_FIELDS, SETTINGS_FIELDS,
+    _case_dir_has_data, _clear_setup_summary, _read_setup_summary, _record_run_timing,
+    _save_run_settings, _settings_mismatch, _validate_settings, _write_setup_summary,
+    case_awaiting_phase2_resume, _MESH_AFFECTING_FIELDS, SETTINGS_FIELDS,
 )
+from guvcfd.steady_state_pipeline import _write_phase1_checkpoint
 
 
 def _settings(**overrides):
@@ -258,3 +260,76 @@ def test_opening_project_backfills_missing_t_ss_window_frac():
     old_settings = {"ach": 3.0, "z-value": 2.0}
     restored = _restore_field_values(old_settings)
     assert restored["t-ss-window-frac"] == 0.15
+
+
+# --- Steady-state Phase 2 resume: setup_summary.json checkpoint ---
+
+def test_setup_summary_round_trips(tmp_path):
+    case_dir = str(tmp_path / "case")
+    (tmp_path / "case").mkdir()
+    assert _read_setup_summary(case_dir) is None  # nothing yet
+
+    summary = {"fluence_mean": 2.9, "eACH_uv_well_mixed_mean": 10.4,
+               "flow_converged": True, "ach_delivery": {"within_tolerance": True}}
+    _write_setup_summary(case_dir, summary)
+    assert _read_setup_summary(case_dir) == summary
+
+
+def test_setup_summary_cleared_removes_it(tmp_path):
+    case_dir = str(tmp_path / "case")
+    (tmp_path / "case").mkdir()
+    _write_setup_summary(case_dir, {"fluence_mean": 1.0})
+    assert _read_setup_summary(case_dir) is not None
+    _clear_setup_summary(case_dir)
+    assert _read_setup_summary(case_dir) is None
+
+
+def test_setup_summary_clear_is_a_noop_when_absent(tmp_path):
+    case_dir = str(tmp_path / "case")
+    (tmp_path / "case").mkdir()
+    _clear_setup_summary(case_dir)  # must not raise
+
+
+def test_setup_summary_corrupted_file_reads_as_none(tmp_path):
+    case_dir = str(tmp_path / "case")
+    (tmp_path / "case").mkdir()
+    (tmp_path / "case" / "setup_summary.json").write_text("{not valid json")
+    assert _read_setup_summary(case_dir) is None
+
+
+def test_no_resume_when_setup_never_completed(tmp_path):
+    case_dir = str(tmp_path / "case")
+    (tmp_path / "case").mkdir()
+    assert case_awaiting_phase2_resume(case_dir) is None
+
+
+def test_no_resume_when_run_already_finished(tmp_path):
+    case_dir = str(tmp_path / "case")
+    (tmp_path / "case").mkdir()
+    _write_setup_summary(case_dir, {"fluence_mean": 1.0})
+    (tmp_path / "case" / "results.json").write_text("{}")
+    assert case_awaiting_phase2_resume(case_dir) is None
+
+
+def test_resume_available_without_phase1_checkpoint(tmp_path):
+    # Setup completed (mesh + flow convergence), but the scenario crashed
+    # before Phase 1 of the two-phase steady-state run itself converged -
+    # still resumable (skips setup_case(), but Phase 1 reruns).
+    case_dir = str(tmp_path / "case")
+    (tmp_path / "case").mkdir()
+    _write_setup_summary(case_dir, {"fluence_mean": 1.0})
+    info = case_awaiting_phase2_resume(case_dir)
+    assert info == {"phase1_done": False, "phase1_iterations": None}
+
+
+def test_resume_available_with_phase1_checkpoint(tmp_path):
+    # Both setup AND Phase 1 already completed - resuming should be able to
+    # report Phase 1's own iteration count too, so the panel can tell the
+    # user just how much would be skipped.
+    case_dir = str(tmp_path / "case")
+    (tmp_path / "case").mkdir()
+    _write_setup_summary(case_dir, {"fluence_mean": 1.0})
+    _write_phase1_checkpoint(case_dir, {"T_ss": 1.05, "iterations": 12716}, {},
+                              G=0.027, Su=1.5, source_volume=0.018, n_source_cells=18)
+    info = case_awaiting_phase2_resume(case_dir)
+    assert info == {"phase1_done": True, "phase1_iterations": 12716}

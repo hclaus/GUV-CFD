@@ -34,7 +34,7 @@ from .result_figures import steady_state_figure, decay_figure
 from .run_pipeline import setup_case, resume_case_setup, case_awaiting_flow_decision, FlowConvergenceUndecided
 from . import scenario_runs
 from .splice import set_control_dict_start_from, set_control_dict_time
-from .steady_state_pipeline import run_steady_state_scenario
+from .steady_state_pipeline import run_steady_state_scenario, _read_phase1_checkpoint, _clear_phase1_checkpoint
 from .ventilation_control import run_ventilation_only_control
 from .visualization import WALL_POSITION_DIMS, center_frac_for_wall, plot_case
 from .wsl_utils import run_wsl, run_wsl_or_raise, run_wsl_streaming, wsl_path, StoppedByUser
@@ -196,6 +196,12 @@ _run_state = {
     # needs to resume (see _resume_pipeline_thread), without re-deriving
     # anything from the (possibly since-changed) GUI form fields.
     "decision": None,
+    # Set only when status == "awaiting_phase2_resume" (see
+    # case_awaiting_phase2_resume/_start_run) - everything the Processing
+    # tab's resume panel needs to display and everything a Resume click
+    # needs to finish the run (see _resume_phase2_thread), without
+    # re-deriving anything from the (possibly since-changed) GUI form fields.
+    "phase2_decision": None,
 }
 
 # Scenario Runs (Z x ACH sweep) state - deliberately its own dict rather
@@ -494,6 +500,59 @@ def _settings_mismatch(case_dir, current_settings):
     return [(field, prior[field], current_settings.get(field))
             for field in _MESH_AFFECTING_FIELDS
             if field in prior and prior[field] != current_settings.get(field)]
+
+
+def _write_setup_summary(case_dir, summary):
+    """Persist setup_case()'s return value (fluence_mean, eACH_uv_well_mixed_mean,
+    flow_converged, ach_delivery, etc.) right after it's computed, so a
+    steady-state run that crashes anywhere inside run_steady_state_scenario()
+    (Phase 1, Phase 2, or the bookkeeping between them - see
+    steady_state_pipeline's own phase1_checkpoint) can be resumed later by
+    calling _finish_steady_state() again WITHOUT re-running setup_case() -
+    which would redo mesh generation and flow convergence from scratch,
+    discarding the very state the crash happened downstream of. This is the
+    general form of a real recovery done by hand once already (see
+    steady_state_pipeline._write_phase1_checkpoint's docstring) - now the
+    same idea applied one stage earlier.
+    """
+    with open(f"{case_dir}/setup_summary.json", "w") as f:
+        json.dump(summary, f, indent=2)
+
+
+def _read_setup_summary(case_dir):
+    try:
+        with open(f"{case_dir}/setup_summary.json") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+
+
+def _clear_setup_summary(case_dir):
+    Path(f"{case_dir}/setup_summary.json").unlink(missing_ok=True)
+
+
+def case_awaiting_phase2_resume(case_dir):
+    """Whether `case_dir` holds a steady-state run whose setup_case() fully
+    completed (setup_summary.json on disk) but the scenario never finished
+    (no results.json yet) - Phase 2, or the bookkeeping right after it,
+    crashed, was stopped, or the server was closed mid-run. Resuming skips
+    straight to _finish_steady_state() reusing the persisted setup summary,
+    and - if steady_state_pipeline's own phase1_checkpoint.json is also
+    present - skips Phase 1 of the two-phase scenario too.
+
+    Returns {"phase1_done": bool, "phase1_iterations": int or None} if
+    there's something to resume, or None if there's no setup_summary, or the
+    run already finished.
+    """
+    if not Path(f"{case_dir}/setup_summary.json").exists():
+        return None
+    if Path(f"{case_dir}/results.json").exists():
+        return None
+    phase1 = _read_phase1_checkpoint(case_dir)
+    return {
+        "phase1_done": phase1 is not None,
+        "phase1_iterations": phase1["phase1_summary"]["iterations"] if phase1 else None,
+    }
 
 
 # Fields a Run always needs a real numeric value for. Checked upfront so a
@@ -825,6 +884,13 @@ def _finish_steady_state(case_dir, room, settings, summary):
     without repeating (or having to keep in sync by hand) the Phase 1/
     Phase 2 orchestration below.
     """
+    # Persisted here (not just held in this call's summary argument) so a
+    # crash anywhere below - inside run_steady_state_scenario() or in the
+    # results.json bookkeeping after it - can be resumed from a fresh
+    # server session via case_awaiting_phase2_resume(), without re-running
+    # setup_case()'s mesh generation and flow convergence from scratch.
+    _write_setup_summary(case_dir, summary)
+
     adv = load_advanced_settings()
     fan_kwargs = _fan_kwargs(settings)
     fan_entry = None
@@ -894,6 +960,8 @@ def _finish_steady_state(case_dir, room, settings, summary):
     result["ach_delivery"] = summary.get("ach_delivery")
     with open(f"{case_dir}/results.json", "w") as f:
         json.dump(result, f, indent=2)
+    # Finished end-to-end - nothing left to resume.
+    _clear_setup_summary(case_dir)
     _complete_all_steps()
     _run_log(f"Done. Reduction={result['reduction_pct']:.1f}%, "
              f"eACH_uv={result['eACH_uv_steady_state']:.4g} /hr")
@@ -1008,6 +1076,31 @@ def _resume_pipeline_thread(action, additional_iterations):
         _run_state["status"] = "stopped"
     except FlowConvergenceUndecided as e:
         _handle_flow_convergence_undecided(e, sim_type, guv_path, case_dir, room, settings, started_at, start)
+    except Exception as e:
+        _run_log(f"ERROR: {e}")
+        _run_state["status"] = "error"
+
+
+def _resume_phase2_thread():
+    """Runs after the user clicks Resume on the Processing tab's phase2-
+    resume panel (see case_awaiting_phase2_resume) - skips setup_case()
+    entirely and jumps straight to _finish_steady_state() using the
+    setup_summary.json persisted by an earlier attempt, reusing the mesh,
+    flow field, and UV zones already on disk exactly as they were left
+    (run_steady_state_scenario() itself further skips Phase 1 if
+    steady_state_pipeline's own phase1_checkpoint.json is also present).
+    """
+    decision = _run_state["phase2_decision"]
+    case_dir, room, settings = decision["case_dir"], decision["room"], decision["settings"]
+    started_at, start = decision["started_at"], decision["start"]
+    try:
+        summary = _read_setup_summary(case_dir)
+        _finish_steady_state(case_dir, room, settings, summary)
+        _run_state["status"] = "done"
+        _record_run_timing(case_dir, started_at, time.time() - start)
+    except StoppedByUser as e:
+        _run_log(f"Stopped: {e}")
+        _run_state["status"] = "stopped"
     except Exception as e:
         _run_log(f"ERROR: {e}")
         _run_state["status"] = "error"
@@ -1394,8 +1487,29 @@ flow_decision_panel = dbc.Alert(
     id="flow-decision-panel", color="light", className="mb-3", style={"display": "none"},
 )
 
+# Phase2-resume panel: shown only while _run_state["status"] ==
+# "awaiting_phase2_resume" (see case_awaiting_phase2_resume/_start_run) - a
+# steady-state run whose setup already fully completed (mesh + flow
+# convergence, possibly Phase 1 of the two-phase scenario too) but which
+# never finished offers to pick up exactly where it left off, rather than
+# a fresh Run silently regenerating the mesh and discarding that progress.
+phase2_resume_panel = dbc.Alert(
+    [
+        html.Div("An unfinished steady-state run was found", className="fw-bold mb-2"),
+        html.Div(id="phase2-resume-text", className="small mb-3", style={"whiteSpace": "pre-wrap"}),
+        dbc.Row([
+            dbc.Col(dbc.Button("Resume (skip completed steps)", id="phase2-resume-btn",
+                                color="primary", size="sm", className="w-100"), width="auto"),
+            dbc.Col(dbc.Button("Discard and start over", id="phase2-discard-btn",
+                                color="secondary", size="sm", outline=True, className="w-100"), width="auto"),
+        ], className="g-2 align-items-center"),
+    ],
+    id="phase2-resume-panel", color="light", className="mb-3", style={"display": "none"},
+)
+
 processing_tab = html.Div([
     flow_decision_panel,
+    phase2_resume_panel,
     dbc.Row([
         dbc.Col([
             html.Div(id="run-status-text", className="fs-5 fw-semibold mb-2"),
@@ -2590,6 +2704,32 @@ def _start_run(n_clicks, *values):
         }
         return True, True, False, "", "processing", False, dash.no_update
 
+    # A steady-state case whose setup fully completed (mesh + flow
+    # convergence, possibly Phase 1 too) but never reached results.json -
+    # same reasoning as the flow-convergence check above: a fresh Run here
+    # would silently regenerate the mesh and destroy that progress, and
+    # _case_dir_has_data() below can't be trusted to catch it (Phase 1's own
+    # cleanup can leave the case dir looking mostly like "just 0/"), so this
+    # must also come before the generic overwrite check.
+    resume_info = case_awaiting_phase2_resume(case_dir)
+    if resume_info:
+        if resume_info["phase1_done"]:
+            detail = (f"Phase 1 of the steady-state scenario already converged "
+                      f"({resume_info['phase1_iterations']} iterations) - resuming will skip "
+                      f"straight into Phase 2.")
+        else:
+            detail = ("Phase 1 hadn't converged yet when this run stopped - resuming will redo "
+                      "Phase 1, but mesh generation and flow convergence (already done, and the "
+                      "more expensive steps) won't be repeated.")
+        _run_log(f"Found an unfinished steady-state run in {case_dir} from an earlier session - "
+                 f"awaiting your decision instead of starting a fresh run. {detail}")
+        _run_state["status"] = "awaiting_phase2_resume"
+        _run_state["phase2_decision"] = {
+            "sim_type": sim_type, "guv_path": guv_path, "case_dir": case_dir, "room": room,
+            "settings": settings, "detail": detail, "started_at": datetime.now(), "start": time.time(),
+        }
+        return True, True, False, "", "processing", False, dash.no_update
+
     if _case_dir_has_data(case_dir):
         _pending_run.update(sim_type=sim_type, guv_path=guv_path, case_dir=case_dir,
                              room=room, settings=settings)
@@ -2751,6 +2891,62 @@ def _stop_flow_decision(n_clicks):
     _run_state["status"] = "stopped"
     _run_state["decision"] = None
     return {"display": "none"}, "Stopped (flow-convergence decision deferred)."
+
+
+@app.callback(
+    Output("phase2-resume-panel", "style", allow_duplicate=True),
+    Output("run-btn", "disabled", allow_duplicate=True),
+    Output("continue-btn", "disabled", allow_duplicate=True),
+    Output("run-poll", "disabled", allow_duplicate=True),
+    Output("run-validation-msg", "children", allow_duplicate=True),
+    Output("main-tabs", "active_tab", allow_duplicate=True),
+    Input("phase2-resume-btn", "n_clicks"),
+    [State(fid, "value") for fid in _MESH_AFFECTING_FIELDS],
+    prevent_initial_call=True,
+)
+def _start_phase2_resume(n_clicks, *mesh_values):
+    if _run_state["status"] != "awaiting_phase2_resume" or not _run_state.get("phase2_decision"):
+        return dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update
+
+    case_dir = _run_state["phase2_decision"]["case_dir"]
+    # Same guard as _start_flow_decision - resuming reuses the mesh/flow
+    # field/UV zones already on disk exactly as they were left, so any GUI
+    # change to a mesh-affecting field since the earlier attempt would be
+    # silently ignored (not applied) rather than actually taking effect.
+    mismatches = _settings_mismatch(case_dir, dict(zip(_MESH_AFFECTING_FIELDS, mesh_values)))
+    if mismatches:
+        changed = "; ".join(f"{field} was {prior}, now {current}" for field, prior, current in mismatches)
+        return (dash.no_update, False, False, True,
+                f"These settings differ from the run currently on disk, and resuming won't apply "
+                f"them (it reuses the existing mesh, flow field, and UV zones as-is): {changed}. "
+                f"Discard and run a full simulation instead if you want these changes to take effect.",
+                dash.no_update)
+
+    _run_log("Resuming the unfinished steady-state run (user decision) - reusing the existing mesh, "
+             "flow field, and UV zones as-is, skipping straight to where it left off...")
+    _run_state["status"] = "running"
+    thread = threading.Thread(target=_resume_phase2_thread, daemon=True)
+    thread.start()
+    return {"display": "none"}, True, True, False, "", "processing"
+
+
+@app.callback(
+    Output("phase2-resume-panel", "style", allow_duplicate=True),
+    Output("run-status-text", "children", allow_duplicate=True),
+    Input("phase2-discard-btn", "n_clicks"),
+    prevent_initial_call=True,
+)
+def _discard_phase2_resume(n_clicks):
+    if _run_state["status"] != "awaiting_phase2_resume":
+        return dash.no_update, dash.no_update
+    case_dir = _run_state["phase2_decision"]["case_dir"]
+    _clear_setup_summary(case_dir)
+    _clear_phase1_checkpoint(case_dir)
+    _run_log(f"Discarded the unfinished run's checkpoint in {case_dir} at your request. Press Run "
+             f"to start fresh - this will regenerate the mesh and overwrite the case directory.")
+    _run_state["status"] = "stopped"
+    _run_state["phase2_decision"] = None
+    return {"display": "none"}, "Stopped (unfinished run discarded)."
 
 
 @app.callback(
@@ -2989,6 +3185,8 @@ def _flow_decision_iterations_suggestion(diagnostic):
     Output("flow-decision-panel", "style"),
     Output("flow-decision-text", "children"),
     Output("flow-decision-iterations", "value"),
+    Output("phase2-resume-panel", "style"),
+    Output("phase2-resume-text", "children"),
     Input("run-poll", "n_intervals"),
     prevent_initial_call=True,
 )
@@ -3003,6 +3201,8 @@ def _poll_run(n_intervals):
         # of this status existing is that a user should never have to
         # wonder which one they're looking at (see FlowConvergenceUndecided).
         "awaiting_decision": "Paused - awaiting your decision (see panel above). Not an error, not hung.",
+        "awaiting_phase2_resume": "Paused - an unfinished run is ready to resume (see panel above). "
+                                   "Not an error, not hung.",
         "error": "Failed - see log below.",
         "stopped": "Stopped.",
     }.get(status, "")
@@ -3047,9 +3247,17 @@ def _poll_run(n_intervals):
         panel_text = dash.no_update
         panel_iterations = dash.no_update
 
+    phase2_decision = _run_state.get("phase2_decision")
+    if status == "awaiting_phase2_resume" and phase2_decision:
+        resume_panel_style = {"display": "block"}
+        resume_panel_text = phase2_decision["detail"]
+    else:
+        resume_panel_style = {"display": "none"}
+        resume_panel_text = dash.no_update
+
     return (log_text, status_text, still_running, still_running, not still_running, not still_running,
             _render_checklist(), elapsed, cur_time_text, results_data, results_case_dir,
-            panel_style, panel_text, panel_iterations)
+            panel_style, panel_text, panel_iterations, resume_panel_style, resume_panel_text)
 
 
 @app.callback(
