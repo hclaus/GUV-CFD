@@ -18,10 +18,10 @@ def _synthetic_decay(lambda_per_s, t_max=1000, dt=10, T0=1.0):
 def test_nominal_baseline_matches_uncorrected_behavior():
     lambda_total = 0.005  # /s, e.g. ventilation(3/hr) + UV(~15/hr) combined
     t, T = _synthetic_decay(lambda_total)
-    eACH_eff, lambda_eff, _ = compute_effective_eACH(t, T, ventilation_ach=3.0)
-    assert math.isclose(lambda_eff, lambda_total, rel_tol=1e-6)
+    fit = compute_effective_eACH(t, T, ventilation_ach=3.0)
+    assert math.isclose(fit["lambda_total_effective_per_s"], lambda_total, rel_tol=1e-6)
     expected_eACH = (lambda_total - 3.0 / 3600.0) * 3600.0
-    assert math.isclose(eACH_eff, expected_eACH, rel_tol=1e-6)
+    assert math.isclose(fit["eACH_uv_effective"], expected_eACH, rel_tol=1e-6)
 
 
 def test_measured_ventilation_baseline_overrides_nominal():
@@ -29,13 +29,78 @@ def test_measured_ventilation_baseline_overrides_nominal():
     t, T = _synthetic_decay(lambda_total)
     # Measured ventilation-only rate corresponds to 2.67/hr, not the nominal 3.0/hr.
     measured_lambda = 2.67 / 3600.0
-    eACH_eff, _, _ = compute_effective_eACH(
+    fit = compute_effective_eACH(
         t, T, ventilation_ach=3.0, ventilation_lambda_per_s=measured_lambda)
     expected_eACH = (lambda_total - measured_lambda) * 3600.0
-    assert math.isclose(eACH_eff, expected_eACH, rel_tol=1e-6)
+    assert math.isclose(fit["eACH_uv_effective"], expected_eACH, rel_tol=1e-6)
     # Using the smaller measured baseline attributes MORE of the decay to UV.
-    eACH_eff_nominal, _, _ = compute_effective_eACH(t, T, ventilation_ach=3.0)
-    assert eACH_eff > eACH_eff_nominal
+    fit_nominal = compute_effective_eACH(t, T, ventilation_ach=3.0)
+    assert fit["eACH_uv_effective"] > fit_nominal["eACH_uv_effective"]
+
+
+def test_fit_effective_decay_rate_ci_widens_with_noise():
+    # A perfect synthetic exponential has ~zero residual, so its CI is
+    # essentially a point; adding noise should give a real, non-trivial CI
+    # around the point estimate (always true by construction - not a
+    # containment check against the true rate, which a single random draw
+    # can legitimately miss ~5% of the time by design of a 95% CI).
+    import random
+    random.seed(0)
+    lambda_total = 0.005
+    t, T = _synthetic_decay(lambda_total, dt=5)
+    T_noisy = T * np.array([1 + random.uniform(-0.03, 0.03) for _ in t])
+    fit = compute_effective_eACH(t, T_noisy, ventilation_ach=3.0)
+    assert fit["ci95_eACH_per_hr"] is not None
+    lo, hi = fit["ci95_eACH_per_hr"]
+    assert lo < fit["eACH_uv_effective"] < hi
+    assert (hi - lo) > 0.01  # a real, non-degenerate width, not a near-zero point
+
+
+def test_fit_effective_decay_rate_ci_matches_ols_formula():
+    # Verify against the textbook closed-form OLS slope variance directly
+    # (Var(slope) = residual_variance / sum((t-t_mean)^2)), independent of
+    # this module's own implementation, rather than trusting one random
+    # draw's coverage.
+    import random
+    random.seed(1)
+    lambda_total = 0.004
+    t, T = _synthetic_decay(lambda_total, dt=5)
+    T_noisy = T * np.array([1 + random.uniform(-0.02, 0.02) for _ in t])
+    fit = compute_effective_eACH(t, T_noisy, ventilation_ach=3.0)
+
+    y = np.log(T_noisy)
+    slope, intercept = np.polyfit(t, y, 1)
+    resid = y - (slope * t + intercept)
+    dof = len(t) - 2
+    resid_var = np.sum(resid ** 2) / dof
+    t_spread = np.sum((t - t.mean()) ** 2)
+    expected_se_per_s = np.sqrt(resid_var / t_spread)
+    assert math.isclose(fit["se_per_s"], expected_se_per_s, rel_tol=1e-9)
+
+
+def test_compute_effective_eACH_propagates_ventilation_baseline_uncertainty():
+    # Passing the control run's own SE/dof should widen the corrected
+    # eACH's CI relative to treating the measured baseline as exact - the
+    # whole point of combining two independent fits' uncertainty in
+    # quadrature instead of just shifting a single-fit CI.
+    import random
+    random.seed(2)
+    lambda_total = 0.005
+    t, T = _synthetic_decay(lambda_total, dt=5)
+    T_noisy = T * np.array([1 + random.uniform(-0.02, 0.02) for _ in t])
+    measured_lambda = 2.67 / 3600.0
+
+    fit_exact_baseline = compute_effective_eACH(
+        t, T_noisy, ventilation_ach=3.0, ventilation_lambda_per_s=measured_lambda)
+    fit_propagated = compute_effective_eACH(
+        t, T_noisy, ventilation_ach=3.0, ventilation_lambda_per_s=measured_lambda,
+        ventilation_lambda_se_per_s=5e-6, ventilation_lambda_dof=50)
+
+    lo_exact, hi_exact = fit_exact_baseline["ci95_eACH_per_hr"]
+    lo_prop, hi_prop = fit_propagated["ci95_eACH_per_hr"]
+    assert (hi_prop - lo_prop) > (hi_exact - lo_exact)
+    # Point estimate itself is unaffected - only the interval widens.
+    assert math.isclose(fit_exact_baseline["eACH_uv_effective"], fit_propagated["eACH_uv_effective"])
 
 
 def test_write_results_summary_adds_corrected_fields_only_when_measured_given(tmp_path):

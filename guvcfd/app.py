@@ -34,8 +34,10 @@ from .result_figures import steady_state_figure, decay_figure
 from .run_pipeline import setup_case, resume_case_setup, case_awaiting_flow_decision, FlowConvergenceUndecided
 from . import scenario_runs
 from .splice import set_control_dict_start_from, set_control_dict_time
-from .steady_state_pipeline import run_steady_state_scenario, _read_phase1_checkpoint, _clear_phase1_checkpoint
-from .ventilation_control import run_ventilation_only_control
+from .steady_state_pipeline import (
+    run_steady_state_scenario, _read_phase1_checkpoint, _clear_phase1_checkpoint, Phase1ExtrapolationUndecided,
+)
+from .ventilation_control import prepare_ventilation_only_control, finish_ventilation_only_control
 from .visualization import WALL_POSITION_DIMS, center_frac_for_wall, plot_case
 from .wsl_utils import run_wsl, run_wsl_or_raise, run_wsl_streaming, wsl_path, StoppedByUser
 
@@ -69,7 +71,7 @@ SETTINGS_FIELDS = [
     "outlet2-enable", "outlet2-wall", "outlet2-y-input", "outlet2-z-input", "outlet2-size-w", "outlet2-size-h",
     "fan-enable", "fan-speed", "fan-direction", "fan-radius", "fan-thickness",
     "fan-x-input", "fan-y-input", "fan-z-input",
-    "sim-type", "pimple-end-time", "pimple-write-interval", "no-uv-control-enable",
+    "sim-type", "pimple-end-time", "pimple-write-interval",
     "target-t-ss", "inject-x-input", "inject-y-input", "inject-z-input",
     "phase1-iterations", "phase2-iterations", "t-ss-window-frac",
     "monitoring-enable",
@@ -675,6 +677,94 @@ def _run_decay(guv_path, case_dir, room, settings):
     _finish_decay(case_dir, room, settings, summary)
 
 
+def _decay_run_durations(ach, eACH_well_mixed_est, adv):
+    """Adaptive pimpleFoam durations for the two decay-mode runs, per-run
+    since they have separate targets (see ADVANCED_SETTINGS_DEFAULTS'
+    decay-ach-min-fraction/decay-each-min-fraction/decay-each-max-fraction):
+
+    - The UV-off control run only cares about ventilation's own (usually
+      slow) removal rate, so it targets decay-ach-min-fraction (default
+      90%) - pushing it to decay-each-max-fraction's higher target too
+      would often cost hours for little gain (see the ACH=1 control run
+      that needed ~9.5h of simulated time to reach 99.9% at a 0.73/hr
+      measured rate, versus its UV-on twin needing only ~25 more minutes
+      at 7.4/hr - the same physical time-constant problem that made
+      steady-state's own Phase 1 slow).
+    - The UV-on run targets decay-each-max-fraction (default 99.9%) when
+      that's cheap - i.e. when the estimated time to reach it doesn't
+      already exceed the practical ceiling below - and falls back to
+      decay-each-min-fraction otherwise. "cheap" is operationalized
+      exactly this way (not a separate arbitrary "eACH is high" threshold)
+      since the two are equivalent for a first-order decay: a high combined
+      rate IS what makes a high log-reduction target cheap to reach.
+
+    ceiling matches the GUI's own pimple-end-time slider max (7200s) - the
+    only existing "this is impractically long" convention already in use.
+    """
+    ceiling = 7200
+    control_end_time = _settling_iterations(
+        ach, target_fraction=adv["decay-ach-min-fraction"] / 100.0, max_iterations=ceiling)
+
+    combined_rate = ach + eACH_well_mixed_est
+    raw_each_max_time = _settling_iterations(
+        combined_rate, target_fraction=adv["decay-each-max-fraction"] / 100.0, max_iterations=10 ** 9)
+    each_target = (adv["decay-each-max-fraction"] if raw_each_max_time <= ceiling
+                   else adv["decay-each-min-fraction"])
+    combined_end_time = _settling_iterations(combined_rate, target_fraction=each_target / 100.0,
+                                              max_iterations=ceiling)
+    return combined_end_time, control_end_time
+
+
+def _run_decay_pair(case_dir_wsl, control_dir_wsl):
+    """Run the UV-on and UV-off-control pimpleFoam solves CONCURRENTLY -
+    both only depend on the shared, already-converged flow field prepared
+    before this point, so from here on they're fully independent (see the
+    ACH=1/Z=1.7 vs ACH=6/Z=7 comparisons this session: ~510s concurrent
+    wall-clock for both runs together, vs. what would be roughly double
+    running them back to back).
+
+    Only the main (UV-on) run's output feeds _track_solver_time (which
+    drives the single shared progress bar/ETA display) - interleaving both
+    runs' "Time = N" lines into that same tracker would produce a
+    nonsensical, jumping progress readout, since it assumes one linear
+    sequence. The control run's own output still reaches the visible log
+    (prefixed so it's distinguishable), just not the progress bar.
+
+    should_stop is shared (the single global _should_stop()) - stopping
+    the run is meant to stop the whole scenario (both curves), not just
+    one, so both threads killing on the same "pimpleFoam" pattern is the
+    intended behavior here, not the cross-case-collision risk that pattern
+    would have for genuinely independent, concurrently-running scenarios
+    (see the deferred scenario-run parallelization proposal).
+    """
+    results = {}
+    errors = {}
+
+    def run_one(name, cwd_wsl, on_line, log_prefix):
+        try:
+            def prefixed(line):
+                _run_log(f"[{log_prefix}] {line}")
+                if on_line:
+                    on_line(line)
+            results[name] = run_wsl_streaming(
+                "pimpleFoam 2>&1 | tee log.pimpleFoam", cwd_wsl,
+                on_line=prefixed, should_stop=_should_stop, kill_pattern="pimpleFoam",
+            )
+        except Exception as e:
+            errors[name] = e
+
+    th_uv = threading.Thread(target=run_one, args=("uv", case_dir_wsl, _track_solver_time, "UV-on"))
+    th_control = threading.Thread(target=run_one, args=("control", control_dir_wsl, None, "control"))
+    th_uv.start()
+    th_control.start()
+    th_uv.join()
+    th_control.join()
+
+    if errors:
+        raise next(iter(errors.values()))
+    return results["uv"], results["control"]
+
+
 def _finish_decay(case_dir, room, settings, summary):
     """Everything _run_decay() does after setup_case() returns a summary -
     factored out so the flow-convergence-decision resume path (see
@@ -682,19 +772,51 @@ def _finish_decay(case_dir, room, settings, summary):
     resume_case_setup() resolves a previously-undecided flow convergence,
     without repeating (or having to keep in sync by hand) the pimpleFoam
     run/results-writing/monitoring logic below.
+
+    The UV-off control run is no longer optional (see the removed
+    "no-uv-control-enable" checkbox) - decay mode is now the default path
+    (steady-state is frozen, kept only for illustration/cross-checks), and
+    the measured-ACH correction it provides turned out to matter a lot in
+    practice (a ~35% mixing-efficiency gap showed up on a real case this
+    session) - cheap enough now that it always runs concurrently with the
+    main UV-on solve.
     """
     adv = load_advanced_settings()
     case_dir_wsl = wsl_path(case_dir)
-    _run_log(f"Running pimpleFoam to {settings['pimple-end-time']}s (this can take a while)...")
-    r = run_wsl_streaming(
-        "pimpleFoam 2>&1 | tee log.pimpleFoam", case_dir_wsl,
-        on_line=_track_solver_time, should_stop=_should_stop, kill_pattern="pimpleFoam",
+    control_dir = f"{case_dir}/no_UV"
+    control_dir_wsl = wsl_path(control_dir)
+
+    combined_end_time, control_end_time = _decay_run_durations(
+        settings["ach"], summary["eACH_uv_well_mixed_mean"], adv)
+    _run_log(f"Adaptive run durations: UV-on={combined_end_time}s, UV-off control={control_end_time}s "
+             f"(targets: eACH {adv['decay-each-min-fraction']:.3g}-{adv['decay-each-max-fraction']:.3g}%, "
+             f"ACH {adv['decay-ach-min-fraction']:.3g}%)...")
+    set_control_dict_time(case_dir, end_time=combined_end_time,
+                           write_interval=max(1, combined_end_time // 100), delta_t=adv["pimple-delta-t"])
+
+    if _should_stop():
+        raise StoppedByUser("Stopped before pimpleFoam.")
+    _run_log("=== Preparing UV-off control (subfolder \"no_UV\") - clone before either pimpleFoam run ===")
+    prepare_ventilation_only_control(
+        case_dir, control_dir, settings["ach"], room.x, room.y, room.z,
+        settings["inlet-wall"], (settings["inlet-size-w"], settings["inlet-size-h"]),
+        control_end_time, max(1, control_end_time // 100), pimple_delta_t=adv["pimple-delta-t"],
+        inlet2_wall=settings["inlet2-wall"] if settings.get("inlet2-enable") else None,
+        inlet2_size=(settings["inlet2-size-w"], settings["inlet2-size-h"])
+        if settings.get("inlet2-enable") else None,
+        has_outlet2=bool(settings.get("outlet2-enable")),
+        log_fn=_run_log, should_stop=_should_stop,
     )
+
+    _run_log(f"Running pimpleFoam concurrently: UV-on ({combined_end_time}s) + "
+             f"UV-off control ({control_end_time}s)...")
+    r_uv, r_control = _run_decay_pair(case_dir_wsl, control_dir_wsl)
     if _should_stop():
         raise StoppedByUser("Stopped during pimpleFoam.")
-    if r.returncode != 0 or "FOAM FATAL" in r.stdout or "Floating Point Exception" in r.stdout:
-        tail = "\n".join(r.stdout.splitlines()[-25:]) or "(no output captured)"
-        raise RuntimeError(f"pimpleFoam failed (exit {r.returncode}):\n{tail}")
+    for label, r in (("UV-on", r_uv), ("UV-off control", r_control)):
+        if r.returncode != 0 or "FOAM FATAL" in r.stdout or "Floating Point Exception" in r.stdout:
+            tail = "\n".join(r.stdout.splitlines()[-25:]) or "(no output captured)"
+            raise RuntimeError(f"{label} pimpleFoam failed (exit {r.returncode}):\n{tail}")
 
     _run_log("Running postProcess volAverage...")
     run_wsl_or_raise("postProcess -dict system/volAverageDict", case_dir_wsl, "postProcess volAverage")
@@ -709,27 +831,18 @@ def _finish_decay(case_dir, room, settings, summary):
         },
     )
 
-    if settings.get("no-uv-control-enable"):
-        if _should_stop():
-            raise StoppedByUser("Stopped before UV-off control run.")
-        _run_log("=== Running UV-off ventilation-only control (subfolder \"no_UV\") ===")
-        control_results = run_ventilation_only_control(
-            case_dir, f"{case_dir}/no_UV", settings["ach"], room.x, room.y, room.z,
-            settings["inlet-wall"], (settings["inlet-size-w"], settings["inlet-size-h"]),
-            settings["pimple-end-time"], settings["pimple-write-interval"],
-            inlet2_wall=settings["inlet2-wall"] if settings.get("inlet2-enable") else None,
-            inlet2_size=(settings["inlet2-size-w"], settings["inlet2-size-h"])
-            if settings.get("inlet2-enable") else None,
-            has_outlet2=bool(settings.get("outlet2-enable")),
-            log_fn=_run_log, should_stop=_should_stop, solver_log_fn=_track_solver_time,
-        )
-        _run_log("Updating results.json with corrected mixing efficiency (measured, "
-                 "not nominal, ventilation ACH)...")
-        results = write_results_summary(
-            case_dir, f"{case_dir}/results.json", settings["ach"],
-            summary["eACH_uv_well_mixed_mean"], extra={"n_lamps": summary["n_lamps"], "fluence_mean": summary["fluence_mean"]},
-            measured_ventilation_ach=control_results["total_ach_effective"],
-        )
+    _run_log("=== Post-processing UV-off control ===")
+    control_results = finish_ventilation_only_control(control_dir, settings["ach"], log_fn=_run_log)
+    _run_log("Updating results.json with corrected mixing efficiency (measured, "
+             "not nominal, ventilation ACH)...")
+    results = write_results_summary(
+        case_dir, f"{case_dir}/results.json", settings["ach"],
+        summary["eACH_uv_well_mixed_mean"], extra={"n_lamps": summary["n_lamps"], "fluence_mean": summary["fluence_mean"]},
+        measured_ventilation_ach=control_results["total_ach_effective"],
+        measured_ventilation_ach_ci95=control_results.get("total_ach_effective_ci95"),
+        measured_ventilation_ach_se_per_s=control_results.get("fit_se_per_s"),
+        measured_ventilation_fit_dof=(control_results["fit_n"] - 2) if control_results.get("fit_n") else None,
+    )
 
     points = _gather_monitoring_points(settings)
     if points:
@@ -876,13 +989,20 @@ def _run_steady_state(guv_path, case_dir, room, settings):
     _finish_steady_state(case_dir, room, settings, summary)
 
 
-def _finish_steady_state(case_dir, room, settings, summary):
+def _finish_steady_state(case_dir, room, settings, summary,
+                          phase1_resume_decision=None, phase1_resume_additional_iterations=None):
     """Everything _run_steady_state() does after setup_case() returns a
     summary - factored out so the flow-convergence-decision resume path
     (see _resume_pipeline_thread) can reach the exact same steps after
     resume_case_setup() resolves a previously-undecided flow convergence,
     without repeating (or having to keep in sync by hand) the Phase 1/
     Phase 2 orchestration below.
+
+    phase1_resume_decision/phase1_resume_additional_iterations: set only
+    when resuming a Phase1ExtrapolationUndecided pause (see
+    _resume_phase1_extrapolation_thread) - passed straight through to
+    run_steady_state_scenario, which reuses Phase 1's already-mid-run
+    state (0/, source cellZone, fvOptions) instead of restarting it.
     """
     # Persisted here (not just held in this call's summary argument) so a
     # crash anywhere below - inside run_steady_state_scenario() or in the
@@ -909,12 +1029,28 @@ def _finish_steady_state(case_dir, room, settings, summary):
 
     ach = settings["ach"]
     eACH_uv = summary.get("eACH_uv_well_mixed_mean", 0.0)
-    phase1_iterations = max(settings["phase1-iterations"], _settling_iterations(ach))
+    # Phase 1's naive settling estimate (well-mixed idealization) has been
+    # confirmed to run short of where extrapolation actually stabilizes -
+    # a real case's fitted tau came out ~3x the naive theoretical tau at
+    # the slowest tested ACH. Applying a safety multiplier gives a more
+    # realistic *starting* budget - not a hard cap either way, since
+    # phase1_extrapolation_gate can still raise Phase1ExtrapolationUndecided
+    # and offer to extend further if even this isn't enough.
+    phase1_settling_estimate = round(_settling_iterations(ach) * adv["phase1-settling-safety-multiplier"])
+    # Clamped to the configured ceiling - this is a *starting* budget, not
+    # a promise Phase 1 will actually need this many iterations (the
+    # extrapolation gate below stops as soon as it's confident either way);
+    # the ceiling exists so a first attempt never silently launches a much
+    # bigger run than the user configured as their hard backstop.
+    phase1_iterations = min(max(settings["phase1-iterations"], phase1_settling_estimate),
+                             adv["phase1-max-iterations-ceiling"])
     phase2_iterations = max(settings["phase2-iterations"], _settling_iterations(ach + eACH_uv))
-    _run_log(f"99.5% settling estimate: phase1={_settling_iterations(ach)} iterations "
-             f"(ACH={ach:.3g}/hr alone), phase2={_settling_iterations(ach + eACH_uv)} iterations "
-             f"(ACH+eACH_uv={ach + eACH_uv:.3g}/hr) - using the larger of this and the configured "
-             f"value for each phase ({phase1_iterations}, {phase2_iterations}).")
+    _run_log(f"Settling estimate: phase1={phase1_settling_estimate} iterations (ACH={ach:.3g}/hr alone, "
+             f"{adv['phase1-settling-safety-multiplier']:.1f}x safety margin, capped at "
+             f"{adv['phase1-max-iterations-ceiling']}), "
+             f"phase2={_settling_iterations(ach + eACH_uv)} iterations (ACH+eACH_uv={ach + eACH_uv:.3g}/hr) - "
+             f"using the larger of this and the configured value for each phase "
+             f"({phase1_iterations}, {phase2_iterations}).")
 
     patches_to_monitor = ("outlet", "outlet2") if has_outlet2 else ("outlet",)
     result = run_steady_state_scenario(
@@ -943,7 +1079,12 @@ def _finish_steady_state(case_dir, room, settings, summary):
         # single chunk) otherwise.
         t_inf_check_interval=500 if adv["t-infinity-early-stop-enabled"] else None,
         t_inf_rel_tol=(adv["t-infinity-rel-tol"] / 100.0) if adv["t-infinity-early-stop-enabled"] else None,
+        t_inf_streak=adv["phase1-extrapolation-streak"],
         keep_all_timesteps=adv["keep-all-timesteps"],
+        phase1_t_initial=adv["phase1-t-initial"],
+        phase1_extrapolation_gate=adv["t-infinity-early-stop-enabled"],
+        phase1_resume_decision=phase1_resume_decision,
+        phase1_resume_additional_iterations=phase1_resume_additional_iterations,
         fan_entry=fan_entry, monitoring_points=_gather_monitoring_points(settings),
         patches_to_monitor=patches_to_monitor,
         log_fn=_run_log, should_stop=_should_stop, solver_log_fn=_track_solver_time,
@@ -985,21 +1126,29 @@ def _record_run_timing(case_dir, started_at, elapsed_seconds):
         json.dump(results, f, indent=2)
 
 
-def _handle_flow_convergence_undecided(e, sim_type, guv_path, case_dir, room, settings, started_at, start):
+def _handle_flow_convergence_undecided(e, sim_type, guv_path, case_dir, room, settings, started_at, start,
+                                        kind="flow"):
     """Shared by _run_pipeline_thread and _resume_pipeline_thread (a
     "continue N more iterations" attempt can perfectly well land on
     FlowConvergenceUndecided again, exactly like a fresh attempt would -
     same handling either way: never a dead-end error, always a decision
     with real data behind it (see the diagnostic dict's own docstring in
     run_pipeline._oscillation_diagnostic).
+
+    kind: "flow" (FlowConvergenceUndecided) or "phase1_extrapolation"
+    (steady_state_pipeline.Phase1ExtrapolationUndecided) - both pause on
+    the exact same Processing-tab decision panel (continue/accept/stop),
+    since the UX is identical either way; _start_flow_decision dispatches
+    to the right resume thread based on this field.
     """
-    _run_log(f"Flow convergence paused after {e.total_iterations} iterations - awaiting your decision. "
+    label = "Flow convergence" if kind == "flow" else "Phase 1"
+    _run_log(f"{label} paused after {e.total_iterations} iterations - awaiting your decision. "
              f"{e.diagnostic['summary']}")
     _run_state["status"] = "awaiting_decision"
     _run_state["decision"] = {
         "sim_type": sim_type, "guv_path": guv_path, "case_dir": case_dir, "room": room, "settings": settings,
         "diagnostic": e.diagnostic, "total_iterations": e.total_iterations,
-        "started_at": started_at, "start": start,
+        "started_at": started_at, "start": start, "kind": kind,
     }
 
 
@@ -1018,6 +1167,9 @@ def _run_pipeline_thread(sim_type, guv_path, case_dir, room, settings):
         _run_state["status"] = "stopped"
     except FlowConvergenceUndecided as e:
         _handle_flow_convergence_undecided(e, sim_type, guv_path, case_dir, room, settings, started_at, start)
+    except Phase1ExtrapolationUndecided as e:
+        _handle_flow_convergence_undecided(e, sim_type, guv_path, case_dir, room, settings, started_at, start,
+                                            kind="phase1_extrapolation")
     except Exception as e:
         _run_log(f"ERROR: {e}")
         _run_state["status"] = "error"
@@ -1076,6 +1228,39 @@ def _resume_pipeline_thread(action, additional_iterations):
         _run_state["status"] = "stopped"
     except FlowConvergenceUndecided as e:
         _handle_flow_convergence_undecided(e, sim_type, guv_path, case_dir, room, settings, started_at, start)
+    except Phase1ExtrapolationUndecided as e:
+        _handle_flow_convergence_undecided(e, sim_type, guv_path, case_dir, room, settings, started_at, start,
+                                            kind="phase1_extrapolation")
+    except Exception as e:
+        _run_log(f"ERROR: {e}")
+        _run_state["status"] = "error"
+
+
+def _resume_phase1_extrapolation_thread(action, additional_iterations):
+    """Runs after the user clicks Continue/Accept on the Processing tab's
+    decision panel for a Phase1ExtrapolationUndecided pause. Unlike flow
+    convergence's resume (which needs resume_case_setup() to redo mesh-
+    stage bookkeeping), Phase 1's own mesh/flow/setup already fully
+    succeeded - that's why Phase 1 itself got to run at all - so this just
+    re-enters _finish_steady_state() with phase1_resume_decision set,
+    reusing the persisted setup_summary.json exactly like
+    case_awaiting_phase2_resume's own resume path does.
+    """
+    decision = _run_state["decision"]
+    case_dir, room, settings = decision["case_dir"], decision["room"], decision["settings"]
+    started_at, start = decision["started_at"], decision["start"]
+    try:
+        summary = _read_setup_summary(case_dir)
+        _finish_steady_state(case_dir, room, settings, summary,
+                              phase1_resume_decision=action, phase1_resume_additional_iterations=additional_iterations)
+        _run_state["status"] = "done"
+        _record_run_timing(case_dir, started_at, time.time() - start)
+    except StoppedByUser as e:
+        _run_log(f"Stopped: {e}")
+        _run_state["status"] = "stopped"
+    except Phase1ExtrapolationUndecided as e:
+        _handle_flow_convergence_undecided(e, decision["sim_type"], decision["guv_path"], case_dir, room, settings,
+                                            started_at, start, kind="phase1_extrapolation")
     except Exception as e:
         _run_log(f"ERROR: {e}")
         _run_state["status"] = "error"
@@ -1401,14 +1586,16 @@ project_setup_tab = dbc.Row([
                 value="decay",
             ),
             html.Div(id="decay-controls", children=[
-                _labeled("Simulated duration (s)", dbc.Row([
+                _labeled("Suggested duration (s)", dbc.Row([
                     dbc.Col(dcc.Input(
                         id="pimple-end-time", type="number", value=120, min=10, max=7200, step=10,
                         className="form-control form-control-sm"), width=8),
                     dbc.Col(dbc.Button("Suggest", id="suggest-duration-btn", size="sm",
                                        color="secondary", outline=True, className="w-100"), width=4),
                 ], className="g-2"),
-                    help_text="Estimated time to 99% reduction from ACH + well-mixed eACH_uv."),
+                    help_text="Starting value only - the actual run duration is now computed "
+                              "adaptively per the eACH/ACH fit-target settings (Settings menu) "
+                              "once the well-mixed eACH estimate is known, and overrides this."),
                 _labeled("Write interval (s)", dcc.Input(
                     id="pimple-write-interval", type="number", value=10, min=1, max=600, step=1,
                     className="form-control form-control-sm")),
@@ -1440,10 +1627,6 @@ project_setup_tab = dbc.Row([
             ]),
         ]),
 
-        dbc.Checkbox(id="no-uv-control-enable", value=False,
-                     label="Also run a UV-off control (subfolder \"no_UV\") for corrected "
-                           "mixing efficiency",
-                     className="mb-2"),
         dbc.Button("Run simulation", id="run-btn", color="success", className="w-100 mb-2"),
         dbc.Button("Continue to longer duration", id="continue-btn", color="secondary",
                    outline=True, className="w-100 mb-2"),
@@ -1803,16 +1986,19 @@ settings_modal = dbc.Modal(
                     "%", _adv_defaults["plateau-rel-tol"],
                 ),
                 _settings_field(
-                    "settings-mass-balance-tol", "Mass balance tolerance (Phase 1)",
+                    "settings-mass-balance-tol", "Mass balance cross-check tolerance (Phase 1)",
                     "Phase 1's contaminant source has a known injection rate G; at a true steady "
                     "state, whatever leaves through the outlet(s) must equal G exactly, so comparing "
-                    "measured outlet removal to G is a convergence check that needs no curve-fitting "
-                    "or windowing assumptions at all - confirmed directly catching a still-climbing, "
-                    "not-yet-converged run (outlet removal read ~75% of injection while T was "
-                    "visibly still rising). This tolerance is how far apart they may be and still "
-                    "count as \"balanced.\" Lower = stricter; higher = looser. Not used for Phase 2 "
-                    "(UV also removes T via the sink zones themselves, not just outflow, so the "
-                    "same simple identity doesn't hold there).",
+                    "the trailing-window average of measured outlet removal to G is a convergence "
+                    "signal that needs no curve-fitting assumptions at all (a single instantaneous "
+                    "reading is NOT trustworthy for this - confirmed directly stable/low-noise "
+                    "(~0.5% CV) only once properly windowed). Reported alongside the result as a "
+                    "cross-check, not Phase 1's primary readiness gate (see the T∞ extrapolation "
+                    "section below) - confirmed on a real run that reaching 95% mass balance needed "
+                    "meaningfully more iterations than the cheaper extrapolation already trusted. "
+                    "Lower = stricter; higher = looser. Not used for Phase 2 (UV also removes T via "
+                    "the sink zones themselves, not just outflow, so the same simple identity "
+                    "doesn't hold there).",
                     "%", _adv_defaults["mass-balance-tol"],
                 ),
                 html.Hr(className="my-2"),
@@ -1846,37 +2032,79 @@ settings_modal = dbc.Modal(
                     "", _adv_defaults["scalar-relaxation"],
                 ),
                 html.Hr(className="my-2"),
-                html.Div("Steady-state early stopping (experimental)",
+                html.Div("Phase 1 readiness (T∞ extrapolation)",
                           className="small fw-bold text-uppercase mb-1"),
                 html.Div(
-                    "Each steady-state phase (Phase 1/Phase 2) can stop before its full configured "
-                    "iteration budget once its extrapolated true steady-state value (\"Extrapolated "
-                    "T∞\" - see the report/Analysis tab) has stopped changing across several checks, "
-                    "instead of always running to completion. Purely an early exit — the configured "
-                    "iteration count remains a hard upper bound either way, so this can only save "
-                    "time, never make a run longer or change its final answer once T∞ genuinely has "
-                    "settled. Backtested against a real run: 1% tolerance barely saved anything, "
-                    "2-3% saved a real ~35% of the run without looking fragile (same stop point "
-                    "across that whole range) — start around 2% and loosen further only if it's "
-                    "still too conservative for your cases.",
+                    "Phase 1 is accepted once its extrapolated true steady-state value "
+                    "(\"Extrapolated T∞\" - see the report/Analysis tab) has stopped changing "
+                    "across several consecutive checks, rather than trusting the windowed-CV "
+                    "\"plateaued\" check alone - confirmed directly that a plateaued-looking curve "
+                    "(CV=0.56%, under the 1% threshold) was still genuinely rising, needing ~3x its "
+                    "own iteration budget for mass balance to actually catch up, while the SAME "
+                    "run's T∞ extrapolation was already accurate (within 0.2%) at half that. Phase 2 "
+                    "still treats this purely as an early-stop nicety, not a gate. If the iteration "
+                    "ceiling below is reached without a stable extrapolation, the run pauses with a "
+                    "decision (continue more / accept as-is / stop) on the Processing tab - never a "
+                    "silent wrong answer, never an endless run.",
                     className="small text-muted mb-2",
                 ),
                 _settings_checkbox_field(
-                    "settings-t-infinity-early-stop-enabled", "Enable T∞ early stopping",
-                    "Off by default - this is a new, not-yet-widely-validated mechanism. Turn on "
-                    "once you've compared a couple of early-stopped runs against full runs on your "
-                    "own projects and trust it. Currently cannot be combined with \"Keep all time "
-                    "steps for ParaView\" below - a real directory-naming bug was found in that "
-                    "combination (since fixed, but blocked here as a precaution until it's proven "
-                    "out further).",
+                    "settings-t-infinity-early-stop-enabled", "Use T∞ extrapolation as Phase 1's readiness gate",
+                    "On by default (recommended) - this is now Phase 1's primary \"are we done\" "
+                    "signal, not just a speed optimization. Turn off to fall back to the old "
+                    "CV-plateau/hard-budget-only behavior (an escape hatch, not recommended - see "
+                    "the note above for why that alone was found unreliable). Currently cannot be "
+                    "combined with \"Keep all time steps for ParaView\" below - a real directory-"
+                    "naming bug was found in that combination (since fixed, but blocked here as a "
+                    "precaution until it's proven out further).",
                     _adv_defaults["t-infinity-early-stop-enabled"],
                 ),
                 _settings_field(
                     "settings-t-infinity-rel-tol", "T∞ stability tolerance",
-                    "How much 3 consecutive T∞ estimates (500 iterations apart) may differ from "
-                    "each other before the phase counts as settled and stops early. Only takes "
-                    "effect when the checkbox above is on.",
+                    "How much consecutive T∞ estimates (500 iterations apart) may differ from each "
+                    "other before Phase 1 counts as settled. Only takes effect when the checkbox "
+                    "above is on.",
                     "%", _adv_defaults["t-infinity-rel-tol"],
+                ),
+                _settings_field(
+                    "settings-phase1-extrapolation-streak", "Consecutive stable checks required",
+                    "How many T∞ estimates in a row must agree (within the tolerance above) before "
+                    "Phase 1 is accepted - a single agreeing pair could be coincidence; requiring "
+                    "several in a row is a much less fragile signal. 3 is the validated default "
+                    "(both test trajectories checked this session had already-tight fit quality by "
+                    "the time they were first accepted).",
+                    "checks", _adv_defaults["phase1-extrapolation-streak"],
+                ),
+                _settings_field(
+                    "settings-phase1-t-initial", "Phase 1 starting T",
+                    "T's initial value at the start of Phase 1. 0 (cold start) is the validated "
+                    "default - confirmed directly that warm-starting at the target steady-state "
+                    "value (the old default) needed ~40% MORE iterations to reach a stable, accurate "
+                    "extrapolation on a real case, because a uniform starting guess doesn't match "
+                    "the true (often highly non-uniform) steady spatial pattern, forcing an extra "
+                    "redistribution transient on top of the real exponential build-up. A cold "
+                    "start's curve is simpler and gets trusted sooner despite \"starting further "
+                    "away.\"",
+                    "", _adv_defaults["phase1-t-initial"],
+                ),
+                _settings_field(
+                    "settings-phase1-settling-safety-multiplier", "Settling estimate safety margin",
+                    "Multiplies the ACH-based theoretical settling-time estimate to get Phase 1's "
+                    "starting iteration budget - confirmed directly that the plain theoretical "
+                    "estimate ran short (a real case's fitted time constant came out ~3x the naive "
+                    "theoretical value at the slowest tested ACH). Not a hard cap either way - the "
+                    "extrapolation gate above can still pause and offer to extend further if even "
+                    "this isn't enough (see the iteration ceiling below).",
+                    "x", _adv_defaults["phase1-settling-safety-multiplier"],
+                ),
+                _settings_field(
+                    "settings-phase1-max-iterations-ceiling", "Phase 1 iteration ceiling",
+                    "Hard backstop for Phase 1's very first attempt - reached only if the "
+                    "extrapolation gate above never stabilizes (a genuinely pathological case, or "
+                    "the safety-margin estimate above being badly wrong for this project). Hitting "
+                    "it pauses with a decision (continue more / accept as-is / stop) rather than "
+                    "looping forever or silently accepting an unvalidated answer.",
+                    "iterations", _adv_defaults["phase1-max-iterations-ceiling"],
                 ),
                 html.Hr(className="my-2"),
                 html.Div("Steady-state time-step retention", className="small fw-bold text-uppercase mb-1"),
@@ -1911,6 +2139,34 @@ settings_modal = dbc.Modal(
                     "advances by. Smaller steps are more numerically stable but take longer to "
                     "reach the same simulated duration.",
                     "s", _adv_defaults["pimple-delta-t"],
+                ),
+                _settings_field(
+                    "settings-decay-ach-min-fraction", "ACH fit target reduction",
+                    "How far the UV-off control run (subfolder \"no_UV\", always run alongside the "
+                    "main decay - see the removed \"no UV control\" toggle) decays before its "
+                    "measured ventilation rate is trusted. Ventilation-only decay is often much "
+                    "slower than UV+ventilation combined, so this has its own (lower) target rather "
+                    "than sharing the eACH target below - pushing it to a much higher reduction can "
+                    "cost hours for little gain (confirmed directly: one case needed ~9.5h of "
+                    "simulated time to reach 99.9% at its measured 0.73/hr rate).",
+                    "%", _adv_defaults["decay-ach-min-fraction"],
+                ),
+                _settings_field(
+                    "settings-decay-each-min-fraction", "eACH fit target reduction (baseline)",
+                    "The floor for how far the main UV-on run decays before its combined removal "
+                    "rate is trusted - used whenever the higher target below would take too long "
+                    "to be worth it (see that field).",
+                    "%", _adv_defaults["decay-each-min-fraction"],
+                ),
+                _settings_field(
+                    "settings-decay-each-max-fraction", "eACH fit target reduction (if cheap)",
+                    "When the well-mixed eACH estimate is high enough that reaching this reduction "
+                    "wouldn't exceed the same practical duration ceiling as the baseline target "
+                    "above, the run targets this higher reduction instead - more data, for free, "
+                    "whenever the combined decay rate is fast enough to make it cheap. Falls back "
+                    "to the baseline target otherwise. Not pushed past this value even when very "
+                    "cheap, to avoid needlessly long runs for no real accuracy gain.",
+                    "%", _adv_defaults["decay-each-max-fraction"],
                 ),
                 html.Hr(className="my-2"),
                 html.Div("Mesh & zone resolution", className="small fw-bold text-uppercase mb-1"),
@@ -2419,8 +2675,12 @@ _SETTINGS_FIELD_IDS = [
     "settings-plateau-rel-tol", "settings-mass-balance-tol",
     "settings-momentum-relaxation", "settings-scalar-relaxation",
     "settings-t-infinity-early-stop-enabled", "settings-t-infinity-rel-tol",
+    "settings-phase1-t-initial", "settings-phase1-extrapolation-streak",
+    "settings-phase1-settling-safety-multiplier", "settings-phase1-max-iterations-ceiling",
     "settings-keep-all-timesteps",
-    "settings-pimple-delta-t", "settings-mesh-cell-size",
+    "settings-pimple-delta-t",
+    "settings-decay-ach-min-fraction", "settings-decay-each-min-fraction", "settings-decay-each-max-fraction",
+    "settings-mesh-cell-size",
     "settings-uv-zone-bins", "settings-source-zone-size",
 ]
 # Same order as _SETTINGS_FIELD_IDS - maps each GUI field to its
@@ -2431,8 +2691,12 @@ _SETTINGS_FIELD_KEYS = [
     "plateau-rel-tol", "mass-balance-tol",
     "momentum-relaxation", "scalar-relaxation",
     "t-infinity-early-stop-enabled", "t-infinity-rel-tol",
+    "phase1-t-initial", "phase1-extrapolation-streak",
+    "phase1-settling-safety-multiplier", "phase1-max-iterations-ceiling",
     "keep-all-timesteps",
-    "pimple-delta-t", "mesh-cell-size", "uv-zone-bins", "source-zone-size",
+    "pimple-delta-t",
+    "decay-ach-min-fraction", "decay-each-min-fraction", "decay-each-max-fraction",
+    "mesh-cell-size", "uv-zone-bins", "source-zone-size",
 ]
 
 
@@ -2609,8 +2873,10 @@ def _scenario_sweep_thread(guv_path, settings_path, project_dir, room, settings,
     def on_combo_done(z, ach, status, detail):
         _scenario_state["results"][(z, ach)] = {"status": status, "detail": detail}
 
+    sweep_fn = (scenario_runs.run_decay_sweep if settings.get("sim-type") == "decay"
+                else scenario_runs.run_sweep)
     try:
-        scenario_runs.run_sweep(
+        sweep_fn(
             guv_path, settings_path, project_dir, room, settings, adv,
             z_values, ach_values, log_fn=_scenario_log, should_stop=_scenario_should_stop,
             on_combo_done=on_combo_done,
@@ -2701,6 +2967,7 @@ def _start_run(n_clicks, *values):
             "sim_type": sim_type, "guv_path": guv_path, "case_dir": case_dir, "room": room,
             "settings": settings, "diagnostic": pending["diagnostic"],
             "total_iterations": pending["total_iterations"], "started_at": datetime.now(), "start": time.time(),
+            "kind": "flow",
         }
         return True, True, False, "", "processing", False, dash.no_update
 
@@ -2812,36 +3079,42 @@ def _start_continue(n_clicks, case_dir, sim_type, end_time, write_interval, *mes
 
 def _start_flow_decision(action, additional_iterations, mesh_values):
     """Shared by the Continue/Accept buttons on the flow-decision panel
-    (see FlowConvergenceUndecided) - validates the same way the existing
-    "Continue to longer duration" button does (_settings_mismatch against
-    run_settings.json, since resume_case_setup() reuses the mesh/BCs on
-    disk as-is and would silently ignore any GUI changes made since the
-    pause), then launches _resume_pipeline_thread.
+    (see FlowConvergenceUndecided/Phase1ExtrapolationUndecided) - validates
+    the same way the existing "Continue to longer duration" button does
+    (_settings_mismatch against run_settings.json, since either resume path
+    reuses the mesh/BCs on disk as-is and would silently ignore any GUI
+    changes made since the pause), then launches the resume thread that
+    matches this decision's "kind" (flow convergence vs Phase 1
+    extrapolation - same panel, different underlying resume mechanism).
     """
     if _run_state["status"] != "awaiting_decision" or not _run_state.get("decision"):
         return dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update
 
-    case_dir = _run_state["decision"]["case_dir"]
+    decision = _run_state["decision"]
+    case_dir = decision["case_dir"]
+    kind = decision.get("kind", "flow")
     mismatches = _settings_mismatch(case_dir, dict(zip(_MESH_AFFECTING_FIELDS, mesh_values)))
     if mismatches:
         changed = "; ".join(f"{field} was {prior}, now {current}" for field, prior, current in mismatches)
+        what = "continues flow convergence" if kind == "flow" else "continues Phase 1"
         return (dash.no_update, False, False, True,
                 f"These settings differ from the run currently on disk, and resuming won't apply "
-                f"them (it only continues flow convergence - mesh/BCs are reused as-is): {changed}. "
+                f"them (it only {what} - mesh/BCs are reused as-is): {changed}. "
                 f"Run a full simulation instead if you want these changes to take effect.",
                 dash.no_update)
 
+    label = "flow convergence" if kind == "flow" else "Phase 1"
     if action == "continue":
         if not additional_iterations or additional_iterations <= 0:
             return (dash.no_update, False, False, True,
                     "Enter a positive number of iterations to continue.", dash.no_update)
-        _run_log(f"Continuing flow convergence for {additional_iterations} more iterations "
-                 f"(user decision)...")
+        _run_log(f"Continuing {label} for {additional_iterations} more iterations (user decision)...")
     else:
-        _run_log("Accepting current flow field state as-is (user decision) and continuing...")
+        _run_log(f"Accepting current {label} state as-is (user decision) and continuing...")
 
     _run_state["status"] = "running"
-    thread = threading.Thread(target=_resume_pipeline_thread, args=(action, additional_iterations), daemon=True)
+    target = _resume_pipeline_thread if kind == "flow" else _resume_phase1_extrapolation_thread
+    thread = threading.Thread(target=target, args=(action, additional_iterations), daemon=True)
     thread.start()
     return {"display": "none"}, True, True, False, "", "processing"
 
@@ -2886,11 +3159,13 @@ def _start_flow_decision_accept(n_clicks, *mesh_values):
 def _stop_flow_decision(n_clicks):
     if _run_state["status"] != "awaiting_decision":
         return dash.no_update, dash.no_update
-    _run_log("Stopped at your request - the case directory is untouched, exactly as it was when "
-             "flow convergence paused. Come back to it any time via Continue; nothing is lost.")
+    kind = (_run_state.get("decision") or {}).get("kind", "flow")
+    label = "flow convergence" if kind == "flow" else "Phase 1"
+    _run_log(f"Stopped at your request - the case directory is untouched, exactly as it was when "
+             f"{label} paused. Come back to it any time via Run; nothing is lost.")
     _run_state["status"] = "stopped"
     _run_state["decision"] = None
-    return {"display": "none"}, "Stopped (flow-convergence decision deferred)."
+    return {"display": "none"}, f"Stopped ({label} decision deferred)."
 
 
 @app.callback(

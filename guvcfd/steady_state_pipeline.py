@@ -20,7 +20,7 @@ from .case_io import read_openfoam_scalar_field
 from .cellzones import bin_decay_rates
 from .contaminant_source import (
     write_source_topo_set_dict, compute_source_strength, source_Su, source_fvoptions_entry,
-    write_fvoptions_file, check_mass_balance,
+    write_fvoptions_file, live_mass_balance_functions, windowed_mass_balance,
 )
 from .decay_analysis import (
     read_vol_average_dat, check_plateau_windowed, windowed_stats,
@@ -33,8 +33,80 @@ from .monitoring_points import write_monitoring_topo_set_dict, zone_name
 from .splice import (
     splice_fv_options_into_control_dict, splice_into_functions_block,
     set_control_dict_time, set_function_write_interval, ensure_simple_fvsolution,
+    disable_simple_residual_control,
 )
 from .wsl_utils import wsl_path, run_wsl_or_raise, run_wsl_streaming, StoppedByUser
+
+
+class Phase1ExtrapolationUndecided(Exception):
+    """Raised when Phase 1's iteration ceiling is exhausted without
+    fit_asymptotic_value ever reaching a stable, accepted extrapolation
+    (decay_analysis.check_t_infinity_stability) - the primary readiness
+    gate for Phase 1. A windowed CV-plateau check alone can be fooled by a
+    curve that's still genuinely rising: confirmed directly on a real run
+    where a CV=0.56% "plateaued" verdict at 18000 iterations sat on a curve
+    that needed ~25000 iterations to actually reach 95% mass balance, while
+    the SAME run's T-infinity extrapolation was already accurate (within
+    0.22%) using only the original 18000-iteration data. Mirrors
+    run_pipeline.FlowConvergenceUndecided's role and shape exactly - an
+    expected outcome needing a human decision, not a crash, carrying a
+    diagnostic (see _phase1_extrapolation_diagnostic) and enough state
+    (see _write_phase1_pending/resume via run_steady_state_scenario's
+    phase1_resume_decision) to continue without redoing mesh/flow work or
+    restarting Phase 1's own iteration count from scratch.
+
+    Distinct from a genuine solver failure (FOAM FATAL, non-zero exit,
+    StoppedByUser) - those still raise RuntimeError/StoppedByUser as
+    before.
+    """
+
+    def __init__(self, message, diagnostic, total_iterations):
+        super().__init__(message)
+        self.diagnostic = diagnostic
+        self.total_iterations = total_iterations
+
+
+def _phase1_extrapolation_diagnostic(tinf_history, streak, rel_tol, n_iterations, check_interval):
+    """Best-effort analysis of Phase 1's T-infinity fit history when the
+    iteration ceiling was reached without check_t_infinity_stability ever
+    accepting a streak - mirrors run_pipeline._oscillation_diagnostic's
+    role for flow convergence: distinguishes "never saw enough curvature
+    to even attempt a fit" from "fits keep failing/disagreeing" from
+    "fits agree, just not for a full streak yet" - these need different
+    user-facing messages, not one generic failure.
+    """
+    n_attempts = len(tinf_history)
+    n_successful = sum(1 for v in tinf_history if v is not None)
+    recent = tinf_history[-streak:] if tinf_history else []
+    recent_successful = [v for v in recent if v is not None]
+
+    if n_successful == 0:
+        summary = (
+            f"No extrapolation could be fit yet across {n_attempts} check(s) - the curve hasn't "
+            f"shown enough curvature toward an asymptote yet. This usually just means more "
+            f"iterations are needed, not that something is wrong."
+        )
+    elif len(recent_successful) < streak:
+        summary = (
+            f"Extrapolation fits are succeeding ({n_successful}/{n_attempts} checks so far), but "
+            f"not yet {streak} in a row without interruption - the most recent {len(recent)} "
+            f"check(s) included at least one where the fit failed."
+        )
+    else:
+        mean_est = sum(recent_successful) / len(recent_successful)
+        spread = (max(recent_successful) - min(recent_successful)) / mean_est if mean_est else float("inf")
+        summary = (
+            f"The last {streak} extrapolation estimates ({[round(v, 4) for v in recent_successful]}) "
+            f"are still {spread:.1%} apart (target <= {rel_tol:.0%}) - trending toward agreement, "
+            f"just not stable enough yet."
+        )
+
+    return {
+        "n_attempts": n_attempts, "n_successful_fits": n_successful,
+        "recent_estimates": recent, "streak_required": streak, "rel_tol": rel_tol,
+        "chunk_size": check_interval, "n_iterations": n_iterations,
+        "summary": summary,
+    }
 
 
 def compute_corrected_eACH_uv(T_ss1, T_ss2, Su, source_volume, room_volume):
@@ -185,7 +257,8 @@ def _copy_latest_to_zero(case_dir_wsl, latest, include_T, log_fn):
 def _run_phase(case_dir, case_dir_wsl, n_iterations, write_interval, window_frac, plateau_rel_tol,
                 log_fn, should_stop=None, solver_log_fn=None, live_monitoring_zones=(),
                 live_patches=(), check_interval=None, t_inf_rel_tol=None, t_inf_streak=3,
-                keep_all_timesteps=False, iteration_offset=0):
+                keep_all_timesteps=False, iteration_offset=0, mass_balance_patches=(),
+                injection_rate_G=None, mass_balance_tol=None):
     """Run simpleFoam for n_iterations, tracking the room-wide (and any
     monitoring-point) volAverage(T) live, every iteration.
 
@@ -227,6 +300,30 @@ def _run_phase(case_dir, case_dir_wsl, n_iterations, write_interval, window_frac
     `postProcess -dict system/volAverageDict` pass entirely - result_figures.py
     already prefers "live" over "decay_curve" wherever both exist, so
     this is a safe, compatible substitution).
+
+    mass_balance_patches: if given, also live-tracks each patch's flow
+    rate and flow-weighted T every iteration (see contaminant_source.
+    live_mass_balance_functions) - lets the caller compute a proper
+    trailing-window mass-balance ratio (contaminant_source.
+    windowed_mass_balance) instead of trusting a single instantaneous
+    snapshot (see check_mass_balance's docstring for why that matters -
+    confirmed directly that a windowed ratio is stable/low-noise, ~0.5%
+    CV, where a naive short-window derivative proxy was badly biased).
+    Returned via the new mass_balance_flux entry in the accumulated dict.
+
+    injection_rate_G/mass_balance_tol: when given (together with
+    mass_balance_patches), acceptance requires mass balance to *also* be
+    within tolerance, not just T-infinity stability alone - confirmed
+    directly necessary on two separate real cases: a cold-start ACH=1.5
+    run accepted with mass balance at 83% (fit_cv was tight, 0.18% - a
+    well-constrained fit that was still wrong), and an ACH=1 run accepted
+    with mass balance at just 6.3% (fit_cv was loose, 3.28% - a poorly-
+    constrained fit that coincidentally satisfied the streak by chance).
+    Mass balance was the one signal that would have caught BOTH failures;
+    T-infinity stability alone isn't sufficient. A fit whose own fit_cv
+    exceeds t_inf_rel_tol is treated as if it had failed entirely (never
+    contributes to the streak) - a cheap first filter for the second
+    failure mode, checked before the (pricier) mass-balance measurement.
     """
     check_interval = check_interval or n_iterations
     if not keep_all_timesteps:
@@ -240,20 +337,29 @@ def _run_phase(case_dir, case_dir_wsl, n_iterations, write_interval, window_frac
     # Idempotent: controlDict persists across both phases (never
     # regenerated in between), so a phase-2 call would otherwise splice a
     # second, duplicate copy of the same named entries - only splice once.
-    live_block_names = ["volAverageLive1"] + [f"{p}AverageLive" for p in live_patches] \
-        + [f"monitor_{z}Live" for z in live_monitoring_zones]
+    mass_balance_block_names = [n for p in mass_balance_patches
+                                 for n in (f"{p}FlowRateLive", f"{p}FlowWeightedTLive")]
+    live_block_names = (["volAverageLive1"] + [f"{p}AverageLive" for p in live_patches]
+                         + [f"monitor_{z}Live" for z in live_monitoring_zones] + mass_balance_block_names)
     with open(f"{case_dir}/system/controlDict") as f:
-        already_spliced = "volAverageLive1" in f.read()
-    if not already_spliced:
+        controldict_content = f.read()
+    if "volAverageLive1" not in controldict_content:
         block = live_vol_average_functions(
             field="T", patches=live_patches, monitoring_zones=live_monitoring_zones)
         _, n_open, n_close = splice_into_functions_block(case_dir, block)
         assert n_open == n_close, f"Brace mismatch after live-volAverage splice: {n_open} vs {n_close}"
+    if mass_balance_patches and "FlowRateLive" not in controldict_content:
+        mb_block = live_mass_balance_functions(mass_balance_patches)
+        _, n_open, n_close = splice_into_functions_block(case_dir, mb_block)
+        assert n_open == n_close, f"Brace mismatch after live-mass-balance splice: {n_open} vs {n_close}"
 
     accumulated = {"room": ([], [])}
     for zone in live_monitoring_zones:
         accumulated[zone] = ([], [])
+    mb_flow = {p: [] for p in mass_balance_patches}
+    mb_weighted_t = {p: [] for p in mass_balance_patches}
     tinf_history = []
+    stopped_via_tinf = False
     total_run = 0
     final_dir_name = None
 
@@ -306,18 +412,65 @@ def _run_phase(case_dir, case_dir_wsl, n_iterations, write_interval, window_frac
             azt, azT = accumulated[zone]
             azt.extend((zt + total_run).tolist())
             azT.extend(zT.tolist())
+        for patch in mass_balance_patches:
+            _, pflow = read_vol_average_dat(f"{case_dir}/postProcessing/{patch}FlowRateLive/0/surfaceFieldValue.dat")
+            _, pT = read_vol_average_dat(f"{case_dir}/postProcessing/{patch}FlowWeightedTLive/0/surfaceFieldValue.dat")
+            mb_flow[patch].extend(pflow.tolist())
+            mb_weighted_t[patch].extend(pT.tolist())
 
-        total_run += chunk_size
-        chunk_start = total_run - chunk_size
+        # NOT chunk_size (the requested budget) - simpleFoam's own SIMPLE
+        # residualControl (on U/p/(k|omega), inherited from the same
+        # fvSolution flow convergence uses) can trigger "SIMPLE solution
+        # converged" and exit long before reaching the requested endTime,
+        # completely independent of T's own state (T is a passive scalar,
+        # not part of that residual check) - confirmed directly on a real
+        # ACH=1 run where every single 500-iteration chunk actually only
+        # ran ~16-19 iterations this way, so total_run was silently
+        # overcounting by ~30x (15000 "counted" vs ~500 real iterations of
+        # actual T build-up). `latest` is the chunk's own true iteration
+        # count regardless of why it stopped (a normal full chunk writes
+        # its final snapshot named after chunk_size exactly, so this is a
+        # no-op change for the common case) - trust it, not the request.
+        chunk_start = total_run
+        total_run += int(latest)
 
+        # Attempted on every chunk (including the final one, not just while
+        # there's still budget left) - this is the NEW primary readiness
+        # signal for Phase 1 (see Phase1ExtrapolationUndecided), not just an
+        # early-stop nicety, so the caller needs to know whether acceptance
+        # happened at all by the time the loop ends, even if that happened
+        # to land exactly on the last chunk rather than "early".
         stop_early = False
-        if t_inf_rel_tol is not None and total_run < n_iterations:
+        if t_inf_rel_tol is not None:
             fit = fit_asymptotic_value(np.array(acc_t), np.array(acc_T))
+            # A numerically-successful fit that isn't well-constrained is
+            # treated as no fit at all - otherwise a run of noisy estimates
+            # can coincidentally land within t_inf_rel_tol of each other
+            # and satisfy the streak by chance (confirmed directly: a real
+            # ACH=1 run's accepted fit had fit_cv=3.28%, and its mass
+            # balance came out at 6.3% - nowhere near converged).
+            if fit is not None and fit["fit_cv"] is not None and fit["fit_cv"] > t_inf_rel_tol:
+                fit = None
             tinf_history.append(fit["Tinf"] if fit else None)
-            if check_t_infinity_stability(tinf_history, rel_tol=t_inf_rel_tol, streak=t_inf_streak):
-                log_fn(f"  T-infinity stable ({t_inf_streak}x within {t_inf_rel_tol:.0%}) - "
-                       f"stopping early at {total_run}/{n_iterations} iterations.")
-                stop_early = True
+            extrapolation_stable = check_t_infinity_stability(tinf_history, rel_tol=t_inf_rel_tol, streak=t_inf_streak)
+
+            mass_balance_ok = True
+            mb_ratio_text = ""
+            if extrapolation_stable and mass_balance_patches and injection_rate_G and mass_balance_tol is not None:
+                mb_check = windowed_mass_balance(np.array(acc_t), mb_flow, mb_weighted_t, injection_rate_G,
+                                                  window_frac=window_frac, tol=mass_balance_tol)
+                mass_balance_ok = mb_check["within_tolerance"]
+                mb_ratio_text = f", mass balance {mb_check['ratio']:.1%}"
+                if not mass_balance_ok:
+                    log_fn(f"  T-infinity stable, but mass balance ({mb_check['ratio']:.1%}) isn't yet - "
+                           f"not accepting Phase 1 as done.")
+
+            if extrapolation_stable and mass_balance_ok:
+                stopped_via_tinf = True
+                if total_run < n_iterations:
+                    log_fn(f"  T-infinity stable ({t_inf_streak}x within {t_inf_rel_tol:.0%}{mb_ratio_text}) - "
+                           f"stopping early at {total_run}/{n_iterations} iterations.")
+                    stop_early = True
 
         if stop_early or total_run >= n_iterations:
             # Final chunk - leave its own directory in place (renamed to
@@ -394,7 +547,9 @@ def _run_phase(case_dir, case_dir_wsl, n_iterations, write_interval, window_frac
     # many iterations did this phase run" wants the unshifted total_run
     # instead (returned separately).
     assert final_dir_name is not None, "loop must run at least one chunk (n_iterations > 0)"
-    return final_dir_name, total_run, sparse_t, sparse_T, converged, live_curves
+    mass_balance_flux = {"flow": mb_flow, "weighted_t": mb_weighted_t}
+    return (final_dir_name, total_run, sparse_t, sparse_T, converged, live_curves,
+            stopped_via_tinf, tinf_history, mass_balance_flux)
 
 
 def _room_phase_summary(live_room, window_frac, converged, iterations, sparse_t, sparse_T, log_fn):
@@ -492,6 +647,37 @@ def _clear_phase1_checkpoint(case_dir):
     Path(_phase1_checkpoint_path(case_dir)).unlink(missing_ok=True)
 
 
+def _phase1_pending_path(case_dir):
+    return f"{case_dir}/phase1_pending.json"
+
+
+def _write_phase1_pending(case_dir, G, Su, source_volume, n_source_cells):
+    """Persisted once, right before Phase 1's own solve starts (before
+    _phase1_checkpoint.json exists) - lets a fresh process resume a
+    Phase1ExtrapolationUndecided decision (read G/Su back rather than
+    recompute) without needing the source cellZone re-carved or T reset,
+    since 0/ already holds Phase 1's current (mid-run, undecided) state.
+    Cleared once Phase 1 either finishes (checkpoint written) or the
+    whole scenario is abandoned.
+    """
+    data = {"G": G, "Su": Su, "source_volume": source_volume, "n_source_cells": n_source_cells}
+    with open(_phase1_pending_path(case_dir), "w") as f:
+        json.dump(data, f, indent=2)
+
+
+def _read_phase1_pending(case_dir):
+    path = _phase1_pending_path(case_dir)
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+
+
+def _clear_phase1_pending(case_dir):
+    Path(_phase1_pending_path(case_dir)).unlink(missing_ok=True)
+
+
 def run_steady_state_scenario(case_dir, room_x, room_y, room_z, ach, Z, nbins=25,
                                source_center=None, source_size=0.3, target_T_ss=0.3,
                                cell_size=0.1, inlet_velocity=(0.278, 0, 0),
@@ -505,6 +691,8 @@ def run_steady_state_scenario(case_dir, room_x, room_y, room_z, ach, Z, nbins=25
                                plateau_rel_tol=0.01, window_frac=0.15,
                                t_inf_check_interval=None, t_inf_rel_tol=None, t_inf_streak=3,
                                keep_all_timesteps=False, mass_balance_tol=0.10,
+                               phase1_t_initial=0.0, phase1_extrapolation_gate=True,
+                               phase1_resume_decision=None, phase1_resume_additional_iterations=None,
                                fan_entry=None, monitoring_points=None,
                                patches_to_monitor=("outlet",), log_fn=print, should_stop=None,
                                solver_log_fn=None):
@@ -512,20 +700,65 @@ def run_steady_state_scenario(case_dir, room_x, room_y, room_z, ach, Z, nbins=25
     an already-converged case (mesh + flow + fluenceRate/kUV must already
     exist - see run_pipeline.setup_case()). Returns a summary dict.
 
-    mass_balance_tol: fractional tolerance for Phase 1's mass-balance check
-    (contaminant_source.check_mass_balance) - compares the actual outlet
-    removal rate against the known injection rate G, a curve-fitting-free
-    convergence signal (at true steady state they must match exactly).
-    Phase-1-only: Phase 2 also removes T via the UV sink cellZones, not
-    just advective outflow, so the same simple injection=removal identity
-    doesn't hold there (see check_mass_balance's docstring).
+    mass_balance_tol: fractional tolerance for Phase 1's mass-balance cross-
+    check (contaminant_source.windowed_mass_balance) - compares the actual
+    outlet removal rate (trailing-window average of the live per-iteration
+    flux, NOT a single instantaneous snapshot - confirmed directly that a
+    snapshot is the wrong quantity to trust, while a properly windowed
+    average is stable/low-noise, ~0.5% CV) against the known injection
+    rate G, a curve-fitting-free signal: at true steady state they must
+    match exactly. No longer Phase 1's primary readiness gate (see
+    phase1_extrapolation_gate) - demoted to an informational cross-check
+    surfaced in the results, since reaching it reliably needs meaningfully
+    more iterations than the cheaper T-infinity extrapolation already
+    trusts (confirmed on a real run: extrapolation was accurate at ~2x the
+    original budget, mass balance didn't reach 95% until ~2.8x). Phase-1-
+    only: Phase 2 also removes T via the UV sink cellZones, not just
+    advective outflow, so the same simple injection=removal identity
+    doesn't hold there.
 
-    t_inf_check_interval/t_inf_rel_tol/t_inf_streak: optional early-stop
-    for both phases via T-infinity extrapolation stability (see
-    _run_phase/decay_analysis.check_t_infinity_stability) - t_inf_rel_tol
-    is None by default (disabled; each phase always runs its full
-    phaseN_iterations budget, today's behavior). GUI-exposed as a
-    cross-project "advanced" setting (Settings menu, right of File).
+    phase1_t_initial: Phase 1's starting T value (0.0 by default). Used to
+    warm-start at target_T_ss - confirmed directly that this is NOT
+    actually faster under the extrapolation-based readiness gate: a cold
+    (T=0) start reached a stable, accurate extrapolation in ~40% fewer
+    iterations than a warm start on the same case, because a uniform
+    target_T_ss guess doesn't match the true (often highly non-uniform)
+    steady spatial pattern, forcing an extra redistribution transient on
+    top of the real exponential relaxation - a cold start's curve is
+    simpler (closer to the single-exponential shape fit_asymptotic_value
+    assumes) and gets trusted sooner despite "starting further away."
+
+    phase1_extrapolation_gate: if True (default), Phase 1 is not accepted
+    until fit_asymptotic_value has produced a stable, accepted
+    extrapolation (t_inf_streak consecutive fits agreeing within
+    t_inf_rel_tol - see _run_phase) - if phase1_iterations is exhausted
+    first, raises Phase1ExtrapolationUndecided rather than silently
+    accepting whatever the CV-plateau check says (confirmed directly: a
+    "plateaued" CV=0.56% verdict at 18000 iterations sat on a curve still
+    genuinely rising, needing ~25000 iterations for mass balance to catch
+    up - the CV-plateau check alone isn't a reliable Phase-1-done signal).
+    If False, falls back to the old behavior (CV-plateau/hard-budget only,
+    T-infinity early-stop purely a speed optimization if enabled) - an
+    escape hatch, not the recommended setting.
+
+    phase1_resume_decision/phase1_resume_additional_iterations: set by a
+    caller resuming a Phase1ExtrapolationUndecided decision (see that
+    exception and _read_phase1_pending) - "continue" runs
+    phase1_resume_additional_iterations more iterations from Phase 1's
+    current (already mid-run) state without re-carving the source zone or
+    resetting T; "accept" treats the current state as final regardless of
+    whether extrapolation ever stabilized (flagged as such in the result).
+    Only meaningful when phase1_pending.json exists (Phase 1 was already
+    attempted and left undecided) - ignored otherwise.
+
+    t_inf_check_interval/t_inf_rel_tol/t_inf_streak: chunk size / stability
+    tolerance / consecutive-agreement streak for T-infinity extrapolation
+    stability (see _run_phase/decay_analysis.check_t_infinity_stability) -
+    t_inf_rel_tol is None by default (disabled; each phase always runs its
+    full phaseN_iterations budget). GUI-exposed as a cross-project
+    "advanced" setting (Settings menu, right of File). For Phase 1, this is
+    now the primary readiness signal (see phase1_extrapolation_gate), not
+    just an early-stop nicety - Phase 2 still treats it as early-stop-only.
 
     keep_all_timesteps: if True, every write_interval snapshot from both
     phases is kept on disk (renamed to one continuous, collision-free
@@ -567,6 +800,12 @@ def run_steady_state_scenario(case_dir, room_x, room_y, room_z, ach, Z, nbins=25
 
     log_fn("Ensuring SIMPLE fvSolution and outlet-average monitoring are set up...")
     ensure_simple_fvsolution(case_dir)
+    # Flow convergence (setup_case()) is already done by this point, so the
+    # residualControl block that was useful there would only hurt now - it
+    # would let simpleFoam declare "converged" and exit a Phase 1/2 chunk
+    # after ~16-19 iterations based on the (already-converged) flow field,
+    # starving T of the iterations each chunk is actually meant to deliver.
+    disable_simple_residual_control(case_dir)
     write_vol_average_dict(case_dir, field="T", patches=patches_to_monitor)
 
     # Carve monitoring cellZones now, before either phase's solve, instead
@@ -583,6 +822,7 @@ def run_steady_state_scenario(case_dir, room_x, room_y, room_z, ach, Z, nbins=25
         live_zone_names = [zone_name(p["name"]) for p in monitoring_points]
 
     checkpoint = _read_phase1_checkpoint(case_dir)
+    pending = _read_phase1_pending(case_dir) if checkpoint is None else None
     iters1 = 0
     if checkpoint is not None:
         # Phase 1 already ran and converged in an earlier attempt (see
@@ -604,120 +844,184 @@ def run_steady_state_scenario(case_dir, room_x, room_y, room_z, ach, Z, nbins=25
         source_entry = source_fvoptions_entry(Su)
         fan_entries = [fan_entry] if fan_entry is not None else []
     else:
-        log_fn(f"Carving source cellZone at {source_center}, size {source_size}...")
-        write_source_topo_set_dict(case_dir, source_center, source_size, cell_size=cell_size)
-        r = run_wsl_or_raise("topoSet -dict system/sourceTopoSetDict", case_dir_wsl, "topoSet (source zone)")
-        m = re.search(r"cellSet sourceZoneCells now size (\d+)", r.stdout)
-        if not m:
-            raise RuntimeError(f"Could not parse source cell count from topoSet output:\n{r.stdout}")
-        n_source_cells = int(m.group(1))
-        source_volume = n_source_cells * cell_size ** 3
-        log_fn(f"  {n_source_cells} cells, source_volume={source_volume:.4g} m^3")
+        if pending is not None and phase1_resume_decision is not None:
+            # Resuming a Phase1ExtrapolationUndecided decision - 0/ already
+            # holds Phase 1's current (mid-run, undecided) state, and the
+            # source cellZone/fvOptions/BCs are already set up from the
+            # earlier attempt - do NOT re-carve or reset T (see
+            # phase1_resume_decision's docstring).
+            log_fn(f"Resuming Phase 1's undecided state (decision: {phase1_resume_decision})...")
+            G, Su = pending["G"], pending["Su"]
+            source_volume, n_source_cells = pending["source_volume"], pending["n_source_cells"]
+            summary["source_Su"] = Su
+            summary["source_volume"] = source_volume
+            summary["injection_rate_total"] = G
+            source_entry = source_fvoptions_entry(Su)
+            fan_entries = [fan_entry] if fan_entry is not None else []
 
-        G = compute_source_strength(room_volume, ach, target_T_ss)
-        Su = source_Su(G, source_volume)
-        summary["source_Su"] = Su
-        summary["source_volume"] = source_volume
-        # G is the total room-wide generation rate: T[amount]/m^3 * m^3/s = T[amount]/s
-        # (e.g. CFU/s if T represents CFU/m^3 - see the T-field note in the report).
-        summary["injection_rate_total"] = G
-        log_fn(f"  G={G:.4g}, Su={Su:.4g}")
+            if phase1_resume_decision == "continue":
+                additional = phase1_resume_additional_iterations or phase1_iterations
+                log_fn(f"=== Phase 1 (resumed): {additional} more iterations ===")
+                run_iterations, run_check_interval, run_t_inf_rel_tol = additional, t_inf_check_interval, t_inf_rel_tol
+            else:  # "accept" - sample one more window to build a live series to report against,
+                   # not to re-litigate stability (the previous attempt's own per-iteration
+                   # series lived only in that process's memory, not persisted - only the
+                   # scalar tinf_history/G/Su in phase1_pending.json survive a fresh process).
+                run_iterations = t_inf_check_interval or 500
+                log_fn(f"=== Phase 1 (accepting current state): sampling {run_iterations} more "
+                       f"iterations to build a representative window ===")
+                run_check_interval, run_t_inf_rel_tol = None, None
 
-        source_entry = source_fvoptions_entry(Su)
-        fan_entries = [fan_entry] if fan_entry is not None else []
+            latest1, iters1, t1, T1, converged1, live1, stopped_via_tinf1, tinf_history1, mb_flux1 = _run_phase(
+                case_dir, case_dir_wsl, run_iterations, phase1_write_interval,
+                window_frac, plateau_rel_tol, log_fn, should_stop=should_stop,
+                solver_log_fn=solver_log_fn, live_monitoring_zones=live_zone_names,
+                live_patches=patches_to_monitor,
+                check_interval=run_check_interval, t_inf_rel_tol=run_t_inf_rel_tol, t_inf_streak=t_inf_streak,
+                keep_all_timesteps=keep_all_timesteps, mass_balance_patches=patches_to_monitor,
+                injection_rate_G=G, mass_balance_tol=mass_balance_tol,
+            )
+            if (phase1_resume_decision == "continue" and phase1_extrapolation_gate
+                    and t_inf_rel_tol is not None and not stopped_via_tinf1):
+                diagnostic = _phase1_extrapolation_diagnostic(
+                    tinf_history1, t_inf_streak, t_inf_rel_tol, run_iterations,
+                    t_inf_check_interval or run_iterations)
+                raise Phase1ExtrapolationUndecided(
+                    f"Phase 1 extrapolation still undecided after {additional} more iterations "
+                    f"(resumed) - {diagnostic['summary']}", diagnostic, iters1)
 
-        # setup_case() already resolved "ceiling"-diffuser inlets into a
-        # per-face velocity list once; mapFields/flow-convergence's own
-        # restore_boundary_conditions() calls (inside setup_case()) may have
-        # since overwritten 0/U with that resolved value, but this scenario
-        # starts by explicitly rewriting boundary conditions again (T_initial=0
-        # for the steady-state build-up) - re-resolve the same way here rather
-        # than assuming the plain inlet_velocity tuple this function received
-        # is still the right BC value for a "ceiling" inlet.
-        if inlet_diffuser_type == "ceiling":
-            v_mag = float(np.linalg.norm(inlet_velocity))
-            center = opening_center(inlet_wall, room_x, room_y, room_z, inlet_center, inlet_size,
-                                     cell_size=cell_size)
-            extents = opening_half_extents(inlet_wall, room_x, room_y, room_z, inlet_center, inlet_size,
-                                            cell_size=cell_size)
-            inlet_velocity = resolve_inlet_velocity(case_dir, "inlet", inlet_wall, center, v_mag, "ceiling",
-                                                     half_extents=extents)
-        if inlet2_diffuser_type == "ceiling" and inlet2_velocity is not None:
-            v_mag2 = float(np.linalg.norm(inlet2_velocity))
-            center2 = opening_center(inlet2_wall, room_x, room_y, room_z, inlet2_center, inlet2_size,
-                                      cell_size=cell_size)
-            extents2 = opening_half_extents(inlet2_wall, room_x, room_y, room_z, inlet2_center, inlet2_size,
-                                             cell_size=cell_size)
-            inlet2_velocity = resolve_inlet_velocity(case_dir, "inlet2", inlet2_wall, center2, v_mag2, "ceiling",
-                                                      half_extents=extents2)
+            summary["phase1"] = _room_phase_summary(live1["room"], window_frac, converged1, iters1, t1, T1, log_fn)
+            summary["phase1"]["mass_balance"] = windowed_mass_balance(
+                live1["room"][0], mb_flux1["flow"], mb_flux1["weighted_t"], G, window_frac, mass_balance_tol)
+            if phase1_resume_decision == "accept":
+                summary["phase1"]["accepted_by_user_before_stable_extrapolation"] = True
+            phase1_monitoring = {
+                p["name"]: _point_phase_summary(live1[zone_name(p["name"])], window_frac)
+                for p in (monitoring_points or [])
+            }
+            _copy_latest_to_zero(case_dir_wsl, latest1, include_T=True, log_fn=log_fn)
+            run_wsl_or_raise("cp 0/T phase1_T.snapshot", case_dir_wsl,
+                              "saving Phase 1's final T field for later spatial-mixing analysis")
+            if not keep_all_timesteps:
+                _clean_time_dirs(case_dir_wsl)
+            _clear_phase1_pending(case_dir)
+            _write_phase1_checkpoint(case_dir, summary["phase1"], phase1_monitoring, G, Su, source_volume,
+                                      n_source_cells)
+        else:
+            log_fn(f"Carving source cellZone at {source_center}, size {source_size}...")
+            write_source_topo_set_dict(case_dir, source_center, source_size, cell_size=cell_size)
+            r = run_wsl_or_raise("topoSet -dict system/sourceTopoSetDict", case_dir_wsl, "topoSet (source zone)")
+            m = re.search(r"cellSet sourceZoneCells now size (\d+)", r.stdout)
+            if not m:
+                raise RuntimeError(f"Could not parse source cell count from topoSet output:\n{r.stdout}")
+            n_source_cells = int(m.group(1))
+            source_volume = n_source_cells * cell_size ** 3
+            log_fn(f"  {n_source_cells} cells, source_volume={source_volume:.4g} m^3")
 
-        # --- Phase 1: source only, no UV ---
-        log_fn("=== Phase 1: source only (no UV) ===")
-        write_fvoptions_file(case_dir, [source_entry] + fan_entries)
-        _, n_open, n_close = splice_fv_options_into_control_dict(case_dir)
-        assert n_open == n_close, f"Brace mismatch: {n_open} vs {n_close}"
-        # Warm-start T at target_T_ss rather than 0: this is a linear system (T
-        # doesn't feed back into U/p), so the final steady state doesn't depend
-        # on the initial condition at all - only how many iterations it takes to
-        # get there does. target_T_ss is exactly what the source strength was
-        # calibrated to reach under the idealized well-mixed assumption (see
-        # compute_source_strength), so it's a good guess to start near rather
-        # than the full climb from 0 - confirmed on a real case that starting
-        # near the eventual answer reaches a tight, guard-passing plateau in a
-        # small fraction of the iterations a T=0 start needed for the same
-        # curve. Phase 2 already does the equivalent right thing (starts from
-        # Phase 1's own converged T); this brings Phase 1 in line with that.
-        restore_boundary_conditions(case_dir, inlet_velocity=inlet_velocity, T_initial=target_T_ss,
-                                     inlet2_velocity=inlet2_velocity, has_outlet2=has_outlet2)
+            G = compute_source_strength(room_volume, ach, target_T_ss)
+            Su = source_Su(G, source_volume)
+            summary["source_Su"] = Su
+            summary["source_volume"] = source_volume
+            # G is the total room-wide generation rate: T[amount]/m^3 * m^3/s = T[amount]/s
+            # (e.g. CFU/s if T represents CFU/m^3 - see the T-field note in the report).
+            summary["injection_rate_total"] = G
+            log_fn(f"  G={G:.4g}, Su={Su:.4g}")
 
-        latest1, iters1, t1, T1, converged1, live1 = _run_phase(
-            case_dir, case_dir_wsl, phase1_iterations, phase1_write_interval,
-            window_frac, plateau_rel_tol, log_fn, should_stop=should_stop,
-            solver_log_fn=solver_log_fn, live_monitoring_zones=live_zone_names,
-            live_patches=patches_to_monitor,
-            check_interval=t_inf_check_interval, t_inf_rel_tol=t_inf_rel_tol, t_inf_streak=t_inf_streak,
-            keep_all_timesteps=keep_all_timesteps,
-        )
-        summary["phase1"] = _room_phase_summary(live1["room"], window_frac, converged1, iters1, t1, T1, log_fn)
-        summary["phase1"]["mass_balance"] = check_mass_balance(
-            case_dir, patches_to_monitor, G, tol=mass_balance_tol, log_fn=log_fn)
-        phase1_monitoring = {
-            p["name"]: _point_phase_summary(live1[zone_name(p["name"])], window_frac)
-            for p in (monitoring_points or [])
-        }
-        # _run_phase leaves its final chunk's own time directory in place
-        # (named latest1, its true cumulative iteration count) rather than
-        # cleaning it itself - phase 1's own final state isn't meant for
-        # standalone ParaView viewing (unlike phase 2's, kept below), so the
-        # caller copies it into 0/ and, normally, cleans it away here. With
-        # keep_all_timesteps, every phase-1 snapshot stays instead (phase 2's
-        # _run_phase call below is offset by iters1 so its own directory names
-        # continue the same numbering rather than colliding with phase 1's).
-        _copy_latest_to_zero(case_dir_wsl, latest1, include_T=True, log_fn=log_fn)
-        # Phase 2 is about to overwrite 0/T with its own (source + UV)
-        # build-up state - keep a plain copy of Phase 1's converged field
-        # under its own name (not inside a time directory - a stray extra
-        # field there is otherwise harmless, but this keeps it unambiguous
-        # and out of the way of anything mesh/time-directory-based) so a
-        # spatial-uniformity analysis (see monitoring_points.
-        # mixing_uniformity_note) can later be run against ventilation-only
-        # mixing specifically, not conflated with Phase 2's highly non-
-        # uniform UV-dose pattern (confirmed on a real run: even after
-        # excluding the source cellZone and the most extreme 5% of cells,
-        # Phase 2's spatial CV was still 213% - Phase 1 alone is the only
-        # way to tell how much of that is ventilation mixing vs. UV dose).
-        run_wsl_or_raise("cp 0/T phase1_T.snapshot", case_dir_wsl,
-                          "saving Phase 1's final T field for later spatial-mixing analysis")
-        if not keep_all_timesteps:
-            _clean_time_dirs(case_dir_wsl)
+            source_entry = source_fvoptions_entry(Su)
+            fan_entries = [fan_entry] if fan_entry is not None else []
 
-        # Phase 1 is done and its converged state is safely in 0/ - write
-        # the checkpoint now, before Phase 2 starts, so any failure from
-        # here on can resume without repeating Phase 1 (see this run's own
-        # real motivating case: Phase 1 converged fine, then an unrelated
-        # directory-naming bug crashed the very next step).
-        _write_phase1_checkpoint(case_dir, summary["phase1"], phase1_monitoring, G, Su, source_volume,
-                                  n_source_cells)
+            # setup_case() already resolved "ceiling"-diffuser inlets into a
+            # per-face velocity list once; mapFields/flow-convergence's own
+            # restore_boundary_conditions() calls (inside setup_case()) may have
+            # since overwritten 0/U with that resolved value, but this scenario
+            # starts by explicitly rewriting boundary conditions again - re-resolve
+            # the same way here rather than assuming the plain inlet_velocity tuple
+            # this function received is still the right BC value for a "ceiling"
+            # inlet.
+            if inlet_diffuser_type == "ceiling":
+                v_mag = float(np.linalg.norm(inlet_velocity))
+                center = opening_center(inlet_wall, room_x, room_y, room_z, inlet_center, inlet_size,
+                                         cell_size=cell_size)
+                extents = opening_half_extents(inlet_wall, room_x, room_y, room_z, inlet_center, inlet_size,
+                                                cell_size=cell_size)
+                inlet_velocity = resolve_inlet_velocity(case_dir, "inlet", inlet_wall, center, v_mag, "ceiling",
+                                                         half_extents=extents)
+            if inlet2_diffuser_type == "ceiling" and inlet2_velocity is not None:
+                v_mag2 = float(np.linalg.norm(inlet2_velocity))
+                center2 = opening_center(inlet2_wall, room_x, room_y, room_z, inlet2_center, inlet2_size,
+                                          cell_size=cell_size)
+                extents2 = opening_half_extents(inlet2_wall, room_x, room_y, room_z, inlet2_center, inlet2_size,
+                                                 cell_size=cell_size)
+                inlet2_velocity = resolve_inlet_velocity(case_dir, "inlet2", inlet2_wall, center2, v_mag2, "ceiling",
+                                                          half_extents=extents2)
+
+            # --- Phase 1: source only, no UV ---
+            log_fn("=== Phase 1: source only (no UV) ===")
+            write_fvoptions_file(case_dir, [source_entry] + fan_entries)
+            _, n_open, n_close = splice_fv_options_into_control_dict(case_dir)
+            assert n_open == n_close, f"Brace mismatch: {n_open} vs {n_close}"
+            restore_boundary_conditions(case_dir, inlet_velocity=inlet_velocity, T_initial=phase1_t_initial,
+                                         inlet2_velocity=inlet2_velocity, has_outlet2=has_outlet2)
+            _write_phase1_pending(case_dir, G, Su, source_volume, n_source_cells)
+
+            latest1, iters1, t1, T1, converged1, live1, stopped_via_tinf1, tinf_history1, mb_flux1 = _run_phase(
+                case_dir, case_dir_wsl, phase1_iterations, phase1_write_interval,
+                window_frac, plateau_rel_tol, log_fn, should_stop=should_stop,
+                solver_log_fn=solver_log_fn, live_monitoring_zones=live_zone_names,
+                live_patches=patches_to_monitor,
+                check_interval=t_inf_check_interval, t_inf_rel_tol=t_inf_rel_tol, t_inf_streak=t_inf_streak,
+                keep_all_timesteps=keep_all_timesteps, mass_balance_patches=patches_to_monitor,
+                injection_rate_G=G, mass_balance_tol=mass_balance_tol,
+            )
+            if phase1_extrapolation_gate and t_inf_rel_tol is not None and not stopped_via_tinf1:
+                diagnostic = _phase1_extrapolation_diagnostic(
+                    tinf_history1, t_inf_streak, t_inf_rel_tol, phase1_iterations,
+                    t_inf_check_interval or phase1_iterations)
+                raise Phase1ExtrapolationUndecided(
+                    f"Phase 1's {phase1_iterations}-iteration ceiling was reached without a "
+                    f"stable extrapolation - {diagnostic['summary']}", diagnostic, iters1)
+
+            summary["phase1"] = _room_phase_summary(live1["room"], window_frac, converged1, iters1, t1, T1, log_fn)
+            summary["phase1"]["mass_balance"] = windowed_mass_balance(
+                live1["room"][0], mb_flux1["flow"], mb_flux1["weighted_t"], G, window_frac, mass_balance_tol)
+            phase1_monitoring = {
+                p["name"]: _point_phase_summary(live1[zone_name(p["name"])], window_frac)
+                for p in (monitoring_points or [])
+            }
+            # _run_phase leaves its final chunk's own time directory in place
+            # (named latest1, its true cumulative iteration count) rather than
+            # cleaning it itself - phase 1's own final state isn't meant for
+            # standalone ParaView viewing (unlike phase 2's, kept below), so the
+            # caller copies it into 0/ and, normally, cleans it away here. With
+            # keep_all_timesteps, every phase-1 snapshot stays instead (phase 2's
+            # _run_phase call below is offset by iters1 so its own directory names
+            # continue the same numbering rather than colliding with phase 1's).
+            _copy_latest_to_zero(case_dir_wsl, latest1, include_T=True, log_fn=log_fn)
+            # Phase 2 is about to overwrite 0/T with its own (source + UV)
+            # build-up state - keep a plain copy of Phase 1's converged field
+            # under its own name (not inside a time directory - a stray extra
+            # field there is otherwise harmless, but this keeps it unambiguous
+            # and out of the way of anything mesh/time-directory-based) so a
+            # spatial-uniformity analysis (see monitoring_points.
+            # mixing_uniformity_note) can later be run against ventilation-only
+            # mixing specifically, not conflated with Phase 2's highly non-
+            # uniform UV-dose pattern (confirmed on a real run: even after
+            # excluding the source cellZone and the most extreme 5% of cells,
+            # Phase 2's spatial CV was still 213% - Phase 1 alone is the only
+            # way to tell how much of that is ventilation mixing vs. UV dose).
+            run_wsl_or_raise("cp 0/T phase1_T.snapshot", case_dir_wsl,
+                              "saving Phase 1's final T field for later spatial-mixing analysis")
+            if not keep_all_timesteps:
+                _clean_time_dirs(case_dir_wsl)
+
+            # Phase 1 is done and its converged state is safely in 0/ - write
+            # the checkpoint now, before Phase 2 starts, so any failure from
+            # here on can resume without repeating Phase 1 (see this run's own
+            # real motivating case: Phase 1 converged fine, then an unrelated
+            # directory-naming bug crashed the very next step).
+            _clear_phase1_pending(case_dir)
+            _write_phase1_checkpoint(case_dir, summary["phase1"], phase1_monitoring, G, Su, source_volume,
+                                      n_source_cells)
 
     # --- Phase 2: source + UV ---
     log_fn("=== Phase 2: source + UV ===")
@@ -727,7 +1031,12 @@ def run_steady_state_scenario(case_dir, room_x, room_y, room_z, ach, Z, nbins=25
     _, n_open, n_close = splice_fv_options_into_control_dict(case_dir)
     assert n_open == n_close, f"Brace mismatch: {n_open} vs {n_close}"
 
-    latest2, iters2, t2, T2, converged2, live2 = _run_phase(
+    # Phase 2 keeps T-infinity as an early-stop nicety only (not a hard
+    # gate like Phase 1 - see phase1_extrapolation_gate) - stopped_via_tinf/
+    # tinf_history/mass_balance_flux aren't meaningful for Phase 2 (mass
+    # balance's injection=removal identity doesn't hold once UV sinks are
+    # also removing T, see windowed_mass_balance's Phase-1-only caveat).
+    latest2, iters2, t2, T2, converged2, live2, _, _, _ = _run_phase(
         case_dir, case_dir_wsl, phase2_iterations, phase2_write_interval,
         window_frac, plateau_rel_tol, log_fn, should_stop=should_stop,
         solver_log_fn=solver_log_fn, live_monitoring_zones=live_zone_names,

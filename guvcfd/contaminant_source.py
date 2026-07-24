@@ -5,15 +5,17 @@ source). No mesh/patch changes needed - a topoSet-carved cellZone, distinct
 from (and coexisting with) the UV sink cellZones in cellzones.py.
 
 Two phases share this source, staying on throughout:
-  Phase 1 (no UV): T starts warm (see steady_state_pipeline.run_steady_state_
-    scenario's T_initial=target_T_ss), builds up/settles to a steady state
-    set by the balance between this source and ventilation removal alone.
+  Phase 1 (no UV): T starts at phase1_t_initial (0 by default - see
+    steady_state_pipeline.run_steady_state_scenario), builds up/settles to
+    a steady state set by the balance between this source and ventilation
+    removal alone.
   Phase 2 (UV on): starting from phase 1's converged T, UV cellZones are
     added on top of the still-active source, reaching a new, lower steady
     state.
 """
 import re
 
+from .decay_analysis import fit_asymptotic_value
 from .wsl_utils import wsl_path, run_wsl_or_raise, run_wsl
 
 
@@ -176,6 +178,123 @@ def _mass_balance_dict(patches):
         ]
     lines += ["}", ""]
     return "\n".join(lines)
+
+
+def live_mass_balance_functions(patches, indent="    "):
+    """Splice-ready controlDict `functions{}` entries (no FoamFile/functions
+    wrapper - see monitoring.live_vol_average_functions, same pattern)
+    tracking each patch's flow rate and flow-weighted T *every solver
+    iteration*, instead of a single `postProcess -latestTime` snapshot
+    (see check_mass_balance).
+
+    Why this matters: a single-instant read is the wrong quantity to
+    trust for "has mass balance actually converged" - confirmed directly
+    on a real run where the true (windowed, many-iteration) ratio was a
+    stable 89.9% (CV=0.475%, not noisy at all) but a naive derivative-
+    based proxy computed from a short window gave a badly biased ~97-99%
+    for the same period. The live per-iteration series this produces lets
+    a caller compute a proper trailing-window average (see
+    windowed_mass_balance) instead of trusting one snapshot.
+
+    Named with a "Live" suffix, same collision-avoidance convention as
+    every other live tracker spliced into this controlDict.
+    """
+    lines = []
+    for patch in patches:
+        lines += [
+            "", f"{patch}FlowRateLive", "{",
+            "    type            surfaceFieldValue;",
+            '    libs            ("libfieldFunctionObjects.so");',
+            "    fields          (phi);",
+            "    operation       sum;",
+            "    regionType      patch;",
+            f"    name            {patch};",
+            "    executeControl  timeStep;",
+            "    executeInterval 1;",
+            "    writeControl    timeStep;",
+            "    writeInterval   1;",
+            "    writeFields     false;",
+            "}",
+            "", f"{patch}FlowWeightedTLive", "{",
+            "    type            surfaceFieldValue;",
+            '    libs            ("libfieldFunctionObjects.so");',
+            "    fields          (T);",
+            "    operation       weightedAverage;",
+            "    weightField     phi;",
+            "    regionType      patch;",
+            f"    name            {patch};",
+            "    executeControl  timeStep;",
+            "    executeInterval 1;",
+            "    writeControl    timeStep;",
+            "    writeInterval   1;",
+            "    writeFields     false;",
+            "}",
+        ]
+    return "\n".join(indent + line if line else "" for line in lines)
+
+
+def windowed_mass_balance(t, flow_by_patch, weighted_t_by_patch, injection_rate_G, window_frac=0.15, tol=0.10):
+    """Trailing-window mass-balance ratio from live per-iteration flux data
+    (see live_mass_balance_functions), replacing check_mass_balance's
+    single-instant snapshot with a proper windowed average - see that
+    function's docstring for why a snapshot alone isn't trustworthy.
+
+    flow_by_patch/weighted_t_by_patch: {patch_name: array} - the raw
+    per-iteration sum(phi)/weightedAverage(T, weight=phi) series for each
+    patch, same length as `t`.
+
+    Returns the same shape as check_mass_balance() plus `cv` (the windowed
+    ratio's own coefficient of variation) and `window_n`/`window_span` for
+    labeling.
+
+    cv is DETRENDED (residual after removing the window's systematic
+    approach to steady state), not the raw spread around the mean - a
+    window that's still climbing/falling has raw CV conflating that
+    systematic drift with genuine noise, which can read as deceptively
+    "tight" while the ratio is still moving several percent over the
+    window (confirmed directly: a 15%-frac window still spanning a
+    substantial change in mean gave a raw CV that understated how far from
+    settled the ratio actually was).
+
+    The ratio approaches 1.0 the same way T approaches Tinf - a single-
+    exponential relaxation, not a straight line (both come from the same
+    underlying SIMPLE-iteration convergence) - so the trend removed here is
+    fit_asymptotic_value's exponential model, not a linear one; a linear
+    detrend still leaves real curvature in the residual whenever the window
+    hasn't fully flattened, understating drift the same way raw CV does.
+    Falls back to a linear detrend if the exponential fit doesn't converge
+    (see fit_asymptotic_value's own self-consistency guard), and further to
+    the plain mean-relative std for n<=2 or if even that's degenerate.
+    """
+    import numpy as np
+    t = np.asarray(t, dtype=float)
+    n = max(2, round(len(t) * window_frac))
+    removal_rate = np.zeros(n)
+    for patch in flow_by_patch:
+        phi = np.asarray(flow_by_patch[patch][-n:], dtype=float)
+        wT = np.asarray(weighted_t_by_patch[patch][-n:], dtype=float)
+        removal_rate += np.abs(phi) * wT
+    ratio_series = removal_rate / injection_rate_G if injection_rate_G else np.full(n, float("inf"))
+    ratio = float(ratio_series.mean())
+    tail_t = t[-n:]
+    cv = None
+    if ratio and n >= 10:
+        fit = fit_asymptotic_value(tail_t, ratio_series, fit_frac=1.0)
+        if fit is not None:
+            cv = fit["fit_cv"]
+    if cv is None and ratio and n > 2:
+        slope, intercept = np.polyfit(tail_t, ratio_series, 1)
+        residuals = ratio_series - (slope * tail_t + intercept)
+        cv = float(residuals.std(ddof=2) / ratio)
+    elif cv is None and ratio:
+        cv = float(ratio_series.std(ddof=1) / ratio)
+    within_tolerance = (1 - tol) <= ratio <= (1 + tol)
+    window_span = float(t[-1] - t[-n])
+    return {
+        "measured_removal_rate": float(removal_rate.mean()), "injection_rate": injection_rate_G,
+        "ratio": ratio, "within_tolerance": within_tolerance, "tol": tol,
+        "cv": cv, "window_n": n, "window_span": window_span,
+    }
 
 
 def check_mass_balance(case_dir, patches, injection_rate_G, tol=0.10, log_fn=print):

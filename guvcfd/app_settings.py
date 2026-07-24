@@ -22,13 +22,20 @@ ADVANCED_SETTINGS_DEFAULTS = {
     "source-zone-size": 0.30,  # meters
     "momentum-relaxation": 0.7,  # SIMPLE under-relaxation for U/(k|omega)
     "scalar-relaxation": 0.7,    # SIMPLE under-relaxation for T
-    "t-infinity-early-stop-enabled": False,  # opt-in - see steady_state_pipeline._run_phase
+    "t-infinity-early-stop-enabled": True,  # Phase 1's primary readiness gate - see run_steady_state_scenario
     "t-infinity-rel-tol": 2.0,   # % - T-infinity stability tolerance (see check_t_infinity_stability)
     "keep-all-timesteps": False,  # opt-in - see steady_state_pipeline.run_steady_state_scenario
     "oscillation-window": 6,        # chunks - run_pipeline._is_stable_oscillation
     "oscillation-growth-tol": 1.5,  # ratio - run_pipeline._is_stable_oscillation
     "ach-delivery-tol": 10.0,   # % - run_pipeline.check_ach_delivery
-    "mass-balance-tol": 10.0,   # % - contaminant_source.check_mass_balance (steady-state Phase 1)
+    "mass-balance-tol": 10.0,   # % - contaminant_source.windowed_mass_balance (steady-state Phase 1 cross-check)
+    "phase1-t-initial": 0.0,    # Phase 1's starting T value - see run_steady_state_scenario
+    "phase1-extrapolation-streak": 3,  # consecutive stable T-infinity fits required (see check_t_infinity_stability)
+    "phase1-settling-safety-multiplier": 2.5,  # safety factor on the ACH-based minimum iteration estimate
+    "phase1-max-iterations-ceiling": 40000,  # hard backstop - see Phase1ExtrapolationUndecided
+    "decay-ach-min-fraction": 90.0,   # % - decay-mode UV-off control run's target reduction
+    "decay-each-min-fraction": 90.0,  # % - decay-mode UV-on run's baseline target reduction
+    "decay-each-max-fraction": 99.9,  # % - decay-mode UV-on run's target when eACH is high (cheap to reach)
 }
 
 

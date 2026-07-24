@@ -10,6 +10,7 @@ import re
 import warnings
 
 import numpy as np
+from scipy import stats
 from scipy.optimize import curve_fit, OptimizeWarning
 
 
@@ -31,20 +32,49 @@ def read_vol_average_dat(path):
 
 
 def fit_effective_decay_rate(t, T):
-    """Least-squares fit of ln(T) = -lambda*t + c. Returns lambda [1/s].
+    """Least-squares fit of ln(T) = -lambda*t + c.
 
     A real CFD decay curve (imperfect mixing) isn't a perfect single
     exponential, so this is a best-fit summary, not an exact value -
     intercept should come out close to ln(T[0]) if the fit is well-behaved.
+
+    Returns a dict {lambda_per_s, intercept, se_per_s, ci95_per_s, n}.
+    se_per_s/ci95_per_s are the OLS slope's standard error and 95%
+    confidence interval - the standard closed-form regression quantities
+    (Var(slope) = residual_variance / sum((t-t_mean)^2), CI via the
+    t-distribution with n-2 degrees of freedom), not a bespoke statistic -
+    a scientist reading this report already knows how to interpret a
+    regression CI. None when n<=2 (no residual degrees of freedom left to
+    estimate a variance from).
     """
     t = np.asarray(t, dtype=float)
     T = np.asarray(T, dtype=float)
+    n = len(t)
+    y = np.log(T)
     A = np.vstack([t, np.ones_like(t)]).T
-    slope, intercept = np.linalg.lstsq(A, np.log(T), rcond=None)[0]
-    return -slope, intercept
+    slope, intercept = np.linalg.lstsq(A, y, rcond=None)[0]
+    lambda_per_s = -slope
+
+    se_per_s, ci95_per_s = None, None
+    dof = n - 2
+    if dof > 0:
+        resid = y - (slope * t + intercept)
+        t_spread = np.sum((t - t.mean()) ** 2)
+        if t_spread:
+            resid_var = np.sum(resid ** 2) / dof
+            se_slope = np.sqrt(resid_var / t_spread)
+            se_per_s = se_slope  # Var(-slope) = Var(slope)
+            margin = stats.t.ppf(0.975, dof) * se_slope
+            ci95_per_s = (lambda_per_s - margin, lambda_per_s + margin)
+
+    return {
+        "lambda_per_s": lambda_per_s, "intercept": intercept,
+        "se_per_s": se_per_s, "ci95_per_s": ci95_per_s, "n": n,
+    }
 
 
-def compute_effective_eACH(t, T, ventilation_ach, ventilation_lambda_per_s=None):
+def compute_effective_eACH(t, T, ventilation_ach, ventilation_lambda_per_s=None,
+                            ventilation_lambda_se_per_s=None, ventilation_lambda_dof=None):
     """Effective eACH_UV [1/hr] implied by an actual CFD decay curve, i.e.
     what UV-only air-change-equivalent would explain the observed *total*
     decay rate once ventilation's own contribution is subtracted out.
@@ -63,11 +93,51 @@ def compute_effective_eACH(t, T, ventilation_ach, ventilation_lambda_per_s=None)
     already isolates for UV) - using the measured baseline removes that
     small bias from eACH_uv_effective. Defaults to the nominal ACH when not
     given (the original, uncorrected behavior).
+
+    ventilation_lambda_se_per_s/ventilation_lambda_dof: if the measured
+    ventilation_lambda_per_s came from its OWN separate regression fit
+    (e.g. a UV-off control run's own fit_effective_decay_rate), passing its
+    standard error and degrees of freedom here combines it IN QUADRATURE
+    with this fit's own uncertainty (assuming independence - reasonable,
+    since the two curves come from separate CFD runs) to give a properly
+    propagated CI on eACH_uv_effective, instead of treating the
+    ventilation baseline as an exact constant. The combined interval uses
+    the SMALLER of the two fits' degrees of freedom (a standard,
+    conservative simplification of the exact Welch-Satterthwaite
+    approximation - appropriate here since both fits typically have
+    plenty of points). Omitting these treats ventilation_lambda_per_s as
+    exact, same as before (a CI that's too narrow if it actually came from
+    its own noisy fit).
+
+    Returns a dict {eACH_uv_effective, lambda_total_effective_per_s,
+    intercept, se_per_s, ci95_eACH_per_hr, n}.
     """
-    lambda_total_effective, intercept = fit_effective_decay_rate(t, T)
+    fit = fit_effective_decay_rate(t, T)
+    lambda_total_effective = fit["lambda_per_s"]
     lambda_vent = ventilation_lambda_per_s if ventilation_lambda_per_s is not None else ventilation_ach / 3600.0
     eACH_uv_effective = (lambda_total_effective - lambda_vent) * 3600.0
-    return eACH_uv_effective, lambda_total_effective, intercept
+
+    ci95_eACH_per_hr = None
+    if ventilation_lambda_se_per_s is not None and fit["se_per_s"] is not None:
+        se_combined = np.sqrt(fit["se_per_s"] ** 2 + ventilation_lambda_se_per_s ** 2)
+        dof = fit["n"] - 2
+        if ventilation_lambda_dof is not None:
+            dof = min(dof, ventilation_lambda_dof)
+        if dof > 0:
+            margin = stats.t.ppf(0.975, dof) * se_combined * 3600.0
+            ci95_eACH_per_hr = (eACH_uv_effective - margin, eACH_uv_effective + margin)
+    elif fit["ci95_per_s"] is not None:
+        lo, hi = fit["ci95_per_s"]
+        ci95_eACH_per_hr = ((lo - lambda_vent) * 3600.0, (hi - lambda_vent) * 3600.0)
+
+    return {
+        "eACH_uv_effective": eACH_uv_effective,
+        "lambda_total_effective_per_s": lambda_total_effective,
+        "intercept": fit["intercept"],
+        "se_per_s": fit["se_per_s"],
+        "ci95_eACH_per_hr": ci95_eACH_per_hr,
+        "n": fit["n"],
+    }
 
 
 def check_plateau_windowed(t, T, frac=0.15, rel_tol=0.01):
@@ -270,7 +340,10 @@ def check_t_infinity_stability(history, rel_tol=0.02, streak=3):
 
 def write_results_summary(case_dir, out_path, ventilation_ach, well_mixed_eACH_mean,
                            vol_average_dat="postProcessing/volAverage1/0/volFieldValue.dat",
-                           extra=None, measured_ventilation_ach=None):
+                           extra=None, measured_ventilation_ach=None,
+                           measured_ventilation_ach_ci95=None,
+                           measured_ventilation_ach_se_per_s=None,
+                           measured_ventilation_fit_dof=None):
     """Write a single results.json combining the well-mixed eACH (from
     setup_case's fluence computation) with the CFD-fit effective eACH (from
     an actual completed pimpleFoam run's decay curve) - everything a results
@@ -282,28 +355,65 @@ def write_results_summary(case_dir, out_path, ventilation_ach, well_mixed_eACH_m
     eACH_uv_effective_corrected/mixing_efficiency_corrected fields that
     subtract this measured baseline instead of the nominal ventilation_ach -
     see compute_effective_eACH's docstring for why that's more accurate.
+
+    measured_ventilation_ach_ci95: that control run's OWN 95% CI on its
+    fitted rate (its "total_ach_effective_ci95"), passed through here
+    purely for display next to "ventilation_ach_measured".
+
+    measured_ventilation_ach_se_per_s/measured_ventilation_fit_dof: that
+    same control run's own fit standard error [1/s] and degrees of freedom
+    (its "fit_se_per_s"/"fit_n"-1) - when given, PROPERLY combined in
+    quadrature with this run's own fit uncertainty to give
+    eACH_uv_effective_corrected_ci95 a rigorous, non-underestimated width
+    (see compute_effective_eACH's docstring) instead of treating the
+    measured baseline as an exact constant.
     """
     dat_path = f"{case_dir}/{vol_average_dat}"
     t, T = read_vol_average_dat(dat_path)
-    eACH_eff, lambda_eff, intercept = compute_effective_eACH(t, T, ventilation_ach)
+    fit = compute_effective_eACH(t, T, ventilation_ach)
+    eACH_eff = fit["eACH_uv_effective"]
+    lambda_eff = fit["lambda_total_effective_per_s"]
+
+    # total_ach_effective = ventilation_ach + eACH_eff - ventilation_ach is
+    # an exact constant here, so its CI is just eACH_eff's own CI shifted
+    # by the same amount (see compute_effective_eACH's docstring on why
+    # this doesn't widen the interval).
+    total_ach_effective_ci95 = None
+    if fit["ci95_eACH_per_hr"] is not None:
+        lo, hi = fit["ci95_eACH_per_hr"]
+        total_ach_effective_ci95 = (ventilation_ach + lo, ventilation_ach + hi)
 
     summary = {
         "ventilation_ach": ventilation_ach,
         "eACH_uv_well_mixed": well_mixed_eACH_mean,
         "eACH_uv_effective": eACH_eff,
+        "eACH_uv_effective_ci95": fit["ci95_eACH_per_hr"],
         "mixing_efficiency": eACH_eff / well_mixed_eACH_mean if well_mixed_eACH_mean else None,
         "total_ach_well_mixed": ventilation_ach + well_mixed_eACH_mean,
         "total_ach_effective": ventilation_ach + eACH_eff,
+        "total_ach_effective_ci95": total_ach_effective_ci95,
         "lambda_total_effective_per_s": lambda_eff,
-        "fit_intercept": intercept,
+        "fit_intercept": fit["intercept"],
+        "fit_n": fit["n"],
+        "fit_se_per_s": fit["se_per_s"],
         "decay_curve": {"t_seconds": t.tolist(), "volAverage_T": T.tolist()},
     }
 
     if measured_ventilation_ach is not None:
-        eACH_eff_corrected, _, _ = compute_effective_eACH(
-            t, T, ventilation_ach, ventilation_lambda_per_s=measured_ventilation_ach / 3600.0)
+        # measured_ventilation_ach_se_per_s/dof (this control run's OWN fit
+        # uncertainty, if given - see finish_ventilation_only_control's
+        # results.json: fit_se_per_s/fit_n) propagate into a properly
+        # combined CI here, rather than treating the measured baseline as
+        # an exact constant - see compute_effective_eACH's docstring.
+        fit_corrected = compute_effective_eACH(
+            t, T, ventilation_ach, ventilation_lambda_per_s=measured_ventilation_ach / 3600.0,
+            ventilation_lambda_se_per_s=measured_ventilation_ach_se_per_s,
+            ventilation_lambda_dof=measured_ventilation_fit_dof)
+        eACH_eff_corrected = fit_corrected["eACH_uv_effective"]
         summary["ventilation_ach_measured"] = measured_ventilation_ach
+        summary["ventilation_ach_measured_ci95"] = measured_ventilation_ach_ci95
         summary["eACH_uv_effective_corrected"] = eACH_eff_corrected
+        summary["eACH_uv_effective_corrected_ci95"] = fit_corrected["ci95_eACH_per_hr"]
         summary["mixing_efficiency_corrected"] = (
             eACH_eff_corrected / well_mixed_eACH_mean if well_mixed_eACH_mean else None)
 

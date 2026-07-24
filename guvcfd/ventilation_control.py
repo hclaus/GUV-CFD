@@ -16,19 +16,23 @@ from .splice import (
     set_control_dict_start_from,
     set_control_dict_time,
 )
-from .wsl_utils import wsl_path, run_wsl_or_raise, run_wsl_streaming, StoppedByUser
+from .wsl_utils import wsl_path, run_wsl_or_raise, StoppedByUser
 
 
-def run_ventilation_only_control(case_dir, control_dir, ach, room_x, room_y, room_z,
-                                  inlet_wall, inlet_size, pimple_end_time,
-                                  pimple_write_interval, pimple_delta_t=0.5,
-                                  inlet2_wall=None, inlet2_size=None, has_outlet2=False,
-                                  log_fn=print, should_stop=None, solver_log_fn=None):
+def prepare_ventilation_only_control(case_dir, control_dir, ach, room_x, room_y, room_z,
+                                      inlet_wall, inlet_size, pimple_end_time,
+                                      pimple_write_interval, pimple_delta_t=0.5,
+                                      inlet2_wall=None, inlet2_size=None, has_outlet2=False,
+                                      log_fn=print, should_stop=None):
     """Clone case_dir's mesh/converged flow field into control_dir, remove
-    every UV source, reset T fresh, and run the transient decay driven by
-    ventilation alone. Returns the control run's results dict (ventilation_ach
-    set, eACH_uv_well_mixed=0.0) - its total_ach_effective is the actual
-    measured ventilation air-change rate.
+    every UV source, reset T fresh, and set its own transient-decay duration
+    - everything needed before pimpleFoam can run. Split out from actually
+    running the solve (see finish_ventilation_only_control) so the caller
+    can launch this control run's pimpleFoam CONCURRENTLY with the main
+    UV-on run - both only depend on case_dir's already-converged flow
+    field, so from here on they're fully independent (this is now always
+    run alongside the main decay run, not an optional toggle - see
+    app._finish_decay).
 
     inlet2_wall/inlet2_size/has_outlet2: mirror whatever 2nd inlet/outlet
     the original case_dir was actually built with (see setup_case) - the
@@ -87,17 +91,15 @@ def run_ventilation_only_control(case_dir, control_dir, ach, room_x, room_y, roo
     set_control_dict_time(control_dir, end_time=pimple_end_time,
                            write_interval=pimple_write_interval, delta_t=pimple_delta_t)
 
-    log_fn(f"Running pimpleFoam (UV-off control) to {pimple_end_time}s...")
-    r = run_wsl_streaming(
-        "pimpleFoam 2>&1 | tee log.pimpleFoam", control_dir_wsl,
-        on_line=solver_log_fn or log_fn, should_stop=should_stop, kill_pattern="pimpleFoam",
-    )
-    if should_stop is not None and should_stop():
-        raise StoppedByUser("Stopped during UV-off control pimpleFoam.")
-    if r.returncode != 0 or "FOAM FATAL" in r.stdout or "Floating Point Exception" in r.stdout:
-        tail = "\n".join(r.stdout.splitlines()[-25:]) or "(no output captured)"
-        raise RuntimeError(f"UV-off control pimpleFoam failed (exit {r.returncode}):\n{tail}")
 
+def finish_ventilation_only_control(control_dir, ach, log_fn=print):
+    """Post-process an already-completed UV-off control pimpleFoam run (see
+    prepare_ventilation_only_control) - volAverage T postProcess plus
+    results.json. Returns the results dict (ventilation_ach set,
+    eACH_uv_well_mixed=0.0) - its total_ach_effective is the actual
+    measured ventilation air-change rate.
+    """
+    control_dir_wsl = wsl_path(control_dir)
     log_fn("Post-processing the control run (volAverage T)...")
     write_vol_average_dict(control_dir)
     run_wsl_or_raise("rm -rf postProcessing", control_dir_wsl, "clearing postProcessing")

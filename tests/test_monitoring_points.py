@@ -86,15 +86,20 @@ def test_mixing_uniformity_note_none_when_points_track_room_average():
 
 
 def test_mixing_uniformity_note_flags_decay_scenario_deviation():
+    # Trailing-window mean (windowed_stats, frac=0.15 -> last 2 of 3
+    # points here), not the single raw last sample - see
+    # mixing_uniformity_note's decay branch.
     result = {
-        "decay_curve": {"volAverage_T": [1.0, 0.5, 0.25]},
-        "monitoring": {"Patient": {"volAverage_T": [1.0, 0.4, 0.10]}},
+        "decay_curve": {"t_seconds": [0, 10, 20], "volAverage_T": [1.0, 0.5, 0.25]},
+        "monitoring": {"Patient": {"t_seconds": [0, 10, 20], "volAverage_T": [1.0, 0.4, 0.10]}},
     }
     note = mixing_uniformity_note(result)
     assert note is not None
     assert "NOT well mixed" in note
     assert "Patient" in note
-    assert "60%" in note  # (0.25 - 0.10) / 0.25 = 60% below
+    # room trailing-2 mean = (0.5+0.25)/2 = 0.375; Patient = (0.4+0.10)/2 = 0.25
+    # deviation = (0.25 - 0.375) / 0.375 = -33.3% (below)
+    assert "33%" in note
 
 
 def test_mixing_uniformity_note_flags_steady_state_scenario_deviation():

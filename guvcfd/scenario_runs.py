@@ -22,19 +22,24 @@ than imported, for the same reason.
 import json
 import math
 import re
+import threading
 from pathlib import Path
 
 import numpy as np
 
 from .case_io import read_boundary_patch_names, read_openfoam_scalar_field, write_scalar_field
 from .cellzones import bin_decay_rates, write_cellzones
+from .decay_analysis import write_results_summary
 from .fan import fan_fvoptions_entry, write_fan_topo_set_dict
 from .fluence import compute_inactivation_rate, compute_well_mixed_eACH
 from .initial_fields import compute_inlet_velocities
+from .monitoring_points import compute_monitoring_results
 from .run_pipeline import setup_case
+from .splice import set_control_dict_time
 from .steady_state_pipeline import run_steady_state_scenario
+from .ventilation_control import prepare_ventilation_only_control, finish_ventilation_only_control
 from .visualization import center_frac_for_wall
-from .wsl_utils import StoppedByUser, run_wsl_or_raise, wsl_path
+from .wsl_utils import StoppedByUser, run_wsl_or_raise, run_wsl_streaming, wsl_path
 
 _TEMPLATE_CASE_DIR = str(Path(__file__).resolve().parent / "templates" / "case_template")
 
@@ -291,6 +296,228 @@ def _run_scenario(case_dir, room, settings, z, ach, adv, z_summary, log_fn, shou
     result["fluence_mean"] = z_summary["fluence_mean"]
     result["eACH_uv_well_mixed"] = z_summary.get("eACH_uv_well_mixed_mean")
     return result
+
+
+# --- decay-mode scenario (mirrors app._decay_run_durations/_run_decay_pair/
+# _finish_decay, but parametrized on the caller's log_fn/should_stop rather
+# than the Dash app's globals - see module docstring for why this module
+# doesn't import app.py) ---
+
+def _decay_run_durations(ach, eACH_well_mixed_est, adv):
+    """Same rule as app._decay_run_durations: the UV-off control run
+    targets decay-ach-min-fraction alone (ventilation-only decay is often
+    much slower than combined, so pushing it further can cost hours for
+    little gain); the UV-on run targets decay-each-max-fraction when that's
+    cheap (estimated time <= the same practical ceiling), else falls back
+    to decay-each-min-fraction.
+    """
+    ceiling = 7200
+    control_end_time = _settling_iterations(
+        ach, target_fraction=adv["decay-ach-min-fraction"] / 100.0, max_iterations=ceiling)
+
+    combined_rate = ach + eACH_well_mixed_est
+    raw_each_max_time = _settling_iterations(
+        combined_rate, target_fraction=adv["decay-each-max-fraction"] / 100.0, max_iterations=10 ** 9)
+    each_target = (adv["decay-each-max-fraction"] if raw_each_max_time <= ceiling
+                   else adv["decay-each-min-fraction"])
+    combined_end_time = _settling_iterations(combined_rate, target_fraction=each_target / 100.0,
+                                              max_iterations=ceiling)
+    return combined_end_time, control_end_time
+
+
+def _run_decay_pair(case_dir_wsl, control_dir_wsl, should_stop, log_fn, solver_log_fn):
+    """Run the UV-on and UV-off-control pimpleFoam solves concurrently -
+    see app._run_decay_pair (same design, just parametrized instead of
+    using the Dash app's global _run_log/_should_stop/_track_solver_time).
+    """
+    results = {}
+    errors = {}
+
+    def run_one(name, cwd_wsl, on_line, log_prefix):
+        try:
+            def prefixed(line):
+                log_fn(f"[{log_prefix}] {line}")
+                if on_line:
+                    on_line(line)
+            results[name] = run_wsl_streaming(
+                "pimpleFoam 2>&1 | tee log.pimpleFoam", cwd_wsl,
+                on_line=prefixed, should_stop=should_stop, kill_pattern="pimpleFoam",
+            )
+        except Exception as e:
+            errors[name] = e
+
+    th_uv = threading.Thread(target=run_one, args=("uv", case_dir_wsl, solver_log_fn, "UV-on"))
+    th_control = threading.Thread(target=run_one, args=("control", control_dir_wsl, None, "control"))
+    th_uv.start()
+    th_control.start()
+    th_uv.join()
+    th_control.join()
+
+    if errors:
+        raise next(iter(errors.values()))
+    return results["uv"], results["control"]
+
+
+def _run_decay_scenario(case_dir, room, settings, z, ach, adv, z_summary, log_fn, should_stop, solver_log_fn,
+                         base_summary=None):
+    """Decay-mode equivalent of _run_scenario() - runs the UV-on decay and
+    its UV-off control concurrently (always both - see app._finish_decay)
+    at this combination's z/ach, with adaptive durations, then writes the
+    same corrected results.json shape a single decay run would.
+
+    Unlike steady-state's _run_scenario, this doesn't need
+    run_steady_state_scenario at all - setup_case()/_apply_z() (called by
+    the caller before this) already carved this Z's UV cellZones/fvOptions
+    into case_dir; a decay run's own scalar-transport function object and
+    fvOptions splice were already done inside setup_case() too, so this
+    only needs to (re)set the adaptive duration and run the two solves.
+    """
+    case_dir_wsl = wsl_path(case_dir)
+    control_dir = f"{case_dir}/no_UV"
+    control_dir_wsl = wsl_path(control_dir)
+
+    eACH_well_mixed_est = z_summary.get("eACH_uv_well_mixed_mean", 0.0)
+    combined_end_time, control_end_time = _decay_run_durations(ach, eACH_well_mixed_est, adv)
+    log_fn(f"  Adaptive run durations: UV-on={combined_end_time}s, UV-off control={control_end_time}s...")
+    set_control_dict_time(case_dir, end_time=combined_end_time,
+                           write_interval=max(1, combined_end_time // 100), delta_t=adv["pimple-delta-t"])
+
+    if should_stop is not None and should_stop():
+        raise StoppedByUser("Stopped before pimpleFoam.")
+    has_inlet2 = bool(settings.get("inlet2-enable"))
+    log_fn("  Preparing UV-off control (subfolder \"no_UV\")...")
+    prepare_ventilation_only_control(
+        case_dir, control_dir, ach, room.x, room.y, room.z,
+        settings["inlet-wall"], (settings["inlet-size-w"], settings["inlet-size-h"]),
+        control_end_time, max(1, control_end_time // 100), pimple_delta_t=adv["pimple-delta-t"],
+        inlet2_wall=settings["inlet2-wall"] if has_inlet2 else None,
+        inlet2_size=(settings["inlet2-size-w"], settings["inlet2-size-h"]) if has_inlet2 else None,
+        has_outlet2=bool(settings.get("outlet2-enable")),
+        log_fn=log_fn, should_stop=should_stop,
+    )
+
+    log_fn(f"  Running pimpleFoam concurrently: UV-on ({combined_end_time}s) + "
+           f"UV-off control ({control_end_time}s)...")
+    r_uv, r_control = _run_decay_pair(case_dir_wsl, control_dir_wsl, should_stop, log_fn, solver_log_fn)
+    if should_stop is not None and should_stop():
+        raise StoppedByUser("Stopped during pimpleFoam.")
+    for label, r in (("UV-on", r_uv), ("UV-off control", r_control)):
+        if r.returncode != 0 or "FOAM FATAL" in r.stdout or "Floating Point Exception" in r.stdout:
+            tail = "\n".join(r.stdout.splitlines()[-25:]) or "(no output captured)"
+            raise RuntimeError(f"{label} pimpleFoam failed (exit {r.returncode}):\n{tail}")
+
+    log_fn("  Running postProcess volAverage...")
+    run_wsl_or_raise("postProcess -dict system/volAverageDict", case_dir_wsl, "postProcess volAverage")
+
+    log_fn("  Post-processing UV-off control...")
+    control_results = finish_ventilation_only_control(control_dir, ach, log_fn=log_fn)
+
+    log_fn("  Writing results summary...")
+    result = write_results_summary(
+        case_dir, f"{case_dir}/results.json", ach, eACH_well_mixed_est,
+        extra={
+            "fluence_mean": z_summary.get("fluence_mean"),
+            "flow_converged": (base_summary or {}).get("flow_converged"),
+            "ach_delivery": (base_summary or {}).get("ach_delivery"),
+            "n_lamps": (base_summary or {}).get("n_lamps"),
+        },
+        measured_ventilation_ach=control_results["total_ach_effective"],
+        measured_ventilation_ach_ci95=control_results.get("total_ach_effective_ci95"),
+        measured_ventilation_ach_se_per_s=control_results.get("fit_se_per_s"),
+        measured_ventilation_fit_dof=(control_results["fit_n"] - 2) if control_results.get("fit_n") else None,
+    )
+
+    points = _gather_monitoring_points(settings)
+    if points:
+        if should_stop is not None and should_stop():
+            raise StoppedByUser("Stopped before monitoring locations.")
+        log_fn("  Computing monitoring locations...")
+        result["monitoring"] = compute_monitoring_results(
+            case_dir, points, cell_size=adv["mesh-cell-size"], ventilation_ach=ach, log_fn=log_fn)
+        with open(f"{case_dir}/results.json", "w") as f:
+            json.dump(result, f, indent=2)
+    return result
+
+
+def _trim_decay_report(result):
+    """Decay-mode equivalent of _trim_report() - strips the bulky
+    per-iteration decay_curve arrays (top-level and each monitoring
+    point's), keeping every scalar result (eACH_uv figures, mixing
+    efficiency, measured ACH, ...).
+    """
+    trimmed = dict(result)
+    trimmed.pop("decay_curve", None)
+    monitoring = trimmed.get("monitoring")
+    if monitoring:
+        trimmed_monitoring = {}
+        for name, point in monitoring.items():
+            point = dict(point)
+            point.pop("t_seconds", None)
+            point.pop("volAverage_T", None)
+            trimmed_monitoring[name] = point
+        trimmed["monitoring"] = trimmed_monitoring
+    return trimmed
+
+
+def run_decay_sweep(guv_path, settings_path, project_dir, room, settings, adv,
+                     z_values, ach_values, log_fn=print, should_stop=None,
+                     on_combo_done=None, solver_log_fn=None):
+    """Decay-mode equivalent of run_sweep() - same Z x ACH cross-product,
+    same shared-flow-field-per-ACH reuse (_build_flow_base/_copy_base_case/
+    _apply_z are identical either way - only the per-combination solve
+    itself differs), but running the UV-on decay and its UV-off control
+    concurrently for each combination instead of steady_state_pipeline's
+    two-phase build-up (see _run_decay_scenario).
+    """
+    combos = sweep_combinations(z_values, ach_values)
+    achs = sorted({ach for _, ach in combos})
+    project_name = _sanitize(Path(project_dir).name)
+
+    for ach in achs:
+        if should_stop is not None and should_stop():
+            raise StoppedByUser("Stopped before starting the next ACH group.")
+
+        base_dir = f"{project_dir}/_base_ACH{_fmt(ach)}"
+        log_fn(f"=== ACH={ach}: converging flow field (shared by every Z at this ACH) ===")
+        base_summary = _build_flow_base(guv_path, base_dir, room, settings, ach, adv, log_fn, should_stop, solver_log_fn)
+        fan_kw = _fan_kwargs(settings)
+
+        try:
+            for z, combo_ach in combos:
+                if combo_ach != ach:
+                    continue
+                if should_stop is not None and should_stop():
+                    raise StoppedByUser("Stopped before the next combination.")
+
+                subdir = _subdir_name(z, ach)
+                case_dir = f"{project_dir}/{subdir}"
+                log_fn(f"--- Z={z}, ACH={ach} -> {subdir} ---")
+                try:
+                    _copy_base_case(base_dir, case_dir, log_fn)
+                    z_summary = _apply_z(case_dir, z, adv["uv-zone-bins"], fan_kw, log_fn)
+                    result = _run_decay_scenario(case_dir, room, settings, z, ach, adv,
+                                                  z_summary, log_fn, should_stop, solver_log_fn,
+                                                  base_summary=base_summary)
+                    _save_run_settings(case_dir, settings, guv_path, settings_path, z, ach)
+
+                    trimmed = _trim_decay_report(result)
+                    report_path = f"{project_dir}/{project_name}_{subdir}_report.json"
+                    with open(report_path, "w") as f:
+                        json.dump(trimmed, f, indent=2)
+                    log_fn(f"  Done. eACH_uv effective={result['eACH_uv_effective']:.4g} /hr "
+                           f"(well-mixed={result['eACH_uv_well_mixed']:.4g} /hr)")
+                    if on_combo_done:
+                        on_combo_done(z, ach, "done", trimmed)
+                except StoppedByUser:
+                    raise
+                except Exception as e:
+                    log_fn(f"ERROR (Z={z}, ACH={ach}): {e}")
+                    if on_combo_done:
+                        on_combo_done(z, ach, "error", str(e))
+        finally:
+            log_fn(f"  Removing shared base case for ACH={ach}...")
+            run_wsl_or_raise(f'rm -rf "{wsl_path(base_dir)}"', wsl_path(project_dir),
+                              "cleaning up shared base case")
 
 
 def _trim_report(result):

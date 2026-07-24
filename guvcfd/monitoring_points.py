@@ -11,7 +11,7 @@ control run, "Continue").
 """
 import re
 
-from .decay_analysis import read_vol_average_dat, compute_effective_eACH
+from .decay_analysis import read_vol_average_dat, compute_effective_eACH, windowed_stats
 from .wsl_utils import wsl_path, run_wsl_or_raise
 
 _UNSAFE_ZONE_CHARS_RE = re.compile(r"[^A-Za-z0-9_]+")
@@ -173,8 +173,9 @@ def compute_monitoring_results(case_dir, points, cell_size=0.1,
         t, T = read_vol_average_dat(dat_path)
         entry = {"t_seconds": t.tolist(), "volAverage_T": T.tolist()}
         if fit_decay and ventilation_ach is not None and len(t) > 2:
-            eACH_eff, lambda_eff, intercept = compute_effective_eACH(t, T, ventilation_ach)
-            entry["eACH_uv_effective"] = eACH_eff
+            fit = compute_effective_eACH(t, T, ventilation_ach)
+            entry["eACH_uv_effective"] = fit["eACH_uv_effective"]
+            entry["eACH_uv_effective_ci95"] = fit["ci95_eACH_per_hr"]
         results[p["name"]] = entry
         suffix = f", eACH_uv={entry['eACH_uv_effective']:.4g}/hr" if "eACH_uv_effective" in entry else ""
         log_fn(f"  {p['name']}: {len(t)} points, final volAverage(T)={T[-1]:.4g}{suffix}")
@@ -202,8 +203,9 @@ def mixing_uniformity_note(result):
     if not monitoring:
         return None
 
+    is_decay = "phase1" not in next(iter(monitoring.values()))
     deviations = []
-    if "phase1" in next(iter(monitoring.values())):
+    if not is_decay:
         for phase_key, phase_label, room_val in (
             ("phase1", "Phase 1", (result.get("phase1") or {}).get("T_ss")),
             ("phase2", "Phase 2", (result.get("phase2") or {}).get("T_ss")),
@@ -222,19 +224,37 @@ def mixing_uniformity_note(result):
                     continue
                 deviations.append((name, phase_label, point_val, (point_val - room_val) / room_val))
     else:
-        curve = (result.get("decay_curve") or {}).get("volAverage_T")
-        room_val = curve[-1] if curve else None
+        decay_curve = result.get("decay_curve") or {}
+        t_room, T_room = decay_curve.get("t_seconds"), decay_curve.get("volAverage_T")
+        # Trailing-window mean (same statistic used everywhere else in this
+        # codebase - see decay_analysis.windowed_stats), not the single raw
+        # last sample - a decay curve run well past its target reduction
+        # (e.g. for diagnostic purposes) can have both room-average and
+        # point values sitting deep in solver/floating-point noise-floor
+        # territory by the final sample, making a last-sample comparison
+        # mostly noise rather than a real spatial-uniformity signal.
+        room_val = windowed_stats(t_room, T_room)[0] if t_room and T_room else None
         if room_val:
             for name, data in monitoring.items():
-                point_curve = data.get("volAverage_T")
-                if not point_curve:
+                t_point, T_point = data.get("t_seconds"), data.get("volAverage_T")
+                if not t_point or not T_point:
                     continue
-                point_val = point_curve[-1]
+                point_val = windowed_stats(t_point, T_point)[0]
                 deviations.append((name, "final", point_val, (point_val - room_val) / room_val))
 
     flagged = [d for d in deviations if abs(d[3]) >= _MIXING_UNIFORMITY_THRESHOLD]
     if not flagged:
         return None
+
+    # Decay mode has a single continuous curve (phase_label is always the
+    # placeholder "final", not a real distinction worth reporting) - drop
+    # the phase suffix entirely there; steady-state genuinely has two
+    # distinct phases, so keeps it.
+    if is_decay:
+        parts = [f"'{name}' is {abs(pct * 100):.0f}% {'below' if pct < 0 else 'above'} the room average"
+                  for name, phase_label, point_val, pct in flagged]
+        return ("Note: the room is NOT well mixed - " + "; ".join(parts) + ". These values should "
+                "be taken into account when doing localized risk considerations.")
 
     parts = [f"'{name}' is {abs(pct * 100):.0f}% {'below' if pct < 0 else 'above'} the room "
              f"average ({phase_label})" for name, phase_label, point_val, pct in flagged]

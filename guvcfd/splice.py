@@ -269,6 +269,38 @@ def ensure_simple_fvsolution(case_dir):
     return fvs_path
 
 
+def disable_simple_residual_control(case_dir):
+    """Empty out SIMPLE{residualControl{...}} so simpleFoam can no longer
+    auto-stop a chunk early based on flow-field residuals.
+
+    residualControl (p/U/(k|omega) at 1e-4) is exactly what we want during
+    setup_case()'s own flow convergence, but by the time Phase 1/2's chunked
+    scalar-transport runs start, the flow field is already converged from
+    iteration 1 of every chunk - so those same residuals are already below
+    tolerance immediately, and simpleFoam declares "SIMPLE solution
+    converged" and exits after only ~16-19 iterations regardless of T's own
+    state (T is a passive scalar, not part of that residual check). This
+    silently starved chunks of real T-buildup iterations (confirmed
+    directly: 30 "counted" 500-iteration chunks delivering only ~500 real
+    iterations total). An empty residualControl block is valid OpenFOAM
+    syntax for "no residual-based auto-stop" - the solver then only stops
+    at the chunk's requested endTime, which is what Phase 1/2 need.
+    Idempotent and safe to call repeatedly (a no-op once already emptied).
+    """
+    fvs_path = f"{case_dir}/system/fvSolution"
+    with open(fvs_path) as f:
+        content = f.read()
+    new_content = re.sub(
+        r'(residualControl\s*\n\s*\{)[^}]*(\})',
+        r'\1\2',
+        content,
+    )
+    if new_content != content:
+        with open(fvs_path, "w") as f:
+            f.write(new_content)
+    return fvs_path
+
+
 def set_relaxation_factors(case_dir, momentum_factor=None, scalar_factor=None):
     """Overwrite fvSolution's relaxationFactors{}.equations entries for
     U/(k|omega) (momentum_factor) and T (scalar_factor) - GUI-exposed as

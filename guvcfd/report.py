@@ -15,6 +15,7 @@ from lxml import etree
 from guv_calcs import Project
 
 from .contaminant_source import compute_source_strength
+from .decay_analysis import windowed_stats_detrended
 from .monitoring_points import mixing_uniformity_note
 from .result_figures import decay_figure, steady_state_figure
 from .system_info import get_system_info
@@ -101,33 +102,207 @@ _ROW_LABELS_FAN = [
                              f"{s['fan-z-input']:.3g})m, radius={s['fan-radius']:.3g}m"),
 ]
 
-_ROW_LABELS_RESULTS_DECAY = [
-    ("Average fluence rate", lambda res: f"{res['fluence_mean']:.4g} µW/cm²"
-                                          if res.get("fluence_mean") is not None else "n/a"),
-    ("Ventilation ACH (nominal)", lambda res: f"{res['ventilation_ach']:.3g} /hr"),
-    ("eACH_uv, well-mixed (idealized: Z x E_avg)", lambda res: f"{res['eACH_uv_well_mixed']:.4g} /hr"),
-    ("eACH_uv, CFD-fit (nominal ventilation ACH)", lambda res: f"{res['eACH_uv_effective']:.4g} /hr"),
-    ("Mixing efficiency", lambda res: f"{res['mixing_efficiency'] * 100:.1f}%"
-                                        if res.get("mixing_efficiency") is not None else "n/a"),
-    ("Total ACH, effective", lambda res: f"{res.get('total_ach_effective', 0):.3g} /hr"),
-    ("Simulated duration", lambda res: f"{res['decay_curve']['t_seconds'][-1]:.4g} s"
-                                         if res.get("decay_curve", {}).get("t_seconds") else "n/a"),
-]
+# Decay reports are seeded from their own approved template (a fixed
+# 17-row results table plus a 2-row per-point monitoring table), the decay-
+# mode counterpart to _RESULTS_TABLE_TEMPLATE_PATH below - see
+# _decay_results_table_cell_values for the row layout.
+_DECAY_RESULTS_TABLE_TEMPLATE_PATH = Path(__file__).resolve().parent / "templates" / "decay_results_table_template.docx"
 
-# Ventilation ACH is *measured* here (from a UV-off control run) instead of
-# assumed at its nominal design value, so the eACH_uv/mixing-efficiency
-# numbers below isolate UV's own contribution more accurately - see
-# decay_analysis.compute_effective_eACH's docstring. Only present when that
-# control run was used.
-_ROW_LABELS_RESULTS_DECAY_CORRECTED = [
-    ("Ventilation ACH (measured, UV-off control)",
-     lambda res: f"{res['ventilation_ach_measured']:.4g} /hr"),
-    ("eACH_uv, CFD-fit (measured ventilation ACH)",
-     lambda res: f"{res['eACH_uv_effective_corrected']:.4g} /hr"),
-    ("Mixing efficiency (using measured ventilation ACH)",
-     lambda res: f"{res['mixing_efficiency_corrected'] * 100:.1f}%"
-                 if res.get("mixing_efficiency_corrected") is not None else "n/a"),
-]
+
+def _decay_reduction_ratio(eACH, ach):
+    """Analytical steady-state pathogen reduction implied by a given
+    ACH/eACH pair, WITHOUT running the (expensive) steady-state pipeline:
+    for a fixed continuous source, T_ss ∝ 1/(ACH+eACH) (see
+    compute_source_strength), so reduction = 1 - T_ss(with UV)/T_ss(no UV)
+    = 1 - ACH/(ACH+eACH) = eACH/(ACH+eACH) - algebraically the same
+    quantity steady_state_pipeline.compute_corrected_eACH_uv's own
+    reduction_pct computes from an actual T_ss1/T_ss2 CFD ratio.
+
+    An earlier version of this used a transient "1 - exp(-rate*1hr)"
+    formula instead - correct for "how much decays away in one hour
+    starting from a pulse," but not the steady-state (continuous-source)
+    reduction this report actually needs; replaced after a real case
+    showed a physically meaningless ~100% (saturated exp(-rate) with a
+    large rate) where the true steady-state figure was ~11.9%.
+    """
+    return eACH / (ach + eACH) if (ach + eACH) else None
+
+
+def _ci_suffix(ci95):
+    """' (95% CI: lo–hi /hr)' for a (lo, hi) tuple in /hr, else ''.
+
+    The CI is this fit's own regression uncertainty only (see
+    compute_effective_eACH's docstring) - a real, standard OLS confidence
+    interval a scientist reading this report would recognize, not a
+    bespoke statistic. Silently omitted (not "n/a") when unavailable
+    (older results.json, or a curve too short to have residual degrees of
+    freedom) - the point estimate alone still stands on its own.
+    """
+    if ci95 is None:
+        return ""
+    lo, hi = ci95
+    return f" (95% CI: {lo:.4g}–{hi:.4g} /hr)"
+
+
+def _decay_results_table_cell_values(results, settings):
+    """(row, col) -> replacement text for every cell in the decay
+    results-table template that needs a real number - decay-mode
+    counterpart to _results_table_cell_values. Row indices (0-based) match
+    templates/decay_results_table_template.docx exactly:
+
+      1 Average fluence rate           7  Effective ACHeff CFD measured
+      2 Susceptibility constant Z      8  ACH efficiency
+      3 (fixed IC - always "1")        9  eACHeff CFD measured
+      4 Calculated eACH (well-mixed)  10  Total Room ACHeff+eACHeff (measured)
+      6 ACH (air) measured            12  Total pathogen reduction/hour
+                                      13  Room pathogen removal efficacy
+                                      15  True UVGI Effectiveness
+
+    (Row 14, "Total ACH in room (ACH+eACH_uv)" - the nominal/well-mixed
+    total - was removed from the template: it only duplicated numbers
+    already shown elsewhere (ACH + row 4) and risked being read as another
+    measured figure alongside row 10.)
+
+    "ACH (air) measured" (row 6) is the flow-rate/BC-based delivery check
+    (setup_case's check_ach_delivery) - how much air is actually flowing.
+    "Effective ACHeff CFD measured" (row 7) is the decay-curve-fit
+    ventilation rate from the UV-off control run - how fast pathogen is
+    actually removed, which can differ from row 6 due to imperfect mixing
+    (confirmed directly on a real case: ~99% air delivery but only ~73%
+    contaminant-removal-equivalent ACH). "ACH efficiency" (row 8) isolates
+    that mixing-only gap: row7/row6.
+
+    "Total average Pathogen reduction" (row 12) and "True UVGI
+    Effectiveness" (row 15) are the same analytical steady-state figure
+    (see _decay_reduction_ratio) - eACHeff/(ACHeff+eACHeff), using the
+    measured ACHeff/eACHeff pair. "Room pathogen removal efficacy"
+    (row 13) is a different ratio - measured total removal rate over the
+    nominal/well-mixed total (ventilation_ach + eACH_uv_well_mixed) -
+    computed internally even though that nominal total no longer gets its
+    own row.
+    """
+    values = {}
+    if results.get("fluence_mean") is not None:
+        values[(1, 1)] = f"{results['fluence_mean']:.4g} µW/cm²"
+    if settings.get("z-value") is not None:
+        values[(2, 1)] = str(settings["z-value"])
+    values[(3, 1)] = "1"  # decay mode's fixed initial condition (write_initial_fields default)
+
+    eACH_well_mixed = results.get("eACH_uv_well_mixed")
+    if eACH_well_mixed is not None:
+        values[(4, 1)] = f"{eACH_well_mixed:.4g} /hr"
+
+    ach_air_measured = (results.get("ach_delivery") or {}).get("measured_ach")
+    if ach_air_measured is not None:
+        values[(6, 1)] = f"{ach_air_measured:.4g} /hr"
+
+    ach_eff = results.get("ventilation_ach_measured")
+    if ach_eff is not None:
+        values[(7, 1)] = f"{ach_eff:.4g} /hr{_ci_suffix(results.get('ventilation_ach_measured_ci95'))}"
+    if ach_eff is not None and ach_air_measured:
+        values[(8, 1)] = f"{ach_eff / ach_air_measured * 100:.1f}%"
+
+    eACH_eff = results.get("eACH_uv_effective_corrected", results.get("eACH_uv_effective"))
+    eACH_eff_ci = results.get("eACH_uv_effective_corrected_ci95", results.get("eACH_uv_effective_ci95"))
+    if eACH_eff is not None:
+        values[(9, 1)] = f"{eACH_eff:.4g} /hr{_ci_suffix(eACH_eff_ci)}"
+
+    total_measured = (ach_eff + eACH_eff) if (ach_eff is not None and eACH_eff is not None) else None
+    if total_measured is not None:
+        values[(10, 1)] = f"{total_measured:.4g} /hr"
+        # "True" UVGI Effectiveness and "Total average Pathogen reduction"
+        # are algebraically identical here (both reduce to eACH/(ACH+eACH))
+        # - same convention steady-state's own results table already uses
+        # for its "True"/"Simple" UVGI Effectiveness rows, rather than
+        # inventing a divergent formula that isn't actually there.
+        reduction = _decay_reduction_ratio(eACH_eff, ach_eff)
+        if reduction is not None:
+            values[(12, 1)] = f"{reduction * 100:.1f}%"
+            values[(15, 1)] = f"{reduction * 100:.1f}%"
+
+    # Nominal/well-mixed total (ACH + eACH_uv well-mixed) - used for the
+    # efficacy ratio below, but no longer has its own row (see docstring).
+    total_nominal = results.get("total_ach_well_mixed")
+    if total_measured is not None and total_nominal:
+        values[(13, 1)] = f"{total_measured / total_nominal * 100:.1f}%"
+
+    return values
+
+
+def _fill_decay_results_table(table, results, settings):
+    """Fill the decay results-table template's cells with real numbers, in
+    place - decay-mode counterpart to _fill_results_table."""
+    for (row, col), text in _decay_results_table_cell_values(results, settings).items():
+        _set_paragraph_text(table.rows[row].cells[col].paragraphs[0], text)
+
+
+def _monitoring_point_level_stats(results, point_data):
+    """(T_point/T_avg ratio, point's detrended CV), both from trailing-
+    window means/residuals (decay_analysis.windowed_stats_detrended) -
+    the LEVEL a point sits at relative to the room average, which the
+    reduction%/eACH figures never capture (those measure decay RATE, and a
+    point can track the room average's rate closely while still sitting
+    at a persistently different absolute level - confirmed directly: a
+    real monitoring point ran at ~0.58-0.63x the room average for most of
+    a run while its own eACH came out within ~1% of the room's). This
+    matters for anything downstream that cares about absolute
+    concentration at a specific location (e.g. infection-probability
+    estimates), not just how fast it falls.
+
+    None, None if either curve is missing - callers should skip silently
+    (older results.json, or a run that predates recording t_seconds).
+    """
+    room = results.get("decay_curve") or {}
+    t_room, T_room = room.get("t_seconds"), room.get("volAverage_T")
+    t_point, T_point = point_data.get("t_seconds"), point_data.get("volAverage_T")
+    if not (t_room and T_room and t_point and T_point):
+        return None, None
+    room_mean, *_ = windowed_stats_detrended(t_room, T_room)
+    point_mean, _, point_cv, *_ = windowed_stats_detrended(t_point, T_point)
+    ratio = point_mean / room_mean if room_mean else None
+    return ratio, point_cv
+
+
+def _fill_decay_monitoring_table(table, results):
+    """Fill the decay template's per-point monitoring table (fixed row
+    labels, e.g. "Patient pathogen reduction") by matching each row's own
+    label text against a monitoring point name, rather than assuming a
+    fixed point order - a differently-named or missing point just leaves
+    that row as the template's own "xx.x %" placeholder.
+
+    Per-point reduction uses the SAME analytical steady-state ratio as the
+    room-average row (_decay_reduction_ratio), combining the room's own
+    measured ACHeff (no separate per-point UV-off control curve is
+    computed - see compute_monitoring_results) with that point's own
+    eACH_uv_effective (nominal-ACH-corrected, the only per-point
+    measurement available) - a reasonable approximation, slightly less
+    rigorous than the room-average version above which benefits from the
+    real measured-ACH correction. The T_point/T_avg ratio and detrended CV
+    (_monitoring_point_level_stats) are appended alongside it, since
+    reduction% alone only reports rate, not the absolute level a point
+    sits at relative to the room average.
+    """
+    monitoring = results.get("monitoring") or {}
+    ach_eff = results.get("ventilation_ach_measured", results.get("ventilation_ach"))
+    if ach_eff is None:
+        return
+    for row in table.rows:
+        label = row.cells[0].text
+        match = next((data for name, data in monitoring.items() if name.lower() in label.lower()), None)
+        if match is None or match.get("eACH_uv_effective") is None:
+            continue
+        reduction = _decay_reduction_ratio(match["eACH_uv_effective"], ach_eff)
+        if reduction is None:
+            continue
+        text = f"{reduction * 100:.1f}%"
+        ratio, cv_detrended = _monitoring_point_level_stats(results, match)
+        if ratio is not None:
+            text += f" (T/Tavg={ratio:.2f}"
+            if cv_detrended is not None:
+                text += f", CV={cv_detrended * 100:.1f}%"
+            text += ")"
+        _set_paragraph_text(row.cells[1].paragraphs[0], text)
+
 
 def _ach_source_note(res):
     """Appended to Reduction/measured-ACH rows: whether these were derived
@@ -651,21 +826,38 @@ def generate_report_docx(case_dir, out_path):
 
 def _write_report_docx(doc_out_path, case_dir, guv_path, settings, results, room,
                         image_path, curve_image_path):
-    # Steady-state reports are seeded from the approved results-table
-    # template (real Word footnotes; see _RESULTS_TABLE_TEMPLATE_PATH)
-    # instead of a blank Document() - its Results heading/T-note/table
-    # start out at the very TOP of the body, so everything built below
-    # gets relocated in front of them just before saving (_relocate_after)
-    # to restore normal top-to-bottom report order. Decay reports are
-    # unaffected - built from a blank document exactly as before.
+    # Both report kinds are seeded from an approved template (real Word
+    # footnotes for steady-state; a fixed results+monitoring table layout
+    # for decay - see _RESULTS_TABLE_TEMPLATE_PATH/_DECAY_RESULTS_TABLE_
+    # TEMPLATE_PATH) instead of a blank Document() - the template's own
+    # content starts out at the very TOP of the body, so everything built
+    # below gets relocated in front of it just before saving
+    # (_relocate_after) to restore normal top-to-bottom report order.
     is_steady_state = "phase1" in results
-    doc = Document(str(_RESULTS_TABLE_TEMPLATE_PATH)) if is_steady_state else Document()
-    results_anchor = doc.paragraphs[0]._p if is_steady_state else None
-    # Captured now, while the template's results table is still the
-    # document's only table - doc.tables[0] would re-resolve by body
+    doc = Document(str(_RESULTS_TABLE_TEMPLATE_PATH if is_steady_state else _DECAY_RESULTS_TABLE_TEMPLATE_PATH))
+    results_anchor = doc.paragraphs[0]._p
+    # Captured now, while the template's own table(s) are still the only
+    # ones in the document - doc.tables[0] would re-resolve by body
     # position later and silently pick up a different table once other
     # sections get relocated in front of it (see _fill_results_table).
-    results_table = doc.tables[0] if is_steady_state else None
+    results_table = doc.tables[0]
+    monitoring_table = doc.tables[1] if not is_steady_state and len(doc.tables) > 1 else None
+    # The decay template's own mixing-uniformity note paragraph - found by
+    # its own content, NOT doc.paragraphs[-1] (the template has a trailing
+    # *empty* paragraph after it, which silently ate the replacement text
+    # via _set_paragraph_text's "no text runs -> no-op" guard - confirmed
+    # directly: the shipped example text, "...(Phase 1)...(Phase 2)...",
+    # survived untouched in a generated report). Captured as a Paragraph
+    # object (not an index) so it stays correctly identified even after
+    # _relocate_after reorders everything in front of it.
+    decay_uniformity_para = None
+    if not is_steady_state:
+        decay_uniformity_para = next(p for p in doc.paragraphs if "well mixed" in p.text.lower())
+    # after_element for _relocate_after: the template's own last piece of
+    # content - the results table for steady-state (nothing follows it),
+    # or the true trailing paragraph for decay (its own blank paragraph,
+    # not the uniformity note - there's more after the note itself).
+    template_tail = results_table._tbl if is_steady_state else doc.paragraphs[-1]._p
 
     doc.add_heading("GUV-CFD Simulation Report", level=1)
     doc.add_paragraph(f"Illuminate room design file: {guv_path}")
@@ -700,33 +892,35 @@ def _write_report_docx(doc_out_path, case_dir, guv_path, settings, results, room
         doc.add_heading("Convergence & Trust", level=2)
         _add_kv_table(doc, trust_rows)
 
+    # Relocate everything built so far (title/metadata, Room Setup, Case
+    # Setup) to in front of the template's own content - see this
+    # function's opening comment.
+    _relocate_after(doc, template_tail, results_anchor)
+
     if is_steady_state:
-        # Relocate everything built so far (title/metadata, Room Setup,
-        # Case Setup) to in front of the template's Results heading/note/
-        # table - see _write_report_docx's opening comment.
-        _relocate_after(doc, results_table._tbl, results_anchor)
         _fill_results_table(results_table, results, settings)
         if curve_image_path is not None:
             doc.add_picture(str(curve_image_path), width=Inches(6.0))
         if results.get("ventilation_ach_measured") is not None:
             doc.add_paragraph().add_run(EFFECTIVE_ACH_NOTE).italic = True
+
+        monitoring_rows = _monitoring_rows(results.get("monitoring"))
+        if monitoring_rows:
+            doc.add_heading("Monitoring Results", level=2)
+            _add_kv_table(doc, monitoring_rows)
+
+        uniformity_note = mixing_uniformity_note(results)
+        if uniformity_note:
+            doc.add_paragraph().add_run(uniformity_note).italic = True
     else:
-        doc.add_heading("Results", level=2)
-        doc.add_paragraph().add_run(T_FIELD_NOTE).italic = True
-        _add_kv_table(doc, [(label, fn(results)) for label, fn in _ROW_LABELS_RESULTS_DECAY])
-        if results.get("ventilation_ach_measured") is not None:
-            _add_kv_table(doc, [(label, fn(results)) for label, fn in _ROW_LABELS_RESULTS_DECAY_CORRECTED])
+        _fill_decay_results_table(results_table, results, settings)
+        if monitoring_table is not None:
+            _fill_decay_monitoring_table(monitoring_table, results)
+            _set_paragraph_text(decay_uniformity_para, mixing_uniformity_note(results) or "")
         if curve_image_path is not None:
             doc.add_picture(str(curve_image_path), width=Inches(6.0))
-
-    monitoring_rows = _monitoring_rows(results.get("monitoring"))
-    if monitoring_rows:
-        doc.add_heading("Monitoring Results", level=2)
-        _add_kv_table(doc, monitoring_rows)
-
-    uniformity_note = mixing_uniformity_note(results)
-    if uniformity_note:
-        doc.add_paragraph().add_run(uniformity_note).italic = True
+        if results.get("ventilation_ach_measured") is not None:
+            doc.add_paragraph().add_run(EFFECTIVE_ACH_NOTE).italic = True
 
     doc.save(doc_out_path)
     if is_steady_state:
