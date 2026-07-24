@@ -341,7 +341,12 @@ def _run_decay_pair(case_dir_wsl, control_dir_wsl, should_stop, log_fn, solver_l
     def run_one(name, cwd_wsl, on_line, log_prefix):
         try:
             def prefixed(line):
-                if _TIME_LINE_RE.match(line.strip()):
+                stripped = line.strip()
+                # "[...]"-wrapped lines are run_wsl_streaming's own
+                # diagnostics (stall/retry notices), not solver chatter -
+                # always shown, never throttled like routine "Time = N"
+                # lines, so a stall/kill is never silent in the log.
+                if _TIME_LINE_RE.match(stripped) or stripped.startswith("["):
                     log_fn(f"[{log_prefix}] {line}")
                 if on_line:
                     on_line(line)

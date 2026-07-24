@@ -380,8 +380,18 @@ def _track_solver_time(line):
     on_line was just _run_log) flooded the kept log fast enough to scroll
     real narration (step transitions, convergence summaries, errors) out
     of the visible window within seconds of the next step starting.
+
+    "[...]"-wrapped lines are the exception - run_wsl_streaming's own
+    stall/retry diagnostics (see its docstring), not solver chatter -
+    always forwarded to _run_log so a stalled/killed process is never
+    silent just because this callback otherwise discards everything that
+    isn't a "Time = N" line.
     """
-    m = _TIME_RE.match(line.strip())
+    stripped = line.strip()
+    if stripped.startswith("["):
+        _run_log(stripped)
+        return
+    m = _TIME_RE.match(stripped)
     if m:
         base = _run_state.get("chunk_base")
         _run_state["current_time"] = str(float(m.group(1)) + base) if base is not None else m.group(1)
@@ -757,7 +767,13 @@ def _run_decay_pair(case_dir_wsl, control_dir_wsl):
     def run_one(name, cwd_wsl, on_line, log_prefix):
         try:
             def prefixed(line):
-                if _TIME_LINE_RE.match(line.strip()):
+                stripped = line.strip()
+                # "[...]"-wrapped lines are run_wsl_streaming's own
+                # diagnostics (stall/retry notices - see its docstring),
+                # not solver chatter - always shown, never throttled like
+                # routine "Time = N" lines, so a stall/kill is never
+                # silent in the visible log.
+                if _TIME_LINE_RE.match(stripped) or stripped.startswith("["):
                     _run_log(f"[{log_prefix}] {line}")
                 if on_line:
                     on_line(line)
@@ -2900,8 +2916,12 @@ def _scenario_sweep_thread(guv_path, settings_path, project_dir, room, settings,
             # (residuals, "Time = N" banners) would flood the scenario
             # log. Mirrors _run_steady_state's use of _track_solver_time,
             # but scenario runs don't have a single "current time" to
-            # track (many combinations interleave), so this just discards.
-            solver_log_fn=lambda line: None,
+            # track (many combinations interleave), so this discards
+            # everything EXCEPT run_wsl_streaming's own "[...]"-wrapped
+            # stall/retry diagnostics (see its docstring) - those still
+            # need to reach the visible scenario log, or a stalled/killed
+            # solver goes completely unnoticed here too.
+            solver_log_fn=lambda line: _scenario_log(line) if line.strip().startswith("[") else None,
         )
         _scenario_state["status"] = "done"
     except StoppedByUser as e:
