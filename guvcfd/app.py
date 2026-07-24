@@ -3276,9 +3276,6 @@ def _start_scenario_sweep(n_clicks, z_text, ach_text, *values):
                 "Load .guv file first.", dash.no_update)
 
     settings = dict(zip(SETTINGS_FIELDS, values))
-    if settings.get("sim-type") != "steady_state":
-        return (False, True, True, "Scenario Runs only supports steady-state projects "
-                "(set Simulation type to Steady State on the Project Setup tab).", dash.no_update)
     if not settings.get("case-dir"):
         return False, True, True, "Set an OpenFOAM project directory first.", dash.no_update
 
