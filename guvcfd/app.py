@@ -293,6 +293,12 @@ _PHASE_TARGET_PATTERNS = [
 # cumulative iteration count.
 _FLOW_BUDGET_RE = re.compile(r"Flow-convergence budget: (\d+) iterations max")
 _FLOW_CHUNK_RE = re.compile(r"Running simpleFoam iterations (\d+)-\d+ \(chunk size")
+# Matches pimpleFoam's per-timestep "Time = N" banner line, not the ~8-10
+# residual/Courant-number/continuity-error lines that follow it - used to
+# throttle concurrent decay runs' visible log output (see
+# app._run_decay_pair) down to one line per timestep instead of flooding
+# with the full per-iteration dump for both runs at once.
+_TIME_LINE_RE = re.compile(r"^Time\s*=\s*[\d.]+\s*$")
 
 
 def _reset_run_progress(sim_type):
@@ -727,8 +733,13 @@ def _run_decay_pair(case_dir_wsl, control_dir_wsl):
     drives the single shared progress bar/ETA display) - interleaving both
     runs' "Time = N" lines into that same tracker would produce a
     nonsensical, jumping progress readout, since it assumes one linear
-    sequence. The control run's own output still reaches the visible log
-    (prefixed so it's distinguishable), just not the progress bar.
+    sequence. Only each run's own "Time = N" lines reach the visible log
+    (prefixed so they're distinguishable) - the full per-iteration residual
+    dump (Ux/Uy/Uz/p/k/omega, continuity errors - ~8-10 lines per "Time ="
+    line) never did for a single run either (it only ever fed
+    _track_solver_time, silently), so forwarding it here too for BOTH
+    concurrent runs would flood the log with 2x that noise, interleaved
+    and unreadable.
 
     should_stop is shared (the single global _should_stop()) - stopping
     the run is meant to stop the whole scenario (both curves), not just
@@ -743,7 +754,8 @@ def _run_decay_pair(case_dir_wsl, control_dir_wsl):
     def run_one(name, cwd_wsl, on_line, log_prefix):
         try:
             def prefixed(line):
-                _run_log(f"[{log_prefix}] {line}")
+                if _TIME_LINE_RE.match(line.strip()):
+                    _run_log(f"[{log_prefix}] {line}")
                 if on_line:
                     on_line(line)
             results[name] = run_wsl_streaming(

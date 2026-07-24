@@ -44,6 +44,11 @@ from .wsl_utils import StoppedByUser, run_wsl_or_raise, run_wsl_streaming, wsl_p
 _TEMPLATE_CASE_DIR = str(Path(__file__).resolve().parent / "templates" / "case_template")
 
 _UNSAFE_FOLDER_CHARS_RE = re.compile(r"[^A-Za-z0-9._-]+")
+# Matches pimpleFoam's per-timestep "Time = N" banner, not the residual/
+# Courant-number/continuity-error lines that follow it - see
+# _run_decay_pair, which throttles concurrent decay runs' log_fn output to
+# this instead of flooding with the full per-iteration dump for both runs.
+_TIME_LINE_RE = re.compile(r"^Time\s*=\s*[\d.]+\s*$")
 
 
 def _sanitize(name):
@@ -336,7 +341,8 @@ def _run_decay_pair(case_dir_wsl, control_dir_wsl, should_stop, log_fn, solver_l
     def run_one(name, cwd_wsl, on_line, log_prefix):
         try:
             def prefixed(line):
-                log_fn(f"[{log_prefix}] {line}")
+                if _TIME_LINE_RE.match(line.strip()):
+                    log_fn(f"[{log_prefix}] {line}")
                 if on_line:
                     on_line(line)
             results[name] = run_wsl_streaming(
