@@ -94,3 +94,35 @@ def test_progress_and_eta_are_separate_lines():
     assert eta.startswith("Expected finish of this step in ")
     assert "ETA" not in progress
     assert "Simulation time step" not in eta
+
+
+def test_scenario_progress_table_handles_decay_mode_result():
+    # Regression: _scenario_progress_table hardcoded detail['reduction_pct']/
+    # detail['eACH_uv_steady_state'] - steady-state-only field names - and
+    # crashed with KeyError on any decay-mode scenario combo's own trimmed
+    # result shape (_trim_decay_report), which has neither.
+    guvcfd_app._scenario_state["combos"] = [(6.0, 3.0)]
+    guvcfd_app._scenario_state["results"] = {
+        (6.0, 3.0): {
+            "status": "done",
+            "detail": {
+                "eACH_uv_effective_corrected": 34.7,
+                "ventilation_ach_measured": 4.2,
+                "eACH_uv_well_mixed": 72.3,
+            },
+        },
+    }
+    table = guvcfd_app._scenario_progress_table()  # must not raise
+    assert table is not None
+
+
+def test_scenario_progress_table_still_handles_steady_state_result():
+    guvcfd_app._scenario_state["combos"] = [(6.0, 3.0)]
+    guvcfd_app._scenario_state["results"] = {
+        (6.0, 3.0): {
+            "status": "done",
+            "detail": {"reduction_pct": 74.7, "eACH_uv_steady_state": 17.73},
+        },
+    }
+    table = guvcfd_app._scenario_progress_table()  # must not raise
+    assert table is not None

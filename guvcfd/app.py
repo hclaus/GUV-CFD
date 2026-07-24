@@ -29,7 +29,10 @@ from . import help_content
 from .initial_fields import compute_inlet_velocities
 from .monitoring_points import compute_monitoring_results, mixing_uniformity_note
 from .paraview_launch import launch_paraview
-from .report import generate_report_docx, T_FIELD_NOTE, EFFECTIVE_ACH_NOTE, _phase_ss_rows, _ach_source_note
+from .report import (
+    generate_report_docx, T_FIELD_NOTE, EFFECTIVE_ACH_NOTE, _phase_ss_rows, _ach_source_note,
+    _decay_reduction_ratio,
+)
 from .result_figures import steady_state_figure, decay_figure
 from .run_pipeline import setup_case, resume_case_setup, case_awaiting_flow_decision, FlowConvergenceUndecided
 from . import scenario_runs
@@ -3337,8 +3340,22 @@ def _scenario_progress_table():
         elif entry["status"] == "done":
             detail = entry["detail"]
             status = "done"
-            reduction = f"{detail['reduction_pct']:.1f}%"
-            eACH = f"{detail['eACH_uv_steady_state']:.4g} /hr"
+            if "reduction_pct" in detail:
+                reduction = f"{detail['reduction_pct']:.1f}%"
+                eACH = f"{detail['eACH_uv_steady_state']:.4g} /hr"
+            else:
+                # Decay-mode trimmed result (_trim_decay_report) has no
+                # reduction_pct field at all - compute the same analytical
+                # steady-state ratio the .docx report shows (see
+                # report._decay_reduction_ratio), from whichever ACH/eACH
+                # pair is available (measured-corrected if a control run
+                # was used, else the nominal-ACH one).
+                eACH_eff = detail.get("eACH_uv_effective_corrected", detail.get("eACH_uv_effective"))
+                ach_eff = detail.get("ventilation_ach_measured", detail.get("ventilation_ach"))
+                ratio = (_decay_reduction_ratio(eACH_eff, ach_eff)
+                          if eACH_eff is not None and ach_eff is not None else None)
+                reduction = f"{ratio * 100:.1f}%" if ratio is not None else "n/a"
+                eACH = f"{eACH_eff:.4g} /hr" if eACH_eff is not None else "n/a"
         else:
             status, reduction, eACH = f"error: {entry['detail']}", "", ""
         rows.append(html.Tr([html.Td(z), html.Td(ach), html.Td(status), html.Td(reduction), html.Td(eACH)]))
