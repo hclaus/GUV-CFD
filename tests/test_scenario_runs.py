@@ -322,7 +322,10 @@ def test_run_decay_scenario_status_fn_gets_time_lines_and_clears_on_finish(tmp_p
                             control_results=control_results, status_fn=lambda k, m: status_calls.append((k, m)))
 
     key = "Z=6.0/ACH=3.0/UV-on"
-    assert (key, "[UV-on] Time = 12.5") in status_calls
+    # No log_prefix wrapping here - status_key already carries the combo
+    # identity, and the caller (app._poll_scenario) renders "[key] value"
+    # itself, so double-prefixing here would just duplicate it.
+    assert (key, "Time = 12.5") in status_calls
     assert status_calls[-1] == (key, None)  # cleared once the solve finished
 
 
@@ -348,7 +351,7 @@ def test_run_shared_control_status_fn_gets_time_lines_and_clears_on_finish(tmp_p
                             should_stop=None, solver_log_fn=None, status_fn=lambda k, m: status_calls.append((k, m)))
 
     key = "ACH=3.0/control"
-    assert (key, "[control] Time = 5") in status_calls
+    assert (key, "Time = 5") in status_calls
     assert status_calls[-1] == (key, None)
 
 

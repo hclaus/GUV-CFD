@@ -3431,7 +3431,12 @@ def _poll_scenario(n_intervals):
     status = _scenario_state["status"]
     log_text = "\n".join(_scenario_state["log"][-300:])
     live_status = _scenario_state.get("live_status", {})
-    live_text = "\n".join(live_status[k] for k in sorted(live_status)) or "(nothing running)"
+    # live_status's dict KEY (e.g. "Z=6/ACH=3/UV-on") carries the actual
+    # combo/phase identity - the stored value is just the raw "Time = N"
+    # line (see _scenario_status_update), so the key must be rendered too
+    # or the panel shows a bare "Time = N" with no way to tell which
+    # concurrent combination it belongs to.
+    live_text = "\n".join(f"[{k}] {live_status[k]}" for k in sorted(live_status)) or "(nothing running)"
     n_done = sum(1 for r in _scenario_state["results"].values() if r["status"] == "done")
     n_error = sum(1 for r in _scenario_state["results"].values() if r["status"] == "error")
     n_total = len(_scenario_state["combos"])

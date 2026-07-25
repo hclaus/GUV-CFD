@@ -374,12 +374,17 @@ def _throttled_solver_callback(log_fn, log_prefix, on_line=None, status_fn=None,
     this function already avoids doing for the raw per-iteration residual
     dump. "[...]" diagnostics always still go to log_fn - those are rare
     and important enough to want scrolling, not overwritten away.
+
+    The status_fn branch deliberately does NOT prefix the line with
+    log_prefix - status_key already carries that (and the combo's Z/ACH
+    identity too), and the caller renders "[{key}] {value}" itself (see
+    app._poll_scenario) - prefixing here too would just double it up.
     """
     def callback(line):
         stripped = line.strip()
         if _TIME_LINE_RE.match(stripped):
             if status_fn is not None:
-                status_fn(status_key, f"[{log_prefix}] {line}")
+                status_fn(status_key, stripped)
             else:
                 log_fn(f"[{log_prefix}] {line}")
         elif stripped.startswith("["):
