@@ -410,9 +410,11 @@ def _run_decay_scenario(case_dir, room, settings, z, ach, adv, z_summary, log_fn
 
     eACH_well_mixed_est = z_summary.get("eACH_uv_well_mixed_mean", 0.0)
     combined_end_time, control_end_time = _decay_run_durations(ach, eACH_well_mixed_est, adv)
-    log_fn(f"  Adaptive run durations: UV-on={combined_end_time}s, UV-off control={control_end_time}s...")
+    write_interval = max(1, settings["pimple-write-interval"])
+    log_fn(f"  Adaptive run durations: UV-on={combined_end_time}s, UV-off control={control_end_time}s, "
+           f"write interval={write_interval}s (as configured)...")
     set_control_dict_time(case_dir, end_time=combined_end_time,
-                           write_interval=max(1, combined_end_time // 100), delta_t=adv["pimple-delta-t"])
+                           write_interval=write_interval, delta_t=adv["pimple-delta-t"])
 
     if should_stop is not None and should_stop():
         raise StoppedByUser("Stopped before pimpleFoam.")
@@ -421,7 +423,7 @@ def _run_decay_scenario(case_dir, room, settings, z, ach, adv, z_summary, log_fn
     prepare_ventilation_only_control(
         case_dir, control_dir, ach, room.x, room.y, room.z,
         settings["inlet-wall"], (settings["inlet-size-w"], settings["inlet-size-h"]),
-        control_end_time, max(1, control_end_time // 100), pimple_delta_t=adv["pimple-delta-t"],
+        control_end_time, write_interval, pimple_delta_t=adv["pimple-delta-t"],
         inlet2_wall=settings["inlet2-wall"] if has_inlet2 else None,
         inlet2_size=(settings["inlet2-size-w"], settings["inlet2-size-h"]) if has_inlet2 else None,
         has_outlet2=bool(settings.get("outlet2-enable")),

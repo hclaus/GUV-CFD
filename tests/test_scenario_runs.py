@@ -256,7 +256,7 @@ def test_run_decay_scenario_rebuilds_fvoptions_from_this_combos_own_kuv(tmp_path
     room = type("Room", (), {"x": 4.0, "y": 5.0, "z": 2.7})()
     settings = {"fan-enable": False, "inlet2-enable": False, "outlet2-enable": False,
                 "inlet-wall": "xMin", "inlet-size-w": 0.3, "inlet-size-h": 0.3,
-                "monitoring-enable": False}
+                "monitoring-enable": False, "pimple-write-interval": 3}
     adv = {"uv-zone-bins": 5, "pimple-delta-t": 0.5,
            "decay-ach-min-fraction": 90.0, "decay-each-min-fraction": 90.0, "decay-each-max-fraction": 99.9}
 
@@ -276,3 +276,47 @@ def test_run_decay_scenario_rebuilds_fvoptions_from_this_combos_own_kuv(tmp_path
                             should_stop=None, solver_log_fn=lambda m: None)
     entries_z1 = written[case_dir]
     assert entries_z1 != entries_z6
+
+
+def test_run_decay_scenario_uses_configured_write_interval_not_duration_over_100(tmp_path, monkeypatch):
+    # Regression: write_interval was silently computed as duration // 100
+    # regardless of the user's own "Write interval (s)" setting - typing
+    # 3 (say) had no effect at all once the run actually started.
+    case_dir, _ = _write_synthetic_case(tmp_path, n_cells=8)
+    sr._apply_z(case_dir, Z=6.0, nbins=5, fan_kwargs={}, log_fn=lambda m: None)
+
+    monkeypatch.setattr(sr, "write_fvoptions_file", lambda *a, **k: None)
+    monkeypatch.setattr(sr, "splice_fv_options_into_control_dict", lambda *a, **k: (None, 1, 1))
+    monkeypatch.setattr(sr, "_run_decay_pair", lambda *a, **k: (
+        type("R", (), {"returncode": 0, "stdout": ""})(),
+        type("R", (), {"returncode": 0, "stdout": ""})(),
+    ))
+    monkeypatch.setattr(sr, "run_wsl_or_raise", lambda *a, **k: None)
+    monkeypatch.setattr(sr, "finish_ventilation_only_control", lambda *a, **k: {"total_ach_effective": 3.0})
+    monkeypatch.setattr(sr, "write_results_summary", lambda *a, **k: {
+        "eACH_uv_effective": 10.0, "eACH_uv_well_mixed": 20.0,
+    })
+
+    control_time_calls = []
+    monkeypatch.setattr(sr, "set_control_dict_time", lambda case_dir, end_time=None, write_interval=None,
+                         delta_t=None: control_time_calls.append(("main", write_interval)))
+    prepare_calls = []
+    monkeypatch.setattr(sr, "prepare_ventilation_only_control", lambda case_dir, control_dir, ach, x, y, z,
+                         inlet_wall, inlet_size, end_time, write_interval, **k:
+                         prepare_calls.append(("control", write_interval)))
+
+    room = type("Room", (), {"x": 4.0, "y": 5.0, "z": 2.7})()
+    settings = {"fan-enable": False, "inlet2-enable": False, "outlet2-enable": False,
+                "inlet-wall": "xMin", "inlet-size-w": 0.3, "inlet-size-h": 0.3,
+                "monitoring-enable": False, "pimple-write-interval": 3}
+    # A duration long enough that duration // 100 (the old, wrong formula)
+    # would clearly differ from the configured 3s.
+    adv = {"uv-zone-bins": 5, "pimple-delta-t": 0.5,
+           "decay-ach-min-fraction": 99.9, "decay-each-min-fraction": 99.9, "decay-each-max-fraction": 99.9}
+
+    sr._run_decay_scenario(case_dir, room, settings, z=6.0, ach=3.0, adv=adv,
+                            z_summary={"eACH_uv_well_mixed_mean": 20.0}, log_fn=lambda m: None,
+                            should_stop=None, solver_log_fn=lambda m: None)
+
+    assert control_time_calls == [("main", 3)]
+    assert prepare_calls == [("control", 3)]
