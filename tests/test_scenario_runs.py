@@ -239,13 +239,8 @@ def test_run_decay_scenario_rebuilds_fvoptions_from_this_combos_own_kuv(tmp_path
     # current kUV-derived entries, not about the actual solve.
     monkeypatch.setattr(sr, "set_control_dict_time", lambda *a, **k: None)
     monkeypatch.setattr(sr, "splice_fv_options_into_control_dict", lambda *a, **k: (None, 1, 1))
-    monkeypatch.setattr(sr, "prepare_ventilation_only_control", lambda *a, **k: None)
-    monkeypatch.setattr(sr, "_run_decay_pair", lambda *a, **k: (
-        type("R", (), {"returncode": 0, "stdout": ""})(),
-        type("R", (), {"returncode": 0, "stdout": ""})(),
-    ))
+    monkeypatch.setattr(sr, "run_wsl_streaming", lambda *a, **k: type("R", (), {"returncode": 0, "stdout": ""})())
     monkeypatch.setattr(sr, "run_wsl_or_raise", lambda *a, **k: None)
-    monkeypatch.setattr(sr, "finish_ventilation_only_control", lambda *a, **k: {"total_ach_effective": 3.0})
     monkeypatch.setattr(sr, "write_results_summary", lambda *a, **k: {
         "eACH_uv_effective": 10.0, "eACH_uv_well_mixed": 20.0,
     })
@@ -253,6 +248,8 @@ def test_run_decay_scenario_rebuilds_fvoptions_from_this_combos_own_kuv(tmp_path
     written = {}
     monkeypatch.setattr(sr, "write_fvoptions_file", lambda cd, entries: written.__setitem__(cd, entries))
 
+    control_results = {"total_ach_effective": 3.0, "total_ach_effective_ci95": None,
+                        "fit_se_per_s": None, "fit_n": None}
     room = type("Room", (), {"x": 4.0, "y": 5.0, "z": 2.7})()
     settings = {"fan-enable": False, "inlet2-enable": False, "outlet2-enable": False,
                 "inlet-wall": "xMin", "inlet-size-w": 0.3, "inlet-size-h": 0.3,
@@ -262,7 +259,8 @@ def test_run_decay_scenario_rebuilds_fvoptions_from_this_combos_own_kuv(tmp_path
 
     sr._run_decay_scenario(case_dir, room, settings, z=6.0, ach=3.0, adv=adv,
                             z_summary={"eACH_uv_well_mixed_mean": 20.0}, log_fn=lambda m: None,
-                            should_stop=None, solver_log_fn=lambda m: None)
+                            should_stop=None, solver_log_fn=lambda m: None,
+                            control_results=control_results)
 
     entries_z6 = written[case_dir]
     assert len(entries_z6) > 0
@@ -273,7 +271,8 @@ def test_run_decay_scenario_rebuilds_fvoptions_from_this_combos_own_kuv(tmp_path
     sr._apply_z(case_dir, Z=1.0, nbins=5, fan_kwargs={}, log_fn=lambda m: None)
     sr._run_decay_scenario(case_dir, room, settings, z=1.0, ach=3.0, adv=adv,
                             z_summary={"eACH_uv_well_mixed_mean": 3.3}, log_fn=lambda m: None,
-                            should_stop=None, solver_log_fn=lambda m: None)
+                            should_stop=None, solver_log_fn=lambda m: None,
+                            control_results=control_results)
     entries_z1 = written[case_dir]
     assert entries_z1 != entries_z6
 
@@ -287,12 +286,8 @@ def test_run_decay_scenario_uses_configured_write_interval_not_duration_over_100
 
     monkeypatch.setattr(sr, "write_fvoptions_file", lambda *a, **k: None)
     monkeypatch.setattr(sr, "splice_fv_options_into_control_dict", lambda *a, **k: (None, 1, 1))
-    monkeypatch.setattr(sr, "_run_decay_pair", lambda *a, **k: (
-        type("R", (), {"returncode": 0, "stdout": ""})(),
-        type("R", (), {"returncode": 0, "stdout": ""})(),
-    ))
+    monkeypatch.setattr(sr, "run_wsl_streaming", lambda *a, **k: type("R", (), {"returncode": 0, "stdout": ""})())
     monkeypatch.setattr(sr, "run_wsl_or_raise", lambda *a, **k: None)
-    monkeypatch.setattr(sr, "finish_ventilation_only_control", lambda *a, **k: {"total_ach_effective": 3.0})
     monkeypatch.setattr(sr, "write_results_summary", lambda *a, **k: {
         "eACH_uv_effective": 10.0, "eACH_uv_well_mixed": 20.0,
     })
@@ -300,11 +295,9 @@ def test_run_decay_scenario_uses_configured_write_interval_not_duration_over_100
     control_time_calls = []
     monkeypatch.setattr(sr, "set_control_dict_time", lambda case_dir, end_time=None, write_interval=None,
                          delta_t=None: control_time_calls.append(("main", write_interval)))
-    prepare_calls = []
-    monkeypatch.setattr(sr, "prepare_ventilation_only_control", lambda case_dir, control_dir, ach, x, y, z,
-                         inlet_wall, inlet_size, end_time, write_interval, **k:
-                         prepare_calls.append(("control", write_interval)))
 
+    control_results = {"total_ach_effective": 3.0, "total_ach_effective_ci95": None,
+                        "fit_se_per_s": None, "fit_n": None}
     room = type("Room", (), {"x": 4.0, "y": 5.0, "z": 2.7})()
     settings = {"fan-enable": False, "inlet2-enable": False, "outlet2-enable": False,
                 "inlet-wall": "xMin", "inlet-size-w": 0.3, "inlet-size-h": 0.3,
@@ -316,7 +309,32 @@ def test_run_decay_scenario_uses_configured_write_interval_not_duration_over_100
 
     sr._run_decay_scenario(case_dir, room, settings, z=6.0, ach=3.0, adv=adv,
                             z_summary={"eACH_uv_well_mixed_mean": 20.0}, log_fn=lambda m: None,
-                            should_stop=None, solver_log_fn=lambda m: None)
+                            should_stop=None, solver_log_fn=lambda m: None,
+                            control_results=control_results)
 
     assert control_time_calls == [("main", 3)]
+
+
+def test_run_shared_control_uses_configured_write_interval(tmp_path, monkeypatch):
+    # Companion to the above: the UV-off control's write interval is now
+    # set inside _run_shared_control (run once per ACH), not inside
+    # _run_decay_scenario.
+    prepare_calls = []
+    monkeypatch.setattr(sr, "prepare_ventilation_only_control", lambda case_dir, control_dir, ach, x, y, z,
+                         inlet_wall, inlet_size, end_time, write_interval, **k:
+                         prepare_calls.append(("control", write_interval)))
+    monkeypatch.setattr(sr, "run_wsl_streaming", lambda *a, **k: type("R", (), {"returncode": 0, "stdout": ""})())
+    monkeypatch.setattr(sr, "finish_ventilation_only_control", lambda *a, **k: {"total_ach_effective": 3.0})
+
+    room = type("Room", (), {"x": 4.0, "y": 5.0, "z": 2.7})()
+    settings = {"inlet2-enable": False, "outlet2-enable": False,
+                "inlet-wall": "xMin", "inlet-size-w": 0.3, "inlet-size-h": 0.3,
+                "pimple-write-interval": 3}
+    adv = {"pimple-delta-t": 0.5, "decay-ach-min-fraction": 99.9,
+           "decay-each-max-fraction": 99.9, "decay-each-min-fraction": 90.0}
+
+    sr._run_shared_control(str(tmp_path / "base"), str(tmp_path / "control"), ach=3.0, room=room,
+                            settings=settings, adv=adv, log_fn=lambda m: None,
+                            should_stop=None, solver_log_fn=lambda m: None)
+
     assert prepare_calls == [("control", 3)]
