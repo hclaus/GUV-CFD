@@ -254,11 +254,41 @@ def _copy_latest_to_zero(case_dir_wsl, latest, include_T, log_fn):
     run_wsl_or_raise(f"cp -f {cp_targets} 0/", case_dir_wsl, "copying converged fields")
 
 
+_TIME_LINE_RE = re.compile(r"^Time\s*=\s*[\d.]+\s*$")
+
+
+def _phase_solver_callback(log_fn, solver_log_fn, status_fn, status_key):
+    """Wraps a phase's simpleFoam on_line callback.
+
+    With no status_fn (single-run mode - progress there comes from
+    solver_log_fn/app._track_solver_time instead, which has never shown
+    per-iteration lines in its own log), this is a no-op and returns
+    exactly what the call site used before status_fn existed
+    (solver_log_fn or log_fn getting every raw line).
+
+    With status_fn (a concurrent sweep combination - see
+    scenario_runs._run_sweep_concurrent), "Time = N" banners go to
+    status_fn instead - overwritten in place, not appended - so several
+    combinations solving at once don't flood the scrolling log the same
+    way decay mode's _throttled_solver_callback already avoids. solver_log_fn
+    still receives every raw line either way.
+    """
+    if status_fn is None:
+        return solver_log_fn or log_fn
+
+    def callback(line):
+        if _TIME_LINE_RE.match(line.strip()):
+            status_fn(status_key, line.strip())
+        if solver_log_fn:
+            solver_log_fn(line)
+    return callback
+
+
 def _run_phase(case_dir, case_dir_wsl, n_iterations, write_interval, window_frac, plateau_rel_tol,
                 log_fn, should_stop=None, solver_log_fn=None, live_monitoring_zones=(),
                 live_patches=(), check_interval=None, t_inf_rel_tol=None, t_inf_streak=3,
                 keep_all_timesteps=False, iteration_offset=0, mass_balance_patches=(),
-                injection_rate_G=None, mass_balance_tol=None):
+                injection_rate_G=None, mass_balance_tol=None, status_fn=None, status_key=None):
     """Run simpleFoam for n_iterations, tracking the room-wide (and any
     monitoring-point) volAverage(T) live, every iteration.
 
@@ -384,7 +414,8 @@ def _run_phase(case_dir, case_dir_wsl, n_iterations, write_interval, window_frac
                f"iterations, writing every {write_interval})...")
         r = run_wsl_streaming(
             "simpleFoam 2>&1 | tee log.simpleFoam", case_dir_wsl,
-            on_line=solver_log_fn or log_fn, should_stop=should_stop, kill_pattern="simpleFoam",
+            on_line=_phase_solver_callback(log_fn, solver_log_fn, status_fn, status_key),
+            should_stop=should_stop, kill_pattern="simpleFoam",
         )
         if should_stop is not None and should_stop():
             raise StoppedByUser("Stopped during simpleFoam phase.")
@@ -695,7 +726,7 @@ def run_steady_state_scenario(case_dir, room_x, room_y, room_z, ach, Z, nbins=25
                                phase1_resume_decision=None, phase1_resume_additional_iterations=None,
                                fan_entry=None, monitoring_points=None,
                                patches_to_monitor=("outlet",), log_fn=print, should_stop=None,
-                               solver_log_fn=None):
+                               solver_log_fn=None, status_fn=None):
     """Run both phases of a continuous-source steady-state scenario against
     an already-converged case (mesh + flow + fluenceRate/kUV must already
     exist - see run_pipeline.setup_case()). Returns a summary dict.
@@ -789,6 +820,11 @@ def run_steady_state_scenario(case_dir, room_x, room_y, room_z, ach, Z, nbins=25
     for the trailing-window mean/std/CV (T_ss and every monitoring point).
     Persisted per-phase as T_ss_window_frac so historical reports stay
     correct even if this default changes for future runs.
+
+    status_fn(key, line_or_None), if given (a concurrent sweep combination
+    - see scenario_runs._run_sweep_concurrent), receives each phase's
+    latest "Time = N" line to display in place instead of the scrolling
+    log - see _phase_solver_callback.
     """
     case_dir_wsl = wsl_path(case_dir)
     room_volume = room_x * room_y * room_z
@@ -872,15 +908,21 @@ def run_steady_state_scenario(case_dir, room_x, room_y, room_z, ach, Z, nbins=25
                        f"iterations to build a representative window ===")
                 run_check_interval, run_t_inf_rel_tol = None, None
 
-            latest1, iters1, t1, T1, converged1, live1, stopped_via_tinf1, tinf_history1, mb_flux1 = _run_phase(
-                case_dir, case_dir_wsl, run_iterations, phase1_write_interval,
-                window_frac, plateau_rel_tol, log_fn, should_stop=should_stop,
-                solver_log_fn=solver_log_fn, live_monitoring_zones=live_zone_names,
-                live_patches=patches_to_monitor,
-                check_interval=run_check_interval, t_inf_rel_tol=run_t_inf_rel_tol, t_inf_streak=t_inf_streak,
-                keep_all_timesteps=keep_all_timesteps, mass_balance_patches=patches_to_monitor,
-                injection_rate_G=G, mass_balance_tol=mass_balance_tol,
-            )
+            status_key1 = f"Z={Z}/ACH={ach}/Phase1"
+            try:
+                latest1, iters1, t1, T1, converged1, live1, stopped_via_tinf1, tinf_history1, mb_flux1 = _run_phase(
+                    case_dir, case_dir_wsl, run_iterations, phase1_write_interval,
+                    window_frac, plateau_rel_tol, log_fn, should_stop=should_stop,
+                    solver_log_fn=solver_log_fn, live_monitoring_zones=live_zone_names,
+                    live_patches=patches_to_monitor,
+                    check_interval=run_check_interval, t_inf_rel_tol=run_t_inf_rel_tol, t_inf_streak=t_inf_streak,
+                    keep_all_timesteps=keep_all_timesteps, mass_balance_patches=patches_to_monitor,
+                    injection_rate_G=G, mass_balance_tol=mass_balance_tol,
+                    status_fn=status_fn, status_key=status_key1,
+                )
+            finally:
+                if status_fn is not None:
+                    status_fn(status_key1, None)
             if (phase1_resume_decision == "continue" and phase1_extrapolation_gate
                     and t_inf_rel_tol is not None and not stopped_via_tinf1):
                 diagnostic = _phase1_extrapolation_diagnostic(
@@ -964,15 +1006,21 @@ def run_steady_state_scenario(case_dir, room_x, room_y, room_z, ach, Z, nbins=25
                                          inlet2_velocity=inlet2_velocity, has_outlet2=has_outlet2)
             _write_phase1_pending(case_dir, G, Su, source_volume, n_source_cells)
 
-            latest1, iters1, t1, T1, converged1, live1, stopped_via_tinf1, tinf_history1, mb_flux1 = _run_phase(
-                case_dir, case_dir_wsl, phase1_iterations, phase1_write_interval,
-                window_frac, plateau_rel_tol, log_fn, should_stop=should_stop,
-                solver_log_fn=solver_log_fn, live_monitoring_zones=live_zone_names,
-                live_patches=patches_to_monitor,
-                check_interval=t_inf_check_interval, t_inf_rel_tol=t_inf_rel_tol, t_inf_streak=t_inf_streak,
-                keep_all_timesteps=keep_all_timesteps, mass_balance_patches=patches_to_monitor,
-                injection_rate_G=G, mass_balance_tol=mass_balance_tol,
-            )
+            status_key1 = f"Z={Z}/ACH={ach}/Phase1"
+            try:
+                latest1, iters1, t1, T1, converged1, live1, stopped_via_tinf1, tinf_history1, mb_flux1 = _run_phase(
+                    case_dir, case_dir_wsl, phase1_iterations, phase1_write_interval,
+                    window_frac, plateau_rel_tol, log_fn, should_stop=should_stop,
+                    solver_log_fn=solver_log_fn, live_monitoring_zones=live_zone_names,
+                    live_patches=patches_to_monitor,
+                    check_interval=t_inf_check_interval, t_inf_rel_tol=t_inf_rel_tol, t_inf_streak=t_inf_streak,
+                    keep_all_timesteps=keep_all_timesteps, mass_balance_patches=patches_to_monitor,
+                    injection_rate_G=G, mass_balance_tol=mass_balance_tol,
+                    status_fn=status_fn, status_key=status_key1,
+                )
+            finally:
+                if status_fn is not None:
+                    status_fn(status_key1, None)
             if phase1_extrapolation_gate and t_inf_rel_tol is not None and not stopped_via_tinf1:
                 diagnostic = _phase1_extrapolation_diagnostic(
                     tinf_history1, t_inf_streak, t_inf_rel_tol, phase1_iterations,
@@ -1036,14 +1084,20 @@ def run_steady_state_scenario(case_dir, room_x, room_y, room_z, ach, Z, nbins=25
     # tinf_history/mass_balance_flux aren't meaningful for Phase 2 (mass
     # balance's injection=removal identity doesn't hold once UV sinks are
     # also removing T, see windowed_mass_balance's Phase-1-only caveat).
-    latest2, iters2, t2, T2, converged2, live2, _, _, _ = _run_phase(
-        case_dir, case_dir_wsl, phase2_iterations, phase2_write_interval,
-        window_frac, plateau_rel_tol, log_fn, should_stop=should_stop,
-        solver_log_fn=solver_log_fn, live_monitoring_zones=live_zone_names,
-        live_patches=patches_to_monitor,
-        check_interval=t_inf_check_interval, t_inf_rel_tol=t_inf_rel_tol, t_inf_streak=t_inf_streak,
-        keep_all_timesteps=keep_all_timesteps, iteration_offset=iters1,
-    )
+    status_key2 = f"Z={Z}/ACH={ach}/Phase2"
+    try:
+        latest2, iters2, t2, T2, converged2, live2, _, _, _ = _run_phase(
+            case_dir, case_dir_wsl, phase2_iterations, phase2_write_interval,
+            window_frac, plateau_rel_tol, log_fn, should_stop=should_stop,
+            solver_log_fn=solver_log_fn, live_monitoring_zones=live_zone_names,
+            live_patches=patches_to_monitor,
+            check_interval=t_inf_check_interval, t_inf_rel_tol=t_inf_rel_tol, t_inf_streak=t_inf_streak,
+            keep_all_timesteps=keep_all_timesteps, iteration_offset=iters1,
+            status_fn=status_fn, status_key=status_key2,
+        )
+    finally:
+        if status_fn is not None:
+            status_fn(status_key2, None)
     summary["phase2"] = _room_phase_summary(live2["room"], window_frac, converged2, iters2, t2, T2, log_fn)
     if monitoring_points:
         summary["monitoring"] = {

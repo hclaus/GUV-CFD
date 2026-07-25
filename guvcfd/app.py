@@ -2934,16 +2934,11 @@ def _scenario_sweep_thread(guv_path, settings_path, project_dir, room, settings,
 
     is_decay = settings.get("sim-type") == "decay"
     sweep_fn = scenario_runs.run_decay_sweep if is_decay else scenario_runs.run_sweep
-    # status_fn only exists on run_decay_sweep for now (run_sweep doesn't
-    # forward Time=N lines to the log at all today, so it has nothing to
-    # redirect - see scenario_runs.run_decay_sweep's docstring; TODO:
-    # extend once steady-state's own sweep needs this too).
-    status_kwargs = {"status_fn": _scenario_status_update} if is_decay else {}
     try:
         sweep_fn(
             guv_path, settings_path, project_dir, room, settings, adv,
             z_values, ach_values, log_fn=_scenario_log, should_stop=_scenario_should_stop,
-            on_combo_done=on_combo_done,
+            on_combo_done=on_combo_done, status_fn=_scenario_status_update,
             # Without this, _run_phase()'s on_line=solver_log_fn or log_fn
             # falls back to log_fn - every raw per-iteration solver line
             # (residuals, "Time = N" banners) would flood the scenario
@@ -2955,7 +2950,6 @@ def _scenario_sweep_thread(guv_path, settings_path, project_dir, room, settings,
             # need to reach the visible scenario log, or a stalled/killed
             # solver goes completely unnoticed here too.
             solver_log_fn=lambda line: _scenario_log(line) if line.strip().startswith("[") else None,
-            **status_kwargs,
         )
         _scenario_state["status"] = "done"
     except StoppedByUser as e:

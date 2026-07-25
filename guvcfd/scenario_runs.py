@@ -259,9 +259,14 @@ def _apply_z(case_dir, Z, nbins, fan_kwargs, log_fn):
     }
 
 
-def _run_scenario(case_dir, room, settings, z, ach, adv, z_summary, log_fn, should_stop, solver_log_fn):
+def _run_scenario(case_dir, room, settings, z, ach, adv, z_summary, log_fn, should_stop, solver_log_fn,
+                   status_fn=None):
     """run_steady_state_scenario() with this combination's z/ach - same
     call app._run_steady_state makes for a single run.
+
+    status_fn, if given, receives each phase's latest "Time = N" line to
+    display in place instead of the scrolling log - see
+    steady_state_pipeline.run_steady_state_scenario's own docstring.
     """
     fan_entry = None
     if settings.get("fan-enable"):
@@ -307,6 +312,7 @@ def _run_scenario(case_dir, room, settings, z, ach, adv, z_summary, log_fn, shou
         fan_entry=fan_entry, monitoring_points=_gather_monitoring_points(settings),
         patches_to_monitor=patches_to_monitor,
         log_fn=log_fn, should_stop=should_stop, solver_log_fn=solver_log_fn,
+        status_fn=status_fn,
     )
     result["fluence_mean"] = z_summary["fluence_mean"]
     result["eACH_uv_well_mixed"] = z_summary.get("eACH_uv_well_mixed_mean")
@@ -708,7 +714,7 @@ def _trim_report(result):
 
 def run_sweep(guv_path, settings_path, project_dir, room, settings, adv,
               z_values, ach_values, log_fn=print, should_stop=None,
-              on_combo_done=None, solver_log_fn=None):
+              on_combo_done=None, solver_log_fn=None, status_fn=None):
     """Run the full Z x ACH cross-product against an already-loaded
     project, one subfolder per combination directly under project_dir,
     reusing a single converged flow field for every Z sharing an ACH (see
@@ -734,6 +740,11 @@ def run_sweep(guv_path, settings_path, project_dir, room, settings, adv,
     field) run at once, and every Z's own steady-state scenario draws from
     one shared pool of _MAX_CONCURRENT_Z workers across all of them - see
     _run_sweep_concurrent.
+
+    status_fn(key, line_or_None), if given, receives each concurrent
+    combo's latest "Time = N" line to display in place instead of the
+    scrolling log - see run_decay_sweep's own docstring for the same
+    mechanism.
     """
     combos = sweep_combinations(z_values, ach_values)
     achs = sorted({ach for _, ach in combos})
@@ -758,7 +769,8 @@ def run_sweep(guv_path, settings_path, project_dir, room, settings, adv,
             _copy_base_case(ctx["base_dir"], case_dir, combo_log_fn)
             z_summary = _apply_z(case_dir, z, adv["uv-zone-bins"], ctx["fan_kw"], combo_log_fn)
             result = _run_scenario(case_dir, room, settings, z, ach, adv,
-                                    z_summary, combo_log_fn, should_stop, solver_log_fn)
+                                    z_summary, combo_log_fn, should_stop, solver_log_fn,
+                                    status_fn=status_fn)
             with open(f"{case_dir}/results.json", "w") as f:
                 json.dump(result, f, indent=2)
             _save_run_settings(case_dir, settings, guv_path, settings_path, z, ach)

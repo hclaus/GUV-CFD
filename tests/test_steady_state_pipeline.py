@@ -32,6 +32,36 @@ def test_chunk_write_interval_clamps_for_short_final_chunk():
     assert _chunk_write_interval(100, 84) == 84
 
 
+def test_phase_solver_callback_falls_back_unchanged_without_status_fn():
+    # No status_fn (single-run mode - progress there comes from
+    # solver_log_fn/app._track_solver_time instead, which has never shown
+    # per-iteration lines in its own log) - must behave exactly like the
+    # old `solver_log_fn or log_fn` it replaced.
+    solver_lines = []
+    callback = ssp._phase_solver_callback(_log, solver_lines.append, None, "key")
+    callback("Time = 1")
+    assert solver_lines == ["Time = 1"]
+    assert ssp._phase_solver_callback(_log, None, None, "key") is _log
+
+
+def test_phase_solver_callback_redirects_time_lines_to_status_fn():
+    # A concurrent sweep combination (status_fn given): "Time = N" banners
+    # go to status_fn instead of the scrolling log, so several
+    # combinations solving at once don't flood it - solver_log_fn still
+    # gets every raw line either way (preserves single-run-style progress
+    # tracking even inside a sweep).
+    solver_lines = []
+    status_calls = []
+    callback = ssp._phase_solver_callback(
+        _log, solver_lines.append, lambda k, m: status_calls.append((k, m)), "Z=6/ACH=3/Phase1")
+
+    callback("Time = 42.5")
+    callback("smoothSolver:  Solving for Ux, Initial residual = 0.01")
+
+    assert status_calls == [("Z=6/ACH=3/Phase1", "Time = 42.5")]
+    assert solver_lines == ["Time = 42.5", "smoothSolver:  Solving for Ux, Initial residual = 0.01"]
+
+
 def _log(msg):
     pass
 
