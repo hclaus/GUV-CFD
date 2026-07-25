@@ -83,6 +83,7 @@ def test_run_steady_state_scenario_still_accepts_advanced_settings_params():
     assert params["t_inf_rel_tol"].default is None  # disabled by default - opt-in
     assert params["t_inf_streak"].default == 3
     assert params["keep_all_timesteps"].default is False  # opt-in - off keeps case dirs small
+    assert params["phase1_only"].default is False  # off by default - normal single/per-Z runs do both phases
 
 
 def test_rename_chunk_time_dirs_is_noop_at_zero_offset(monkeypatch):

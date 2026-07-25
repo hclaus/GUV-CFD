@@ -726,7 +726,7 @@ def run_steady_state_scenario(case_dir, room_x, room_y, room_z, ach, Z, nbins=25
                                phase1_resume_decision=None, phase1_resume_additional_iterations=None,
                                fan_entry=None, monitoring_points=None,
                                patches_to_monitor=("outlet",), log_fn=print, should_stop=None,
-                               solver_log_fn=None, status_fn=None):
+                               solver_log_fn=None, status_fn=None, phase1_only=False):
     """Run both phases of a continuous-source steady-state scenario against
     an already-converged case (mesh + flow + fluenceRate/kUV must already
     exist - see run_pipeline.setup_case()). Returns a summary dict.
@@ -825,6 +825,18 @@ def run_steady_state_scenario(case_dir, room_x, room_y, room_z, ach, Z, nbins=25
     - see scenario_runs._run_sweep_concurrent), receives each phase's
     latest "Time = N" line to display in place instead of the scrolling
     log - see _phase_solver_callback.
+
+    phase1_only: stop right after Phase 1 finishes (and its checkpoint is
+    written) instead of continuing into Phase 2 - used by
+    scenario_runs._run_shared_phase1 to run Phase 1 ONCE per ACH group in
+    a shared directory (Phase 1's own physics - injection strength G/Su -
+    depends only on ach/target_T_ss/source geometry, none of which vary
+    with Z, the same way decay mode's UV-off control doesn't depend on Z).
+    Every Z sharing that ACH then clones the shared, phase1-converged
+    directory and calls this function normally (phase1_only=False) - the
+    existing checkpoint-detection logic below picks up the already-
+    converged state and skips straight to Phase 2, without needing to
+    know phase1_only was ever used.
     """
     case_dir_wsl = wsl_path(case_dir)
     room_volume = room_x * room_y * room_z
@@ -1070,6 +1082,9 @@ def run_steady_state_scenario(case_dir, room_x, room_y, room_z, ach, Z, nbins=25
             _clear_phase1_pending(case_dir)
             _write_phase1_checkpoint(case_dir, summary["phase1"], phase1_monitoring, G, Su, source_volume,
                                       n_source_cells)
+
+    if phase1_only:
+        return summary
 
     # --- Phase 2: source + UV ---
     log_fn("=== Phase 2: source + UV ===")

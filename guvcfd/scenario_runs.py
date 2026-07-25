@@ -11,6 +11,14 @@ value (_build_flow_base) and reused (via a plain directory copy) for
 every Z at that ACH (_apply_z) - only the ACH-major outer loop pays for a
 full mesh + flow convergence.
 
+Same reasoning applies one level deeper for steady-state sweeps: Phase 1
+("source only, no UV") depends only on ach/target_T_ss/source geometry,
+never Z, so it's ALSO converged once per ACH (_run_shared_phase1) and
+reused via run_steady_state_scenario's own checkpoint-resume mechanism -
+every Z sharing that ACH clones the phase1-converged directory and jumps
+straight to Phase 2. Decay mode has the equivalent optimization for its
+Z-independent UV-off control run (_run_shared_control).
+
 This module only orchestrates repeated calls into run_pipeline.setup_case()
 and steady_state_pipeline.run_steady_state_scenario() - it doesn't
 duplicate their logic, and deliberately doesn't import from app.py (kept a
@@ -29,7 +37,7 @@ import numpy as np
 
 from .case_io import read_boundary_patch_names, read_openfoam_scalar_field, write_scalar_field
 from .cellzones import bin_decay_rates, write_cellzones
-from .contaminant_source import write_fvoptions_file
+from .contaminant_source import write_fvoptions_file, write_source_topo_set_dict
 from .decay_analysis import write_results_summary
 from .fan import fan_fvoptions_entry, write_fan_topo_set_dict
 from .fluence import compute_inactivation_rate, compute_well_mixed_eACH
@@ -317,6 +325,85 @@ def _run_scenario(case_dir, room, settings, z, ach, adv, z_summary, log_fn, shou
     result["fluence_mean"] = z_summary["fluence_mean"]
     result["eACH_uv_well_mixed"] = z_summary.get("eACH_uv_well_mixed_mean")
     return result
+
+
+def _run_shared_phase1(base_dir, phase1_dir, ach, room, settings, adv, log_fn, should_stop, solver_log_fn,
+                        status_fn=None):
+    """Run Phase 1 ("source only, no UV") ONCE per ACH group, shared
+    across every Z sharing that ACH - Phase 1's own physics (injection
+    strength G/Su depend only on ach/target_T_ss/source geometry, none of
+    which vary with Z) doesn't depend on Z at all, the same way decay
+    mode's UV-off control doesn't (see _run_shared_control). Confirmed
+    directly: a real sweep's log showed Phase 1 ("source only, no UV")
+    restarting from scratch for every Z sharing an ACH, each paying its
+    own full phase1_iterations cost for a result that would have been
+    identical regardless of which Z it ran under.
+
+    Clones base_dir (the shared, flow-converged case) into phase1_dir and
+    runs run_steady_state_scenario() there with phase1_only=True - stops
+    right after Phase 1 converges and writes its checkpoint (see that
+    function's docstring), leaving phase1_dir with a converged Phase 1
+    state (0/T, phase1_T.snapshot) and checkpoint file on disk.
+
+    Every Z sharing this ACH then clones phase1_dir instead of base_dir
+    (see run_sweep's run_z_fn) - run_steady_state_scenario's existing
+    checkpoint-detection logic picks up the already-converged state there
+    and skips straight to Phase 2, without any special-casing needed on
+    its end. The one thing that copy loses that _apply_z's own cellZones
+    rewrite would otherwise destroy anyway - the source cellZone Phase 1
+    carved - has to be re-carved per Z after _apply_z runs (see run_z_fn),
+    the same way _apply_z already re-carves the fan zone for the same
+    reason.
+    """
+    _copy_base_case(base_dir, phase1_dir, log_fn)
+
+    fan_entry = None
+    if settings.get("fan-enable"):
+        direction = (0, 0, -1) if settings["fan-direction"] == "down" else (0, 0, 1)
+        fan_entry = fan_fvoptions_entry(settings["fan-speed"], direction=direction)
+
+    room_volume = room.x * room.y * room.z
+    openings = [(settings["inlet-wall"], settings["inlet-size-w"] * settings["inlet-size-h"])]
+    has_inlet2 = bool(settings.get("inlet2-enable"))
+    if has_inlet2:
+        openings.append((settings["inlet2-wall"], settings["inlet2-size-w"] * settings["inlet2-size-h"]))
+    velocities = compute_inlet_velocities(ach, room_volume, openings)
+    inlet_velocity = velocities[0]
+    inlet2_velocity = velocities[1] if has_inlet2 else None
+    has_outlet2 = bool(settings.get("outlet2-enable"))
+
+    phase1_iterations = max(settings["phase1-iterations"], _settling_iterations(ach))
+    patches_to_monitor = ("outlet", "outlet2") if has_outlet2 else ("outlet",)
+
+    log_fn(f"=== ACH={ach}: Phase 1 (source only, no UV - shared by every Z at this ACH) ===")
+    run_steady_state_scenario(
+        # Z is a placeholder here (Phase 1 has no UV, so its value is
+        # irrelevant) - same convention _build_flow_base's own docstring
+        # already uses for the shared flow base.
+        phase1_dir, room.x, room.y, room.z, ach, settings["z-value"],
+        source_center=(settings["inject-x-input"], settings["inject-y-input"], settings["inject-z-input"]),
+        target_T_ss=settings["target-t-ss"],
+        inlet_velocity=inlet_velocity, inlet2_velocity=inlet2_velocity, has_outlet2=has_outlet2,
+        inlet_diffuser_type=settings.get("inlet-diffuser-type", "direct"),
+        inlet_wall=settings["inlet-wall"], inlet_center=_opening_center_frac(settings, "inlet", room),
+        inlet_size=(settings["inlet-size-w"], settings["inlet-size-h"]),
+        inlet2_diffuser_type=settings.get("inlet2-diffuser-type", "direct") if has_inlet2 else "direct",
+        inlet2_wall=settings["inlet2-wall"] if has_inlet2 else None,
+        inlet2_center=_opening_center_frac(settings, "inlet2", room) if has_inlet2 else None,
+        inlet2_size=(settings["inlet2-size-w"], settings["inlet2-size-h"]) if has_inlet2 else None,
+        phase1_iterations=phase1_iterations,
+        window_frac=settings.get("t-ss-window-frac") or 0.15,
+        cell_size=adv["mesh-cell-size"],
+        source_size=adv["source-zone-size"],
+        plateau_rel_tol=adv["plateau-rel-tol"] / 100.0,
+        t_inf_check_interval=500 if adv["t-infinity-early-stop-enabled"] else None,
+        t_inf_rel_tol=(adv["t-infinity-rel-tol"] / 100.0) if adv["t-infinity-early-stop-enabled"] else None,
+        keep_all_timesteps=adv["keep-all-timesteps"],
+        fan_entry=fan_entry, monitoring_points=_gather_monitoring_points(settings),
+        patches_to_monitor=patches_to_monitor,
+        log_fn=log_fn, should_stop=should_stop, solver_log_fn=solver_log_fn,
+        status_fn=status_fn, phase1_only=True,
+    )
 
 
 # --- decay-mode scenario (mirrors app._decay_run_durations/_run_decay_pair/
@@ -722,9 +809,10 @@ def run_sweep(guv_path, settings_path, project_dir, room, settings, adv,
               on_combo_done=None, solver_log_fn=None, status_fn=None):
     """Run the full Z x ACH cross-product against an already-loaded
     project, one subfolder per combination directly under project_dir,
-    reusing a single converged flow field for every Z sharing an ACH (see
-    module docstring). Writes results.json/run_settings.json into each
-    subfolder (same as a normal single run - "Export Report" and
+    reusing a single converged flow field AND a single converged Phase 1
+    ("source only, no UV") run for every Z sharing an ACH (see module
+    docstring - _run_shared_phase1). Writes results.json/run_settings.json
+    into each subfolder (same as a normal single run - "Export Report" and
     ParaView both work per-subfolder unchanged) plus a trimmed, compound-
     named report.json directly in project_dir.
 
@@ -758,9 +846,15 @@ def run_sweep(guv_path, settings_path, project_dir, room, settings, adv,
     def build_ach_fn(ach):
         ach_log_fn = _prefixed_log_fn(log_fn, f"ACH={ach}")
         base_dir = f"{project_dir}/_base_ACH{_fmt(ach)}"
+        phase1_dir = f"{project_dir}/_phase1_ACH{_fmt(ach)}"
         ach_log_fn("=== converging flow field (shared by every Z at this ACH) ===")
         _build_flow_base(guv_path, base_dir, room, settings, ach, adv, ach_log_fn, should_stop, solver_log_fn)
-        return {"ach": ach, "base_dir": base_dir, "fan_kw": _fan_kwargs(settings)}
+        # Phase 1 ("source only, no UV") is Z-independent (see
+        # _run_shared_phase1) - run it once per ACH here, not once per Z
+        # in run_z_fn below.
+        _run_shared_phase1(base_dir, phase1_dir, ach, room, settings, adv, ach_log_fn, should_stop, solver_log_fn,
+                            status_fn=status_fn)
+        return {"ach": ach, "base_dir": base_dir, "phase1_dir": phase1_dir, "fan_kw": _fan_kwargs(settings)}
 
     def run_z_fn(ctx, z, ach):
         if should_stop is not None and should_stop():
@@ -771,8 +865,18 @@ def run_sweep(guv_path, settings_path, project_dir, room, settings, adv,
         case_dir = f"{project_dir}/{subdir}"
         combo_log_fn(f"--- -> {subdir} ---")
         try:
-            _copy_base_case(ctx["base_dir"], case_dir, combo_log_fn)
+            _copy_base_case(ctx["phase1_dir"], case_dir, combo_log_fn)
             z_summary = _apply_z(case_dir, z, adv["uv-zone-bins"], ctx["fan_kw"], combo_log_fn)
+            # _apply_z's write_cellzones() rewrites cellZones from scratch,
+            # wiping the source cellZone _run_shared_phase1 already carved
+            # into phase1_dir (the same reason _apply_z itself re-carves
+            # the fan zone) - re-carve it here too so Phase 2's source
+            # fvOptions entry still resolves against a real cellZone.
+            write_source_topo_set_dict(
+                case_dir, (settings["inject-x-input"], settings["inject-y-input"], settings["inject-z-input"]),
+                adv["source-zone-size"], cell_size=adv["mesh-cell-size"])
+            run_wsl_or_raise("topoSet -dict system/sourceTopoSetDict", wsl_path(case_dir),
+                              "topoSet (restoring source zone wiped by _apply_z)")
             result = _run_scenario(case_dir, room, settings, z, ach, adv,
                                     z_summary, combo_log_fn, should_stop, solver_log_fn,
                                     status_fn=status_fn)
@@ -798,8 +902,9 @@ def run_sweep(guv_path, settings_path, project_dir, room, settings, adv,
     def cleanup_ach_fn(ctx):
         ach = ctx["ach"]
         ach_log_fn = _prefixed_log_fn(log_fn, f"ACH={ach}")
-        ach_log_fn("Removing shared base case...")
-        run_wsl_or_raise(f'rm -rf "{wsl_path(ctx["base_dir"])}"', wsl_path(project_dir),
-                          "cleaning up shared base case")
+        ach_log_fn("Removing shared base case and Phase 1 run...")
+        run_wsl_or_raise(
+            f'rm -rf "{wsl_path(ctx["base_dir"])}" "{wsl_path(ctx["phase1_dir"])}"', wsl_path(project_dir),
+            "cleaning up shared base case and Phase 1 run")
 
     _run_sweep_concurrent(achs, combos, should_stop, build_ach_fn, run_z_fn, cleanup_ach_fn)

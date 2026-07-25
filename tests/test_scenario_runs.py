@@ -131,6 +131,8 @@ def test_run_sweep_creates_expected_subfolders_and_reports(tmp_path, monkeypatch
 
     build_calls = []
     monkeypatch.setattr(sr, "_build_flow_base", lambda *a, **k: build_calls.append(a[4]))
+    monkeypatch.setattr(sr, "_run_shared_phase1", lambda *a, **k: None)
+    monkeypatch.setattr(sr, "write_source_topo_set_dict", lambda *a, **k: None)
     monkeypatch.setattr(sr, "_copy_base_case", lambda base, target, log_fn: __import__("os").makedirs(target, exist_ok=True))
     monkeypatch.setattr(sr, "_apply_z", lambda case_dir, z, nbins, fan_kwargs, log_fn:
                          {"fluence_mean": 1.0, "eACH_uv_well_mixed_mean": 0.0})
@@ -149,7 +151,7 @@ def test_run_sweep_creates_expected_subfolders_and_reports(tmp_path, monkeypatch
                 "inlet-wall": "xMin", "inlet-size-w": 0.3, "inlet-size-h": 0.3,
                 "phase1-iterations": 100, "phase2-iterations": 100, "target-t-ss": 1.0,
                 "inject-x-input": 2, "inject-y-input": 2.5, "inject-z-input": 1.3, "z-value": 6}
-    adv = {"uv-zone-bins": 25}
+    adv = {"uv-zone-bins": 25, "source-zone-size": 0.3, "mesh-cell-size": 0.1}
 
     results_seen = []
     sr.run_sweep(
@@ -175,6 +177,8 @@ def test_run_sweep_skips_failed_combo_and_continues(tmp_path, monkeypatch):
     project_dir = tmp_path / "proj"
     project_dir.mkdir()
     monkeypatch.setattr(sr, "_build_flow_base", lambda *a, **k: None)
+    monkeypatch.setattr(sr, "_run_shared_phase1", lambda *a, **k: None)
+    monkeypatch.setattr(sr, "write_source_topo_set_dict", lambda *a, **k: None)
     monkeypatch.setattr(sr, "_copy_base_case", lambda base, target, log_fn: __import__("os").makedirs(target, exist_ok=True))
     monkeypatch.setattr(sr, "run_wsl_or_raise", lambda *a, **k: None)
 
@@ -195,7 +199,7 @@ def test_run_sweep_skips_failed_combo_and_continues(tmp_path, monkeypatch):
     seen = []
     sr.run_sweep(
         guv_path="p.guv", settings_path="p.guvcfd", project_dir=str(project_dir),
-        room=room, settings=settings, adv={"uv-zone-bins": 25},
+        room=room, settings=settings, adv={"uv-zone-bins": 25, "source-zone-size": 0.3, "mesh-cell-size": 0.1},
         z_values=[2, 6], ach_values=[3], log_fn=lambda m: None,
         on_combo_done=lambda z, ach, status, detail: seen.append((z, status)),
     )
@@ -205,10 +209,89 @@ def test_run_sweep_skips_failed_combo_and_continues(tmp_path, monkeypatch):
     assert set(seen) == {(2, "error"), (6, "done")}
 
 
+def test_run_shared_phase1_clones_base_dir_and_runs_phase1_only(tmp_path, monkeypatch):
+    # Regression: Phase 1 ("source only, no UV") depends only on
+    # ach/target_T_ss/source geometry, never Z - confirmed directly on a
+    # real sweep where its log showed Phase 1 restarting from scratch for
+    # every Z sharing an ACH. _run_shared_phase1 runs it once per ACH,
+    # in its own directory cloned from the shared flow base, and stops
+    # right after Phase 1 (phase1_only=True) so every Z can later clone
+    # this directory and skip straight to Phase 2 via
+    # run_steady_state_scenario's own checkpoint-detection.
+    copy_calls = []
+    monkeypatch.setattr(sr, "_copy_base_case", lambda base, target, log_fn: copy_calls.append((base, target)))
+
+    scenario_calls = []
+    def fake_run_steady_state_scenario(case_dir, room_x, room_y, room_z, ach, Z, **kwargs):
+        scenario_calls.append({"case_dir": case_dir, "ach": ach, "Z": Z, **kwargs})
+    monkeypatch.setattr(sr, "run_steady_state_scenario", fake_run_steady_state_scenario)
+
+    room = type("Room", (), {"x": 4.0, "y": 5.0, "z": 2.7})()
+    settings = {"fan-enable": False, "inlet2-enable": False, "outlet2-enable": False,
+                "inlet-wall": "xMin", "inlet-y-input": 1.5, "inlet-z-input": 1.3,
+                "inlet-size-w": 0.3, "inlet-size-h": 0.3,
+                "phase1-iterations": 100, "target-t-ss": 1.0, "z-value": 6,
+                "inject-x-input": 2, "inject-y-input": 2.5, "inject-z-input": 1.3,
+                "t-ss-window-frac": None, "monitoring-enable": False}
+    adv = {"mesh-cell-size": 0.1, "source-zone-size": 0.3, "plateau-rel-tol": 1.0,
+           "t-infinity-early-stop-enabled": False, "keep-all-timesteps": False}
+
+    sr._run_shared_phase1("base_dir", "phase1_dir", ach=3.0, room=room, settings=settings, adv=adv,
+                           log_fn=lambda m: None, should_stop=None, solver_log_fn=None)
+
+    assert copy_calls == [("base_dir", "phase1_dir")]
+    assert len(scenario_calls) == 1
+    call = scenario_calls[0]
+    assert call["case_dir"] == "phase1_dir"
+    assert call["ach"] == 3.0
+    assert call["Z"] == 6  # placeholder - Phase 1 has no UV, so Z is irrelevant
+    assert call["phase1_only"] is True
+
+
+def test_run_sweep_recarves_source_zone_after_apply_z_wipes_it(tmp_path, monkeypatch):
+    # _apply_z's write_cellzones() rewrites cellZones from scratch,
+    # wiping the source cellZone _run_shared_phase1 already carved into
+    # the shared phase1_dir - run_z_fn must re-carve it (the same reason
+    # _apply_z itself already re-carves the fan zone) or Phase 2's source
+    # fvOptions entry would reference a cellZone that no longer exists.
+    project_dir = tmp_path / "proj"
+    project_dir.mkdir()
+    monkeypatch.setattr(sr, "_build_flow_base", lambda *a, **k: None)
+    monkeypatch.setattr(sr, "_run_shared_phase1", lambda *a, **k: None)
+    monkeypatch.setattr(sr, "_copy_base_case", lambda base, target, log_fn: __import__("os").makedirs(target, exist_ok=True))
+    monkeypatch.setattr(sr, "_apply_z", lambda case_dir, z, nbins, fan_kwargs, log_fn:
+                         {"fluence_mean": 1.0, "eACH_uv_well_mixed_mean": 0.0})
+    monkeypatch.setattr(sr, "_run_scenario", lambda *a, **k: {
+        "reduction_pct": 90.0, "eACH_uv_steady_state": 50.0, "phase1": {}, "phase2": {}})
+
+    topo_calls = []
+    monkeypatch.setattr(sr, "write_source_topo_set_dict",
+                         lambda case_dir, center, size, cell_size=None: topo_calls.append((case_dir, center, size)))
+    wsl_calls = []
+    monkeypatch.setattr(sr, "run_wsl_or_raise", lambda cmd, *a, **k: wsl_calls.append(cmd))
+
+    room = type("Room", (), {"x": 4.0, "y": 5.0, "z": 2.7})()
+    settings = {"sim-type": "steady_state", "fan-enable": False, "monitoring-enable": False,
+                "inlet-wall": "xMin", "inlet-size-w": 0.3, "inlet-size-h": 0.3,
+                "phase1-iterations": 100, "phase2-iterations": 100, "target-t-ss": 1.0,
+                "inject-x-input": 2, "inject-y-input": 2.5, "inject-z-input": 1.3, "z-value": 6}
+    adv = {"uv-zone-bins": 25, "source-zone-size": 0.3, "mesh-cell-size": 0.1}
+
+    sr.run_sweep(
+        guv_path="p.guv", settings_path="p.guvcfd", project_dir=str(project_dir),
+        room=room, settings=settings, adv=adv,
+        z_values=[6], ach_values=[3], log_fn=lambda m: None,
+    )
+
+    assert topo_calls == [(f"{project_dir}/Z6_ACH3", (2, 2.5, 1.3), 0.3)]
+    assert any("topoSet" in cmd and "sourceTopoSetDict" in cmd for cmd in wsl_calls)
+
+
 def test_run_sweep_stop_between_combinations_raises_stopped_by_user(tmp_path, monkeypatch):
     project_dir = tmp_path / "proj"
     project_dir.mkdir()
     monkeypatch.setattr(sr, "_build_flow_base", lambda *a, **k: None)
+    monkeypatch.setattr(sr, "_run_shared_phase1", lambda *a, **k: None)
     monkeypatch.setattr(sr, "run_wsl_or_raise", lambda *a, **k: None)
 
     calls = {"n": 0}
