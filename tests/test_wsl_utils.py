@@ -85,6 +85,35 @@ def test_stall_timeout_gives_up_and_terminates_without_should_stop(monkeypatch):
     assert result.returncode == -15
 
 
+def test_kill_pattern_is_scoped_to_this_calls_own_cwd(monkeypatch):
+    # Regression: a bare `pkill -f pimpleFoam` kills every same-named
+    # solver process system-wide - fine with one solve at a time, wrong
+    # once concurrent ACH/Z combinations can each be running their own
+    # "pimpleFoam" at once. The kill must be scoped to the specific case
+    # directory this run_wsl_streaming call was launched in.
+    monkeypatch.setattr(wsl_utils, "_STALL_POLL_INTERVAL_S", 0.02)
+    fake_proc = _FakeProc(lines=["Time = 1"])
+    monkeypatch.setattr(subprocess, "Popen", lambda *a, **k: fake_proc)
+
+    kill_calls = []
+    monkeypatch.setattr(subprocess, "run", lambda cmd, **k: kill_calls.append(cmd))
+
+    calls = {"n": 0}
+
+    def should_stop():
+        calls["n"] += 1
+        return calls["n"] >= 3
+
+    wsl_utils.run_wsl_streaming(
+        "pimpleFoam", "/mnt/project/Z6_ACH3", should_stop=should_stop, kill_pattern="pimpleFoam")
+
+    assert len(kill_calls) == 1
+    script = kill_calls[0][-1]
+    assert "/mnt/project/Z6_ACH3" in script
+    assert "pimpleFoam" in script
+    assert "cwd" in script  # scoped by /proc/$p/cwd, not a bare name match
+
+
 def test_normal_output_and_clean_exit_is_unaffected(monkeypatch):
     monkeypatch.setattr(wsl_utils, "_STALL_POLL_INTERVAL_S", 0.05)
 

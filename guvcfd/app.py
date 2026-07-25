@@ -216,7 +216,7 @@ _run_state = {
 # "error", "detail": trimmed result dict or an error message}.
 _scenario_state = {
     "status": "idle", "log": [], "combos": [], "results": {},
-    "start_time": None, "stop_requested": False,
+    "start_time": None, "stop_requested": False, "live_status": {},
 }
 
 
@@ -226,6 +226,21 @@ def _scenario_log(msg):
     log.append(msg)
     if len(log) > _MAX_LOG_LINES:
         del log[: len(log) - _MAX_LOG_LINES]
+
+
+def _scenario_status_update(key, msg):
+    """Per-stream "latest Time = N" status, overwritten in place rather
+    than appended - see scenario_runs._throttled_solver_callback's
+    status_fn. Several concurrent ACH/Z combinations each printing their
+    own Time=N line every step would otherwise flood _scenario_log the
+    same way the raw per-iteration residual dump already doesn't. msg=None
+    removes the entry (that stream's solve just finished).
+    """
+    live = _scenario_state["live_status"]
+    if msg is None:
+        live.pop(key, None)
+    else:
+        live[key] = msg
 
 
 def _scenario_should_stop():
@@ -1779,6 +1794,18 @@ scenario_tab = dbc.Row([
     dbc.Col([
         html.Div("Combinations", className="small fw-semibold text-uppercase mb-1"),
         html.Div(id="scenario-progress-table"),
+        html.Div("Running now", className="small fw-semibold text-uppercase mb-1 mt-3"),
+        # One line per currently-active ACH/Z solve, overwritten in place
+        # each poll (see app._scenario_status_update) rather than
+        # appended - with several concurrent combinations each printing
+        # their own "Time = N" line every step, letting those scroll in
+        # the log below would flood it (see
+        # scenario_runs._throttled_solver_callback's status_fn).
+        html.Pre(id="scenario-live-status", className="small", style={
+            "minHeight": "1.4em", "fontSize": "11px",
+            "background": "rgba(127,127,127,0.08)", "padding": "6px 8px",
+            "border": "1px solid rgba(127,127,127,0.3)", "whiteSpace": "pre-wrap",
+        }),
         html.Div("Log", className="small fw-semibold text-uppercase mb-1 mt-3"),
         html.Pre(id="scenario-log", className="small", style={
             "height": "40vh", "overflowY": "auto", "fontSize": "11px",
@@ -2905,8 +2932,13 @@ def _scenario_sweep_thread(guv_path, settings_path, project_dir, room, settings,
     def on_combo_done(z, ach, status, detail):
         _scenario_state["results"][(z, ach)] = {"status": status, "detail": detail}
 
-    sweep_fn = (scenario_runs.run_decay_sweep if settings.get("sim-type") == "decay"
-                else scenario_runs.run_sweep)
+    is_decay = settings.get("sim-type") == "decay"
+    sweep_fn = scenario_runs.run_decay_sweep if is_decay else scenario_runs.run_sweep
+    # status_fn only exists on run_decay_sweep for now (run_sweep doesn't
+    # forward Time=N lines to the log at all today, so it has nothing to
+    # redirect - see scenario_runs.run_decay_sweep's docstring; TODO:
+    # extend once steady-state's own sweep needs this too).
+    status_kwargs = {"status_fn": _scenario_status_update} if is_decay else {}
     try:
         sweep_fn(
             guv_path, settings_path, project_dir, room, settings, adv,
@@ -2923,6 +2955,7 @@ def _scenario_sweep_thread(guv_path, settings_path, project_dir, room, settings,
             # need to reach the visible scenario log, or a stalled/killed
             # solver goes completely unnoticed here too.
             solver_log_fn=lambda line: _scenario_log(line) if line.strip().startswith("[") else None,
+            **status_kwargs,
         )
         _scenario_state["status"] = "done"
     except StoppedByUser as e:
@@ -2931,12 +2964,18 @@ def _scenario_sweep_thread(guv_path, settings_path, project_dir, room, settings,
     except Exception as e:
         _scenario_log(f"ERROR: {e}")
         _scenario_state["status"] = "error"
+    finally:
+        # Belt-and-suspenders: every stream already clears its own
+        # live_status entry when it finishes (see _run_shared_control/
+        # _run_decay_scenario's try/finally), but wipe the whole thing
+        # here too so nothing stale can survive the sweep ending.
+        _scenario_state["live_status"].clear()
 
 
 def _launch_scenario_sweep(guv_path, settings_path, project_dir, room, settings, adv, z_values, ach_values):
     combos = scenario_runs.sweep_combinations(z_values, ach_values)
     _scenario_state.update(status="running", log=[], combos=combos, results={},
-                            start_time=time.time(), stop_requested=False)
+                            start_time=time.time(), stop_requested=False, live_status={})
     thread = threading.Thread(
         target=_scenario_sweep_thread,
         args=(guv_path, settings_path, project_dir, room, settings, adv, z_values, ach_values),
@@ -3385,6 +3424,7 @@ def _scenario_progress_table():
 
 @app.callback(
     Output("scenario-log", "children"),
+    Output("scenario-live-status", "children"),
     Output("scenario-status-text", "children"),
     Output("scenario-progress-table", "children"),
     Output("scenario-poll", "disabled", allow_duplicate=True),
@@ -3396,6 +3436,8 @@ def _scenario_progress_table():
 def _poll_scenario(n_intervals):
     status = _scenario_state["status"]
     log_text = "\n".join(_scenario_state["log"][-300:])
+    live_status = _scenario_state.get("live_status", {})
+    live_text = "\n".join(live_status[k] for k in sorted(live_status)) or "(nothing running)"
     n_done = sum(1 for r in _scenario_state["results"].values() if r["status"] == "done")
     n_error = sum(1 for r in _scenario_state["results"].values() if r["status"] == "error")
     n_total = len(_scenario_state["combos"])
@@ -3406,7 +3448,7 @@ def _poll_scenario(n_intervals):
         "stopped": f"Stopped. {n_done}/{n_total} succeeded, {n_error} failed.",
     }.get(status, "")
     still_running = status == "running"
-    return (log_text, status_text, _scenario_progress_table(),
+    return (log_text, live_text, status_text, _scenario_progress_table(),
             not still_running, still_running, not still_running)
 
 

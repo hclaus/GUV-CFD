@@ -1,4 +1,6 @@
 import json
+import threading
+import time
 
 import numpy as np
 import pytest
@@ -157,7 +159,9 @@ def test_run_sweep_creates_expected_subfolders_and_reports(tmp_path, monkeypatch
     )
 
     assert build_calls == [3]  # one flow base built, for ACH=3
-    assert results_seen == [(2, 3, "done"), (6, 3, "done")]
+    # Z=2 and Z=6 now run concurrently (shared Z-worker pool - see
+    # _run_sweep_concurrent), so completion order isn't guaranteed.
+    assert set(results_seen) == {(2, 3, "done"), (6, 3, "done")}
     assert (project_dir / "myproject_Z2_ACH3_report.json").exists()
     assert (project_dir / "myproject_Z6_ACH3_report.json").exists()
     trimmed = json.loads((project_dir / "myproject_Z2_ACH3_report.json").read_text())
@@ -195,7 +199,9 @@ def test_run_sweep_skips_failed_combo_and_continues(tmp_path, monkeypatch):
         on_combo_done=lambda z, ach, status, detail: seen.append((z, status)),
     )
 
-    assert seen == [(2, "error"), (6, "done")]  # combo 1 failed, sweep continued to combo 2
+    # Z=2 and Z=6 now run concurrently, so completion order isn't
+    # guaranteed - only that combo 1 failing didn't stop combo 2.
+    assert set(seen) == {(2, "error"), (6, "done")}
 
 
 def test_run_sweep_stop_between_combinations_raises_stopped_by_user(tmp_path, monkeypatch):
@@ -277,6 +283,74 @@ def test_run_decay_scenario_rebuilds_fvoptions_from_this_combos_own_kuv(tmp_path
     assert entries_z1 != entries_z6
 
 
+def test_run_decay_scenario_status_fn_gets_time_lines_and_clears_on_finish(tmp_path, monkeypatch):
+    # status_fn is the overwrite-in-place alternative to the scrolling log
+    # for "Time = N" banners (see _throttled_solver_callback) - with
+    # several concurrent combinations each printing one every step,
+    # appending them all to the log would flood it the same way the raw
+    # per-iteration residual dump already doesn't.
+    case_dir, _ = _write_synthetic_case(tmp_path, n_cells=8)
+    sr._apply_z(case_dir, Z=6.0, nbins=5, fan_kwargs={}, log_fn=lambda m: None)
+
+    monkeypatch.setattr(sr, "write_fvoptions_file", lambda *a, **k: None)
+    monkeypatch.setattr(sr, "splice_fv_options_into_control_dict", lambda *a, **k: (None, 1, 1))
+    monkeypatch.setattr(sr, "set_control_dict_time", lambda *a, **k: None)
+    monkeypatch.setattr(sr, "run_wsl_or_raise", lambda *a, **k: None)
+    monkeypatch.setattr(sr, "write_results_summary", lambda *a, **k: {
+        "eACH_uv_effective": 10.0, "eACH_uv_well_mixed": 20.0,
+    })
+
+    def fake_run_wsl_streaming(cmd, cwd, on_line=None, **k):
+        on_line("Time = 12.5")
+        return type("R", (), {"returncode": 0, "stdout": ""})()
+    monkeypatch.setattr(sr, "run_wsl_streaming", fake_run_wsl_streaming)
+
+    status_calls = []
+    control_results = {"total_ach_effective": 3.0, "total_ach_effective_ci95": None,
+                        "fit_se_per_s": None, "fit_n": None}
+    room = type("Room", (), {"x": 4.0, "y": 5.0, "z": 2.7})()
+    settings = {"fan-enable": False, "inlet2-enable": False, "outlet2-enable": False,
+                "inlet-wall": "xMin", "inlet-size-w": 0.3, "inlet-size-h": 0.3,
+                "monitoring-enable": False, "pimple-write-interval": 3}
+    adv = {"uv-zone-bins": 5, "pimple-delta-t": 0.5,
+           "decay-ach-min-fraction": 90.0, "decay-each-min-fraction": 90.0, "decay-each-max-fraction": 99.9}
+
+    sr._run_decay_scenario(case_dir, room, settings, z=6.0, ach=3.0, adv=adv,
+                            z_summary={"eACH_uv_well_mixed_mean": 20.0}, log_fn=lambda m: None,
+                            should_stop=None, solver_log_fn=None,
+                            control_results=control_results, status_fn=lambda k, m: status_calls.append((k, m)))
+
+    key = "Z=6.0/ACH=3.0/UV-on"
+    assert (key, "[UV-on] Time = 12.5") in status_calls
+    assert status_calls[-1] == (key, None)  # cleared once the solve finished
+
+
+def test_run_shared_control_status_fn_gets_time_lines_and_clears_on_finish(tmp_path, monkeypatch):
+    monkeypatch.setattr(sr, "prepare_ventilation_only_control", lambda *a, **k: None)
+    monkeypatch.setattr(sr, "finish_ventilation_only_control", lambda *a, **k: {"total_ach_effective": 3.0})
+
+    def fake_run_wsl_streaming(cmd, cwd, on_line=None, **k):
+        on_line("Time = 5")
+        return type("R", (), {"returncode": 0, "stdout": ""})()
+    monkeypatch.setattr(sr, "run_wsl_streaming", fake_run_wsl_streaming)
+
+    status_calls = []
+    room = type("Room", (), {"x": 4.0, "y": 5.0, "z": 2.7})()
+    settings = {"inlet2-enable": False, "outlet2-enable": False,
+                "inlet-wall": "xMin", "inlet-size-w": 0.3, "inlet-size-h": 0.3,
+                "pimple-write-interval": 3}
+    adv = {"pimple-delta-t": 0.5, "decay-ach-min-fraction": 99.9,
+           "decay-each-max-fraction": 99.9, "decay-each-min-fraction": 90.0}
+
+    sr._run_shared_control(str(tmp_path / "base"), str(tmp_path / "control"), ach=3.0, room=room,
+                            settings=settings, adv=adv, log_fn=lambda m: None,
+                            should_stop=None, solver_log_fn=None, status_fn=lambda k, m: status_calls.append((k, m)))
+
+    key = "ACH=3.0/control"
+    assert (key, "[control] Time = 5") in status_calls
+    assert status_calls[-1] == (key, None)
+
+
 def test_run_decay_scenario_uses_configured_write_interval_not_duration_over_100(tmp_path, monkeypatch):
     # Regression: write_interval was silently computed as duration // 100
     # regardless of the user's own "Write interval (s)" setting - typing
@@ -338,3 +412,85 @@ def test_run_shared_control_uses_configured_write_interval(tmp_path, monkeypatch
                             should_stop=None, solver_log_fn=lambda m: None)
 
     assert prepare_calls == [("control", 3)]
+
+
+# --- _run_sweep_concurrent (see wsl_utils._kill_wsl_in_dir for the matching
+# kill-scoping fix that makes this safe): bounded ACH/Z concurrency shared
+# by run_sweep/run_decay_sweep ---
+
+def test_run_sweep_concurrent_bounds_ach_and_z_concurrency(monkeypatch):
+    monkeypatch.setattr(sr, "_MAX_CONCURRENT_ACH", 2)
+    monkeypatch.setattr(sr, "_MAX_CONCURRENT_Z", 2)
+
+    lock = threading.Lock()
+    state = {"ach_live": 0, "ach_peak": 0, "z_live": 0, "z_peak": 0}
+
+    def build_ach_fn(ach):
+        with lock:
+            state["ach_live"] += 1
+            state["ach_peak"] = max(state["ach_peak"], state["ach_live"])
+        time.sleep(0.05)
+        with lock:
+            state["ach_live"] -= 1
+        return {"ach": ach}
+
+    def run_z_fn(ctx, z, ach):
+        with lock:
+            state["z_live"] += 1
+            state["z_peak"] = max(state["z_peak"], state["z_live"])
+        time.sleep(0.05)
+        with lock:
+            state["z_live"] -= 1
+
+    cleaned_up = []
+    def cleanup_ach_fn(ctx):
+        cleaned_up.append(ctx["ach"])
+
+    achs = [1, 2, 3, 4]
+    combos = [(z, ach) for ach in achs for z in (10, 20, 30)]  # 3 Z's per ACH, more than either pool size
+
+    sr._run_sweep_concurrent(achs, combos, should_stop=None,
+                              build_ach_fn=build_ach_fn, run_z_fn=run_z_fn, cleanup_ach_fn=cleanup_ach_fn)
+
+    assert state["ach_peak"] <= 2
+    assert state["z_peak"] <= 2
+    assert sorted(cleaned_up) == achs  # every ACH group's cleanup ran exactly once
+
+
+def test_run_sweep_concurrent_isolates_per_z_errors(monkeypatch):
+    monkeypatch.setattr(sr, "_MAX_CONCURRENT_ACH", 3)
+    monkeypatch.setattr(sr, "_MAX_CONCURRENT_Z", 3)
+
+    done = []
+    lock = threading.Lock()
+
+    def run_z_fn(ctx, z, ach):
+        if z == 2:
+            # A real run_z_fn (see run_sweep/run_decay_sweep) catches its
+            # own Exception and reports "error" instead of propagating -
+            # this fake mirrors that contract.
+            with lock:
+                done.append((z, ach, "error"))
+            return
+        with lock:
+            done.append((z, ach, "done"))
+
+    combos = [(2, 3), (6, 3)]
+    sr._run_sweep_concurrent([3], combos, should_stop=None,
+                              build_ach_fn=lambda ach: {"ach": ach},
+                              run_z_fn=run_z_fn, cleanup_ach_fn=lambda ctx: None)
+
+    assert set(done) == {(2, 3, "error"), (6, 3, "done")}
+
+
+def test_run_sweep_concurrent_propagates_stopped_by_user():
+    def build_ach_fn(ach):
+        return {"ach": ach}
+
+    def run_z_fn(ctx, z, ach):
+        raise StoppedByUser("stop requested mid-combination")
+
+    with pytest.raises(StoppedByUser):
+        sr._run_sweep_concurrent([3], [(2, 3)], should_stop=None,
+                                  build_ach_fn=build_ach_fn, run_z_fn=run_z_fn,
+                                  cleanup_ach_fn=lambda ctx: None)

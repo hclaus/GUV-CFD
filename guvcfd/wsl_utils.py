@@ -74,8 +74,21 @@ class StoppedByUser(Exception):
     from a genuine failure."""
 
 
-def _kill_wsl_pattern(kill_pattern):
-    subprocess.run(["wsl", "-e", "bash", "-lc", f"pkill -9 -f '{kill_pattern}'"], capture_output=True)
+def _kill_wsl_in_dir(cwd_wsl, name_pattern):
+    """Kill only processes matching name_pattern whose cwd is exactly
+    cwd_wsl - a bare `pkill -f name_pattern` would kill every same-named
+    solver process system-wide, which is fine when only one solve ever
+    runs at a time but wrong once several ACH/Z combinations' solvers
+    (all named e.g. "pimpleFoam") can be running concurrently: one
+    combination stalling or being stopped must not kill its siblings.
+    """
+    script = (
+        f"target=$(readlink -f '{cwd_wsl}'); "
+        f"for p in $(pgrep -f '{name_pattern}'); do "
+        f"[ \"$(readlink -f /proc/$p/cwd 2>/dev/null)\" = \"$target\" ] && kill -9 $p; "
+        f"done"
+    )
+    subprocess.run(["wsl", "-e", "bash", "-lc", script], capture_output=True)
 
 
 def run_wsl_streaming(cmd, cwd_wsl, on_line=None, should_stop=None, kill_pattern=None,
@@ -145,7 +158,7 @@ def run_wsl_streaming(cmd, cwd_wsl, on_line=None, should_stop=None, kill_pattern
             if should_stop is not None and should_stop():
                 stopped = True
                 if kill_pattern:
-                    _kill_wsl_pattern(kill_pattern)
+                    _kill_wsl_in_dir(cwd_wsl, kill_pattern)
                 proc.terminate()
                 break
             if time.time() - last_output_time > stall_timeout:
@@ -153,7 +166,7 @@ def run_wsl_streaming(cmd, cwd_wsl, on_line=None, should_stop=None, kill_pattern
                     on_line(f"[no output for {stall_timeout}s - the process looks stuck/"
                             f"unresponsive (or was killed externally); giving up on it]")
                 if kill_pattern:
-                    _kill_wsl_pattern(kill_pattern)
+                    _kill_wsl_in_dir(cwd_wsl, kill_pattern)
                 proc.terminate()
                 break
 

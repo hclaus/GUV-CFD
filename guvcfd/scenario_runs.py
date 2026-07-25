@@ -22,6 +22,7 @@ than imported, for the same reason.
 import json
 import math
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import numpy as np
@@ -43,11 +44,20 @@ from .wsl_utils import StoppedByUser, run_wsl_or_raise, run_wsl_streaming, wsl_p
 
 _TEMPLATE_CASE_DIR = str(Path(__file__).resolve().parent / "templates" / "case_template")
 
+# Two-level concurrency budget for run_sweep/run_decay_sweep (see
+# _run_sweep_concurrent): up to this many ACH groups build their flow field
+# at once, and - across whichever ACH groups are active - up to this many
+# Z values' own solves run at once, drawn from ONE shared pool rather than
+# one pool per ACH (so total concurrent OpenFOAM processes stays bounded by
+# MAX_ACH + MAX_Z regardless of how many ACH/Z values are actually swept).
+_MAX_CONCURRENT_ACH = 3
+_MAX_CONCURRENT_Z = 3
+
 _UNSAFE_FOLDER_CHARS_RE = re.compile(r"[^A-Za-z0-9._-]+")
 # Matches pimpleFoam's per-timestep "Time = N" banner, not the residual/
 # Courant-number/continuity-error lines that follow it - see
-# _run_decay_pair, which throttles concurrent decay runs' log_fn output to
-# this instead of flooding with the full per-iteration dump for both runs.
+# _throttled_solver_callback, which throttles concurrent decay runs' log_fn
+# output to this instead of flooding with the full per-iteration dump.
 _TIME_LINE_RE = re.compile(r"^Time\s*=\s*[\d.]+\s*$")
 
 
@@ -330,24 +340,51 @@ def _decay_run_durations(ach, eACH_well_mixed_est, adv):
     return combined_end_time, control_end_time
 
 
-def _throttled_solver_callback(log_fn, log_prefix, on_line=None):
+def _prefixed_log_fn(log_fn, prefix):
+    """Wraps log_fn so every line it emits is tagged with which ACH group
+    or Z/ACH combination it came from - necessary once multiple ACH
+    groups/Z values can be solving concurrently (see _run_sweep_concurrent)
+    and their log lines interleave; under the old strictly-sequential
+    sweep this context was implicit (only one combination's lines were
+    ever being produced at a time).
+    """
+    return lambda msg: log_fn(f"[{prefix}] {msg}")
+
+
+def _throttled_solver_callback(log_fn, log_prefix, on_line=None, status_fn=None, status_key=None):
     """Wraps a solver's on_line callback so only "Time = N" banner lines
     and run_wsl_streaming's own "[...]"-wrapped stall/retry diagnostics
     reach the visible log - the full per-iteration residual dump (~8-10
     lines per "Time =" line) never did even for a single run (it only
     ever fed a silent progress tracker), so forwarding all of it here too
     would flood the log (see app._run_decay_pair for the same reasoning).
+
+    status_fn(status_key, line), if given, receives "Time = N" banner
+    lines INSTEAD of log_fn - a one-entry-per-stream "latest time" status
+    the caller can overwrite in place (see app._scenario_status_update)
+    rather than appending to the scrolling log, since with several
+    concurrent ACH/Z combinations each printing their own "Time = N" line
+    every step, appending all of them would flood the log exactly the way
+    this function already avoids doing for the raw per-iteration residual
+    dump. "[...]" diagnostics always still go to log_fn - those are rare
+    and important enough to want scrolling, not overwritten away.
     """
     def callback(line):
         stripped = line.strip()
-        if _TIME_LINE_RE.match(stripped) or stripped.startswith("["):
+        if _TIME_LINE_RE.match(stripped):
+            if status_fn is not None:
+                status_fn(status_key, f"[{log_prefix}] {line}")
+            else:
+                log_fn(f"[{log_prefix}] {line}")
+        elif stripped.startswith("["):
             log_fn(f"[{log_prefix}] {line}")
         if on_line:
             on_line(line)
     return callback
 
 
-def _run_shared_control(base_dir, control_dir, ach, room, settings, adv, log_fn, should_stop, solver_log_fn):
+def _run_shared_control(base_dir, control_dir, ach, room, settings, adv, log_fn, should_stop, solver_log_fn,
+                         status_fn=None):
     """Run the UV-off control decay ONCE per ACH group, shared across
     every Z sharing that ACH - control's own physics (uniform T=1 initial
     condition, no UV sink, same converged flow field) doesn't depend on Z
@@ -383,11 +420,16 @@ def _run_shared_control(base_dir, control_dir, ach, room, settings, adv, log_fn,
     if should_stop is not None and should_stop():
         raise StoppedByUser("Stopped before pimpleFoam.")
     log_fn(f"  Running pimpleFoam (shared control, {control_end_time}s)...")
-    r = run_wsl_streaming(
-        "pimpleFoam 2>&1 | tee log.pimpleFoam", control_dir_wsl,
-        on_line=_throttled_solver_callback(log_fn, "control"),
-        should_stop=should_stop, kill_pattern="pimpleFoam",
-    )
+    status_key = f"ACH={ach}/control"
+    try:
+        r = run_wsl_streaming(
+            "pimpleFoam 2>&1 | tee log.pimpleFoam", control_dir_wsl,
+            on_line=_throttled_solver_callback(log_fn, "control", status_fn=status_fn, status_key=status_key),
+            should_stop=should_stop, kill_pattern="pimpleFoam",
+        )
+    finally:
+        if status_fn is not None:
+            status_fn(status_key, None)
     if should_stop is not None and should_stop():
         raise StoppedByUser("Stopped during pimpleFoam.")
     if r.returncode != 0 or "FOAM FATAL" in r.stdout or "Floating Point Exception" in r.stdout:
@@ -399,7 +441,7 @@ def _run_shared_control(base_dir, control_dir, ach, room, settings, adv, log_fn,
 
 
 def _run_decay_scenario(case_dir, room, settings, z, ach, adv, z_summary, log_fn, should_stop, solver_log_fn,
-                         control_results, base_summary=None):
+                         control_results, base_summary=None, status_fn=None):
     """Decay-mode equivalent of _run_scenario() - runs this combination's
     own UV-on decay (adaptive duration) and writes the same corrected
     results.json shape a single decay run would, using control_results
@@ -446,11 +488,17 @@ def _run_decay_scenario(case_dir, room, settings, z, ach, adv, z_summary, log_fn
     if should_stop is not None and should_stop():
         raise StoppedByUser("Stopped before pimpleFoam.")
     log_fn(f"  Running pimpleFoam (UV-on, {combined_end_time}s)...")
-    r_uv = run_wsl_streaming(
-        "pimpleFoam 2>&1 | tee log.pimpleFoam", case_dir_wsl,
-        on_line=_throttled_solver_callback(log_fn, "UV-on", solver_log_fn),
-        should_stop=should_stop, kill_pattern="pimpleFoam",
-    )
+    status_key = f"Z={z}/ACH={ach}/UV-on"
+    try:
+        r_uv = run_wsl_streaming(
+            "pimpleFoam 2>&1 | tee log.pimpleFoam", case_dir_wsl,
+            on_line=_throttled_solver_callback(log_fn, "UV-on", solver_log_fn,
+                                                status_fn=status_fn, status_key=status_key),
+            should_stop=should_stop, kill_pattern="pimpleFoam",
+        )
+    finally:
+        if status_fn is not None:
+            status_fn(status_key, None)
     if should_stop is not None and should_stop():
         raise StoppedByUser("Stopped during pimpleFoam.")
     if r_uv.returncode != 0 or "FOAM FATAL" in r_uv.stdout or "Floating Point Exception" in r_uv.stdout:
@@ -507,70 +555,126 @@ def _trim_decay_report(result):
     return trimmed
 
 
+def _run_sweep_concurrent(achs, combos, should_stop, build_ach_fn, run_z_fn, cleanup_ach_fn):
+    """Bounded two-level concurrency shared by run_sweep/run_decay_sweep:
+    up to _MAX_CONCURRENT_ACH ACH groups build their flow state at once;
+    every Z across every active ACH group draws from ONE shared pool of
+    _MAX_CONCURRENT_Z workers (not one pool per ACH), so total concurrent
+    OpenFOAM solves is bounded by MAX_ACH + MAX_Z regardless of how many
+    ACH/Z values are actually swept.
+
+    build_ach_fn(ach) -> ctx, called once per ACH on the ACH pool.
+    run_z_fn(ctx, z, ach), called once per Z on the shared Z pool - must
+        itself catch and report per-combo errors (StoppedByUser excepted)
+        so one Z's failure doesn't cancel its siblings, same as the old
+        sequential loops' inline try/except did.
+    cleanup_ach_fn(ctx), called once per ACH after every Z under it
+        (whether it succeeded, failed, or was skipped) has finished -
+        always called if build_ach_fn returned, even on error/stop.
+    """
+    z_pool = ThreadPoolExecutor(max_workers=_MAX_CONCURRENT_Z)
+
+    def ach_worker(ach):
+        if should_stop is not None and should_stop():
+            raise StoppedByUser("Stopped before starting the next ACH group.")
+        ctx = build_ach_fn(ach)
+        zs = [z for z, a in combos if a == ach]
+        z_futures = [z_pool.submit(run_z_fn, ctx, z, ach) for z in zs]
+        try:
+            for f in z_futures:
+                f.result()  # re-raises StoppedByUser; per-combo errors are already caught inside run_z_fn
+        finally:
+            cleanup_ach_fn(ctx)
+
+    try:
+        with ThreadPoolExecutor(max_workers=_MAX_CONCURRENT_ACH) as ach_pool:
+            ach_futures = [ach_pool.submit(ach_worker, ach) for ach in achs]
+            for f in as_completed(ach_futures):
+                f.result()
+    finally:
+        z_pool.shutdown(wait=True)
+
+
 def run_decay_sweep(guv_path, settings_path, project_dir, room, settings, adv,
                      z_values, ach_values, log_fn=print, should_stop=None,
-                     on_combo_done=None, solver_log_fn=None):
+                     on_combo_done=None, solver_log_fn=None, status_fn=None):
     """Decay-mode equivalent of run_sweep() - same Z x ACH cross-product,
     same shared-flow-field-per-ACH reuse (_build_flow_base/_copy_base_case/
     _apply_z are identical either way - only the per-combination solve
-    itself differs), but running the UV-on decay and its UV-off control
-    concurrently for each combination instead of steady_state_pipeline's
-    two-phase build-up (see _run_decay_scenario).
+    itself differs). Up to _MAX_CONCURRENT_ACH ACH groups (each building
+    its own flow field + shared UV-off control) run at once, and every
+    Z's own UV-on decay draws from one shared pool of _MAX_CONCURRENT_Z
+    workers across all of them - see _run_sweep_concurrent.
+
+    status_fn(key, line_or_None), if given, receives each concurrent
+    combo's latest "Time = N" line to display in place (overwritten, not
+    appended - see _throttled_solver_callback) instead of the scrolling
+    log; called with None once that combo's stream finishes, so the
+    caller can drop it from whatever "currently running" display it
+    keeps.
     """
     combos = sweep_combinations(z_values, ach_values)
     achs = sorted({ach for _, ach in combos})
     project_name = _sanitize(Path(project_dir).name)
 
-    for ach in achs:
-        if should_stop is not None and should_stop():
-            raise StoppedByUser("Stopped before starting the next ACH group.")
-
+    def build_ach_fn(ach):
+        ach_log_fn = _prefixed_log_fn(log_fn, f"ACH={ach}")
         base_dir = f"{project_dir}/_base_ACH{_fmt(ach)}"
         control_dir = f"{project_dir}/_control_ACH{_fmt(ach)}"
-        log_fn(f"=== ACH={ach}: converging flow field (shared by every Z at this ACH) ===")
-        base_summary = _build_flow_base(guv_path, base_dir, room, settings, ach, adv, log_fn, should_stop, solver_log_fn)
-        fan_kw = _fan_kwargs(settings)
+        ach_log_fn("=== converging flow field (shared by every Z at this ACH) ===")
+        base_summary = _build_flow_base(guv_path, base_dir, room, settings, ach, adv,
+                                         ach_log_fn, should_stop, solver_log_fn)
         # UV-off control is Z-independent (see _run_shared_control) - run
-        # it once per ACH here, not once per Z inside the loop below.
+        # it once per ACH here, not once per Z in run_z_fn below.
         control_results = _run_shared_control(base_dir, control_dir, ach, room, settings, adv,
-                                               log_fn, should_stop, solver_log_fn)
+                                               ach_log_fn, should_stop, solver_log_fn, status_fn=status_fn)
+        return {
+            "ach": ach, "base_dir": base_dir, "control_dir": control_dir,
+            "base_summary": base_summary, "control_results": control_results,
+            "fan_kw": _fan_kwargs(settings),
+        }
 
+    def run_z_fn(ctx, z, ach):
+        if should_stop is not None and should_stop():
+            raise StoppedByUser("Stopped before the next combination.")
+
+        combo_log_fn = _prefixed_log_fn(log_fn, f"Z={z}/ACH={ach}")
+        subdir = _subdir_name(z, ach)
+        case_dir = f"{project_dir}/{subdir}"
+        combo_log_fn(f"--- -> {subdir} ---")
         try:
-            for z, combo_ach in combos:
-                if combo_ach != ach:
-                    continue
-                if should_stop is not None and should_stop():
-                    raise StoppedByUser("Stopped before the next combination.")
+            _copy_base_case(ctx["base_dir"], case_dir, combo_log_fn)
+            z_summary = _apply_z(case_dir, z, adv["uv-zone-bins"], ctx["fan_kw"], combo_log_fn)
+            result = _run_decay_scenario(case_dir, room, settings, z, ach, adv,
+                                          z_summary, combo_log_fn, should_stop, solver_log_fn,
+                                          ctx["control_results"], base_summary=ctx["base_summary"],
+                                          status_fn=status_fn)
+            _save_run_settings(case_dir, settings, guv_path, settings_path, z, ach)
 
-                subdir = _subdir_name(z, ach)
-                case_dir = f"{project_dir}/{subdir}"
-                log_fn(f"--- Z={z}, ACH={ach} -> {subdir} ---")
-                try:
-                    _copy_base_case(base_dir, case_dir, log_fn)
-                    z_summary = _apply_z(case_dir, z, adv["uv-zone-bins"], fan_kw, log_fn)
-                    result = _run_decay_scenario(case_dir, room, settings, z, ach, adv,
-                                                  z_summary, log_fn, should_stop, solver_log_fn,
-                                                  control_results, base_summary=base_summary)
-                    _save_run_settings(case_dir, settings, guv_path, settings_path, z, ach)
+            trimmed = _trim_decay_report(result)
+            report_path = f"{project_dir}/{project_name}_{subdir}_report.json"
+            with open(report_path, "w") as f:
+                json.dump(trimmed, f, indent=2)
+            combo_log_fn(f"  Done. eACH_uv effective={result['eACH_uv_effective']:.4g} /hr "
+                         f"(well-mixed={result['eACH_uv_well_mixed']:.4g} /hr)")
+            if on_combo_done:
+                on_combo_done(z, ach, "done", trimmed)
+        except StoppedByUser:
+            raise
+        except Exception as e:
+            combo_log_fn(f"ERROR: {e}")
+            if on_combo_done:
+                on_combo_done(z, ach, "error", str(e))
 
-                    trimmed = _trim_decay_report(result)
-                    report_path = f"{project_dir}/{project_name}_{subdir}_report.json"
-                    with open(report_path, "w") as f:
-                        json.dump(trimmed, f, indent=2)
-                    log_fn(f"  Done. eACH_uv effective={result['eACH_uv_effective']:.4g} /hr "
-                           f"(well-mixed={result['eACH_uv_well_mixed']:.4g} /hr)")
-                    if on_combo_done:
-                        on_combo_done(z, ach, "done", trimmed)
-                except StoppedByUser:
-                    raise
-                except Exception as e:
-                    log_fn(f"ERROR (Z={z}, ACH={ach}): {e}")
-                    if on_combo_done:
-                        on_combo_done(z, ach, "error", str(e))
-        finally:
-            log_fn(f"  Removing shared base case and control run for ACH={ach}...")
-            run_wsl_or_raise(f'rm -rf "{wsl_path(base_dir)}" "{wsl_path(control_dir)}"', wsl_path(project_dir),
-                              "cleaning up shared base case and control run")
+    def cleanup_ach_fn(ctx):
+        ach = ctx["ach"]
+        ach_log_fn = _prefixed_log_fn(log_fn, f"ACH={ach}")
+        ach_log_fn("Removing shared base case and control run...")
+        run_wsl_or_raise(
+            f'rm -rf "{wsl_path(ctx["base_dir"])}" "{wsl_path(ctx["control_dir"])}"', wsl_path(project_dir),
+            "cleaning up shared base case and control run")
+
+    _run_sweep_concurrent(achs, combos, should_stop, build_ach_fn, run_z_fn, cleanup_ach_fn)
 
 
 def _trim_report(result):
@@ -619,59 +723,66 @@ def run_sweep(guv_path, settings_path, project_dir, room, settings, adv,
     to update a live progress table.
 
     A failed combination is logged and skipped - the sweep continues to
-    the next one. should_stop() is checked between combinations (raises
-    StoppedByUser to abort the rest of the sweep, same pattern every
-    other pipeline entry point already uses) - not currently checked
-    *within* a combination's own setup_case()/run_steady_state_scenario()
-    call beyond what those functions already do internally.
+    the next one. should_stop() is checked before each ACH group and each
+    combination (raises StoppedByUser to abort the rest of the sweep, same
+    pattern every other pipeline entry point already uses) - not currently
+    checked *within* a combination's own setup_case()/
+    run_steady_state_scenario() call beyond what those functions already
+    do internally.
+
+    Up to _MAX_CONCURRENT_ACH ACH groups (each building its own flow
+    field) run at once, and every Z's own steady-state scenario draws from
+    one shared pool of _MAX_CONCURRENT_Z workers across all of them - see
+    _run_sweep_concurrent.
     """
     combos = sweep_combinations(z_values, ach_values)
     achs = sorted({ach for _, ach in combos})
     project_name = _sanitize(Path(project_dir).name)
 
-    for ach in achs:
-        if should_stop is not None and should_stop():
-            raise StoppedByUser("Stopped before starting the next ACH group.")
-
+    def build_ach_fn(ach):
+        ach_log_fn = _prefixed_log_fn(log_fn, f"ACH={ach}")
         base_dir = f"{project_dir}/_base_ACH{_fmt(ach)}"
-        log_fn(f"=== ACH={ach}: converging flow field (shared by every Z at this ACH) ===")
-        _build_flow_base(guv_path, base_dir, room, settings, ach, adv, log_fn, should_stop, solver_log_fn)
-        fan_kw = _fan_kwargs(settings)
+        ach_log_fn("=== converging flow field (shared by every Z at this ACH) ===")
+        _build_flow_base(guv_path, base_dir, room, settings, ach, adv, ach_log_fn, should_stop, solver_log_fn)
+        return {"ach": ach, "base_dir": base_dir, "fan_kw": _fan_kwargs(settings)}
 
+    def run_z_fn(ctx, z, ach):
+        if should_stop is not None and should_stop():
+            raise StoppedByUser("Stopped before the next combination.")
+
+        combo_log_fn = _prefixed_log_fn(log_fn, f"Z={z}/ACH={ach}")
+        subdir = _subdir_name(z, ach)
+        case_dir = f"{project_dir}/{subdir}"
+        combo_log_fn(f"--- -> {subdir} ---")
         try:
-            for z, combo_ach in combos:
-                if combo_ach != ach:
-                    continue
-                if should_stop is not None and should_stop():
-                    raise StoppedByUser("Stopped before the next combination.")
+            _copy_base_case(ctx["base_dir"], case_dir, combo_log_fn)
+            z_summary = _apply_z(case_dir, z, adv["uv-zone-bins"], ctx["fan_kw"], combo_log_fn)
+            result = _run_scenario(case_dir, room, settings, z, ach, adv,
+                                    z_summary, combo_log_fn, should_stop, solver_log_fn)
+            with open(f"{case_dir}/results.json", "w") as f:
+                json.dump(result, f, indent=2)
+            _save_run_settings(case_dir, settings, guv_path, settings_path, z, ach)
 
-                subdir = _subdir_name(z, ach)
-                case_dir = f"{project_dir}/{subdir}"
-                log_fn(f"--- Z={z}, ACH={ach} -> {subdir} ---")
-                try:
-                    _copy_base_case(base_dir, case_dir, log_fn)
-                    z_summary = _apply_z(case_dir, z, adv["uv-zone-bins"], fan_kw, log_fn)
-                    result = _run_scenario(case_dir, room, settings, z, ach, adv,
-                                            z_summary, log_fn, should_stop, solver_log_fn)
-                    with open(f"{case_dir}/results.json", "w") as f:
-                        json.dump(result, f, indent=2)
-                    _save_run_settings(case_dir, settings, guv_path, settings_path, z, ach)
+            trimmed = _trim_report(result)
+            report_path = f"{project_dir}/{project_name}_{subdir}_report.json"
+            with open(report_path, "w") as f:
+                json.dump(trimmed, f, indent=2)
+            combo_log_fn(f"  Done. Reduction={result['reduction_pct']:.1f}%, "
+                         f"eACH_uv={result['eACH_uv_steady_state']:.4g} /hr")
+            if on_combo_done:
+                on_combo_done(z, ach, "done", trimmed)
+        except StoppedByUser:
+            raise
+        except Exception as e:
+            combo_log_fn(f"ERROR: {e}")
+            if on_combo_done:
+                on_combo_done(z, ach, "error", str(e))
 
-                    trimmed = _trim_report(result)
-                    report_path = f"{project_dir}/{project_name}_{subdir}_report.json"
-                    with open(report_path, "w") as f:
-                        json.dump(trimmed, f, indent=2)
-                    log_fn(f"  Done. Reduction={result['reduction_pct']:.1f}%, "
-                           f"eACH_uv={result['eACH_uv_steady_state']:.4g} /hr")
-                    if on_combo_done:
-                        on_combo_done(z, ach, "done", trimmed)
-                except StoppedByUser:
-                    raise
-                except Exception as e:
-                    log_fn(f"ERROR (Z={z}, ACH={ach}): {e}")
-                    if on_combo_done:
-                        on_combo_done(z, ach, "error", str(e))
-        finally:
-            log_fn(f"  Removing shared base case for ACH={ach}...")
-            run_wsl_or_raise(f'rm -rf "{wsl_path(base_dir)}"', wsl_path(project_dir),
-                              "cleaning up shared base case")
+    def cleanup_ach_fn(ctx):
+        ach = ctx["ach"]
+        ach_log_fn = _prefixed_log_fn(log_fn, f"ACH={ach}")
+        ach_log_fn("Removing shared base case...")
+        run_wsl_or_raise(f'rm -rf "{wsl_path(ctx["base_dir"])}"', wsl_path(project_dir),
+                          "cleaning up shared base case")
+
+    _run_sweep_concurrent(achs, combos, should_stop, build_ach_fn, run_z_fn, cleanup_ach_fn)
