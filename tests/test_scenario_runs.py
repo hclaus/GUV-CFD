@@ -220,3 +220,59 @@ def test_run_sweep_stop_between_combinations_raises_stopped_by_user(tmp_path, mo
             z_values=[2, 6], ach_values=[3], log_fn=lambda m: None,
             should_stop=should_stop,
         )
+
+
+def test_run_decay_scenario_rebuilds_fvoptions_from_this_combos_own_kuv(tmp_path, monkeypatch):
+    # Regression: _run_decay_scenario used to assume setup_case()'s
+    # one-time fvOptions write (from whatever Z the shared ACH-group flow
+    # base was built with) was still valid - it wasn't. _apply_z() only
+    # rewrites the kUV *field*, deliberately not the fvOptions splice (see
+    # its own docstring) - every Z sharing an ACH group silently reused
+    # the first Z's actual UV removal rate in the solver regardless,
+    # confirmed directly on a real sweep where two different-Z
+    # combinations produced byte-identical decay curves.
+    case_dir, fluence = _write_synthetic_case(tmp_path, n_cells=8)
+    sr._apply_z(case_dir, Z=6.0, nbins=5, fan_kwargs={}, log_fn=lambda m: None)
+
+    # Everything except the fvOptions rebuild is faked out - this test is
+    # only about whether write_fvoptions_file gets this combo's own,
+    # current kUV-derived entries, not about the actual solve.
+    monkeypatch.setattr(sr, "set_control_dict_time", lambda *a, **k: None)
+    monkeypatch.setattr(sr, "splice_fv_options_into_control_dict", lambda *a, **k: (None, 1, 1))
+    monkeypatch.setattr(sr, "prepare_ventilation_only_control", lambda *a, **k: None)
+    monkeypatch.setattr(sr, "_run_decay_pair", lambda *a, **k: (
+        type("R", (), {"returncode": 0, "stdout": ""})(),
+        type("R", (), {"returncode": 0, "stdout": ""})(),
+    ))
+    monkeypatch.setattr(sr, "run_wsl_or_raise", lambda *a, **k: None)
+    monkeypatch.setattr(sr, "finish_ventilation_only_control", lambda *a, **k: {"total_ach_effective": 3.0})
+    monkeypatch.setattr(sr, "write_results_summary", lambda *a, **k: {
+        "eACH_uv_effective": 10.0, "eACH_uv_well_mixed": 20.0,
+    })
+
+    written = {}
+    monkeypatch.setattr(sr, "write_fvoptions_file", lambda cd, entries: written.__setitem__(cd, entries))
+
+    room = type("Room", (), {"x": 4.0, "y": 5.0, "z": 2.7})()
+    settings = {"fan-enable": False, "inlet2-enable": False, "outlet2-enable": False,
+                "inlet-wall": "xMin", "inlet-size-w": 0.3, "inlet-size-h": 0.3,
+                "monitoring-enable": False}
+    adv = {"uv-zone-bins": 5, "pimple-delta-t": 0.5,
+           "decay-ach-min-fraction": 90.0, "decay-each-min-fraction": 90.0, "decay-each-max-fraction": 99.9}
+
+    sr._run_decay_scenario(case_dir, room, settings, z=6.0, ach=3.0, adv=adv,
+                            z_summary={"eACH_uv_well_mixed_mean": 20.0}, log_fn=lambda m: None,
+                            should_stop=None, solver_log_fn=lambda m: None)
+
+    entries_z6 = written[case_dir]
+    assert len(entries_z6) > 0
+
+    # Now re-carve for a DIFFERENT Z on the same case dir (same as a 2nd
+    # combination reusing the same ACH-group's copied case) and confirm
+    # the rebuilt fvOptions entries actually change.
+    sr._apply_z(case_dir, Z=1.0, nbins=5, fan_kwargs={}, log_fn=lambda m: None)
+    sr._run_decay_scenario(case_dir, room, settings, z=1.0, ach=3.0, adv=adv,
+                            z_summary={"eACH_uv_well_mixed_mean": 3.3}, log_fn=lambda m: None,
+                            should_stop=None, solver_log_fn=lambda m: None)
+    entries_z1 = written[case_dir]
+    assert entries_z1 != entries_z6

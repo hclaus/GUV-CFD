@@ -29,14 +29,15 @@ import numpy as np
 
 from .case_io import read_boundary_patch_names, read_openfoam_scalar_field, write_scalar_field
 from .cellzones import bin_decay_rates, write_cellzones
+from .contaminant_source import write_fvoptions_file
 from .decay_analysis import write_results_summary
 from .fan import fan_fvoptions_entry, write_fan_topo_set_dict
 from .fluence import compute_inactivation_rate, compute_well_mixed_eACH
 from .initial_fields import compute_inlet_velocities
 from .monitoring_points import compute_monitoring_results
 from .run_pipeline import setup_case
-from .splice import set_control_dict_time
-from .steady_state_pipeline import run_steady_state_scenario
+from .splice import set_control_dict_time, splice_fv_options_into_control_dict
+from .steady_state_pipeline import run_steady_state_scenario, _uv_fvoptions_entries
 from .ventilation_control import prepare_ventilation_only_control, finish_ventilation_only_control
 from .visualization import center_frac_for_wall
 from .wsl_utils import StoppedByUser, run_wsl_or_raise, run_wsl_streaming, wsl_path
@@ -377,15 +378,35 @@ def _run_decay_scenario(case_dir, room, settings, z, ach, adv, z_summary, log_fn
     same corrected results.json shape a single decay run would.
 
     Unlike steady-state's _run_scenario, this doesn't need
-    run_steady_state_scenario at all - setup_case()/_apply_z() (called by
-    the caller before this) already carved this Z's UV cellZones/fvOptions
-    into case_dir; a decay run's own scalar-transport function object and
-    fvOptions splice were already done inside setup_case() too, so this
-    only needs to (re)set the adaptive duration and run the two solves.
+    run_steady_state_scenario itself - but it DOES need to rebuild the UV
+    fvOptions fresh from this combination's own 0/kUV field, the same way
+    run_steady_state_scenario does via _uv_fvoptions_entries. _apply_z()
+    (called by the caller before this) only rewrites the kUV *field* and
+    cellZones, deliberately NOT the fvOptions splice itself (see its own
+    docstring) - it assumes the caller rebuilds that, matching what
+    run_steady_state_scenario already does for the steady-state sweep.
+    An earlier version of this function assumed setup_case()'s own
+    one-time fvOptions write (done once per ACH group, using whatever Z
+    the shared flow base happened to be built with) was still valid here
+    - it wasn't: every Z sharing an ACH group silently reused that first
+    Z's actual UV removal rate in the solver, regardless of its own kUV
+    field being correctly recomputed on disk (confirmed directly: two
+    different-Z combinations produced byte-identical decay curves).
     """
     case_dir_wsl = wsl_path(case_dir)
     control_dir = f"{case_dir}/no_UV"
     control_dir_wsl = wsl_path(control_dir)
+
+    has_fan = bool(settings.get("fan-enable"))
+    fan_entries = []
+    if has_fan:
+        direction = (0, 0, -1) if settings["fan-direction"] == "down" else (0, 0, 1)
+        fan_entries = [fan_fvoptions_entry(settings["fan-speed"], direction=direction)]
+    k_values = read_openfoam_scalar_field(f"{case_dir}/0/kUV")
+    uv_entries = _uv_fvoptions_entries(np.array(k_values), adv["uv-zone-bins"])
+    write_fvoptions_file(case_dir, uv_entries + fan_entries)
+    _, n_open, n_close = splice_fv_options_into_control_dict(case_dir)
+    assert n_open == n_close, f"Brace mismatch after UV fvOptions splice: open={n_open} close={n_close}"
 
     eACH_well_mixed_est = z_summary.get("eACH_uv_well_mixed_mean", 0.0)
     combined_end_time, control_end_time = _decay_run_durations(ach, eACH_well_mixed_est, adv)
