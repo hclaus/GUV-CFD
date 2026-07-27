@@ -126,3 +126,49 @@ def test_scenario_progress_table_still_handles_steady_state_result():
     }
     table = guvcfd_app._scenario_progress_table()  # must not raise
     assert table is not None
+
+
+def _row_cell_texts(table, row_index):
+    row = table.children[row_index]
+    return [cell.children for cell in row.children]
+
+
+def test_scenario_progress_table_prefers_corrected_eACH_for_steady_state():
+    # Regression: this column showed detail['eACH_uv_steady_state'] (the
+    # NOMINAL-ACH-based value) unconditionally, while the decay-mode branch
+    # right below it already preferred the measured-ACH-corrected variant -
+    # so the two sim types' tables were reporting different quantities.
+    # Confirmed on a real run where a room only delivering ~half its nominal
+    # ACH showed 39.24 /hr (nominal) here but 19.59 /hr (corrected, matching
+    # decay's own reporting convention) in the exported .docx report.
+    guvcfd_app._scenario_state["combos"] = [(1.7, 9.0)]
+    guvcfd_app._scenario_state["results"] = {
+        (1.7, 9.0): {
+            "status": "done",
+            "detail": {
+                "reduction_pct": 81.34,
+                "eACH_uv_steady_state": 39.24,
+                "eACH_uv_steady_state_corrected": 19.59,
+                "ventilation_ach_measured": 4.49,
+            },
+        },
+    }
+    table = guvcfd_app._scenario_progress_table()
+    z, ach, status, reduction, eACH = _row_cell_texts(table, 1)
+    assert eACH == "19.59 /hr"
+
+
+def test_scenario_progress_table_falls_back_to_raw_eACH_when_uncorrected():
+    # No control/measured-ACH data available (e.g. monitoring/control run
+    # wasn't part of this sweep) - falls back to the nominal value rather
+    # than crashing or showing nothing.
+    guvcfd_app._scenario_state["combos"] = [(6.0, 3.0)]
+    guvcfd_app._scenario_state["results"] = {
+        (6.0, 3.0): {
+            "status": "done",
+            "detail": {"reduction_pct": 74.7, "eACH_uv_steady_state": 17.73},
+        },
+    }
+    table = guvcfd_app._scenario_progress_table()
+    z, ach, status, reduction, eACH = _row_cell_texts(table, 1)
+    assert eACH == "17.73 /hr"

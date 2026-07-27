@@ -109,10 +109,55 @@ def _phase1_extrapolation_diagnostic(tinf_history, streak, rel_tol, n_iterations
     }
 
 
+def compute_corrected_eACH_uv_from_control(T_ss2, Su, source_volume, room_volume, ventilation_ach_measured):
+    """Corrected eACH_uv using a ventilation rate measured the same way
+    decay mode measures it - a dedicated UV-off control run (see
+    scenario_runs._run_shared_control) - instead of deriving it from
+    Phase 1's own point-source buildup (compute_corrected_eACH_uv).
+
+    Phase 1 starts from T=0 and continuously injects from a single,
+    typically tiny (see setup_case's source_size) source zone - the room-
+    average concentration can only rise as fast as the contaminant
+    physically spreads from that point, which is a transport-plus-removal
+    problem, not the removal-only problem a decay-style control (uniform
+    initial condition, no source, just relaxing via ventilation) measures.
+    Confirmed directly on a real combo: Phase 1's own buildup curve was
+    STILL visibly rising after 6500s/6400 iterations (its T-infinity
+    extrapolation's own fitted time constant, ~2450s, was already slower
+    than either of decay's own ventilation-rate estimates for the same
+    room/ACH) - accepting that as "the" steady state underestimates T_ss1,
+    which inflates both the derived ventilation rate and eACH_uv_steady_state
+    (both use T_ss1 in a denominator/ratio). A control run sidesteps this
+    entirely: it starts already-mixed, so it only ever measures removal,
+    never mixing-transport lag.
+
+    lambda_total_actual = G/(V*T_ss2) still comes from Phase 2 (unchanged,
+    and not subject to the same problem - adding UV only shortens the
+    system's time constant, so Phase 2 converges faster than Phase 1, not
+    slower). eACH_uv = lambda_total_actual - ventilation_ach_measured,
+    mirroring decay_analysis.compute_effective_eACH's identical
+    "total minus measured ventilation" subtraction exactly.
+
+    Returns eACH_uv_corrected, or None if T_ss2 isn't usable (zero/falsy).
+    """
+    if not T_ss2:
+        return None
+    G_total = Su * source_volume
+    lambda_total_actual = G_total / (room_volume * T_ss2) * 3600
+    return lambda_total_actual - ventilation_ach_measured
+
+
 def compute_corrected_eACH_uv(T_ss1, T_ss2, Su, source_volume, room_volume):
     """Corrected eACH_uv using the *actual* ventilation removal rate instead
     of the nominal ACH - derived for free from Phase 1's own steady state,
     no separate UV-off control run needed (unlike the decay scenario).
+
+    Prefer compute_corrected_eACH_uv_from_control when a control run is
+    available (run_sweep always runs one - see _run_shared_control) - this
+    T_ss1-based version is biased whenever Phase 1 hasn't fully escaped
+    its point-source mixing-transport lag (see that function's docstring),
+    which is common for a small/localized source zone. Kept for the
+    single-run path, which doesn't run a control.
 
     G (the total room-wide injection rate) was calibrated as
     room_volume*lambda_vent_nominal*target_T_ss (see
@@ -288,7 +333,8 @@ def _run_phase(case_dir, case_dir_wsl, n_iterations, write_interval, window_frac
                 log_fn, should_stop=None, solver_log_fn=None, live_monitoring_zones=(),
                 live_patches=(), check_interval=None, t_inf_rel_tol=None, t_inf_streak=3,
                 keep_all_timesteps=False, iteration_offset=0, mass_balance_patches=(),
-                injection_rate_G=None, mass_balance_tol=None, status_fn=None, status_key=None):
+                injection_rate_G=None, mass_balance_tol=None, status_fn=None, status_key=None,
+                should_pause=None):
     """Run simpleFoam for n_iterations, tracking the room-wide (and any
     monitoring-point) volAverage(T) live, every iteration.
 
@@ -415,7 +461,7 @@ def _run_phase(case_dir, case_dir_wsl, n_iterations, write_interval, window_frac
         r = run_wsl_streaming(
             "simpleFoam 2>&1 | tee log.simpleFoam", case_dir_wsl,
             on_line=_phase_solver_callback(log_fn, solver_log_fn, status_fn, status_key),
-            should_stop=should_stop, kill_pattern="simpleFoam",
+            should_stop=should_stop, kill_pattern="simpleFoam", should_pause=should_pause,
         )
         if should_stop is not None and should_stop():
             raise StoppedByUser("Stopped during simpleFoam phase.")
@@ -726,7 +772,8 @@ def run_steady_state_scenario(case_dir, room_x, room_y, room_z, ach, Z, nbins=25
                                phase1_resume_decision=None, phase1_resume_additional_iterations=None,
                                fan_entry=None, monitoring_points=None,
                                patches_to_monitor=("outlet",), log_fn=print, should_stop=None,
-                               solver_log_fn=None, status_fn=None, phase1_only=False):
+                               solver_log_fn=None, status_fn=None, phase1_only=False, should_pause=None,
+                               measured_ventilation_ach=None):
     """Run both phases of a continuous-source steady-state scenario against
     an already-converged case (mesh + flow + fluenceRate/kUV must already
     exist - see run_pipeline.setup_case()). Returns a summary dict.
@@ -825,6 +872,19 @@ def run_steady_state_scenario(case_dir, room_x, room_y, room_z, ach, Z, nbins=25
     - see scenario_runs._run_sweep_concurrent), receives each phase's
     latest "Time = N" line to display in place instead of the scrolling
     log - see _phase_solver_callback.
+
+    should_pause: forwarded straight through to each _run_phase call's
+    run_wsl_streaming - suspends the active simpleFoam process in place
+    (no iterations lost, no exception raised) instead of killing it,
+    unlike should_stop.
+
+    measured_ventilation_ach: a ventilation-only rate [1/hr] measured by a
+    separate UV-off control run (see scenario_runs._run_shared_control),
+    if one was run. When given, eACH_uv_steady_state_corrected uses
+    compute_corrected_eACH_uv_from_control (Phase 2's T_ss2 minus this
+    measured rate) instead of deriving the ventilation rate from Phase 1's
+    own T_ss1 (compute_corrected_eACH_uv) - see the former's docstring for
+    why that matters whenever the source zone is small/localized.
 
     phase1_only: stop right after Phase 1 finishes (and its checkpoint is
     written) instead of continuing into Phase 2 - used by
@@ -930,7 +990,7 @@ def run_steady_state_scenario(case_dir, room_x, room_y, room_z, ach, Z, nbins=25
                     check_interval=run_check_interval, t_inf_rel_tol=run_t_inf_rel_tol, t_inf_streak=t_inf_streak,
                     keep_all_timesteps=keep_all_timesteps, mass_balance_patches=patches_to_monitor,
                     injection_rate_G=G, mass_balance_tol=mass_balance_tol,
-                    status_fn=status_fn, status_key=status_key1,
+                    status_fn=status_fn, status_key=status_key1, should_pause=should_pause,
                 )
             finally:
                 if status_fn is not None:
@@ -1028,7 +1088,7 @@ def run_steady_state_scenario(case_dir, room_x, room_y, room_z, ach, Z, nbins=25
                     check_interval=t_inf_check_interval, t_inf_rel_tol=t_inf_rel_tol, t_inf_streak=t_inf_streak,
                     keep_all_timesteps=keep_all_timesteps, mass_balance_patches=patches_to_monitor,
                     injection_rate_G=G, mass_balance_tol=mass_balance_tol,
-                    status_fn=status_fn, status_key=status_key1,
+                    status_fn=status_fn, status_key=status_key1, should_pause=should_pause,
                 )
             finally:
                 if status_fn is not None:
@@ -1108,7 +1168,7 @@ def run_steady_state_scenario(case_dir, room_x, room_y, room_z, ach, Z, nbins=25
             live_patches=patches_to_monitor,
             check_interval=t_inf_check_interval, t_inf_rel_tol=t_inf_rel_tol, t_inf_streak=t_inf_streak,
             keep_all_timesteps=keep_all_timesteps, iteration_offset=iters1,
-            status_fn=status_fn, status_key=status_key2,
+            status_fn=status_fn, status_key=status_key2, should_pause=should_pause,
         )
     finally:
         if status_fn is not None:
@@ -1155,17 +1215,40 @@ def run_steady_state_scenario(case_dir, room_x, room_y, room_z, ach, Z, nbins=25
     summary["eACH_uv_steady_state"] = eACH_uv
     log_fn(f"Reduction: {reduction_pct:.1f}%, eACH_uv (steady-state method) = {eACH_uv:.4g} /hr")
 
-    # Corrected eACH_uv using the actual (not nominal) ventilation removal
-    # rate - see compute_corrected_eACH_uv's docstring. Unlike the decay
-    # scenario, this is free: no separate UV-off control run needed.
-    ventilation_ach_measured, eACH_uv_corrected = compute_corrected_eACH_uv(
-        T_ss1_ach, T_ss2_ach, Su, source_volume, room_volume)
-    if ventilation_ach_measured is not None:
-        summary["ventilation_ach_measured"] = ventilation_ach_measured
+    if measured_ventilation_ach is not None:
+        # Preferred: a real UV-off control run measured the ventilation
+        # rate directly (see compute_corrected_eACH_uv_from_control's
+        # docstring for why this is more reliable than Phase 1's own
+        # T_ss1 whenever the source zone is small/localized). G_total/V
+        # combined with this measured rate also implies a Phase-1 steady
+        # state that isn't subject to that same mixing-transport-lag bias
+        # - use it for reduction_pct too, not just eACH_uv.
+        G_total = Su * source_volume
+        T_ss1_corrected = G_total / (room_volume * (measured_ventilation_ach / 3600.0))
+        eACH_uv_corrected = compute_corrected_eACH_uv_from_control(
+            T_ss2_ach, Su, source_volume, room_volume, measured_ventilation_ach)
+        reduction_pct_corrected = (1 - T_ss2_ach / T_ss1_corrected) * 100 if T_ss2_ach else None
+        summary["ventilation_ach_measured"] = measured_ventilation_ach
         summary["eACH_uv_steady_state_corrected"] = eACH_uv_corrected
-        log_fn(f"  Measured ventilation ACH (from Phase 1's own steady state) = "
-               f"{ventilation_ach_measured:.4g} /hr (nominal was {ach:.4g} /hr); "
-               f"corrected eACH_uv = {eACH_uv_corrected:.4g} /hr")
+        summary["reduction_pct_corrected"] = reduction_pct_corrected
+        summary["ventilation_measurement_method"] = "control_run"
+        log_fn(f"  Measured ventilation ACH (from UV-off control run) = "
+               f"{measured_ventilation_ach:.4g} /hr (nominal was {ach:.4g} /hr); "
+               f"corrected eACH_uv = {eACH_uv_corrected:.4g} /hr, "
+               f"corrected reduction = {reduction_pct_corrected:.1f}%")
+    else:
+        # Fallback: no control run available (e.g. the single-run path) -
+        # derive the measured ventilation rate from Phase 1's own T_ss1
+        # instead, same as before.
+        ventilation_ach_measured, eACH_uv_corrected = compute_corrected_eACH_uv(
+            T_ss1_ach, T_ss2_ach, Su, source_volume, room_volume)
+        if ventilation_ach_measured is not None:
+            summary["ventilation_ach_measured"] = ventilation_ach_measured
+            summary["eACH_uv_steady_state_corrected"] = eACH_uv_corrected
+            summary["ventilation_measurement_method"] = "phase1_buildup"
+            log_fn(f"  Measured ventilation ACH (from Phase 1's own steady state) = "
+                   f"{ventilation_ach_measured:.4g} /hr (nominal was {ach:.4g} /hr); "
+                   f"corrected eACH_uv = {eACH_uv_corrected:.4g} /hr")
 
     run_wsl_or_raise("touch case.foam", case_dir_wsl, "touching case.foam")
 

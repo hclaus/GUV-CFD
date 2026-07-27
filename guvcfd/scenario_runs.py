@@ -58,8 +58,14 @@ _TEMPLATE_CASE_DIR = str(Path(__file__).resolve().parent / "templates" / "case_t
 # Z values' own solves run at once, drawn from ONE shared pool rather than
 # one pool per ACH (so total concurrent OpenFOAM processes stays bounded by
 # MAX_ACH + MAX_Z regardless of how many ACH/Z values are actually swept).
+# _MAX_CONCURRENT_Z is the one that matters day-to-day - once an ACH
+# group's one-time flow convergence finishes, its slot in the ACH pool
+# goes idle and everything left running draws from the Z pool alone (a
+# sweep with 1-2 ACH values spends most of its time this way) - confirmed
+# on a real sweep: only 3 cores stayed busy during the per-Z decay-solving
+# phase even though up to 6 (MAX_ACH + MAX_Z) was the assumed target.
 _MAX_CONCURRENT_ACH = 3
-_MAX_CONCURRENT_Z = 3
+_MAX_CONCURRENT_Z = 6
 
 _UNSAFE_FOLDER_CHARS_RE = re.compile(r"[^A-Za-z0-9._-]+")
 # Matches pimpleFoam's per-timestep "Time = N" banner, not the residual/
@@ -177,7 +183,8 @@ def _save_run_settings(case_dir, settings, guv_path, settings_path, z, ach):
 
 # --- flow-field build/reuse ---
 
-def _build_flow_base(guv_path, base_dir, room, settings, ach, adv, log_fn, should_stop, solver_log_fn):
+def _build_flow_base(guv_path, base_dir, room, settings, ach, adv, log_fn, should_stop, solver_log_fn,
+                      should_pause=None):
     """setup_case() into base_dir at this ACH - the project's currently
     configured Z is used as a placeholder (every Z-dependent file this
     writes gets overwritten by _apply_z before any subfolder actually
@@ -197,7 +204,7 @@ def _build_flow_base(guv_path, base_dir, room, settings, ach, adv, log_fn, shoul
         cell_size=adv["mesh-cell-size"], nbins=adv["uv-zone-bins"],
         flow_rel_tol=adv["flow-rel-tol"] / 100.0, flow_max_iterations=adv["flow-max-iterations"],
         momentum_relaxation=adv["momentum-relaxation"], scalar_relaxation=adv["scalar-relaxation"],
-        log_fn=log_fn, should_stop=should_stop, solver_log_fn=solver_log_fn,
+        log_fn=log_fn, should_stop=should_stop, solver_log_fn=solver_log_fn, should_pause=should_pause,
         **_fan_kwargs(settings),
         **_second_opening_kwargs(settings, "inlet2", room),
         **_second_opening_kwargs(settings, "outlet2", room),
@@ -268,13 +275,20 @@ def _apply_z(case_dir, Z, nbins, fan_kwargs, log_fn):
 
 
 def _run_scenario(case_dir, room, settings, z, ach, adv, z_summary, log_fn, should_stop, solver_log_fn,
-                   status_fn=None):
+                   status_fn=None, control_results=None, should_pause=None):
     """run_steady_state_scenario() with this combination's z/ach - same
     call app._run_steady_state makes for a single run.
 
     status_fn, if given, receives each phase's latest "Time = N" line to
     display in place instead of the scrolling log - see
     steady_state_pipeline.run_steady_state_scenario's own docstring.
+
+    control_results: the shared, once-per-ACH UV-off control's own result
+    dict (see _run_shared_control) - its measured ventilation rate feeds
+    run_steady_state_scenario's measured_ventilation_ach, which is more
+    reliable than deriving one from Phase 1's own point-source buildup
+    (see compute_corrected_eACH_uv_from_control's docstring). None falls
+    back to the old Phase-1-derived method.
     """
     fan_entry = None
     if settings.get("fan-enable"):
@@ -312,15 +326,16 @@ def _run_scenario(case_dir, room, settings, z, ach, adv, z_summary, log_fn, shou
         phase2_iterations=phase2_iterations,
         window_frac=settings.get("t-ss-window-frac") or 0.15,
         cell_size=adv["mesh-cell-size"], nbins=adv["uv-zone-bins"],
-        source_size=adv["source-zone-size"],
+        source_size=settings["source-zone-size"],
         plateau_rel_tol=adv["plateau-rel-tol"] / 100.0,
         t_inf_check_interval=500 if adv["t-infinity-early-stop-enabled"] else None,
         t_inf_rel_tol=(adv["t-infinity-rel-tol"] / 100.0) if adv["t-infinity-early-stop-enabled"] else None,
         keep_all_timesteps=adv["keep-all-timesteps"],
         fan_entry=fan_entry, monitoring_points=_gather_monitoring_points(settings),
         patches_to_monitor=patches_to_monitor,
-        log_fn=log_fn, should_stop=should_stop, solver_log_fn=solver_log_fn,
+        log_fn=log_fn, should_stop=should_stop, solver_log_fn=solver_log_fn, should_pause=should_pause,
         status_fn=status_fn,
+        measured_ventilation_ach=(control_results or {}).get("total_ach_effective"),
     )
     result["fluence_mean"] = z_summary["fluence_mean"]
     result["eACH_uv_well_mixed"] = z_summary.get("eACH_uv_well_mixed_mean")
@@ -328,7 +343,7 @@ def _run_scenario(case_dir, room, settings, z, ach, adv, z_summary, log_fn, shou
 
 
 def _run_shared_phase1(base_dir, phase1_dir, ach, room, settings, adv, log_fn, should_stop, solver_log_fn,
-                        status_fn=None):
+                        status_fn=None, should_pause=None):
     """Run Phase 1 ("source only, no UV") ONCE per ACH group, shared
     across every Z sharing that ACH - Phase 1's own physics (injection
     strength G/Su depend only on ach/target_T_ss/source geometry, none of
@@ -394,14 +409,14 @@ def _run_shared_phase1(base_dir, phase1_dir, ach, room, settings, adv, log_fn, s
         phase1_iterations=phase1_iterations,
         window_frac=settings.get("t-ss-window-frac") or 0.15,
         cell_size=adv["mesh-cell-size"],
-        source_size=adv["source-zone-size"],
+        source_size=settings["source-zone-size"],
         plateau_rel_tol=adv["plateau-rel-tol"] / 100.0,
         t_inf_check_interval=500 if adv["t-infinity-early-stop-enabled"] else None,
         t_inf_rel_tol=(adv["t-infinity-rel-tol"] / 100.0) if adv["t-infinity-early-stop-enabled"] else None,
         keep_all_timesteps=adv["keep-all-timesteps"],
         fan_entry=fan_entry, monitoring_points=_gather_monitoring_points(settings),
         patches_to_monitor=patches_to_monitor,
-        log_fn=log_fn, should_stop=should_stop, solver_log_fn=solver_log_fn,
+        log_fn=log_fn, should_stop=should_stop, solver_log_fn=solver_log_fn, should_pause=should_pause,
         status_fn=status_fn, phase1_only=True,
     )
 
@@ -482,7 +497,7 @@ def _throttled_solver_callback(log_fn, log_prefix, on_line=None, status_fn=None,
 
 
 def _run_shared_control(base_dir, control_dir, ach, room, settings, adv, log_fn, should_stop, solver_log_fn,
-                         status_fn=None):
+                         status_fn=None, should_pause=None):
     """Run the UV-off control decay ONCE per ACH group, shared across
     every Z sharing that ACH - control's own physics (uniform T=1 initial
     condition, no UV sink, same converged flow field) doesn't depend on Z
@@ -523,7 +538,7 @@ def _run_shared_control(base_dir, control_dir, ach, room, settings, adv, log_fn,
         r = run_wsl_streaming(
             "pimpleFoam 2>&1 | tee log.pimpleFoam", control_dir_wsl,
             on_line=_throttled_solver_callback(log_fn, "control", status_fn=status_fn, status_key=status_key),
-            should_stop=should_stop, kill_pattern="pimpleFoam",
+            should_stop=should_stop, kill_pattern="pimpleFoam", should_pause=should_pause,
         )
     finally:
         if status_fn is not None:
@@ -539,7 +554,7 @@ def _run_shared_control(base_dir, control_dir, ach, room, settings, adv, log_fn,
 
 
 def _run_decay_scenario(case_dir, room, settings, z, ach, adv, z_summary, log_fn, should_stop, solver_log_fn,
-                         control_results, base_summary=None, status_fn=None):
+                         control_results, base_summary=None, status_fn=None, should_pause=None):
     """Decay-mode equivalent of _run_scenario() - runs this combination's
     own UV-on decay (adaptive duration) and writes the same corrected
     results.json shape a single decay run would, using control_results
@@ -592,7 +607,7 @@ def _run_decay_scenario(case_dir, room, settings, z, ach, adv, z_summary, log_fn
             "pimpleFoam 2>&1 | tee log.pimpleFoam", case_dir_wsl,
             on_line=_throttled_solver_callback(log_fn, "UV-on", solver_log_fn,
                                                 status_fn=status_fn, status_key=status_key),
-            should_stop=should_stop, kill_pattern="pimpleFoam",
+            should_stop=should_stop, kill_pattern="pimpleFoam", should_pause=should_pause,
         )
     finally:
         if status_fn is not None:
@@ -693,9 +708,40 @@ def _run_sweep_concurrent(achs, combos, should_stop, build_ach_fn, run_z_fn, cle
         z_pool.shutdown(wait=True)
 
 
+def _skip_if_combo_already_done(case_dir, subdir, combo_log_fn, trim_fn, on_combo_done, z, ach):
+    """True (and reports "done" via on_combo_done using the existing
+    result) if this combination already has a results.json on disk from an
+    earlier attempt at this same project_dir - e.g. the app was closed/
+    restarted mid-sweep, or a sweep was cancelled partway through.
+    Re-launching a sweep should pick up where it left off instead of
+    silently redoing every already-completed combination from scratch.
+
+    False (caller should run this combo normally) if there's no
+    results.json yet, or if the one that's there fails to parse - a
+    combination that isn't actually finished on disk always just re-runs,
+    the same as a fresh sweep would.
+    """
+    result_path = f"{case_dir}/results.json"
+    if not Path(result_path).exists():
+        return False
+    try:
+        with open(result_path) as f:
+            result = json.load(f)
+        trimmed = trim_fn(result)
+    except Exception as e:
+        combo_log_fn(f"  {subdir} has a results.json from an earlier attempt, but it couldn't be "
+                     f"read ({e}) - re-running from scratch.")
+        return False
+    combo_log_fn(f"  {subdir} already completed in an earlier attempt - skipping "
+                 f"(delete {subdir}/ to force a re-run).")
+    if on_combo_done:
+        on_combo_done(z, ach, "done", trimmed)
+    return True
+
+
 def run_decay_sweep(guv_path, settings_path, project_dir, room, settings, adv,
                      z_values, ach_values, log_fn=print, should_stop=None,
-                     on_combo_done=None, solver_log_fn=None, status_fn=None):
+                     on_combo_done=None, solver_log_fn=None, status_fn=None, should_pause=None):
     """Decay-mode equivalent of run_sweep() - same Z x ACH cross-product,
     same shared-flow-field-per-ACH reuse (_build_flow_base/_copy_base_case/
     _apply_z are identical either way - only the per-combination solve
@@ -721,11 +767,12 @@ def run_decay_sweep(guv_path, settings_path, project_dir, room, settings, adv,
         control_dir = f"{project_dir}/_control_ACH{_fmt(ach)}"
         ach_log_fn("=== converging flow field (shared by every Z at this ACH) ===")
         base_summary = _build_flow_base(guv_path, base_dir, room, settings, ach, adv,
-                                         ach_log_fn, should_stop, solver_log_fn)
+                                         ach_log_fn, should_stop, solver_log_fn, should_pause=should_pause)
         # UV-off control is Z-independent (see _run_shared_control) - run
         # it once per ACH here, not once per Z in run_z_fn below.
         control_results = _run_shared_control(base_dir, control_dir, ach, room, settings, adv,
-                                               ach_log_fn, should_stop, solver_log_fn, status_fn=status_fn)
+                                               ach_log_fn, should_stop, solver_log_fn, status_fn=status_fn,
+                                               should_pause=should_pause)
         return {
             "ach": ach, "base_dir": base_dir, "control_dir": control_dir,
             "base_summary": base_summary, "control_results": control_results,
@@ -740,13 +787,15 @@ def run_decay_sweep(guv_path, settings_path, project_dir, room, settings, adv,
         subdir = _subdir_name(z, ach)
         case_dir = f"{project_dir}/{subdir}"
         combo_log_fn(f"--- -> {subdir} ---")
+        if _skip_if_combo_already_done(case_dir, subdir, combo_log_fn, _trim_decay_report, on_combo_done, z, ach):
+            return
         try:
             _copy_base_case(ctx["base_dir"], case_dir, combo_log_fn)
             z_summary = _apply_z(case_dir, z, adv["uv-zone-bins"], ctx["fan_kw"], combo_log_fn)
             result = _run_decay_scenario(case_dir, room, settings, z, ach, adv,
                                           z_summary, combo_log_fn, should_stop, solver_log_fn,
                                           ctx["control_results"], base_summary=ctx["base_summary"],
-                                          status_fn=status_fn)
+                                          status_fn=status_fn, should_pause=should_pause)
             _save_run_settings(case_dir, settings, guv_path, settings_path, z, ach)
 
             trimmed = _trim_decay_report(result)
@@ -806,15 +855,20 @@ def _trim_report(result):
 
 def run_sweep(guv_path, settings_path, project_dir, room, settings, adv,
               z_values, ach_values, log_fn=print, should_stop=None,
-              on_combo_done=None, solver_log_fn=None, status_fn=None):
+              on_combo_done=None, solver_log_fn=None, status_fn=None, should_pause=None):
     """Run the full Z x ACH cross-product against an already-loaded
     project, one subfolder per combination directly under project_dir,
-    reusing a single converged flow field AND a single converged Phase 1
-    ("source only, no UV") run for every Z sharing an ACH (see module
-    docstring - _run_shared_phase1). Writes results.json/run_settings.json
-    into each subfolder (same as a normal single run - "Export Report" and
-    ParaView both work per-subfolder unchanged) plus a trimmed, compound-
-    named report.json directly in project_dir.
+    reusing a single converged flow field, a single converged Phase 1
+    ("source only, no UV") run, AND a single UV-off control run for every
+    Z sharing an ACH (see module docstring - _run_shared_phase1,
+    _run_shared_control). The control run measures the actual ventilation
+    rate directly (same method decay mode already uses), which is more
+    reliable than deriving it from Phase 1's own point-source buildup -
+    see compute_corrected_eACH_uv_from_control's docstring. Writes
+    results.json/run_settings.json into each subfolder (same as a normal
+    single run - "Export Report" and ParaView both work per-subfolder
+    unchanged) plus a trimmed, compound-named report.json directly in
+    project_dir.
 
     on_combo_done(z, ach, status, detail), if given, is called after each
     combination - status is "done"/"error"; detail is the trimmed result
@@ -847,14 +901,25 @@ def run_sweep(guv_path, settings_path, project_dir, room, settings, adv,
         ach_log_fn = _prefixed_log_fn(log_fn, f"ACH={ach}")
         base_dir = f"{project_dir}/_base_ACH{_fmt(ach)}"
         phase1_dir = f"{project_dir}/_phase1_ACH{_fmt(ach)}"
+        control_dir = f"{project_dir}/_control_ACH{_fmt(ach)}"
         ach_log_fn("=== converging flow field (shared by every Z at this ACH) ===")
-        _build_flow_base(guv_path, base_dir, room, settings, ach, adv, ach_log_fn, should_stop, solver_log_fn)
+        _build_flow_base(guv_path, base_dir, room, settings, ach, adv, ach_log_fn, should_stop, solver_log_fn,
+                          should_pause=should_pause)
         # Phase 1 ("source only, no UV") is Z-independent (see
         # _run_shared_phase1) - run it once per ACH here, not once per Z
         # in run_z_fn below.
         _run_shared_phase1(base_dir, phase1_dir, ach, room, settings, adv, ach_log_fn, should_stop, solver_log_fn,
-                            status_fn=status_fn)
-        return {"ach": ach, "base_dir": base_dir, "phase1_dir": phase1_dir, "fan_kw": _fan_kwargs(settings)}
+                            status_fn=status_fn, should_pause=should_pause)
+        # A dedicated UV-off control run (same one decay mode already uses)
+        # measures the actual ventilation rate directly, without Phase 1's
+        # point-source mixing-transport lag - see
+        # compute_corrected_eACH_uv_from_control's docstring for why that
+        # matters. Shared per ACH, same as the flow base and Phase 1.
+        control_results = _run_shared_control(base_dir, control_dir, ach, room, settings, adv,
+                                               ach_log_fn, should_stop, solver_log_fn, status_fn=status_fn,
+                                               should_pause=should_pause)
+        return {"ach": ach, "base_dir": base_dir, "phase1_dir": phase1_dir, "control_dir": control_dir,
+                "control_results": control_results, "fan_kw": _fan_kwargs(settings)}
 
     def run_z_fn(ctx, z, ach):
         if should_stop is not None and should_stop():
@@ -864,6 +929,8 @@ def run_sweep(guv_path, settings_path, project_dir, room, settings, adv,
         subdir = _subdir_name(z, ach)
         case_dir = f"{project_dir}/{subdir}"
         combo_log_fn(f"--- -> {subdir} ---")
+        if _skip_if_combo_already_done(case_dir, subdir, combo_log_fn, _trim_report, on_combo_done, z, ach):
+            return
         try:
             _copy_base_case(ctx["phase1_dir"], case_dir, combo_log_fn)
             z_summary = _apply_z(case_dir, z, adv["uv-zone-bins"], ctx["fan_kw"], combo_log_fn)
@@ -874,12 +941,13 @@ def run_sweep(guv_path, settings_path, project_dir, room, settings, adv,
             # fvOptions entry still resolves against a real cellZone.
             write_source_topo_set_dict(
                 case_dir, (settings["inject-x-input"], settings["inject-y-input"], settings["inject-z-input"]),
-                adv["source-zone-size"], cell_size=adv["mesh-cell-size"])
+                settings["source-zone-size"], cell_size=adv["mesh-cell-size"])
             run_wsl_or_raise("topoSet -dict system/sourceTopoSetDict", wsl_path(case_dir),
                               "topoSet (restoring source zone wiped by _apply_z)")
             result = _run_scenario(case_dir, room, settings, z, ach, adv,
                                     z_summary, combo_log_fn, should_stop, solver_log_fn,
-                                    status_fn=status_fn)
+                                    status_fn=status_fn, control_results=ctx["control_results"],
+                                    should_pause=should_pause)
             with open(f"{case_dir}/results.json", "w") as f:
                 json.dump(result, f, indent=2)
             _save_run_settings(case_dir, settings, guv_path, settings_path, z, ach)
@@ -902,9 +970,9 @@ def run_sweep(guv_path, settings_path, project_dir, room, settings, adv,
     def cleanup_ach_fn(ctx):
         ach = ctx["ach"]
         ach_log_fn = _prefixed_log_fn(log_fn, f"ACH={ach}")
-        ach_log_fn("Removing shared base case and Phase 1 run...")
+        ach_log_fn("Removing shared base case, Phase 1 run, and control run...")
         run_wsl_or_raise(
-            f'rm -rf "{wsl_path(ctx["base_dir"])}" "{wsl_path(ctx["phase1_dir"])}"', wsl_path(project_dir),
-            "cleaning up shared base case and Phase 1 run")
+            f'rm -rf "{wsl_path(ctx["base_dir"])}" "{wsl_path(ctx["phase1_dir"])}" "{wsl_path(ctx["control_dir"])}"',
+            wsl_path(project_dir), "cleaning up shared base case, Phase 1 run, and control run")
 
     _run_sweep_concurrent(achs, combos, should_stop, build_ach_fn, run_z_fn, cleanup_ach_fn)

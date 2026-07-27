@@ -74,25 +74,30 @@ class StoppedByUser(Exception):
     from a genuine failure."""
 
 
-def _kill_wsl_in_dir(cwd_wsl, name_pattern):
-    """Kill only processes matching name_pattern whose cwd is exactly
-    cwd_wsl - a bare `pkill -f name_pattern` would kill every same-named
-    solver process system-wide, which is fine when only one solve ever
-    runs at a time but wrong once several ACH/Z combinations' solvers
-    (all named e.g. "pimpleFoam") can be running concurrently: one
-    combination stalling or being stopped must not kill its siblings.
+def _signal_wsl_in_dir(cwd_wsl, name_pattern, sig):
+    """Send signal `sig` (e.g. "9", "STOP", "CONT") to processes matching
+    name_pattern whose cwd is exactly cwd_wsl - a bare `pkill -f
+    name_pattern` would hit every same-named solver process system-wide,
+    which is fine when only one solve ever runs at a time but wrong once
+    several ACH/Z combinations' solvers (all named e.g. "pimpleFoam") can
+    be running concurrently: one combination stalling, being stopped, or
+    being paused must not affect its siblings.
     """
     script = (
         f"target=$(readlink -f '{cwd_wsl}'); "
         f"for p in $(pgrep -f '{name_pattern}'); do "
-        f"[ \"$(readlink -f /proc/$p/cwd 2>/dev/null)\" = \"$target\" ] && kill -9 $p; "
+        f"[ \"$(readlink -f /proc/$p/cwd 2>/dev/null)\" = \"$target\" ] && kill -{sig} $p; "
         f"done"
     )
     subprocess.run(["wsl", "-e", "bash", "-lc", script], capture_output=True)
 
 
+def _kill_wsl_in_dir(cwd_wsl, name_pattern):
+    _signal_wsl_in_dir(cwd_wsl, name_pattern, "9")
+
+
 def run_wsl_streaming(cmd, cwd_wsl, on_line=None, should_stop=None, kill_pattern=None,
-                       stall_timeout=_DEFAULT_STALL_TIMEOUT_S):
+                       stall_timeout=_DEFAULT_STALL_TIMEOUT_S, should_pause=None):
     """Like run_wsl, but streams stdout line-by-line to on_line(line) as
     it's produced instead of only returning once the whole command exits -
     this is what lets the GUI show live solver progress (e.g. "Time = N"
@@ -106,6 +111,16 @@ def run_wsl_streaming(cmd, cwd_wsl, on_line=None, should_stop=None, kill_pattern
     a CompletedProcess-like object either way, with .returncode/.stdout
     covering everything captured so far - callers check should_stop()
     themselves afterward to distinguish a deliberate stop from a crash.
+
+    should_pause, if given, is polled the same way - but instead of
+    killing the process, it's suspended in place (kill -STOP, via
+    kill_pattern) and the call blocks until should_pause() goes False
+    again (kill -CONT) or should_stop() fires. This is a genuine pause -
+    zero iterations lost, no chunk boundary needed, and critically no
+    exception is ever raised, unlike a Stop - a caller further up (see
+    scenario_runs._run_sweep_concurrent) cleans up shared per-ACH state
+    in a finally block keyed off StoppedByUser propagating, and pausing
+    must never trigger that.
 
     stall_timeout: give up (kill the process, same as a Stop) if NO new
     output arrives for this long. Reads happen on a background thread into
@@ -161,6 +176,25 @@ def run_wsl_streaming(cmd, cwd_wsl, on_line=None, should_stop=None, kill_pattern
                     _kill_wsl_in_dir(cwd_wsl, kill_pattern)
                 proc.terminate()
                 break
+            if should_pause is not None and should_pause():
+                if kill_pattern:
+                    _signal_wsl_in_dir(cwd_wsl, kill_pattern, "STOP")
+                if on_line:
+                    on_line("[paused - process suspended, waiting to continue]")
+                while should_pause() and not (should_stop is not None and should_stop()):
+                    time.sleep(_STALL_POLL_INTERVAL_S)
+                if should_stop is not None and should_stop():
+                    stopped = True
+                    if kill_pattern:
+                        _kill_wsl_in_dir(cwd_wsl, kill_pattern)
+                    proc.terminate()
+                    break
+                if kill_pattern:
+                    _signal_wsl_in_dir(cwd_wsl, kill_pattern, "CONT")
+                if on_line:
+                    on_line("[resumed]")
+                last_output_time = time.time()  # don't count pause duration as a stall
+                continue
             if time.time() - last_output_time > stall_timeout:
                 if on_line:
                     on_line(f"[no output for {stall_timeout}s - the process looks stuck/"

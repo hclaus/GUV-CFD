@@ -5,6 +5,8 @@ approach, which encodes the opening position in the block topology itself).
 
 Sequence: blockMesh -> topoSet -> createPatch -overwrite -> checkMesh.
 """
+import math
+
 import numpy as np
 
 # Face vertex winding matches GenBlockmesh.py's proven convention (validated
@@ -68,6 +70,26 @@ _WALL_SPECS = {
 }
 
 
+def snap_outward(value, cell_size, direction, fp_tol=1e-9):
+    """Snap `value` outward to the nearest cell_size grid line - floor for
+    direction="lo", ceil for direction="hi" (see _opening_box's docstring
+    for why outward, not to-nearest).
+
+    fp_tol: nudges the value slightly toward its own nearest grid line
+    before flooring/ceiling, so a value that's ALREADY grid-aligned but
+    represented with tiny binary floating-point noise (e.g.
+    12.999999999999998 instead of exactly 13.0) doesn't get spuriously
+    pushed a full cell_size further out - only a value that's genuinely
+    off-grid (by more than fp_tol) actually moves. 1e-9 is many orders of
+    magnitude below any physically meaningful cell_size used here, so it
+    can't mask a real (non-noise) misalignment.
+    """
+    n = value / cell_size
+    if direction == "lo":
+        return math.floor(n + fp_tol) * cell_size
+    return math.ceil(n - fp_tol) * cell_size
+
+
 def _opening_box(wall, Lx, Ly, Lz, center_frac, size, cell_size=None, eps=1e-4):
     """Return ((xmin,ymin,zmin),(xmax,ymax,zmax)) for a boxToFace opening on
     any of the 6 room walls (see _WALL_SPECS), centered at center_frac of
@@ -75,20 +97,33 @@ def _opening_box(wall, Lx, Ly, Lz, center_frac, size, cell_size=None, eps=1e-4):
     e.g. (y,z) for xMin/xMax, (x,y) for floor/ceiling), with the given
     (width, height) opening size.
 
-    cell_size: if given, snap both in-plane edges to the nearest mesh grid
-    line (a multiple of cell_size from the room origin) instead of using
-    the raw center_frac/size arithmetic as-is. Without this, a nominal
-    center/size combination that doesn't land on a whole number of cells
-    (e.g. an odd cell count centered exactly on a mesh vertex, which can't
-    be symmetric - 3 cells can't straddle a vertex evenly) produces box
-    edges that coincide almost exactly with a face-center or vertex
-    coordinate, which is a boxToFace floating-point boundary tie: some
-    cells right at the edge get included, others excluded, essentially at
-    random, producing a lopsided/irregular carved patch instead of a clean
-    block. Snapping each edge independently to its nearest grid line
-    sidesteps this rather than requiring the caller to pick sizes that
-    divide evenly - effectively "shifting the center by up to half a cell"
-    on whichever side(s) need it, handling any parity automatically.
+    cell_size: if given, snap both in-plane edges OUTWARD to the mesh grid
+    (floor the low edge, ceil the high edge) instead of using the raw
+    center_frac/size arithmetic as-is. Without this, a nominal center/size
+    combination that doesn't land on a whole number of cells (e.g. an odd
+    cell count centered exactly on a mesh vertex, which can't be symmetric
+    - 3 cells can't straddle a vertex evenly) produces box edges that
+    coincide almost exactly with a face-center or vertex coordinate, which
+    is a boxToFace floating-point boundary tie: some cells right at the
+    edge get included, others excluded, essentially at random, producing a
+    lopsided/irregular carved patch instead of a clean block.
+
+    Snapping outward (rather than to-nearest) guarantees the carved patch
+    always CONTAINS the requested opening, never shrinks it - confirmed
+    this matters on a real case: a 0.3m opening on a 0.1m mesh is exactly
+    3 cells (an odd count with no even split), so BOTH edges land exactly
+    on a rounding tie, and round-to-nearest (Python's banker's rounding)
+    can resolve both ties inward, silently carving a 0.2m opening (44% of
+    the requested area) instead of 0.3m - with no error, no warning, and a
+    downstream CFD delivery-rate check that looked like a real physical
+    ventilation shortfall but was actually just this. Rounding to nearest
+    also isn't even consistently wrong in the same direction: an identical
+    tie elsewhere can round outward instead, growing the opening - the
+    grow-or-shrink outcome depends on incidental integer parity, not
+    anything physical. Snapping outward removes that ambiguity: the result
+    is always >= the requested size (growing by up to one cell_size per
+    edge in the worst case), which is a far safer failure mode than an
+    invisible shortfall.
     """
     if wall not in _WALL_SPECS:
         raise ValueError(f"Unsupported wall {wall!r}, expected one of {sorted(_WALL_SPECS)}")
@@ -100,8 +135,8 @@ def _opening_box(wall, Lx, Ly, Lz, center_frac, size, cell_size=None, eps=1e-4):
     lo[a1], hi[a1] = c1 * dims[a1] - w / 2, c1 * dims[a1] + w / 2
     lo[a2], hi[a2] = c2 * dims[a2] - h / 2, c2 * dims[a2] + h / 2
     if cell_size:
-        lo[a1], hi[a1] = round(lo[a1] / cell_size) * cell_size, round(hi[a1] / cell_size) * cell_size
-        lo[a2], hi[a2] = round(lo[a2] / cell_size) * cell_size, round(hi[a2] / cell_size) * cell_size
+        lo[a1], hi[a1] = snap_outward(lo[a1], cell_size, "lo"), snap_outward(hi[a1], cell_size, "hi")
+        lo[a2], hi[a2] = snap_outward(lo[a2], cell_size, "lo"), snap_outward(hi[a2], cell_size, "hi")
         if hi[a1] <= lo[a1]:
             hi[a1] = lo[a1] + cell_size
         if hi[a2] <= lo[a2]:
@@ -146,6 +181,19 @@ def opening_half_extents(wall, Lx, Ly, Lz, center_frac, size, cell_size=None):
     lo, hi = _opening_box(wall, Lx, Ly, Lz, center_frac, size, cell_size=cell_size)
     _, _, (a1, a2) = _WALL_SPECS[wall]
     return (hi[a1] - lo[a1]) / 2, (hi[a2] - lo[a2]) / 2
+
+
+def opening_grid_alignment(wall, Lx, Ly, Lz, center_frac, size, cell_size):
+    """(nominal_size, actual_size) (width, height) tuples for an opening,
+    comparing the raw requested size against what will actually be
+    carved once its position/size snap to cell_size - lets a caller warn
+    about size drift BEFORE running a simulation (see
+    run_pipeline.check_settings_grid_alignment), rather than discovering
+    it after the fact the way run_pipeline.check_ach_delivery does.
+    """
+    nominal = tuple(2 * v for v in opening_half_extents(wall, Lx, Ly, Lz, center_frac, size))
+    actual = tuple(2 * v for v in opening_half_extents(wall, Lx, Ly, Lz, center_frac, size, cell_size=cell_size))
+    return nominal, actual
 
 
 def _face_set_action(name, box):

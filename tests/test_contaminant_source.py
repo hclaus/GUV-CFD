@@ -33,6 +33,27 @@ def test_source_topo_set_dict_snap_never_collapses_to_zero_width():
         assert h - l >= 0.1 - 1e-9  # float roundoff, e.g. 1.4-1.3 == 0.09999999999999998
 
 
+def test_source_topo_set_dict_matches_real_case_that_used_to_shrink():
+    # Regression test for the real bug: this exact combination (patient
+    # ward injection point (2, 1.5, 1.5), 0.3m cube, 0.1m mesh) used to
+    # silently snap DOWN to a 0.3x0.2x0.2m box (0.012 m^3, 44% of the
+    # requested 0.027 m^3) under round-to-nearest, because two of its
+    # three axes landed exactly on a rounding tie - confirmed directly
+    # against the real steady-state results.json this produced
+    # (source_volume: 0.012 m^3). The outward-snap fix must not reproduce
+    # that shrinkage.
+    import re
+    text = source_topo_set_dict((2.0, 1.5, 1.5), (0.3, 0.3, 0.3), cell_size=0.1)
+    m = re.search(r"box\s+\(([^)]*)\)\s+\(([^)]*)\)", text)
+    lo = [float(v) for v in m.group(1).split()]
+    hi = [float(v) for v in m.group(2).split()]
+    volume = 1.0
+    for l, h in zip(lo, hi):
+        assert h - l >= 0.3 - 1e-9
+        volume *= h - l
+    assert volume >= 0.027 - 1e-9
+
+
 def test_source_topo_set_dict_accepts_scalar_size():
     text = source_topo_set_dict((1.0, 1.0, 1.0), 0.2)
     assert "box     (0.9 0.9 0.9) (1.1 1.1 1.1)" in text

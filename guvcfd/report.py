@@ -67,13 +67,11 @@ T_FIELD_NOTE = (
 # number isn't mistaken for a claim that less air is being delivered - the
 # inlet flow rate is fixed at the nominal ACH by the boundary condition
 # itself (mass conservation guarantees it all exits through the outlet).
-# This metric instead reflects how well that air mixes into the room: it's
-# derived from Phase 1's room-AVERAGE steady-state concentration under a
-# known source rate, which only equals the true flow rate if the room is
-# perfectly mixed. Imperfect mixing (e.g. inlet/outlet short-circuiting,
-# common when both are on the same wall) makes the room-average
-# concentration build up higher than a well-mixed room would show for the
-# same true flow rate, so this "effective" ACH reads lower than nominal.
+# This metric instead reflects how well that air mixes into the room.
+# Two different ways to measure it exist (see
+# steady_state_pipeline.run_steady_state_scenario's "ventilation_measurement_method"
+# field) - _effective_ach_note picks the right explanation for whichever
+# one actually produced this result.
 EFFECTIVE_ACH_NOTE = (
     "Note: the effective/measured ventilation ACH above is not the airflow "
     "rate delivered by the inlet - that's fixed at the nominal design ACH "
@@ -82,6 +80,28 @@ EFFECTIVE_ACH_NOTE = (
     "than nominal when the room mixes imperfectly (e.g. inlet/outlet "
     "short-circuiting on the same wall)."
 )
+
+EFFECTIVE_ACH_NOTE_CONTROL = (
+    "Note: the effective/measured ventilation ACH above is not the airflow "
+    "rate delivered by the inlet - that's fixed at the nominal design ACH "
+    "by the boundary condition. It's measured directly by a dedicated UV-off "
+    "control run (uniform initial concentration, ventilation only, no source) "
+    "run alongside the main scenario - see the OpenFOAM Notes help page for "
+    "why this is preferred over deriving it from Phase 1's own point-source "
+    "buildup. Reads lower than nominal when the room mixes imperfectly (e.g. "
+    "inlet/outlet short-circuiting on the same wall)."
+)
+
+
+def _effective_ach_note(results):
+    """Pick EFFECTIVE_ACH_NOTE vs EFFECTIVE_ACH_NOTE_CONTROL based on which
+    method actually measured ventilation_ach_measured for this result -
+    older results.json files without "ventilation_measurement_method" fall
+    back to the Phase-1-based wording (the only method that existed then).
+    """
+    if results.get("ventilation_measurement_method") == "control_run":
+        return EFFECTIVE_ACH_NOTE_CONTROL
+    return EFFECTIVE_ACH_NOTE
 
 _ROW_LABELS_ROOM = [
     ("Room dimensions", lambda r, s: f"{r.x:.3g} x {r.y:.3g} x {r.z:.3g} {r.units}"),
@@ -426,8 +446,16 @@ def _results_table_cell_values(results, settings):
     else:
         values[(13, 1)] = "n/a (extrapolation unavailable)"
 
-    if results.get("reduction_pct") is not None:
-        values[(15, 1)] = f"{results['reduction_pct']:.1f}% "
+    # Prefer reduction_pct_corrected (uses a T_ss1 implied by a real UV-off
+    # control run's measured ventilation rate - see
+    # compute_corrected_eACH_uv_from_control's docstring) over plain
+    # reduction_pct (Phase 1's own point-source buildup, which can be
+    # biased low by mixing-transport lag before it's fully converged) -
+    # falls back to the uncorrected field for older results/single runs
+    # that never had a control run.
+    reduction_pct = results.get("reduction_pct_corrected", results.get("reduction_pct"))
+    if reduction_pct is not None:
+        values[(15, 1)] = f"{reduction_pct:.1f}% "
     ach_measured = results.get("ventilation_ach_measured")
     if ach_measured is not None:
         values[(16, 0)] = f"Effective pathogen (mechanical) ACHeff{_ach_source_note(results)}"
@@ -439,14 +467,15 @@ def _results_table_cell_values(results, settings):
     if results.get("eACH_uv_steady_state") is not None:
         values[(19, 1)] = f"{results['eACH_uv_steady_state']:.4g} /hr"
     values[(20, 1)] = _total_ach_row(results)
-    if results.get("reduction_pct") is not None:
+    if reduction_pct is not None:
         # "True" and "Simple" UVGI effectiveness are algebraically
         # identical regardless of which ACH basis feeds the eACH_uv/ACHeff
-        # pair (both always reduce to 1 - T_ss2/T_ss1) - approved as
-        # showing the same number in both rows rather than inventing a
-        # divergent "True" formula that isn't actually there.
-        values[(22, 1)] = f"{results['reduction_pct']:.1f}%"
-        values[(23, 1)] = f"{results['reduction_pct']:.1f}%"
+        # pair (both always reduce to 1 - T_ss2/T_ss1, whichever T_ss1 that
+        # is) - approved as showing the same number in both rows rather
+        # than inventing a divergent "True" formula that isn't actually
+        # there.
+        values[(22, 1)] = f"{reduction_pct:.1f}%"
+        values[(23, 1)] = f"{reduction_pct:.1f}%"
     return values
 
 
@@ -902,7 +931,7 @@ def _write_report_docx(doc_out_path, case_dir, guv_path, settings, results, room
         if curve_image_path is not None:
             doc.add_picture(str(curve_image_path), width=Inches(6.0))
         if results.get("ventilation_ach_measured") is not None:
-            doc.add_paragraph().add_run(EFFECTIVE_ACH_NOTE).italic = True
+            doc.add_paragraph().add_run(_effective_ach_note(results)).italic = True
 
         monitoring_rows = _monitoring_rows(results.get("monitoring"))
         if monitoring_rows:
@@ -920,7 +949,10 @@ def _write_report_docx(doc_out_path, case_dir, guv_path, settings, results, room
         if curve_image_path is not None:
             doc.add_picture(str(curve_image_path), width=Inches(6.0))
         if results.get("ventilation_ach_measured") is not None:
-            doc.add_paragraph().add_run(EFFECTIVE_ACH_NOTE).italic = True
+            # Decay mode has only ever had one way to measure this (a
+            # dedicated UV-off control run) - unconditionally the control
+            # wording, unlike steady-state's _effective_ach_note above.
+            doc.add_paragraph().add_run(EFFECTIVE_ACH_NOTE_CONTROL).italic = True
 
     doc.save(doc_out_path)
     if is_steady_state:

@@ -108,6 +108,38 @@ def test_opening_box_snaps_edges_to_grid_when_cell_size_given():
         assert abs(round(v / 0.1) * 0.1 - v) < 1e-9
 
 
+def test_opening_box_snapping_never_shrinks_below_the_requested_size():
+    # The core invariant the outward-snap fix guarantees: the carved
+    # opening always CONTAINS the nominal (unsnapped) box, on every wall
+    # and axis, regardless of tie parity - never smaller than requested.
+    # Swept across a range of centers/sizes that land on ties, near-ties,
+    # and clean multiples alike.
+    for center in [(0.5, 0.5), (0.3, 0.7), (0.1, 0.9), (0.5, 0.1)]:
+        for size in [(0.3, 0.3), (0.1, 0.2), (0.25, 0.15), (0.4, 0.4)]:
+            lo_raw, hi_raw = _opening_box("ceiling", 4.0, 3.0, 2.7, center, size, eps=0.0)
+            lo_snap, hi_snap = _opening_box("ceiling", 4.0, 3.0, 2.7, center, size, cell_size=0.1, eps=0.0)
+            assert lo_snap[0] <= lo_raw[0] + 1e-9, (center, size)
+            assert hi_snap[0] >= hi_raw[0] - 1e-9, (center, size)
+            assert lo_snap[1] <= lo_raw[1] + 1e-9, (center, size)
+            assert hi_snap[1] >= hi_raw[1] - 1e-9, (center, size)
+
+
+def test_opening_box_matches_real_patient_ward_case_that_used_to_shrink():
+    # Regression test for the real bug: this exact combination (patient
+    # ward room, 0.3x0.3m inlet centered at y=1.5/z=2.1, 0.1m mesh) used
+    # to silently snap DOWN to a 0.2x0.2m opening (44% of the requested
+    # area) under round-to-nearest, because both edges landed exactly on
+    # a rounding tie on both axes - confirmed directly against the real
+    # CFD mesh this produced (0.0395 m^2 actual vs 0.09 m^2 nominal). The
+    # outward-snap fix must not reproduce that shrinkage.
+    Lx, Ly, Lz = 3.2, 4.8, 2.57
+    center_frac = (1.5 / Ly, 2.1 / Lz)
+    lo, hi = _opening_box("xMin", Lx, Ly, Lz, center_frac, (0.3, 0.3), cell_size=0.1, eps=0.0)
+    width, height = hi[1] - lo[1], hi[2] - lo[2]
+    assert width >= 0.3 - 1e-9
+    assert height >= 0.3 - 1e-9
+
+
 def test_opening_box_snapping_never_collapses_to_zero_width():
     # A very small opening (smaller than one cell) must still snap to at
     # least one whole cell, not collapse to a zero-width (empty) box.
@@ -134,17 +166,23 @@ def test_opening_center_uses_the_same_snapped_box_as_write_mesh_dicts():
     # center - otherwise the ceiling-diffuser radial direction math would
     # be centered on a point that doesn't match the real patch. For this
     # room, the nominal center (2.0, 1.5) sits exactly on a mesh vertex,
-    # and a 0.3m opening (3 cells - an odd, unstraddleable count) forces a
-    # real half-cell shift in x once snapped, while y (2 cells - even)
-    # doesn't need to shift.
+    # and a 0.3m opening (3 cells - an odd, unstraddleable count) puts
+    # BOTH edges exactly on a snap tie on both axes - snapping outward
+    # (floor the low edge, ceil the high edge) expands each tied edge by
+    # exactly half a cell in opposite directions, so the center itself
+    # doesn't move at all (0.3m grows to 0.4m, symmetrically, on both
+    # axes) - unlike round-to-nearest, which can shift the center and/or
+    # shrink the opening depending on incidental tie parity.
     center_unsnapped = opening_center("ceiling", 4.0, 3.0, 2.7, (0.5, 0.5), (0.3, 0.3))
     center_snapped = opening_center("ceiling", 4.0, 3.0, 2.7, (0.5, 0.5), (0.3, 0.3), cell_size=0.1)
     lo, hi = _opening_box("ceiling", 4.0, 3.0, 2.7, (0.5, 0.5), (0.3, 0.3), cell_size=0.1, eps=0.0)
     expected = tuple((l + h) / 2 for l, h in zip(lo, hi))
     assert center_snapped[0] == expected[0] and center_snapped[1] == expected[1]
     assert center_unsnapped == (2.0, 1.5, 2.7)
-    assert abs(abs(center_snapped[0] - 2.0) - 0.05) < 1e-9  # shifted by half a cell in x
-    assert abs(center_snapped[1] - 1.5) < 1e-9  # y needed no shift (even cell count)
+    assert abs(center_snapped[0] - 2.0) < 1e-9  # no shift - outward snap grows symmetrically
+    assert abs(center_snapped[1] - 1.5) < 1e-9  # no shift - outward snap grows symmetrically
+    assert abs((hi[0] - lo[0]) - 0.4) < 1e-9  # grew from 0.3m to 0.4m (one full cell, split evenly)
+    assert abs((hi[1] - lo[1]) - 0.4) < 1e-9
 
 
 def test_opening_half_extents_matches_nominal_size_when_already_grid_aligned():

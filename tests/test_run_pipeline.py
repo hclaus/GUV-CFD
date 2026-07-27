@@ -154,6 +154,57 @@ def test_check_ach_delivery_raises_on_unparseable_output(monkeypatch, tmp_path):
         pass
 
 
+def _patient_ward_settings():
+    return {
+        "inlet-wall": "xMin", "inlet-y-input": 1.5, "inlet-z-input": 2.1,
+        "inlet-size-w": 0.3, "inlet-size-h": 0.3,
+        "outlet-wall": "xMax", "outlet-y-input": 1.5, "outlet-z-input": 0.4,
+        "outlet-size-w": 0.3, "outlet-size-h": 0.3,
+        "inject-x-input": 2.0, "inject-y-input": 1.5, "inject-z-input": 1.5,
+    }
+
+
+def test_check_settings_grid_alignment_flags_the_real_shrinking_case():
+    # Regression test for the real bug: this exact room/settings/cell_size
+    # combination used to silently carve a 0.2x0.2m inlet and a
+    # 0.3x0.2x0.2m source zone (both 44% of nominal) - now that the
+    # underlying snap is outward-only, this should surface as a "will be
+    # LARGER than typed" note, not a silent shortfall, and not a shrink.
+    room = SimpleNamespace(x=3.2, y=4.8, z=2.57)
+    settings = _patient_ward_settings()
+    mismatches = run_pipeline.check_settings_grid_alignment(settings, room, cell_size=0.1, source_size=0.3)
+    names = {m["name"] for m in mismatches}
+    assert names == {"Inlet", "Outlet", "Contaminant source zone"}
+    for m in mismatches:
+        for nominal, actual in zip(m["nominal"], m["actual"]):
+            assert actual >= nominal - 1e-9  # never a shortfall
+
+
+def test_check_settings_grid_alignment_empty_when_already_grid_aligned():
+    room = SimpleNamespace(x=4.0, y=4.0, z=4.0)
+    settings = {
+        "inlet-wall": "xMin", "inlet-y-input": 2.0, "inlet-z-input": 2.0,
+        "inlet-size-w": 0.4, "inlet-size-h": 0.4,
+        "outlet-wall": "xMax", "outlet-y-input": 2.0, "outlet-z-input": 2.0,
+        "outlet-size-w": 0.4, "outlet-size-h": 0.4,
+    }
+    assert run_pipeline.check_settings_grid_alignment(settings, room, cell_size=0.1) == []
+
+
+def test_check_settings_grid_alignment_skips_disabled_second_openings():
+    room = SimpleNamespace(x=3.2, y=4.8, z=2.57)
+    settings = dict(_patient_ward_settings())
+    settings.update({
+        "inlet2-enable": False, "inlet2-wall": "ceiling", "inlet2-y-input": 2.0, "inlet2-z-input": 1.5,
+        "inlet2-size-w": 0.3, "inlet2-size-h": 0.3,
+        "outlet2-enable": False, "outlet2-wall": "floor", "outlet2-y-input": 2.0, "outlet2-z-input": 1.5,
+        "outlet2-size-w": 0.3, "outlet2-size-h": 0.3,
+    })
+    mismatches = run_pipeline.check_settings_grid_alignment(settings, room, cell_size=0.1, source_size=0.3)
+    names = {m["name"] for m in mismatches}
+    assert "2nd inlet" not in names and "2nd outlet" not in names
+
+
 # --- Persisted chunk history + FlowConvergenceUndecided diagnostics ---
 
 def test_history_round_trips_through_disk(tmp_path):
@@ -229,7 +280,7 @@ def test_converge_flow_field_raises_flow_convergence_undecided_not_runtime_error
             return SimpleNamespace(stdout="U p k omega nut phi", returncode=0)
         return SimpleNamespace(stdout="", returncode=0)
 
-    def fake_run_wsl_streaming(cmd, cwd_wsl, on_line=None, should_stop=None, kill_pattern=None):
+    def fake_run_wsl_streaming(cmd, cwd_wsl, on_line=None, should_stop=None, kill_pattern=None, should_pause=None):
         return SimpleNamespace(stdout="", returncode=0)
 
     monkeypatch.setattr(run_pipeline, "_run_wsl", fake_run_wsl)
@@ -284,6 +335,22 @@ def test_continue_flow_convergence_extends_max_iterations_from_persisted_history
     assert captured["resume"] is True
 
 
+def test_continue_flow_convergence_forwards_should_pause(monkeypatch, tmp_path):
+    _save_history(str(tmp_path), _hist([0.15] * 3))
+
+    captured = {}
+
+    def fake_converge_flow_field(case_dir, **kwargs):
+        captured.update(kwargs)
+        return ("1500", True)
+
+    monkeypatch.setattr(run_pipeline, "converge_flow_field", fake_converge_flow_field)
+    should_pause = lambda: False
+    continue_flow_convergence(str(tmp_path), additional_iterations=500, n_iterations=500,
+                               log_fn=lambda *a: None, should_pause=should_pause)
+    assert captured["should_pause"] is should_pause
+
+
 def test_resume_case_setup_rejects_unknown_decision(tmp_path):
     try:
         resume_case_setup(str(tmp_path), "unused.guv", "sideways", ach=1.5, Z=2.0)
@@ -311,6 +378,35 @@ def test_resume_case_setup_continue_requires_additional_iterations(monkeypatch, 
         assert False, "expected ValueError"
     except ValueError:
         pass
+
+
+def test_resume_case_setup_forwards_should_pause_to_continue_flow_convergence(monkeypatch, tmp_path):
+    class _FakeRoom:
+        x, y, z, units, lamps = 4.0, 6.0, 2.7, "meters", []
+
+    class _FakeProject:
+        rooms = {"a": _FakeRoom()}
+
+        @staticmethod
+        def load(path):
+            return _FakeProject()
+
+    monkeypatch.setattr(run_pipeline, "Project", _FakeProject)
+    captured = {}
+
+    def fake_continue_flow_convergence(case_dir, additional_iterations, **kwargs):
+        captured.update(kwargs)
+        return (None, True)
+    monkeypatch.setattr(run_pipeline, "continue_flow_convergence", fake_continue_flow_convergence)
+    monkeypatch.setattr(run_pipeline, "resolve_inlet_velocity", lambda *a, **k: (0.278, 0, 0))
+    monkeypatch.setattr(run_pipeline, "restore_boundary_conditions", lambda *a, **k: None)
+    monkeypatch.setattr(run_pipeline, "check_ach_delivery", lambda *a, **k: {})
+    monkeypatch.setattr(run_pipeline, "_finish_case_setup", lambda *a, **k: {})
+
+    should_pause = lambda: False
+    resume_case_setup(str(tmp_path), "unused.guv", "continue", ach=1.5, Z=2.0,
+                       additional_iterations=500, should_pause=should_pause)
+    assert captured["should_pause"] is should_pause
 
 
 # --- case_awaiting_flow_decision: resuming from a FRESH server session ---

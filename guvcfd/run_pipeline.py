@@ -14,15 +14,18 @@ from guv_calcs import Project
 
 from .case_io import read_cell_centers, read_boundary_patch_names, write_scalar_field
 from .cellzones import bin_decay_rates, write_cellzones, write_fvoptions
-from .contaminant_source import write_fvoptions_file
+from .contaminant_source import write_fvoptions_file, source_box_grid_alignment
 from .decay_analysis import read_vol_average_dat
 from .fan import write_fan_topo_set_dict, fan_fvoptions_entry
 from .fluence import compute_fluence_at_points, compute_inactivation_rate, compute_well_mixed_eACH
 from .initial_fields import (
     write_initial_fields, compute_inlet_velocity, restore_boundary_conditions, resolve_inlet_velocity,
 )
-from .mesh_gen import write_mesh_dicts, write_map_fields_dict, opening_center, opening_half_extents
+from .mesh_gen import (
+    write_mesh_dicts, write_map_fields_dict, opening_center, opening_half_extents, opening_grid_alignment,
+)
 from .monitoring import write_vol_average_dict
+from .visualization import center_frac_for_wall
 from .splice import (
     splice_fv_options_into_control_dict,
     set_function_object_enabled,
@@ -195,7 +198,7 @@ def _is_stable_oscillation(history, window, growth_tol):
 def converge_flow_field(case_dir, n_iterations=500, fan_entry=None, log_fn=print,
                          max_iterations=20000, check_field="p", rel_tol=0.01, should_stop=None,
                          method="simple", oscillation_window=6, oscillation_growth_tol=1.5,
-                         solver_log_fn=None, resume=False):
+                         solver_log_fn=None, resume=False, should_pause=None):
     """Run simpleFoam to actually converge the flow field on this mesh,
     starting from whatever is in 0/ (e.g. a mapFields warm start), then copy
     the result back into 0/ so it becomes pimpleFoam's starting point.
@@ -289,6 +292,10 @@ def converge_flow_field(case_dir, n_iterations=500, fan_entry=None, log_fn=print
     log generally want a quieter callback here so per-iteration solver
     chatter doesn't flood it (log_fn's own chunk-boundary narration is
     unaffected either way).
+
+    should_pause: forwarded straight to run_wsl_streaming - suspends the
+    active solver process in place (no iterations lost, no exception
+    raised) instead of killing it, unlike should_stop.
     """
     case_dir_wsl = _wsl_path(case_dir)
     solver = "pimpleFoam" if method == "lts" else "simpleFoam"
@@ -358,6 +365,7 @@ def converge_flow_field(case_dir, n_iterations=500, fan_entry=None, log_fn=print
             r = _run_wsl_streaming(
                 f"{solver} 2>&1 | tee log.{solver}", case_dir_wsl,
                 on_line=solver_log_fn or log_fn, should_stop=should_stop, kill_pattern=solver,
+                should_pause=should_pause,
             )
             if should_stop is not None and should_stop():
                 raise StoppedByUser("Stopped during flow convergence.")
@@ -453,7 +461,8 @@ def converge_flow_field(case_dir, n_iterations=500, fan_entry=None, log_fn=print
 
 def continue_flow_convergence(case_dir, additional_iterations, n_iterations=500, fan_entry=None,
                                log_fn=print, should_stop=None, method="simple", rel_tol=0.01,
-                               oscillation_window=6, oscillation_growth_tol=1.5, solver_log_fn=None):
+                               oscillation_window=6, oscillation_growth_tol=1.5, solver_log_fn=None,
+                               should_pause=None):
     """Resume a case directory whose flow convergence previously stopped
     without a verdict (a caller caught FlowConvergenceUndecided and the
     user chose "continue") - runs `additional_iterations` more on top of
@@ -466,6 +475,10 @@ def continue_flow_convergence(case_dir, additional_iterations, n_iterations=500,
     would, just picking up from the accumulated history instead of
     starting over. That's expected, not a bug: the caller should present
     the same decision again (continue further, or accept).
+
+    should_pause: forwarded straight to converge_flow_field/
+    run_wsl_streaming - suspends the active solver process in place
+    instead of killing it, unlike should_stop.
     """
     history = _load_history(case_dir)
     already_run = history[-1]["iteration"] if history else 0
@@ -473,7 +486,7 @@ def continue_flow_convergence(case_dir, additional_iterations, n_iterations=500,
         case_dir, n_iterations=n_iterations, fan_entry=fan_entry, log_fn=log_fn,
         max_iterations=already_run + additional_iterations, rel_tol=rel_tol, should_stop=should_stop,
         method=method, oscillation_window=oscillation_window, oscillation_growth_tol=oscillation_growth_tol,
-        solver_log_fn=solver_log_fn, resume=True,
+        solver_log_fn=solver_log_fn, resume=True, should_pause=should_pause,
     )
 
 
@@ -607,6 +620,58 @@ def check_ach_delivery(case_dir, room_volume, ach, outlet_patches=("outlet",), t
     }
 
 
+def check_settings_grid_alignment(settings, room, cell_size, source_size=None, tol=1e-6):
+    """Check whether the inlet/outlet/inlet2/outlet2 openings and the
+    contaminant source zone (if source_size is given) will be resized
+    once their positions/sizes snap to the mesh grid (see
+    mesh_gen.opening_grid_alignment / contaminant_source.
+    source_box_grid_alignment) - lets a caller warn a user BEFORE running
+    a simulation, rather than discovering the same class of problem only
+    after a multi-hour run the way check_ach_delivery does (confirmed on
+    a real project: a 0.3x0.3m inlet on a 0.1m mesh silently carved down
+    to 0.2x0.2m - 44% of the requested area - and check_ach_delivery only
+    caught the SYMPTOM, a delivery-rate shortfall, after the flow field
+    had already fully converged).
+
+    settings: a project's settings dict (inlet-wall/inlet-y-input/etc,
+    the same shape run_pipeline/scenario_runs already expect).
+    inject-x/y/z-input, if present and source_size is given, gets
+    checked too.
+
+    Returns a list of dicts, one per opening/zone whose actual carved
+    size differs from its nominal (requested) size by more than tol on
+    any axis: {"name", "nominal", "actual"} - empty if everything's
+    already grid-aligned. Thanks to the outward-only snap, "actual" is
+    always >= "nominal" on every axis - a non-empty entry always means
+    "will end up slightly LARGER than typed", never a silent shortfall.
+    """
+    mismatches = []
+
+    def _check_opening(name, prefix, enabled=True):
+        if not enabled:
+            return
+        wall = settings[f"{prefix}-wall"]
+        center_frac = center_frac_for_wall(wall, settings[f"{prefix}-y-input"], settings[f"{prefix}-z-input"], room)
+        size = (settings[f"{prefix}-size-w"], settings[f"{prefix}-size-h"])
+        nominal, actual = opening_grid_alignment(wall, room.x, room.y, room.z, center_frac, size, cell_size)
+        if any(abs(a - n) > tol for n, a in zip(nominal, actual)):
+            mismatches.append({"name": name, "nominal": nominal, "actual": actual})
+
+    _check_opening("Inlet", "inlet")
+    _check_opening("Outlet", "outlet")
+    _check_opening("2nd inlet", "inlet2", enabled=bool(settings.get("inlet2-enable")))
+    _check_opening("2nd outlet", "outlet2", enabled=bool(settings.get("outlet2-enable")))
+
+    has_source_inputs = all(k in settings for k in ("inject-x-input", "inject-y-input", "inject-z-input"))
+    if source_size is not None and has_source_inputs:
+        center = (settings["inject-x-input"], settings["inject-y-input"], settings["inject-z-input"])
+        nominal, actual = source_box_grid_alignment(center, source_size, cell_size)
+        if any(abs(a - n) > tol for n, a in zip(nominal, actual)):
+            mismatches.append({"name": "Contaminant source zone", "nominal": nominal, "actual": actual})
+
+    return mismatches
+
+
 def setup_case(guv_path, case_dir, template_case_dir=None, cell_size=0.1, Z=2.0, nbins=25,
                source_field="T", map_from_case=None, map_from_time=0, ach=3.0,
                inlet_wall="xMin", inlet_center=(0.5, 0.85), inlet_size=(0.3, 0.3),
@@ -622,7 +687,7 @@ def setup_case(guv_path, case_dir, template_case_dir=None, cell_size=0.1, Z=2.0,
                pimple_end_time=120, pimple_write_interval=10, pimple_delta_t=0.5,
                fan_speed=None, fan_center=None, fan_direction=(0, 0, -1),
                fan_disk_radius=0.6, fan_disk_thickness=0.2, fan_height=None,
-               log_fn=print, should_stop=None, solver_log_fn=None):
+               log_fn=print, should_stop=None, solver_log_fn=None, should_pause=None):
     """Set up an OpenFOAM case end-to-end from a .guv project. Returns a dict
     summarizing the run (room dims, lamp count, fluence/k ranges, zone count).
 
@@ -826,7 +891,7 @@ def setup_case(guv_path, case_dir, template_case_dir=None, cell_size=0.1, Z=2.0,
             log_fn=log_fn, should_stop=should_stop, method=flow_convergence_method,
             rel_tol=flow_rel_tol, max_iterations=flow_max_iterations,
             oscillation_window=oscillation_window, oscillation_growth_tol=oscillation_growth_tol,
-            solver_log_fn=solver_log_fn)
+            solver_log_fn=solver_log_fn, should_pause=should_pause)
         summary["flow_converged"] = flow_converged
         if should_stop is not None and should_stop():
             raise StoppedByUser("Stopped after flow convergence.")
@@ -920,7 +985,7 @@ def resume_case_setup(case_dir, guv_path, decision, ach, Z, nbins=25, source_fie
                        ach_delivery_tol=0.10,
                        pimple_end_time=120, pimple_write_interval=10, pimple_delta_t=0.5,
                        fan_speed=None, fan_direction=(0, 0, -1),
-                       log_fn=print, should_stop=None, solver_log_fn=None):
+                       log_fn=print, should_stop=None, solver_log_fn=None, should_pause=None):
     """Resume a case directory whose flow convergence previously raised
     FlowConvergenceUndecided - reuses the existing mesh, 0/ fields, and
     constant/fvOptions on disk exactly as setup_case() left them; does NOT
@@ -986,7 +1051,7 @@ def resume_case_setup(case_dir, guv_path, decision, ach, Z, nbins=25, source_fie
             case_dir, additional_iterations, n_iterations=simple_foam_iterations, fan_entry=fan_entry,
             log_fn=log_fn, should_stop=should_stop, method=flow_convergence_method, rel_tol=flow_rel_tol,
             oscillation_window=oscillation_window, oscillation_growth_tol=oscillation_growth_tol,
-            solver_log_fn=solver_log_fn)
+            solver_log_fn=solver_log_fn, should_pause=should_pause)
         summary["flow_converged"] = flow_converged
     else:
         log_fn("Accepting current flow field state as-is (explicit user override, not the automatic "

@@ -30,11 +30,14 @@ from .initial_fields import compute_inlet_velocities
 from .monitoring_points import compute_monitoring_results, mixing_uniformity_note
 from .paraview_launch import launch_paraview
 from .report import (
-    generate_report_docx, T_FIELD_NOTE, EFFECTIVE_ACH_NOTE, _phase_ss_rows, _ach_source_note,
+    generate_report_docx, T_FIELD_NOTE, _effective_ach_note, _phase_ss_rows, _ach_source_note,
     _decay_reduction_ratio,
 )
 from .result_figures import steady_state_figure, decay_figure
-from .run_pipeline import setup_case, resume_case_setup, case_awaiting_flow_decision, FlowConvergenceUndecided
+from .run_pipeline import (
+    setup_case, resume_case_setup, case_awaiting_flow_decision, FlowConvergenceUndecided,
+    check_settings_grid_alignment,
+)
 from . import scenario_runs
 from .splice import set_control_dict_start_from, set_control_dict_time
 from .steady_state_pipeline import (
@@ -75,7 +78,7 @@ SETTINGS_FIELDS = [
     "fan-enable", "fan-speed", "fan-direction", "fan-radius", "fan-thickness",
     "fan-x-input", "fan-y-input", "fan-z-input",
     "sim-type", "pimple-end-time", "pimple-write-interval",
-    "target-t-ss", "inject-x-input", "inject-y-input", "inject-z-input",
+    "target-t-ss", "inject-x-input", "inject-y-input", "inject-z-input", "source-zone-size",
     "phase1-iterations", "phase2-iterations", "t-ss-window-frac",
     "monitoring-enable",
     "monitor1-enable", "monitor1-name", "monitor1-x-input", "monitor1-y-input",
@@ -194,7 +197,7 @@ def _fresh_case_dir(guv_path):
 _run_state = {
     "status": "idle", "log": [], "case_dir": None, "sim_type": None,
     "steps": [], "step_status": {}, "markers": [],
-    "current_time": None, "start_time": None, "stop_requested": False,
+    "current_time": None, "start_time": None, "stop_requested": False, "pause_requested": False,
     # Set only when status == "awaiting_decision" (see FlowConvergenceUndecided/
     # _run_pipeline_thread) - everything the Processing tab's decision panel
     # needs to display the diagnostic and everything a Continue/Accept button
@@ -216,7 +219,7 @@ _run_state = {
 # "error", "detail": trimmed result dict or an error message}.
 _scenario_state = {
     "status": "idle", "log": [], "combos": [], "results": {},
-    "start_time": None, "stop_requested": False, "live_status": {},
+    "start_time": None, "stop_requested": False, "pause_requested": False, "live_status": {},
 }
 
 
@@ -245,6 +248,10 @@ def _scenario_status_update(key, msg):
 
 def _scenario_should_stop():
     return _scenario_state.get("stop_requested", False)
+
+
+def _scenario_should_pause():
+    return _scenario_state.get("pause_requested", False)
 
 # Checklist shown on the Processing tab, and the log-line substrings that
 # advance it - reuses the log_fn messages the pipeline already emits rather
@@ -330,7 +337,7 @@ def _reset_run_progress(sim_type):
         sim_type=sim_type, steps=steps, markers=markers,
         step_status={s: "pending" for s in steps}, log=[],
         current_time=None, target_time=None, phase_start_time=None, chunk_base=None,
-        start_time=time.time(), stop_requested=False,
+        start_time=time.time(), stop_requested=False, pause_requested=False,
     )
 
 
@@ -341,6 +348,10 @@ def _complete_all_steps():
 
 def _should_stop():
     return _run_state.get("stop_requested", False)
+
+
+def _should_pause():
+    return _run_state.get("pause_requested", False)
 
 
 _MAX_LOG_LINES = 5000
@@ -621,7 +632,7 @@ _OUTLET2_REQUIRED_FIELDS = {
 _STEADY_STATE_REQUIRED_FIELDS = {
     "target-t-ss": "Target steady-state T",
     "inject-x-input": "Injection X position", "inject-y-input": "Injection Y position",
-    "inject-z-input": "Injection Z position",
+    "inject-z-input": "Injection Z position", "source-zone-size": "Source zone size",
     "phase1-iterations": "Phase 1 iterations", "phase2-iterations": "Phase 2 iterations",
 }
 
@@ -702,6 +713,7 @@ def _run_decay(guv_path, case_dir, room, settings):
         ach_delivery_tol=adv["ach-delivery-tol"] / 100.0,
         momentum_relaxation=adv["momentum-relaxation"], scalar_relaxation=adv["scalar-relaxation"],
         log_fn=_run_log, should_stop=_should_stop, solver_log_fn=_track_solver_time,
+        should_pause=_should_pause,
         **_fan_kwargs(settings),
         **_second_opening_kwargs(settings, "inlet2", room),
         **_second_opening_kwargs(settings, "outlet2", room),
@@ -795,6 +807,7 @@ def _run_decay_pair(case_dir_wsl, control_dir_wsl):
             results[name] = run_wsl_streaming(
                 "pimpleFoam 2>&1 | tee log.pimpleFoam", cwd_wsl,
                 on_line=prefixed, should_stop=_should_stop, kill_pattern="pimpleFoam",
+                should_pause=_should_pause,
             )
         except Exception as e:
             errors[name] = e
@@ -947,6 +960,7 @@ def _continue_decay(case_dir, end_time, write_interval):
     r = run_wsl_streaming(
         "pimpleFoam 2>&1 | tee -a log.pimpleFoam", case_dir_wsl,
         on_line=_track_solver_time, should_stop=_should_stop, kill_pattern="pimpleFoam",
+        should_pause=_should_pause,
     )
     if _should_stop():
         raise StoppedByUser("Stopped during pimpleFoam.")
@@ -1027,6 +1041,7 @@ def _run_steady_state(guv_path, case_dir, room, settings):
         ach_delivery_tol=adv["ach-delivery-tol"] / 100.0,
         momentum_relaxation=adv["momentum-relaxation"], scalar_relaxation=adv["scalar-relaxation"],
         log_fn=_run_log, should_stop=_should_stop, solver_log_fn=_track_solver_time,
+        should_pause=_should_pause,
         **fan_kwargs,
         **_second_opening_kwargs(settings, "inlet2", room),
         **_second_opening_kwargs(settings, "outlet2", room),
@@ -1116,7 +1131,7 @@ def _finish_steady_state(case_dir, room, settings, summary,
         phase2_iterations=phase2_iterations,
         window_frac=settings.get("t-ss-window-frac") or 0.15,
         cell_size=adv["mesh-cell-size"], nbins=adv["uv-zone-bins"],
-        source_size=adv["source-zone-size"],
+        source_size=settings["source-zone-size"],
         plateau_rel_tol=adv["plateau-rel-tol"] / 100.0,
         mass_balance_tol=adv["mass-balance-tol"] / 100.0,
         # 500-iteration check interval: the value backtested against a
@@ -1135,6 +1150,7 @@ def _finish_steady_state(case_dir, room, settings, summary,
         fan_entry=fan_entry, monitoring_points=_gather_monitoring_points(settings),
         patches_to_monitor=patches_to_monitor,
         log_fn=_run_log, should_stop=_should_stop, solver_log_fn=_track_solver_time,
+        should_pause=_should_pause,
     )
     result["fluence_mean"] = summary["fluence_mean"]
     result["eACH_uv_well_mixed"] = summary.get("eACH_uv_well_mixed_mean")
@@ -1263,6 +1279,7 @@ def _resume_pipeline_thread(action, additional_iterations):
             pimple_delta_t=adv["pimple-delta-t"],
             fan_speed=fan_kwargs.get("fan_speed"), fan_direction=fan_kwargs.get("fan_direction", (0, 0, -1)),
             log_fn=_run_log, should_stop=_should_stop, solver_log_fn=_track_solver_time,
+            should_pause=_should_pause,
         )
         if sim_type == "decay":
             _finish_decay(case_dir, room, settings, summary)
@@ -1472,9 +1489,9 @@ DIFFUSER_TYPE_OPTIONS = [
     {"label": "Surface-attached (ceiling/wall diffuser)", "value": "ceiling"},
 ]
 
-_GRID_SNAP_NOTE = ("Position and size are automatically snapped to the mesh grid (cell size, "
-                    "Settings menu) - the actual carved geometry may shift by up to half a cell "
-                    "from the exact values entered here.")
+_GRID_SNAP_NOTE = ("Position and size are automatically snapped OUTWARD to the mesh grid (cell "
+                    "size, Settings menu) - the actual carved geometry may end up up to one cell "
+                    "LARGER than entered here, but never smaller.")
 
 
 def _opening_controls(prefix, default_wall, is_inlet=True):
@@ -1656,6 +1673,12 @@ project_setup_tab = dbc.Row([
                 html.Div("Injection position", className="small fw-semibold text-uppercase mt-3 mb-1"),
                 html.Div(_GRID_SNAP_NOTE, className="form-text small mb-2"),
                 *_injection_position_controls(),
+                _labeled("Source zone size (m)", dcc.Input(
+                    id="source-zone-size", type="number", value=0.3, min=0.05, max=2.0, step=0.05,
+                    className="form-control form-control-sm"),
+                    help_text="Side length of the cube-shaped cellZone the contaminant source "
+                              "injects into. Larger zones dilute the injection over more cells; "
+                              "smaller zones concentrate it into fewer, higher-rate cells."),
                 _labeled("Phase 1 iterations (no UV)", dcc.Input(
                     id="phase1-iterations", type="number", value=8000, min=500, max=50000, step=500,
                     className="form-control form-control-sm")),
@@ -1745,7 +1768,8 @@ processing_tab = html.Div([
             html.Div(id="run-status-text", className="fs-5 fw-semibold mb-2"),
             html.Div(id="run-elapsed", className="small text-muted"),
             html.Div(id="run-current-time", className="small text-muted mb-3"),
-            dbc.Button("Stop", id="stop-btn", color="danger", size="sm", className="mb-4", disabled=True),
+            dbc.Button("Stop", id="stop-btn", color="danger", size="sm", className="mb-4 me-2", disabled=True),
+            dbc.Button("Pause", id="pause-btn", color="warning", size="sm", className="mb-4", disabled=True),
             html.Div("Steps", className="small fw-semibold text-uppercase mb-1"),
             html.Ul([_checklist_item(s) for s in DECAY_STEPS], id="run-checklist",
                     className="list-unstyled small"),
@@ -1786,6 +1810,8 @@ scenario_tab = dbc.Row([
         html.Div(id="scenario-combo-count", className="small text-muted mt-2 mb-3"),
         dbc.Button("Run Sweep", id="scenario-run-btn", color="success", className="w-100 mb-2"),
         dbc.Button("Stop Sweep", id="scenario-stop-btn", color="danger", size="sm",
+                    className="mb-2 me-2", disabled=True),
+        dbc.Button("Pause Sweep", id="scenario-pause-btn", color="warning", size="sm",
                     className="mb-2", disabled=True),
         html.Div(id="scenario-validation-msg", className="small text-danger mb-2"),
         html.Div(id="scenario-status-text", className="fs-6 fw-semibold mb-2"),
@@ -1863,7 +1889,7 @@ def _result_notes(result):
     """
     notes = [T_FIELD_NOTE]
     if "phase1" in result and result.get("ventilation_ach_measured") is not None:
-        notes.append(EFFECTIVE_ACH_NOTE)
+        notes.append(_effective_ach_note(result))
     uniformity = mixing_uniformity_note(result)
     if uniformity:
         notes.append(uniformity)
@@ -1885,13 +1911,23 @@ def _steady_state_summary(result):
     has_corrected = result.get("ventilation_ach_measured") is not None
     nominal_label = ("eACH_uv, steady-state CFD-fit (assumes nominal design ACH"
                       + (" - see measured-ACH row below for the corrected value)" if has_corrected else ")"))
+    reduction_pct = result.get("reduction_pct_corrected", result.get("reduction_pct"))
     rows += [
-        ("Reduction", f"{result['reduction_pct']:.1f}%{ach_note}"),
+        ("Reduction", f"{reduction_pct:.1f}%{ach_note}"),
         (nominal_label, f"{result['eACH_uv_steady_state']:.4g} /hr{ach_note}"),
     ]
     if has_corrected:
-        rows.append(("Effective ventilation ACH (well-mixed-equivalent, from Phase 1)",
-                      f"{result['ventilation_ach_measured']:.4g} /hr{ach_note}"))
+        # Measured by a dedicated UV-off control run when one was part of
+        # this sweep (see compute_corrected_eACH_uv_from_control's
+        # docstring - more reliable than Phase 1's own point-source
+        # buildup, which a small/localized source zone can leave under-
+        # converged); falls back to the older Phase-1-derived method
+        # otherwise (e.g. the single-run path, which doesn't run a
+        # control) - ventilation_measurement_method tells us which.
+        via_control = result.get("ventilation_measurement_method") == "control_run"
+        ach_label = ("Effective ventilation ACH (measured, UV-off control run)" if via_control
+                     else "Effective ventilation ACH (well-mixed-equivalent, from Phase 1)")
+        rows.append((ach_label, f"{result['ventilation_ach_measured']:.4g} /hr{ach_note}"))
         rows.append(("eACH_uv, steady-state CFD-fit (measured ventilation ACH)",
                       f"{result['eACH_uv_steady_state_corrected']:.4g} /hr{ach_note}"))
     rows += _monitoring_summary_rows(result.get("monitoring"))
@@ -2256,14 +2292,6 @@ settings_modal = dbc.Modal(
                     "cellZone with one representative rate.",
                     "bins", _adv_defaults["uv-zone-bins"],
                 ),
-                _settings_field(
-                    "settings-source-zone-size", "Source zone size",
-                    "The physical side length (meters) of the cube-shaped cellZone used to inject "
-                    "the contaminant source in steady-state mode. Larger zones dilute the "
-                    "injection over more cells; smaller zones concentrate it into fewer, "
-                    "higher-rate cells.",
-                    "m", _adv_defaults["source-zone-size"],
-                ),
                 html.Div(id="settings-status", className="small text-success mt-2"),
             ],
             style={"maxHeight": "64vh", "overflowY": "auto"},
@@ -2276,6 +2304,18 @@ settings_modal = dbc.Modal(
         ]),
     ],
     id="settings-modal", is_open=False, size="lg",
+)
+
+grid_align_modal = dbc.Modal(
+    [
+        dbc.ModalHeader(dbc.ModalTitle("Openings don't align with the mesh grid")),
+        dbc.ModalBody(id="grid-align-modal-body"),
+        dbc.ModalFooter([
+            dbc.Button("Keep as typed", id="grid-align-keep-btn", color="secondary", outline=True, size="sm"),
+            dbc.Button("Apply suggested fix", id="grid-align-apply-btn", color="primary", size="sm"),
+        ]),
+    ],
+    id="grid-align-modal", is_open=False,
 )
 
 app.layout = dbc.Container([
@@ -2292,6 +2332,7 @@ app.layout = dbc.Container([
         id="help-modal", is_open=False, size="lg", scrollable=True,
     ),
     settings_modal,
+    grid_align_modal,
     dbc.Row(
         dbc.Col(html.H4("GUV-CFD", className="mt-3 mb-1"), width="auto"),
     ),
@@ -2698,6 +2739,8 @@ def _save_project(n_save, n_save_as, *values):
 _open_outputs = [
     Output("project-name-display", "children", allow_duplicate=True),
     Output("project-status", "children", allow_duplicate=True),
+    Output("grid-align-modal", "is_open", allow_duplicate=True),
+    Output("grid-align-modal-body", "children", allow_duplicate=True),
 ]
 _open_outputs += [Output(fid, "value", allow_duplicate=True) for fid in SETTINGS_FIELDS]
 for _prefix, *_ in POSITION_FIELDS:
@@ -2740,7 +2783,7 @@ _SETTINGS_FIELD_IDS = [
     "settings-pimple-delta-t",
     "settings-decay-ach-min-fraction", "settings-decay-each-min-fraction", "settings-decay-each-max-fraction",
     "settings-mesh-cell-size",
-    "settings-uv-zone-bins", "settings-source-zone-size",
+    "settings-uv-zone-bins",
 ]
 # Same order as _SETTINGS_FIELD_IDS - maps each GUI field to its
 # app_settings.py storage key (see ADVANCED_SETTINGS_DEFAULTS).
@@ -2755,7 +2798,7 @@ _SETTINGS_FIELD_KEYS = [
     "keep-all-timesteps",
     "pimple-delta-t",
     "decay-ach-min-fraction", "decay-each-min-fraction", "decay-each-max-fraction",
-    "mesh-cell-size", "uv-zone-bins", "source-zone-size",
+    "mesh-cell-size", "uv-zone-bins",
 ]
 
 
@@ -2834,7 +2877,91 @@ _NEW_FIELD_DEFAULTS = {
     "outlet2-size-w": 0.3, "outlet2-size-h": 0.3,
     "t-ss-window-frac": 0.15,
     "inlet-diffuser-type": "direct", "inlet2-diffuser-type": "direct",
+    # source-zone-size used to be a global advanced setting, not saved per-
+    # project - this is that old global default, for any .guvcfd saved
+    # before it moved to a per-project field.
+    "source-zone-size": 0.3,
 }
+
+
+# Maps check_settings_grid_alignment's "name" back to the actual form
+# field(s) that would need updating to match the mesh-snapped size - the
+# source zone is a single scalar (cube) field, everything else is a
+# separate width/height pair.
+_GRID_ALIGN_FIELD_IDS = {
+    "Inlet": ("inlet-size-w", "inlet-size-h"),
+    "Outlet": ("outlet-size-w", "outlet-size-h"),
+    "2nd inlet": ("inlet2-size-w", "inlet2-size-h"),
+    "2nd outlet": ("outlet2-size-w", "outlet2-size-h"),
+    "Contaminant source zone": ("source-zone-size",),
+}
+_GRID_ALIGN_ALL_FIELD_IDS = [fid for fids in _GRID_ALIGN_FIELD_IDS.values() for fid in fids]
+
+# Holds the mismatch list between _open_project detecting it and the
+# modal's Apply/Keep button click (two separate callbacks/requests) -
+# single-user local tool, same pattern as _pending_run.
+_pending_grid_fix = {"mismatches": None}
+
+
+def _check_grid_alignment(settings, room):
+    """Mismatches for this project's inlet/outlet/2nd-inlet/2nd-outlet/
+    source-zone sizes against the current mesh cell size (see
+    run_pipeline.check_settings_grid_alignment's docstring for the real
+    bug this catches early) - empty list if everything's already grid-
+    aligned, or if the check itself can't run (e.g. a hand-edited project
+    file missing a core inlet/outlet field - not worth failing the whole
+    "Open" action over a diagnostic check).
+    """
+    try:
+        adv = load_advanced_settings()
+        return check_settings_grid_alignment(
+            settings, room, adv["mesh-cell-size"], source_size=settings.get("source-zone-size", 0.3))
+    except Exception:
+        return []
+
+
+def _fmt_size(size):
+    return "x".join(f"{v:.3g}" for v in size) + "m"
+
+
+def _grid_align_modal_body(mismatches):
+    """dbc.ModalBody children explaining the mesh-snap mismatch: why it
+    happens, what actually happens if it's left alone (a record-accuracy
+    issue, NOT a simulation-safety one - the mesh generator always snaps
+    outward and safely regardless of this dialog's outcome), and exactly
+    which fields would change to what.
+    """
+    rows = [
+        html.Tr([html.Td(m["name"]), html.Td(_fmt_size(m["nominal"])), html.Td("→"), html.Td(_fmt_size(m["actual"]))])
+        for m in mismatches
+    ]
+    return [
+        html.P(
+            "This project's mesh cell size doesn't evenly divide one or more opening/source-zone "
+            "positions and sizes below. When the mesh is actually built, each affected edge gets "
+            "snapped outward to the nearest cell boundary (never shrunk - only ever grown, by at "
+            "most one cell) so the carved geometry is always at least as large as requested. That "
+            "snapping happens automatically and safely either way - this dialog is about keeping "
+            "this project's own recorded numbers honest, not about simulation correctness."
+        ),
+        html.P(
+            [
+                html.B("If you don't apply this: "),
+                "the values shown here and saved in this project file will keep reading the "
+                "original numbers you typed, even though the actual simulated opening/source "
+                "zone will be the larger, snapped size instead. The simulation itself is still "
+                "correct - but this project's settings, this report, and anyone comparing across "
+                "projects later would see a number that doesn't match what was actually built.",
+            ]
+        ),
+        html.P(html.B("Suggested changes:")),
+        dbc.Table(
+            [html.Thead(html.Tr([html.Th("Field"), html.Th("Typed"), html.Th(""), html.Th("Will actually be")]))]
+            + [html.Tbody(rows)],
+            bordered=True, size="sm", className="mb-2",
+        ),
+        html.P("Apply these to this project's own fields now?", className="mb-0"),
+    ]
 
 
 @app.callback(
@@ -2864,6 +2991,7 @@ def _open_project(n_clicks):
     guv_path = settings.get("guv_path")
     status = "No .guv file recorded in this project."
     room = None
+    modal_open, modal_body = False, dash.no_update
     if guv_path:
         try:
             project = Project.load(guv_path)
@@ -2874,6 +3002,10 @@ def _open_project(n_clicks):
             gname = guv_path.replace("\\", "/").rsplit("/", 1)[-1]
             status = (f"Loaded {gname}: {room.x:.2f} x {room.y:.2f} x {room.z:.2f} "
                       f"{room.units}, {len(room.lamps)} lamp(s)")
+            mismatches = _check_grid_alignment(settings, room)
+            if mismatches:
+                _pending_grid_fix["mismatches"] = mismatches
+                modal_open, modal_body = True, _grid_align_modal_body(mismatches)
         except Exception as e:
             status = f"Failed to reload {guv_path}: {e}"
 
@@ -2889,7 +3021,42 @@ def _open_project(n_clicks):
         else:
             max_values += [dash.no_update, dash.no_update]
 
-    return tuple([proj_name, status] + field_values + max_values)
+    return tuple([proj_name, status, modal_open, modal_body] + field_values + max_values)
+
+
+@app.callback(
+    Output("grid-align-modal", "is_open", allow_duplicate=True),
+    Output("project-status", "children", allow_duplicate=True),
+    [Output(fid, "value", allow_duplicate=True) for fid in _GRID_ALIGN_ALL_FIELD_IDS],
+    Input("grid-align-apply-btn", "n_clicks"),
+    State("project-status", "children"),
+    prevent_initial_call=True,
+)
+def _apply_grid_align_fix(n_clicks, current_status):
+    mismatches = _pending_grid_fix.get("mismatches") or []
+    updates = {fid: dash.no_update for fid in _GRID_ALIGN_ALL_FIELD_IDS}
+    for m in mismatches:
+        fids = _GRID_ALIGN_FIELD_IDS.get(m["name"], ())
+        if len(fids) == 1:
+            updates[fids[0]] = round(max(m["actual"]), 6)
+        else:
+            for fid, val in zip(fids, m["actual"]):
+                updates[fid] = round(val, 6)
+    _pending_grid_fix["mismatches"] = None
+    note = (current_status or "") + (" | Project settings updated to match the mesh-snapped sizes - "
+                                      "this project has changed and must be saved manually "
+                                      "(File > Save Project) to keep the fix.")
+    return (False, note) + tuple(updates[fid] for fid in _GRID_ALIGN_ALL_FIELD_IDS)
+
+
+@app.callback(
+    Output("grid-align-modal", "is_open", allow_duplicate=True),
+    Input("grid-align-keep-btn", "n_clicks"),
+    prevent_initial_call=True,
+)
+def _keep_grid_align_as_typed(n_clicks):
+    _pending_grid_fix["mismatches"] = None
+    return False
 
 
 def _case_dir_has_data(case_dir):
@@ -2938,6 +3105,7 @@ def _scenario_sweep_thread(guv_path, settings_path, project_dir, room, settings,
         sweep_fn(
             guv_path, settings_path, project_dir, room, settings, adv,
             z_values, ach_values, log_fn=_scenario_log, should_stop=_scenario_should_stop,
+            should_pause=_scenario_should_pause,
             on_combo_done=on_combo_done, status_fn=_scenario_status_update,
             # Without this, _run_phase()'s on_line=solver_log_fn or log_fn
             # falls back to log_fn - every raw per-iteration solver line
@@ -2969,7 +3137,7 @@ def _scenario_sweep_thread(guv_path, settings_path, project_dir, room, settings,
 def _launch_scenario_sweep(guv_path, settings_path, project_dir, room, settings, adv, z_values, ach_values):
     combos = scenario_runs.sweep_combinations(z_values, ach_values)
     _scenario_state.update(status="running", log=[], combos=combos, results={},
-                            start_time=time.time(), stop_requested=False, live_status={})
+                            start_time=time.time(), stop_requested=False, pause_requested=False, live_status={})
     thread = threading.Thread(
         target=_scenario_sweep_thread,
         args=(guv_path, settings_path, project_dir, room, settings, adv, z_values, ach_values),
@@ -3306,6 +3474,24 @@ def _stop_run(n_clicks):
 
 
 @app.callback(
+    Output("run-log", "children", allow_duplicate=True),
+    Input("pause-btn", "n_clicks"),
+    prevent_initial_call=True,
+)
+def _toggle_pause_run(n_clicks):
+    if _run_state["status"] != "running":
+        return (dash.no_update,)
+    if _run_state.get("pause_requested"):
+        _run_state["pause_requested"] = False
+        _run_log("Continue requested - resuming the active solver process...")
+    else:
+        _run_state["pause_requested"] = True
+        _run_log("Pause requested - suspending the active solver process in place "
+                 "(no iterations lost)...")
+    return (dash.no_update,)
+
+
+@app.callback(
     Output("scenario-combo-count", "children"),
     Input("scenario-z-values", "value"),
     Input("scenario-ach-values", "value"),
@@ -3380,6 +3566,24 @@ def _stop_scenario_sweep(n_clicks):
     return (dash.no_update,)
 
 
+@app.callback(
+    Output("scenario-log", "children", allow_duplicate=True),
+    Input("scenario-pause-btn", "n_clicks"),
+    prevent_initial_call=True,
+)
+def _toggle_pause_scenario_sweep(n_clicks):
+    if _scenario_state["status"] != "running":
+        return (dash.no_update,)
+    if _scenario_state.get("pause_requested"):
+        _scenario_state["pause_requested"] = False
+        _scenario_log("Continue requested - resuming every suspended combination...")
+    else:
+        _scenario_state["pause_requested"] = True
+        _scenario_log("Pause requested - suspending every active combination's solver process "
+                      "in place (no iterations lost)...")
+    return (dash.no_update,)
+
+
 def _scenario_progress_table():
     combos = _scenario_state["combos"]
     if not combos:
@@ -3395,8 +3599,21 @@ def _scenario_progress_table():
             detail = entry["detail"]
             status = "done"
             if "reduction_pct" in detail:
-                reduction = f"{detail['reduction_pct']:.1f}%"
-                eACH = f"{detail['eACH_uv_steady_state']:.4g} /hr"
+                # Prefer the control-measured-ventilation-corrected variants
+                # of both columns when a control run was part of this sweep
+                # (see compute_corrected_eACH_uv_from_control's docstring) -
+                # reduction_pct itself still uses Phase 1's own T_ss1 (which
+                # can be biased low by point-source mixing lag), same reason
+                # eACH_uv_steady_state uses the nominal ACH. Falling back to
+                # the uncorrected fields keeps this working for older
+                # results/single runs that never had a control run. Confirmed
+                # directly: a real steady-state combo showed 39.24 /hr
+                # (nominal) vs 19.59 /hr (corrected) for a room only actually
+                # delivering half its nominal ACH.
+                reduction_val = detail.get("reduction_pct_corrected", detail["reduction_pct"])
+                reduction = f"{reduction_val:.1f}%"
+                eACH_val = detail.get("eACH_uv_steady_state_corrected", detail["eACH_uv_steady_state"])
+                eACH = f"{eACH_val:.4g} /hr"
             else:
                 # Decay-mode trimmed result (_trim_decay_report) has no
                 # reduction_pct field at all - compute the same analytical
@@ -3424,6 +3641,8 @@ def _scenario_progress_table():
     Output("scenario-poll", "disabled", allow_duplicate=True),
     Output("scenario-run-btn", "disabled", allow_duplicate=True),
     Output("scenario-stop-btn", "disabled", allow_duplicate=True),
+    Output("scenario-pause-btn", "disabled", allow_duplicate=True),
+    Output("scenario-pause-btn", "children"),
     Input("scenario-poll", "n_intervals"),
     prevent_initial_call=True,
 )
@@ -3440,15 +3659,20 @@ def _poll_scenario(n_intervals):
     n_done = sum(1 for r in _scenario_state["results"].values() if r["status"] == "done")
     n_error = sum(1 for r in _scenario_state["results"].values() if r["status"] == "error")
     n_total = len(_scenario_state["combos"])
+    still_running = status == "running"
+    paused = still_running and _scenario_state.get("pause_requested", False)
     status_text = {
         "running": f"Running... ({n_done + n_error}/{n_total} combinations done)",
         "done": f"Finished. {n_done}/{n_total} succeeded, {n_error} failed.",
         "error": "Failed - see log below.",
         "stopped": f"Stopped. {n_done}/{n_total} succeeded, {n_error} failed.",
     }.get(status, "")
-    still_running = status == "running"
+    if paused:
+        status_text = (f"Paused ({n_done + n_error}/{n_total} done) - every active combination's "
+                        f"solver is suspended in place. Click Continue to resume.")
+    pause_btn_label = "Continue Sweep" if paused else "Pause Sweep"
     return (log_text, live_text, status_text, _scenario_progress_table(),
-            not still_running, still_running, not still_running)
+            not still_running, still_running, not still_running, not still_running, pause_btn_label)
 
 
 def _render_checklist():
@@ -3540,6 +3764,8 @@ def _flow_decision_iterations_suggestion(diagnostic):
     Output("continue-btn", "disabled", allow_duplicate=True),
     Output("run-poll", "disabled"),
     Output("stop-btn", "disabled"),
+    Output("pause-btn", "disabled"),
+    Output("pause-btn", "children"),
     Output("run-checklist", "children"),
     Output("run-elapsed", "children"),
     Output("run-current-time", "children"),
@@ -3570,6 +3796,10 @@ def _poll_run(n_intervals):
         "stopped": "Stopped.",
     }.get(status, "")
     still_running = status == "running"
+    paused = still_running and _run_state.get("pause_requested", False)
+    if paused:
+        status_text = "Paused (solver suspended in place - click Continue to resume, no iterations lost)."
+    pause_btn_label = "Continue" if paused else "Pause"
 
     start = _run_state.get("start_time")
     elapsed = f"Elapsed: {_format_mmss(time.time() - start)}" if start else ""
@@ -3619,6 +3849,7 @@ def _poll_run(n_intervals):
         resume_panel_text = dash.no_update
 
     return (log_text, status_text, still_running, still_running, not still_running, not still_running,
+            not still_running, pause_btn_label,
             _render_checklist(), elapsed, cur_time_text, results_data, results_case_dir,
             panel_style, panel_text, panel_iterations, resume_panel_style, resume_panel_text)
 

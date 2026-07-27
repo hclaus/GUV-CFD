@@ -16,20 +16,23 @@ Two phases share this source, staying on throughout:
 import re
 
 from .decay_analysis import fit_asymptotic_value
+from .mesh_gen import snap_outward
 from .wsl_utils import wsl_path, run_wsl_or_raise, run_wsl
 
 
-def source_topo_set_dict(center, size, zone_name="sourceZone", cellset_name="sourceZoneCells", cell_size=None):
-    """topoSetDict actions carving a small box cellZone (cellSet -> cellZoneSet,
-    the standard two-step pattern) for the contaminant source. No faces/
-    patches involved - this only tags cells, doesn't touch mesh topology.
-
-    cell_size: if given, snap all 6 box edges to the nearest mesh grid
-    line - see mesh_gen._opening_box's docstring for why this matters (a
-    center/size combination that doesn't land on a whole number of cells
-    puts the raw box edges right on a boxToCell floating-point boundary
-    tie, producing an inconsistent/asymmetric carved zone instead of a
-    clean, deterministic block).
+def _source_box(center, size, cell_size=None):
+    """((xlo,ylo,zlo), (xhi,yhi,zhi)) for the source zone's box, snapped
+    OUTWARD to the mesh grid if cell_size is given (floor each low edge,
+    ceil each high edge) - see mesh_gen._opening_box's docstring for why
+    outward, not to-nearest: a center/size combination that doesn't land
+    on a whole number of cells puts the raw box edges right on a
+    boxToCell floating-point boundary tie, and round-to-nearest can
+    resolve that tie inward on every axis, silently shrinking the carved
+    zone well below the requested size (confirmed on a real case: a 0.3m
+    source zone came out as 0.3x0.2x0.2m = 0.012 m^3, 44% of the requested
+    0.027 m^3, because two of its three axes hit exactly this tie).
+    Snapping outward instead guarantees the carved zone always contains
+    the requested box.
     """
     cx, cy, cz = center
     if isinstance(size, (tuple, list)):
@@ -40,10 +43,37 @@ def source_topo_set_dict(center, size, zone_name="sourceZone", cellset_name="sou
     hi = [cx + sx / 2, cy + sy / 2, cz + sz / 2]
     if cell_size:
         for i in range(3):
-            lo[i] = round(lo[i] / cell_size) * cell_size
-            hi[i] = round(hi[i] / cell_size) * cell_size
+            lo[i] = snap_outward(lo[i], cell_size, "lo")
+            hi[i] = snap_outward(hi[i], cell_size, "hi")
             if hi[i] <= lo[i]:
                 hi[i] = lo[i] + cell_size
+    return tuple(lo), tuple(hi)
+
+
+def source_box_grid_alignment(center, size, cell_size):
+    """(nominal_size, actual_size) (width, height, depth) tuples for the
+    source zone, comparing the raw requested box against what will
+    actually be carved once snapped to cell_size - lets a caller warn
+    about size drift BEFORE running a simulation (see
+    run_pipeline.check_settings_grid_alignment), rather than discovering
+    it after the fact the way check_ach_delivery does for the inlet.
+    """
+    lo_nom, hi_nom = _source_box(center, size)
+    lo_snap, hi_snap = _source_box(center, size, cell_size=cell_size)
+    nominal = tuple(h - l for l, h in zip(lo_nom, hi_nom))
+    actual = tuple(h - l for l, h in zip(lo_snap, hi_snap))
+    return nominal, actual
+
+
+def source_topo_set_dict(center, size, zone_name="sourceZone", cellset_name="sourceZoneCells", cell_size=None):
+    """topoSetDict actions carving a small box cellZone (cellSet -> cellZoneSet,
+    the standard two-step pattern) for the contaminant source. No faces/
+    patches involved - this only tags cells, doesn't touch mesh topology.
+
+    cell_size: if given, snap all 6 box edges to the mesh grid - see
+    _source_box's docstring.
+    """
+    lo, hi = _source_box(center, size, cell_size=cell_size)
 
     lines = [
         "FoamFile", "{", "    version     2.0;", "    format      ascii;",

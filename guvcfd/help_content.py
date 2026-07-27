@@ -191,6 +191,57 @@ needing the acceptance criterion, but at a compute cost far beyond what's
 practical for interactive room-ventilation case exploration - RANS is the
 standard, appropriate choice at this scale and level of engineering fidelity.
 
+### Measuring the *actual* ventilation rate
+
+The nominal ACH you type in is only a boundary condition - it fixes how
+much air the inlet delivers, not how effectively that air actually mixes
+into (and clears) the room. A room with the inlet and outlet on the same
+wall can short-circuit air straight across without ever reaching the far
+corners, delivering its nominal ACH at the boundary while the room-average
+concentration behaves as if ventilation were much weaker. Every run
+reports both numbers - the nominal-ACH eACH_uv, and a corrected version
+using the *actual* measured ventilation rate - so the gap between them is
+visible, not hidden.
+
+**How the measurement works** depends on the scenario type:
+
+- **Decay mode** has always measured it directly: alongside the main UV-on
+  decay curve, a second, UV-off "control" run - starting from the same
+  uniform initial concentration, no source, ventilation only - is run once
+  per ACH value (shared across every Z at that ACH, since the control's
+  physics doesn't depend on Z at all) and its own decay rate is fitted the
+  same way the main curve is. Subtracting the control's rate from the
+  combined rate gives the UV's own contribution, independent of however
+  well ventilation alone is actually working.
+
+- **Steady-state mode** now uses the same control-run approach. It didn't
+  always: an earlier version derived the ventilation rate from Phase 1
+  (the source-only, no-UV buildup phase already run to prime Phase 2's
+  starting field) instead of running a separate control. That works fine
+  when the source zone is reasonably sized, but a **small, point-like
+  source zone** (the default, and often the physically correct choice) has
+  to first spread its contaminant through the whole room before the room-
+  average concentration reflects anything close to a true equilibrium -
+  a mixing-*transport* delay, not a removal-rate effect. Confirmed
+  directly on a real case: Phase 1's own buildup curve was still visibly
+  climbing at the end of its iteration budget, and its extrapolated time
+  constant was slower than either of decay mode's own ventilation-rate
+  estimates for the same room and ACH - accepting that still-rising curve
+  as "the" steady state understated the true equilibrium concentration,
+  which in turn overstated the corrected eACH_uv by roughly 1.75x on that
+  case. Phase 1 itself hasn't changed - it still primes Phase 2's starting
+  field exactly as before - only *where the ventilation-rate measurement
+  comes from* has, sidestepping the point-source mixing lag entirely by
+  starting the control run already-mixed, the same way decay mode's always
+  has.
+
+Look for `ventilation_measurement_method` in a result's JSON (or the
+"Effective ventilation ACH" row's label in the Analysis tab) to see which
+method actually produced a given number - "from a UV-off control run" is
+the current, preferred method for both scenario types; "from Phase 1" is
+the older steady-state-only fallback, kept for compatibility with older
+results and any path that doesn't run a control.
+
 ### Known problems / failure modes to watch for
 
 - **Impinging jets/fans directly facing a wall or floor** may never

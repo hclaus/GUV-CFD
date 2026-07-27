@@ -1,11 +1,13 @@
 import inspect
 
 import numpy as np
+import pytest
 
 import guvcfd.steady_state_pipeline as ssp
 from guvcfd.steady_state_pipeline import (
     _chunk_write_interval, _clear_phase1_checkpoint, _list_time_dirs, _point_phase_summary,
     _read_phase1_checkpoint, _rename_chunk_time_dirs, _room_phase_summary, _write_phase1_checkpoint,
+    compute_corrected_eACH_uv, compute_corrected_eACH_uv_from_control,
     run_steady_state_scenario,
 )
 
@@ -84,6 +86,41 @@ def test_run_steady_state_scenario_still_accepts_advanced_settings_params():
     assert params["t_inf_streak"].default == 3
     assert params["keep_all_timesteps"].default is False  # opt-in - off keeps case dirs small
     assert params["phase1_only"].default is False  # off by default - normal single/per-Z runs do both phases
+    assert params["measured_ventilation_ach"].default is None  # off by default - no control run given
+
+
+def test_compute_corrected_eACH_uv_from_control_matches_manual_mass_balance():
+    # lambda_total_actual = G/(V*T_ss2); eACH_uv = lambda_total_actual minus
+    # the (already measured, e.g. by a UV-off control run) ventilation rate -
+    # same "total minus measured ventilation" subtraction
+    # decay_analysis.compute_effective_eACH does, just derived from a
+    # steady-state ratio instead of a transient curve fit.
+    Su, source_volume, room_volume = 2.4672, 0.012, 39.4752
+    T_ss2 = 0.11213866470568581
+    ventilation_ach_measured = 2.455280997637921  # e.g. from a control run
+
+    G = Su * source_volume
+    lambda_total_actual = G / (room_volume * T_ss2) * 3600
+    expected = lambda_total_actual - ventilation_ach_measured
+
+    result = compute_corrected_eACH_uv_from_control(
+        T_ss2, Su, source_volume, room_volume, ventilation_ach_measured)
+    assert result == pytest.approx(expected)
+
+
+def test_compute_corrected_eACH_uv_from_control_handles_zero_T_ss2():
+    assert compute_corrected_eACH_uv_from_control(0.0, 2.4672, 0.012, 39.4752, 2.46) is None
+
+
+def test_compute_corrected_eACH_uv_still_works_unchanged():
+    # The old (Phase-1-T_ss1-derived) path is kept for the single-run
+    # fallback - unchanged behavior, still returns (ventilation_ach_measured,
+    # eACH_uv_corrected).
+    ach_measured, eACH = compute_corrected_eACH_uv(
+        T_ss1=0.6010924162620547, T_ss2=0.11213866470568581,
+        Su=2.4672, source_volume=0.012, room_volume=39.4752)
+    assert ach_measured == pytest.approx(4.491821768090478)
+    assert eACH == pytest.approx(19.585511478977345)
 
 
 def test_rename_chunk_time_dirs_is_noop_at_zero_offset(monkeypatch):

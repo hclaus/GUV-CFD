@@ -19,7 +19,6 @@ ADVANCED_SETTINGS_DEFAULTS = {
     "pimple-delta-t": 0.5,     # seconds - decay solver time step
     "mesh-cell-size": 0.10,    # meters
     "uv-zone-bins": 25,        # bins
-    "source-zone-size": 0.30,  # meters
     "momentum-relaxation": 0.7,  # SIMPLE under-relaxation for U/(k|omega)
     "scalar-relaxation": 0.7,    # SIMPLE under-relaxation for T
     "t-infinity-early-stop-enabled": True,  # Phase 1's primary readiness gate - see run_steady_state_scenario
