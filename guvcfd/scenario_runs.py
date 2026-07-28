@@ -275,7 +275,7 @@ def _apply_z(case_dir, Z, nbins, fan_kwargs, log_fn):
 
 
 def _run_scenario(case_dir, room, settings, z, ach, adv, z_summary, log_fn, should_stop, solver_log_fn,
-                   status_fn=None, control_results=None, should_pause=None):
+                   status_fn=None, control_results=None, base_summary=None, should_pause=None):
     """run_steady_state_scenario() with this combination's z/ach - same
     call app._run_steady_state makes for a single run.
 
@@ -289,6 +289,17 @@ def _run_scenario(case_dir, room, settings, z, ach, adv, z_summary, log_fn, shou
     reliable than deriving one from Phase 1's own point-source buildup
     (see compute_corrected_eACH_uv_from_control's docstring). None falls
     back to the old Phase-1-derived method.
+
+    base_summary: the shared flow base's own setup_case() summary (see
+    _build_flow_base) - carries flow_converged/ach_delivery/n_lamps
+    through to this combo's own results.json, the same way
+    _run_decay_scenario already does for decay mode. Regression fixed
+    2026-07-27: run_sweep's build_ach_fn previously called
+    _build_flow_base() without capturing its return value at all, so
+    steady-state sweep results never had these fields (confirmed on a
+    real sweep: ach_delivery was silently None in every combo's
+    results.json, while the identical decay-mode sweep had it) - only
+    single, non-swept runs (app._run_steady_state) ever set them.
     """
     fan_entry = None
     if settings.get("fan-enable"):
@@ -339,6 +350,9 @@ def _run_scenario(case_dir, room, settings, z, ach, adv, z_summary, log_fn, shou
     )
     result["fluence_mean"] = z_summary["fluence_mean"]
     result["eACH_uv_well_mixed"] = z_summary.get("eACH_uv_well_mixed_mean")
+    result["flow_converged"] = (base_summary or {}).get("flow_converged")
+    result["ach_delivery"] = (base_summary or {}).get("ach_delivery")
+    result["n_lamps"] = (base_summary or {}).get("n_lamps")
     return result
 
 
@@ -816,6 +830,10 @@ def run_decay_sweep(guv_path, settings_path, project_dir, room, settings, adv,
     def cleanup_ach_fn(ctx):
         ach = ctx["ach"]
         ach_log_fn = _prefixed_log_fn(log_fn, f"ACH={ach}")
+        if adv.get("keep-shared-scratch-dirs"):
+            ach_log_fn("Keeping shared base case and control run on disk "
+                       "(\"Keep shared per-ACH scratch directories\" is enabled)...")
+            return
         ach_log_fn("Removing shared base case and control run...")
         run_wsl_or_raise(
             f'rm -rf "{wsl_path(ctx["base_dir"])}" "{wsl_path(ctx["control_dir"])}"', wsl_path(project_dir),
@@ -903,8 +921,8 @@ def run_sweep(guv_path, settings_path, project_dir, room, settings, adv,
         phase1_dir = f"{project_dir}/_phase1_ACH{_fmt(ach)}"
         control_dir = f"{project_dir}/_control_ACH{_fmt(ach)}"
         ach_log_fn("=== converging flow field (shared by every Z at this ACH) ===")
-        _build_flow_base(guv_path, base_dir, room, settings, ach, adv, ach_log_fn, should_stop, solver_log_fn,
-                          should_pause=should_pause)
+        base_summary = _build_flow_base(guv_path, base_dir, room, settings, ach, adv, ach_log_fn, should_stop,
+                                         solver_log_fn, should_pause=should_pause)
         # Phase 1 ("source only, no UV") is Z-independent (see
         # _run_shared_phase1) - run it once per ACH here, not once per Z
         # in run_z_fn below.
@@ -919,7 +937,7 @@ def run_sweep(guv_path, settings_path, project_dir, room, settings, adv,
                                                ach_log_fn, should_stop, solver_log_fn, status_fn=status_fn,
                                                should_pause=should_pause)
         return {"ach": ach, "base_dir": base_dir, "phase1_dir": phase1_dir, "control_dir": control_dir,
-                "control_results": control_results, "fan_kw": _fan_kwargs(settings)}
+                "base_summary": base_summary, "control_results": control_results, "fan_kw": _fan_kwargs(settings)}
 
     def run_z_fn(ctx, z, ach):
         if should_stop is not None and should_stop():
@@ -947,7 +965,7 @@ def run_sweep(guv_path, settings_path, project_dir, room, settings, adv,
             result = _run_scenario(case_dir, room, settings, z, ach, adv,
                                     z_summary, combo_log_fn, should_stop, solver_log_fn,
                                     status_fn=status_fn, control_results=ctx["control_results"],
-                                    should_pause=should_pause)
+                                    base_summary=ctx["base_summary"], should_pause=should_pause)
             with open(f"{case_dir}/results.json", "w") as f:
                 json.dump(result, f, indent=2)
             _save_run_settings(case_dir, settings, guv_path, settings_path, z, ach)
@@ -970,6 +988,10 @@ def run_sweep(guv_path, settings_path, project_dir, room, settings, adv,
     def cleanup_ach_fn(ctx):
         ach = ctx["ach"]
         ach_log_fn = _prefixed_log_fn(log_fn, f"ACH={ach}")
+        if adv.get("keep-shared-scratch-dirs"):
+            ach_log_fn("Keeping shared base case, Phase 1 run, and control run on disk "
+                       "(\"Keep shared per-ACH scratch directories\" is enabled)...")
+            return
         ach_log_fn("Removing shared base case, Phase 1 run, and control run...")
         run_wsl_or_raise(
             f'rm -rf "{wsl_path(ctx["base_dir"])}" "{wsl_path(ctx["phase1_dir"])}" "{wsl_path(ctx["control_dir"])}"',

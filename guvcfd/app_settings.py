@@ -35,6 +35,7 @@ ADVANCED_SETTINGS_DEFAULTS = {
     "decay-ach-min-fraction": 90.0,   # % - decay-mode UV-off control run's target reduction
     "decay-each-min-fraction": 90.0,  # % - decay-mode UV-on run's baseline target reduction
     "decay-each-max-fraction": 99.9,  # % - decay-mode UV-on run's target when eACH is high (cheap to reach)
+    "keep-shared-scratch-dirs": False,  # troubleshooting opt-in - see scenario_runs.py's cleanup_ach_fn
 }
 
 

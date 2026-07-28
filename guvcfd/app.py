@@ -2292,6 +2292,30 @@ settings_modal = dbc.Modal(
                     "cellZone with one representative rate.",
                     "bins", _adv_defaults["uv-zone-bins"],
                 ),
+                html.Hr(className="my-2"),
+                html.Div("Scenario sweep troubleshooting", className="small fw-bold text-uppercase mb-1"),
+                html.Div(
+                    "A scenario sweep (Processing tab) shares one flow-converged base case, "
+                    "Phase 1 run, and UV-off control run across every Z at the same ACH, then "
+                    "deletes those shared directories once that ACH group's last Z finishes - "
+                    "keeping a run's own working directory small, but also removing the one place "
+                    "you could otherwise inspect the shared flow field/control run directly, or "
+                    "reuse it to retry a single combination with different settings (e.g. a "
+                    "different relaxation factor) without re-converging the flow from scratch. Turn "
+                    "this on before a sweep you expect to need to troubleshoot afterward - off by "
+                    "default, since a real multi-ACH sweep can leave several of these directories "
+                    "(one flow base + one Phase 1 + one control run per ACH value) taking up real "
+                    "disk space if never manually cleaned up.",
+                    className="small text-muted mb-2",
+                ),
+                _settings_checkbox_field(
+                    "settings-keep-shared-scratch-dirs", "Keep shared per-ACH scratch directories",
+                    "Off by default so a sweep cleans up after itself. Turn on to keep "
+                    "_base_ACH*/_phase1_ACH*/_control_ACH* directories on disk after the sweep "
+                    "finishes, for inspection or reuse - you'll need to delete them yourself "
+                    "afterward.",
+                    _adv_defaults["keep-shared-scratch-dirs"],
+                ),
                 html.Div(id="settings-status", className="small text-success mt-2"),
             ],
             style={"maxHeight": "64vh", "overflowY": "auto"},
@@ -2784,6 +2808,7 @@ _SETTINGS_FIELD_IDS = [
     "settings-decay-ach-min-fraction", "settings-decay-each-min-fraction", "settings-decay-each-max-fraction",
     "settings-mesh-cell-size",
     "settings-uv-zone-bins",
+    "settings-keep-shared-scratch-dirs",
 ]
 # Same order as _SETTINGS_FIELD_IDS - maps each GUI field to its
 # app_settings.py storage key (see ADVANCED_SETTINGS_DEFAULTS).
@@ -2799,6 +2824,7 @@ _SETTINGS_FIELD_KEYS = [
     "pimple-delta-t",
     "decay-ach-min-fraction", "decay-each-min-fraction", "decay-each-max-fraction",
     "mesh-cell-size", "uv-zone-bins",
+    "keep-shared-scratch-dirs",
 ]
 
 

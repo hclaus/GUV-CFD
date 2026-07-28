@@ -139,7 +139,7 @@ def test_run_sweep_creates_expected_subfolders_and_reports(tmp_path, monkeypatch
                          {"fluence_mean": 1.0, "eACH_uv_well_mixed_mean": 0.0})
 
     def fake_run_scenario(case_dir, room, settings, z, ach, adv, z_summary, log_fn, should_stop, solver_log_fn,
-                           status_fn=None, control_results=None, should_pause=None):
+                           status_fn=None, control_results=None, base_summary=None, should_pause=None):
         return {"reduction_pct": 90.0, "eACH_uv_steady_state": 50.0, "phase1": {"T_ss": 1.0, "live": {"t": [1]}},
                 "phase2": {"T_ss": 0.1, "live": {"t": [1]}}}
     monkeypatch.setattr(sr, "_run_scenario", fake_run_scenario)
@@ -173,6 +173,119 @@ def test_run_sweep_creates_expected_subfolders_and_reports(tmp_path, monkeypatch
     assert "live" not in trimmed["phase1"]
     assert trimmed["reduction_pct"] == 90.0
     assert any("_base_ACH3" in cmd for cmd in removed)  # base dir cleanup happened
+
+
+def test_run_sweep_captures_build_flow_base_return_value_as_base_summary(tmp_path, monkeypatch):
+    # Regression: build_ach_fn used to call _build_flow_base(...) without
+    # assigning its return value at all, so ach_delivery/flow_converged
+    # never reached any combo's results.json for steady-state sweeps.
+    project_dir = tmp_path / "myproject"
+    project_dir.mkdir()
+
+    fake_base_summary = {"flow_converged": True, "ach_delivery": {"measured_ach": 5.9}, "n_lamps": 4}
+    monkeypatch.setattr(sr, "_build_flow_base", lambda *a, **k: fake_base_summary)
+    monkeypatch.setattr(sr, "_run_shared_phase1", lambda *a, **k: None)
+    monkeypatch.setattr(sr, "_run_shared_control", lambda *a, **k: {"total_ach_effective": 3.0})
+    monkeypatch.setattr(sr, "write_source_topo_set_dict", lambda *a, **k: None)
+    monkeypatch.setattr(sr, "_copy_base_case", lambda base, target, log_fn: __import__("os").makedirs(target, exist_ok=True))
+    monkeypatch.setattr(sr, "_apply_z", lambda case_dir, z, nbins, fan_kwargs, log_fn:
+                         {"fluence_mean": 1.0, "eACH_uv_well_mixed_mean": 0.0})
+    monkeypatch.setattr(sr, "run_wsl_or_raise", lambda cmd, *a, **k: None)
+
+    captured = {}
+
+    def fake_run_scenario(case_dir, room, settings, z, ach, adv, z_summary, log_fn, should_stop, solver_log_fn,
+                           status_fn=None, control_results=None, base_summary=None, should_pause=None):
+        captured["base_summary"] = base_summary
+        return {"reduction_pct": 90.0, "eACH_uv_steady_state": 50.0, "phase1": {"T_ss": 1.0, "live": {"t": [1]}},
+                "phase2": {"T_ss": 0.1, "live": {"t": [1]}}}
+    monkeypatch.setattr(sr, "_run_scenario", fake_run_scenario)
+
+    room = type("Room", (), {"x": 4.0, "y": 5.0, "z": 2.7})()
+    settings = {"sim-type": "steady_state", "fan-enable": False, "monitoring-enable": False,
+                "inlet-wall": "xMin", "inlet-size-w": 0.3, "inlet-size-h": 0.3,
+                "phase1-iterations": 100, "phase2-iterations": 100, "target-t-ss": 1.0,
+                "inject-x-input": 2, "inject-y-input": 2.5, "inject-z-input": 1.3, "z-value": 6,
+                "source-zone-size": 0.3}
+    adv = {"uv-zone-bins": 25, "mesh-cell-size": 0.1}
+
+    sr.run_sweep(
+        guv_path="proj.guv", settings_path="proj.guvcfd", project_dir=str(project_dir),
+        room=room, settings=settings, adv=adv,
+        z_values=[6], ach_values=[3], log_fn=lambda m: None,
+    )
+
+    assert captured["base_summary"] == fake_base_summary
+
+
+def test_run_sweep_keeps_shared_dirs_when_setting_enabled(tmp_path, monkeypatch):
+    project_dir = tmp_path / "myproject"
+    project_dir.mkdir()
+
+    monkeypatch.setattr(sr, "_build_flow_base", lambda *a, **k: None)
+    monkeypatch.setattr(sr, "_run_shared_phase1", lambda *a, **k: None)
+    monkeypatch.setattr(sr, "_run_shared_control", lambda *a, **k: {"total_ach_effective": 3.0})
+    monkeypatch.setattr(sr, "write_source_topo_set_dict", lambda *a, **k: None)
+    monkeypatch.setattr(sr, "_copy_base_case", lambda base, target, log_fn: __import__("os").makedirs(target, exist_ok=True))
+    monkeypatch.setattr(sr, "_apply_z", lambda case_dir, z, nbins, fan_kwargs, log_fn:
+                         {"fluence_mean": 1.0, "eACH_uv_well_mixed_mean": 0.0})
+
+    def fake_run_scenario(case_dir, room, settings, z, ach, adv, z_summary, log_fn, should_stop, solver_log_fn,
+                           status_fn=None, control_results=None, base_summary=None, should_pause=None):
+        return {"reduction_pct": 90.0, "eACH_uv_steady_state": 50.0, "phase1": {"T_ss": 1.0, "live": {"t": [1]}},
+                "phase2": {"T_ss": 0.1, "live": {"t": [1]}}}
+    monkeypatch.setattr(sr, "_run_scenario", fake_run_scenario)
+
+    removed = []
+    monkeypatch.setattr(sr, "run_wsl_or_raise", lambda cmd, *a, **k: removed.append(cmd))
+
+    room = type("Room", (), {"x": 4.0, "y": 5.0, "z": 2.7})()
+    settings = {"sim-type": "steady_state", "fan-enable": False, "monitoring-enable": False,
+                "inlet-wall": "xMin", "inlet-size-w": 0.3, "inlet-size-h": 0.3,
+                "phase1-iterations": 100, "phase2-iterations": 100, "target-t-ss": 1.0,
+                "inject-x-input": 2, "inject-y-input": 2.5, "inject-z-input": 1.3, "z-value": 6,
+                "source-zone-size": 0.3}
+    adv = {"uv-zone-bins": 25, "mesh-cell-size": 0.1, "keep-shared-scratch-dirs": True}
+
+    sr.run_sweep(
+        guv_path="proj.guv", settings_path="proj.guvcfd", project_dir=str(project_dir),
+        room=room, settings=settings, adv=adv,
+        z_values=[6], ach_values=[3], log_fn=lambda m: None,
+    )
+
+    assert not any("_base_ACH3" in cmd for cmd in removed)  # no cleanup happened
+
+
+def test_run_decay_sweep_keeps_shared_dirs_when_setting_enabled(tmp_path, monkeypatch):
+    project_dir = tmp_path / "myproject"
+    project_dir.mkdir()
+
+    monkeypatch.setattr(sr, "_build_flow_base", lambda *a, **k: None)
+    monkeypatch.setattr(sr, "_run_shared_control", lambda *a, **k: {"total_ach_effective": 3.0})
+    monkeypatch.setattr(sr, "_copy_base_case", lambda base, target, log_fn: __import__("os").makedirs(target, exist_ok=True))
+    monkeypatch.setattr(sr, "_apply_z", lambda case_dir, z, nbins, fan_kwargs, log_fn:
+                         {"fluence_mean": 1.0, "eACH_uv_well_mixed_mean": 0.0})
+    monkeypatch.setattr(sr, "_run_decay_scenario", lambda *a, **k: {
+        "reduction_pct": 1.0, "eACH_uv_effective": 1.0, "eACH_uv_well_mixed": 1.0, "phase1": {}, "phase2": {}})
+
+    removed = []
+    monkeypatch.setattr(sr, "run_wsl_or_raise", lambda cmd, *a, **k: removed.append(cmd))
+
+    room = type("Room", (), {"x": 4.0, "y": 5.0, "z": 2.7})()
+    settings = {"sim-type": "steady_state", "fan-enable": False, "monitoring-enable": False,
+                "inlet-wall": "xMin", "inlet-size-w": 0.3, "inlet-size-h": 0.3,
+                "phase1-iterations": 100, "phase2-iterations": 100, "target-t-ss": 1.0,
+                "inject-x-input": 2, "inject-y-input": 2.5, "inject-z-input": 1.3, "z-value": 6,
+                "source-zone-size": 0.3}
+    adv = {"uv-zone-bins": 25, "mesh-cell-size": 0.1, "keep-shared-scratch-dirs": True}
+
+    sr.run_decay_sweep(
+        guv_path="proj.guv", settings_path="proj.guvcfd", project_dir=str(project_dir),
+        room=room, settings=settings, adv=adv,
+        z_values=[6], ach_values=[3], log_fn=lambda m: None,
+    )
+
+    assert not any("_base_ACH3" in cmd for cmd in removed)  # no cleanup happened
 
 
 def test_skip_if_combo_already_done_reports_existing_result_without_running():
@@ -252,7 +365,7 @@ def test_run_sweep_skips_a_combo_that_already_has_results_json(tmp_path, monkeyp
     run_scenario_calls = []
 
     def fake_run_scenario(case_dir, room, settings, z, ach, adv, z_summary, log_fn, should_stop, solver_log_fn,
-                           status_fn=None, control_results=None, should_pause=None):
+                           status_fn=None, control_results=None, base_summary=None, should_pause=None):
         run_scenario_calls.append(z)
         return {"reduction_pct": 90.0, "eACH_uv_steady_state": 50.0, "phase1": {"T_ss": 1.0, "live": {"t": [1]}},
                 "phase2": {"T_ss": 0.1, "live": {"t": [1]}}}
@@ -355,6 +468,37 @@ def test_run_scenario_threads_control_results_into_measured_ventilation_ach(monk
                       control_results={"total_ach_effective": 2.46})
 
     assert calls[-1]["measured_ventilation_ach"] == 2.46
+
+
+def test_run_scenario_threads_base_summary_into_flow_converged_and_ach_delivery(monkeypatch):
+    # Regression: run_sweep's build_ach_fn used to call _build_flow_base()
+    # without capturing its return value at all, so steady-state sweep
+    # results never had flow_converged/ach_delivery/n_lamps - confirmed on
+    # a real sweep (ach_delivery was silently None in every combo's
+    # results.json, while the identical decay-mode sweep had it, since
+    # _run_decay_scenario already threads base_summary through correctly).
+    def fake_run_steady_state_scenario(*a, **k):
+        return {"reduction_pct": 90.0, "eACH_uv_steady_state": 50.0}
+    monkeypatch.setattr(sr, "run_steady_state_scenario", fake_run_steady_state_scenario)
+
+    room = type("Room", (), {"x": 4.0, "y": 5.0, "z": 2.7})()
+    settings = {"fan-enable": False, "inlet2-enable": False, "outlet2-enable": False,
+                "inlet-wall": "xMin", "inlet-y-input": 1.5, "inlet-z-input": 1.3,
+                "inlet-size-w": 0.3, "inlet-size-h": 0.3,
+                "phase1-iterations": 100, "phase2-iterations": 100, "target-t-ss": 1.0,
+                "inject-x-input": 2, "inject-y-input": 2.5, "inject-z-input": 1.3,
+                "monitoring-enable": False, "source-zone-size": 0.3}
+    adv = {"uv-zone-bins": 25, "mesh-cell-size": 0.1,
+           "plateau-rel-tol": 1.0, "t-infinity-early-stop-enabled": False, "keep-all-timesteps": False}
+
+    base_summary = {"flow_converged": True, "ach_delivery": {"measured_ach": 5.9, "ratio": 0.98}, "n_lamps": 4}
+    result = sr._run_scenario("case_dir", room, settings, z=6.0, ach=3.0, adv=adv,
+                              z_summary={"eACH_uv_well_mixed_mean": 0.0, "fluence_mean": 1.0}, log_fn=lambda m: None,
+                              should_stop=None, solver_log_fn=None, base_summary=base_summary)
+
+    assert result["flow_converged"] is True
+    assert result["ach_delivery"] == {"measured_ach": 5.9, "ratio": 0.98}
+    assert result["n_lamps"] == 4
 
 
 def test_run_scenario_measured_ventilation_ach_none_without_control_results(monkeypatch):
