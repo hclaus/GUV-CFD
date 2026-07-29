@@ -1133,17 +1133,18 @@ def _finish_steady_state(case_dir, room, settings, summary,
         inlet2_size=(settings["inlet2-size-w"], settings["inlet2-size-h"]) if has_inlet2 else None,
         phase1_iterations=phase1_iterations,
         phase2_iterations=phase2_iterations,
+        phase1_write_interval=adv["phase-write-interval"],
+        phase2_write_interval=adv["phase-write-interval"],
         window_frac=settings.get("t-ss-window-frac") or 0.15,
         cell_size=adv["mesh-cell-size"], nbins=adv["uv-zone-bins"],
         source_size=settings["source-zone-size"],
         plateau_rel_tol=adv["plateau-rel-tol"] / 100.0,
         mass_balance_tol=adv["mass-balance-tol"] / 100.0,
-        # 500-iteration check interval: the value backtested against a
-        # real run (see check_t_infinity_stability's docstring) - only
+        # GUI-exposed cross-project "advanced" default (Settings menu) - only
         # meaningful when t_inf_rel_tol is actually set below, since
         # _run_phase defaults check_interval to the whole phase (a no-op
         # single chunk) otherwise.
-        t_inf_check_interval=500 if adv["t-infinity-early-stop-enabled"] else None,
+        t_inf_check_interval=adv["phase-chunk-size"] if adv["t-infinity-early-stop-enabled"] else None,
         t_inf_rel_tol=(adv["t-infinity-rel-tol"] / 100.0) if adv["t-infinity-early-stop-enabled"] else None,
         t_inf_streak=adv["phase1-extrapolation-streak"],
         keep_all_timesteps=adv["keep-all-timesteps"],
@@ -2186,10 +2187,26 @@ settings_modal = dbc.Modal(
                 ),
                 _settings_field(
                     "settings-t-infinity-rel-tol", "T∞ stability tolerance",
-                    "How much consecutive T∞ estimates (500 iterations apart) may differ from each "
-                    "other before Phase 1 counts as settled. Only takes effect when the checkbox "
-                    "above is on.",
+                    "How much consecutive T∞ estimates (one chunk size apart - see below) may differ "
+                    "from each other before Phase 1 counts as settled. Only takes effect when the "
+                    "checkbox above is on.",
                     "%", _adv_defaults["t-infinity-rel-tol"],
+                ),
+                _settings_field(
+                    "settings-phase-chunk-size", "Phase 1/2 chunk size",
+                    "How many iterations Phase 1/2 run before re-checking T∞ stability and writing a "
+                    "checkpoint. Shorter catches convergence earlier and loses less progress if the "
+                    "run is interrupted (app restart, crash, reboot); longer has less per-chunk "
+                    "overhead (a fresh solver launch, mesh re-read, postProcessing, field copy-back "
+                    "every chunk) and a more stable T∞ refit.",
+                    "iterations", _adv_defaults["phase-chunk-size"],
+                ),
+                _settings_field(
+                    "settings-phase-write-interval", "Phase 1/2 write interval",
+                    "How often (in iterations) Phase 1/2 write a snapshot within each chunk. Always "
+                    "snapped down to the largest divisor of the chunk size above, so a snapshot lands "
+                    "exactly at every chunk's end (never silently skipped).",
+                    "iterations", _adv_defaults["phase-write-interval"],
                 ),
                 _settings_field(
                     "settings-phase1-extrapolation-streak", "Consecutive stable checks required",
@@ -2832,6 +2849,7 @@ _SETTINGS_FIELD_IDS = [
     "settings-momentum-relaxation", "settings-scalar-relaxation",
     "settings-scalar-transport-ncorr", "settings-scalar-transport-tolerance",
     "settings-t-infinity-early-stop-enabled", "settings-t-infinity-rel-tol",
+    "settings-phase-chunk-size", "settings-phase-write-interval",
     "settings-phase1-t-initial", "settings-phase1-extrapolation-streak",
     "settings-phase1-settling-safety-multiplier", "settings-phase1-max-iterations-ceiling",
     "settings-keep-all-timesteps",
@@ -2850,6 +2868,7 @@ _SETTINGS_FIELD_KEYS = [
     "momentum-relaxation", "scalar-relaxation",
     "scalar-transport-ncorr", "scalar-transport-tolerance",
     "t-infinity-early-stop-enabled", "t-infinity-rel-tol",
+    "phase-chunk-size", "phase-write-interval",
     "phase1-t-initial", "phase1-extrapolation-streak",
     "phase1-settling-safety-multiplier", "phase1-max-iterations-ceiling",
     "keep-all-timesteps",

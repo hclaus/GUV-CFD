@@ -32,6 +32,15 @@ ADVANCED_SETTINGS_DEFAULTS = {
     "scalar-transport-tolerance": 1e-4,  # scalarTransport1's own initial-residual target
     "t-infinity-early-stop-enabled": True,  # Phase 1's primary readiness gate - see run_steady_state_scenario
     "t-infinity-rel-tol": 2.0,   # % - T-infinity stability tolerance (see check_t_infinity_stability)
+    # Phase 1/2's own chunk size (was hardcoded 500) and write cadence
+    # (was hardcoded 200 for Phase 1 / 100 for Phase 2, unified here) - see
+    # _run_phase/_chunk_write_interval in steady_state_pipeline.py. Shorter
+    # chunks catch T-infinity convergence earlier and lose less progress if
+    # the run is interrupted (app restart, crash, reboot); longer chunks
+    # have less per-chunk overhead (fresh solver launch, mesh re-read,
+    # postProcessing, field copy-back) and a more stable T-infinity refit.
+    "phase-chunk-size": 400,       # iterations
+    "phase-write-interval": 200,   # iterations
     "keep-all-timesteps": False,  # opt-in - see steady_state_pipeline.run_steady_state_scenario
     "oscillation-window": 6,        # chunks - run_pipeline._is_stable_oscillation
     "oscillation-growth-tol": 1.5,  # ratio - run_pipeline._is_stable_oscillation
