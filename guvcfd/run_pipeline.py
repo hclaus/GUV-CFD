@@ -33,6 +33,7 @@ from .splice import (
     ensure_simple_fvsolution,
     set_lts_ddt_scheme,
     set_relaxation_factors,
+    set_scalar_transport_correction,
 )
 from .wsl_utils import (
     wsl_path as _wsl_path,
@@ -684,6 +685,7 @@ def setup_case(guv_path, case_dir, template_case_dir=None, cell_size=0.1, Z=2.0,
                flow_rel_tol=0.01, flow_max_iterations=20000,
                oscillation_window=6, oscillation_growth_tol=1.5, ach_delivery_tol=0.10,
                momentum_relaxation=None, scalar_relaxation=None,
+               scalar_transport_ncorr=None, scalar_transport_tolerance=None,
                pimple_end_time=120, pimple_write_interval=10, pimple_delta_t=0.5,
                fan_speed=None, fan_center=None, fan_direction=(0, 0, -1),
                fan_disk_radius=0.6, fan_disk_thickness=0.2, fan_height=None,
@@ -742,6 +744,17 @@ def setup_case(guv_path, case_dir, template_case_dir=None, cell_size=0.1, Z=2.0,
     - None (the default) leaves the template's own values untouched.
     GUI-exposed as cross-project "advanced" defaults too.
 
+    scalar_transport_ncorr/scalar_transport_tolerance: the scalarTransport1
+    function object's OWN outer-correction count/residual target (see
+    splice.set_scalar_transport_correction) - T is solved by this function
+    object, entirely outside PIMPLE's own outer-corrector loop, so relaxing
+    T only avoids biasing a transient (pimpleFoam) run's result if these are
+    set high/tight enough for scalarTransport1's loop to actually converge
+    each timestep; OpenFOAM's own defaults (nCorr=0, tolerance=1) mean it
+    never does - see "OpenFoam settings background.md" at the repo root.
+    None (the default) leaves the template's own values untouched.
+    GUI-exposed as cross-project "advanced" defaults too.
+
     pimple_end_time/pimple_write_interval: the transient UV-decay run's
     simulated duration [s] and write cadence [s] - GUI-exposed per-project
     (Project Setup tab), like Z and ach above.
@@ -783,6 +796,9 @@ def setup_case(guv_path, case_dir, template_case_dir=None, cell_size=0.1, Z=2.0,
         if momentum_relaxation is not None or scalar_relaxation is not None:
             set_relaxation_factors(case_dir, momentum_factor=momentum_relaxation,
                                     scalar_factor=scalar_relaxation)
+        if scalar_transport_ncorr is not None or scalar_transport_tolerance is not None:
+            set_scalar_transport_correction(case_dir, ncorr=scalar_transport_ncorr,
+                                             tolerance=scalar_transport_tolerance)
 
     log_fn(f"Loading project {guv_path} ...")
     project = Project.load(guv_path)

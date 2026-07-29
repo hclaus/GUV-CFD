@@ -45,9 +45,23 @@ solvers
 
 PIMPLE
 {
-    nOuterCorrectors 1;
+    nOuterCorrectors 3;
     nCorrectors      2;
     nNonOrthogonalCorrectors 0;
+    turbOnFinalIterOnly false;
+    residualControl
+    {
+        p
+        {
+            tolerance   1e-4;
+            relTol      0;
+        }
+        U
+        {
+            tolerance   1e-4;
+            relTol      0;
+        }
+    }
 }
 
 SIMPLE

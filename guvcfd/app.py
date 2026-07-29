@@ -712,6 +712,8 @@ def _run_decay(guv_path, case_dir, room, settings):
         oscillation_window=adv["oscillation-window"], oscillation_growth_tol=adv["oscillation-growth-tol"],
         ach_delivery_tol=adv["ach-delivery-tol"] / 100.0,
         momentum_relaxation=adv["momentum-relaxation"], scalar_relaxation=adv["scalar-relaxation"],
+        scalar_transport_ncorr=adv["scalar-transport-ncorr"],
+        scalar_transport_tolerance=adv["scalar-transport-tolerance"],
         log_fn=_run_log, should_stop=_should_stop, solver_log_fn=_track_solver_time,
         should_pause=_should_pause,
         **_fan_kwargs(settings),
@@ -1040,6 +1042,8 @@ def _run_steady_state(guv_path, case_dir, room, settings):
         oscillation_window=adv["oscillation-window"], oscillation_growth_tol=adv["oscillation-growth-tol"],
         ach_delivery_tol=adv["ach-delivery-tol"] / 100.0,
         momentum_relaxation=adv["momentum-relaxation"], scalar_relaxation=adv["scalar-relaxation"],
+        scalar_transport_ncorr=adv["scalar-transport-ncorr"],
+        scalar_transport_tolerance=adv["scalar-transport-tolerance"],
         log_fn=_run_log, should_stop=_should_stop, solver_log_fn=_track_solver_time,
         should_pause=_should_pause,
         **fan_kwargs,
@@ -2126,6 +2130,32 @@ settings_modal = dbc.Modal(
                     "or oscillates without bound instead of settling toward equilibrium.",
                     "", _adv_defaults["scalar-relaxation"],
                 ),
+                html.Div(
+                    "T is solved by its own scalarTransport function object, entirely outside "
+                    "PIMPLE's/SIMPLE's own outer-iteration loop — the two settings below control "
+                    "HOW MANY times per iteration it re-solves, and how tightly, before moving on. "
+                    "Confirmed directly: relaxing T above without raising these lets the relaxation "
+                    "bias the result instead of just damping it (a relaxed run converged to a "
+                    "measured ventilation rate ~30% too low vs. an unrelaxed one) — see "
+                    "\"OpenFOAM settings background.md\" at the repo root.",
+                    className="small text-muted mb-2",
+                ),
+                _settings_field(
+                    "settings-scalar-transport-ncorr", "Contaminant (T) outer correctors",
+                    "How many times scalarTransport re-solves T per iteration before moving on "
+                    "(0 = OpenFOAM's own default, exactly one pass regardless of relaxation). "
+                    "Needs to be high enough, together with the tolerance below, for a relaxed T "
+                    "to actually converge each iteration rather than just being damped once.",
+                    "", _adv_defaults["scalar-transport-ncorr"],
+                ),
+                _settings_field(
+                    "settings-scalar-transport-tolerance", "Contaminant (T) residual target",
+                    "The initial-residual threshold scalarTransport checks each of its own "
+                    "correction passes against (OpenFOAM's own default is 1 — essentially always "
+                    "satisfied immediately, which is why raising outer correctors alone doesn't "
+                    "help without tightening this too).",
+                    "", _adv_defaults["scalar-transport-tolerance"],
+                ),
                 html.Hr(className="my-2"),
                 html.Div("Phase 1 readiness (T∞ extrapolation)",
                           className="small fw-bold text-uppercase mb-1"),
@@ -2800,6 +2830,7 @@ _SETTINGS_FIELD_IDS = [
     "settings-oscillation-window", "settings-oscillation-growth-tol", "settings-ach-delivery-tol",
     "settings-plateau-rel-tol", "settings-mass-balance-tol",
     "settings-momentum-relaxation", "settings-scalar-relaxation",
+    "settings-scalar-transport-ncorr", "settings-scalar-transport-tolerance",
     "settings-t-infinity-early-stop-enabled", "settings-t-infinity-rel-tol",
     "settings-phase1-t-initial", "settings-phase1-extrapolation-streak",
     "settings-phase1-settling-safety-multiplier", "settings-phase1-max-iterations-ceiling",
@@ -2817,6 +2848,7 @@ _SETTINGS_FIELD_KEYS = [
     "oscillation-window", "oscillation-growth-tol", "ach-delivery-tol",
     "plateau-rel-tol", "mass-balance-tol",
     "momentum-relaxation", "scalar-relaxation",
+    "scalar-transport-ncorr", "scalar-transport-tolerance",
     "t-infinity-early-stop-enabled", "t-infinity-rel-tol",
     "phase1-t-initial", "phase1-extrapolation-streak",
     "phase1-settling-safety-multiplier", "phase1-max-iterations-ceiling",

@@ -21,6 +21,15 @@ ADVANCED_SETTINGS_DEFAULTS = {
     "uv-zone-bins": 25,        # bins
     "momentum-relaxation": 0.7,  # SIMPLE under-relaxation for U/(k|omega)
     "scalar-relaxation": 0.7,    # SIMPLE under-relaxation for T
+    # scalarTransport1 (controlDict) solves T OUTSIDE PIMPLE's own outer-
+    # corrector loop, once per timestep by default - scalar-relaxation only
+    # avoids biasing the result if nCorr/tolerance are high/tight enough for
+    # this loop to actually iterate to convergence (confirmed empirically:
+    # relax=1.0 with defaults and relax=0.7 with nCorr=3/tol=1e-4 converged
+    # to the same answer; relax=0.7 with OpenFOAM's own defaults (nCorr=0,
+    # tolerance=1) did not - see "OpenFoam settings background.md").
+    "scalar-transport-ncorr": 3,        # scalarTransport1's own outer correctors
+    "scalar-transport-tolerance": 1e-4,  # scalarTransport1's own initial-residual target
     "t-infinity-early-stop-enabled": True,  # Phase 1's primary readiness gate - see run_steady_state_scenario
     "t-infinity-rel-tol": 2.0,   # % - T-infinity stability tolerance (see check_t_infinity_stability)
     "keep-all-timesteps": False,  # opt-in - see steady_state_pipeline.run_steady_state_scenario

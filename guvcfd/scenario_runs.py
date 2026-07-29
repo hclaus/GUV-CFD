@@ -204,6 +204,8 @@ def _build_flow_base(guv_path, base_dir, room, settings, ach, adv, log_fn, shoul
         cell_size=adv["mesh-cell-size"], nbins=adv["uv-zone-bins"],
         flow_rel_tol=adv["flow-rel-tol"] / 100.0, flow_max_iterations=adv["flow-max-iterations"],
         momentum_relaxation=adv["momentum-relaxation"], scalar_relaxation=adv["scalar-relaxation"],
+        scalar_transport_ncorr=adv["scalar-transport-ncorr"],
+        scalar_transport_tolerance=adv["scalar-transport-tolerance"],
         log_fn=log_fn, should_stop=should_stop, solver_log_fn=solver_log_fn, should_pause=should_pause,
         **_fan_kwargs(settings),
         **_second_opening_kwargs(settings, "inlet2", room),

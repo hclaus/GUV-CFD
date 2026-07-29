@@ -34,6 +34,8 @@ functions
         type            scalarTransport;
         libs            ("libsolverFunctionObjects.so");
         field           T;
+        tolerance       1e-4;
+        nCorr           3;
         phi             phi;
         nut             nut;
         alphaD          1;

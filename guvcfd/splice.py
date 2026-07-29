@@ -334,6 +334,55 @@ def set_relaxation_factors(case_dir, momentum_factor=None, scalar_factor=None):
     return fvs_path
 
 
+def set_scalar_transport_correction(case_dir, ncorr=None, tolerance=None):
+    """Overwrite controlDict's scalarTransport1{}.nCorr/tolerance - GUI-
+    exposed as cross-project "advanced" defaults (Settings menu), like
+    set_relaxation_factors above.
+
+    scalarTransport1 solves T via its own for(i=0; i<=nCorr; i++){...; if
+    (converged) break;} loop, entirely OUTSIDE PIMPLE's own outer-corrector
+    loop (confirmed by reading OpenFOAM's own scalarTransport.C - PIMPLE's
+    nOuterCorrectors/residualControl never touch this field). It applies T's
+    relaxationFactors.equations.T factor every pass, same as any other
+    equation - but OpenFOAM's own defaults are nCorr=0 (exactly one pass) and
+    tolerance=1 (trivially "converged" on that first pass regardless of the
+    actual residual), so a relaxed T never gets the extra passes needed to
+    converge away that relaxation's bias. Confirmed empirically: relax=0.7
+    with these OpenFOAM defaults gave a measured ventilation ACH matching
+    relax=0.3 (~30% too low relative to relax=1.0's unbiased answer); the
+    same relax=0.7 with nCorr=3/tolerance=1e-4 landed within 1% of relax=1.0
+    - see "OpenFoam settings background.md" at the repo root for the full
+    investigation.
+
+    None (either arg) leaves that entry at whatever the template already
+    has - only touches what's explicitly asked for.
+    """
+    cd_path = f"{case_dir}/system/controlDict"
+    with open(cd_path) as f:
+        content = f.read()
+    if tolerance is not None:
+        new_content, n = re.subn(
+            r'(scalarTransport1\s*\{[^}]*?\n[ \t]*tolerance\s+)[\d.eE+-]+;',
+            rf'\g<1>{tolerance};', content, count=1)
+        if n == 0:
+            new_content, n = re.subn(
+                r'(scalarTransport1\s*\{\s*\n(?:[^\n]*\n)*?\s*field\s+\w+;\s*\n)',
+                rf'\g<1>        tolerance       {tolerance};\n', content, count=1)
+        content = new_content
+    if ncorr is not None:
+        new_content, n = re.subn(
+            r'(scalarTransport1\s*\{[^}]*?\n[ \t]*nCorr\s+)\d+;',
+            rf'\g<1>{ncorr};', content, count=1)
+        if n == 0:
+            new_content, n = re.subn(
+                r'(scalarTransport1\s*\{\s*\n(?:[^\n]*\n)*?\s*field\s+\w+;\s*\n)',
+                rf'\g<1>        nCorr           {ncorr};\n', content, count=1)
+        content = new_content
+    with open(cd_path, "w") as f:
+        f.write(content)
+    return cd_path
+
+
 _LTS_DDT_DEFAULT = (
     "    default         localEuler;\n"
     "    rDeltaTSmoothingCoeff 0.1;\n"
