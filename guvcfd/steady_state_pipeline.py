@@ -271,22 +271,32 @@ def _list_time_dirs(case_dir_wsl):
 
 
 def _chunk_write_interval(write_interval, chunk_size):
-    """write_interval must not exceed this chunk's own duration, or no
-    snapshot ever lands within it and the post-chunk "did a new time
-    directory appear" check fails a run that actually completed fine.
+    """write_interval must EVENLY DIVIDE this chunk's own duration, or no
+    snapshot ever lands at the chunk's true end - not just when it's
+    shorter than write_interval (the case this originally handled), but
+    whenever chunk_size isn't itself a clean multiple of write_interval.
 
     controlDict's writeControl is "adjustableRunTime" (set once, in the
     template - set_control_dict_time() only ever rewrites endTime/
     writeInterval/deltaT's *values*, never writeControl itself) - unlike
-    "timeStep" mode, this does not force a write at endTime, so a chunk
-    shorter than the phase's normal write_interval writes nothing at all
-    otherwise. Only matters for a short final/remainder chunk - normal
-    full-size chunks are unaffected (chunk_size >= write_interval, so
-    this is a no-op then). The T-infinity early-stop feature is what
-    actually produces short final chunks in practice (whatever's left
-    after dividing n_iterations into check_interval-sized pieces).
+    "timeStep" mode, this does not force a write at endTime. Confirmed as
+    a real, silent ~20%-of-chunk compute waste on a live run: the
+    T-infinity early-stop's hardcoded 500-iteration chunks against a
+    200-iteration write_interval (500 not a multiple of 200) wrote
+    snapshots at 200/400 but never at 500 - the solver genuinely ran all
+    500 iterations, but iterations 401-500 were never written to disk, so
+    _run_phase's "latest" (the true, trusted checkpoint) fell back to 400
+    every single chunk, discarding the last 100 iterations' real progress
+    each time. Returns the LARGEST divisor of chunk_size that's <=
+    write_interval, so a write always lands exactly at chunk_size (the
+    common case - chunk_size already a multiple of write_interval - is
+    unaffected, this only ever narrows the interval when needed).
     """
-    return min(write_interval, chunk_size)
+    limit = min(write_interval, chunk_size)
+    for candidate in range(limit, 0, -1):
+        if chunk_size % candidate == 0:
+            return candidate
+    return 1  # unreachable (candidate=1 always divides chunk_size), kept as an explicit floor
 
 
 def _copy_latest_to_zero(case_dir_wsl, latest, include_T, log_fn):

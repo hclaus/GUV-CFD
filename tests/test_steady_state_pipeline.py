@@ -34,6 +34,28 @@ def test_chunk_write_interval_clamps_for_short_final_chunk():
     assert _chunk_write_interval(100, 84) == 84
 
 
+def test_chunk_write_interval_snaps_down_when_chunk_size_not_a_multiple():
+    # Regression: a FULL-size chunk that isn't a clean multiple of
+    # write_interval wastes real solver progress too, not just short
+    # remainder chunks. Confirmed on a live overnight run: the T-infinity
+    # early-stop's hardcoded 500-iteration chunks against write_interval=200
+    # (500 % 200 != 0) wrote snapshots at 200/400 but never at 500 -
+    # "adjustableRunTime" never forces a write at the true chunk endTime -
+    # so the solver's own last 100 iterations of real progress every chunk
+    # were silently discarded (_run_phase's "latest" checkpoint fell back
+    # to 400, not 500). 125 is the largest divisor of 500 that's <= 200.
+    assert _chunk_write_interval(200, 500) == 125
+    assert 500 % _chunk_write_interval(200, 500) == 0
+
+
+def test_chunk_write_interval_always_evenly_divides_chunk_size():
+    for write_interval in (1, 3, 7, 50, 100, 199, 200, 201, 500, 1000):
+        for chunk_size in (1, 84, 100, 200, 333, 500, 501, 8000):
+            result = _chunk_write_interval(write_interval, chunk_size)
+            assert chunk_size % result == 0, (write_interval, chunk_size, result)
+            assert result <= min(write_interval, chunk_size)
+
+
 def test_phase_solver_callback_falls_back_unchanged_without_status_fn():
     # No status_fn (single-run mode - progress there comes from
     # solver_log_fn/app._track_solver_time instead, which has never shown
