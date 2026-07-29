@@ -286,18 +286,41 @@ def disable_simple_residual_control(case_dir):
     syntax for "no residual-based auto-stop" - the solver then only stops
     at the chunk's requested endTime, which is what Phase 1/2 need.
     Idempotent and safe to call repeatedly (a no-op once already emptied).
+
+    Scoped to SIMPLE's own residualControl only, via brace-depth matching
+    (_find_matching_brace) rather than a flat regex - PIMPLE's own
+    residualControl (added for nOuterCorrectors>1 runs) is a NESTED dict
+    (p{tolerance;relTol;} / U{...}), and a naive '[^}]*' scan stops at the
+    first '}' it finds, which for PIMPLE's block is the inner p{} sub-dict's
+    closing brace, not residualControl's own - silently truncating the rest
+    of the PIMPLE block and leaving a dangling extra '}' (confirmed: this
+    broke every Phase 1 case with a "FOAM FATAL IO ERROR: Unexpected '}'"
+    the first time PIMPLE.residualControl was added alongside this function).
     """
     fvs_path = f"{case_dir}/system/fvSolution"
     with open(fvs_path) as f:
         content = f.read()
-    new_content = re.sub(
-        r'(residualControl\s*\n\s*\{)[^}]*(\})',
-        r'\1\2',
-        content,
-    )
-    if new_content != content:
-        with open(fvs_path, "w") as f:
-            f.write(new_content)
+
+    m = re.search(r'\bSIMPLE\s*\n\s*\{', content)
+    if not m:
+        return fvs_path  # no SIMPLE block at all - nothing to do
+    simple_open = content.index("{", m.end() - 1)
+    simple_close = _find_matching_brace(content, simple_open)
+    simple_block = content[simple_open:simple_close + 1]
+
+    rc_m = re.search(r'residualControl\s*\n\s*\{', simple_block)
+    if not rc_m:
+        return fvs_path  # no residualControl inside SIMPLE - nothing to do
+    rc_open = simple_block.index("{", rc_m.end() - 1)
+    rc_close = _find_matching_brace(simple_block, rc_open)
+    if rc_close == rc_open + 1:
+        return fvs_path  # already empty - no-op
+
+    new_simple_block = simple_block[:rc_open + 1] + simple_block[rc_close:]
+    new_content = content[:simple_open] + new_simple_block + content[simple_close + 1:]
+
+    with open(fvs_path, "w") as f:
+        f.write(new_content)
     return fvs_path
 
 
