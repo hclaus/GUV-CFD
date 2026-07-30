@@ -1127,6 +1127,19 @@ def run_steady_state_scenario(case_dir, room_x, room_y, room_z, ach, Z, nbins=25
             finally:
                 if status_fn is not None:
                     status_fn(status_key1, None)
+            # Copy this attempt's final state into 0/ BEFORE deciding whether
+            # to raise Phase1ExtrapolationUndecided again - _write_phase1_pending's
+            # own docstring promises "0/ already holds Phase 1's current
+            # (mid-run, undecided) state" for a later resume to build on, but
+            # that was only ever true when this attempt got ACCEPTED - if it
+            # raised again, the copy below never ran, so 0/ stayed however
+            # many chunks stale it was from the SAME attempt (every non-final
+            # chunk inside _run_phase's own loop copies its own latest to 0/,
+            # but the final chunk before a raise does not). A further resume
+            # would then silently continue from that stale point while
+            # reporting iteration counts as if it hadn't - confirmed as a
+            # real gap on a live run, not just theoretical.
+            _copy_latest_to_zero(case_dir_wsl, latest1, include_T=True, log_fn=log_fn)
             if (phase1_resume_decision == "continue" and phase1_extrapolation_gate
                     and t_inf_rel_tol is not None and not stopped_via_tinf1):
                 diagnostic = _phase1_extrapolation_diagnostic(
@@ -1145,7 +1158,6 @@ def run_steady_state_scenario(case_dir, room_x, room_y, room_z, ach, Z, nbins=25
                 p["name"]: _point_phase_summary(live1[zone_name(p["name"])], window_frac)
                 for p in (monitoring_points or [])
             }
-            _copy_latest_to_zero(case_dir_wsl, latest1, include_T=True, log_fn=log_fn)
             run_wsl_or_raise("cp 0/T phase1_T.snapshot", case_dir_wsl,
                               "saving Phase 1's final T field for later spatial-mixing analysis")
             if not keep_all_timesteps:
@@ -1226,6 +1238,25 @@ def run_steady_state_scenario(case_dir, room_x, room_y, room_z, ach, Z, nbins=25
             finally:
                 if status_fn is not None:
                     status_fn(status_key1, None)
+            # _run_phase leaves its final chunk's own time directory in place
+            # (named latest1, its true cumulative iteration count) rather than
+            # cleaning it itself - phase 1's own final state isn't meant for
+            # standalone ParaView viewing (unlike phase 2's, kept below), so the
+            # caller copies it into 0/ and, normally, cleans it away below. With
+            # keep_all_timesteps, every phase-1 snapshot stays instead (phase 2's
+            # _run_phase call below is offset by iters1 so its own directory names
+            # continue the same numbering rather than colliding with phase 1's).
+            #
+            # Done BEFORE deciding whether to raise Phase1ExtrapolationUndecided -
+            # _write_phase1_pending's docstring promises 0/ already holds this
+            # attempt's current state for a later resume to build on, but that
+            # was only true when accepted; if raising, 0/ was left however many
+            # chunks stale it was from THIS SAME attempt (only non-final chunks
+            # inside _run_phase's own loop copy their own latest to 0/) - a
+            # further resume would then silently continue from that stale
+            # point while reporting iteration counts as if it hadn't (confirmed
+            # as a real gap on a live run, not just theoretical).
+            _copy_latest_to_zero(case_dir_wsl, latest1, include_T=True, log_fn=log_fn)
             if phase1_extrapolation_gate and t_inf_rel_tol is not None and not stopped_via_tinf1:
                 diagnostic = _phase1_extrapolation_diagnostic(
                     tinf_history1, t_inf_streak, t_inf_rel_tol, phase1_iterations,
@@ -1241,15 +1272,6 @@ def run_steady_state_scenario(case_dir, room_x, room_y, room_z, ach, Z, nbins=25
                 p["name"]: _point_phase_summary(live1[zone_name(p["name"])], window_frac)
                 for p in (monitoring_points or [])
             }
-            # _run_phase leaves its final chunk's own time directory in place
-            # (named latest1, its true cumulative iteration count) rather than
-            # cleaning it itself - phase 1's own final state isn't meant for
-            # standalone ParaView viewing (unlike phase 2's, kept below), so the
-            # caller copies it into 0/ and, normally, cleans it away here. With
-            # keep_all_timesteps, every phase-1 snapshot stays instead (phase 2's
-            # _run_phase call below is offset by iters1 so its own directory names
-            # continue the same numbering rather than colliding with phase 1's).
-            _copy_latest_to_zero(case_dir_wsl, latest1, include_T=True, log_fn=log_fn)
             # Phase 2 is about to overwrite 0/T with its own (source + UV)
             # build-up state - keep a plain copy of Phase 1's converged field
             # under its own name (not inside a time directory - a stray extra

@@ -117,6 +117,50 @@ def test_resolve_phase_delta_ts_applies_effective_fraction_to_both_phases():
     assert dt2 == compute_scaled_delta_t(0.7 * (3.0 + 15.0), 1000, target_fraction=0.995)
 
 
+def test_phase1_extrapolation_undecided_copies_latest_to_zero_before_raising(tmp_path, monkeypatch):
+    # Regression: _write_phase1_pending's docstring promises "0/ already
+    # holds Phase 1's current (mid-run, undecided) state" for a later
+    # resume to build on - but _copy_latest_to_zero used to run AFTER the
+    # Phase1ExtrapolationUndecided raise, so it never executed when the
+    # exception actually fired. A resume would then silently continue from
+    # a stale 0/ (however many non-final chunks behind) while reporting
+    # iteration counts as if it hadn't - confirmed as a real gap on a live
+    # run. Verifies the fix: _copy_latest_to_zero is called (with the
+    # correct final directory name) even though the call still raises.
+    (tmp_path / "system").mkdir()
+    (tmp_path / "constant").mkdir()
+    for fn in ("ensure_simple_fvsolution", "disable_simple_residual_control", "write_vol_average_dict",
+               "write_source_topo_set_dict", "write_fvoptions_file", "restore_boundary_conditions"):
+        monkeypatch.setattr(ssp, fn, lambda *a, **k: None)
+    monkeypatch.setattr(ssp, "splice_fv_options_into_control_dict", lambda *a, **k: (None, 1, 1))
+
+    class _FakeResult:
+        stdout = "cellSet sourceZoneCells now size 64"
+        returncode = 0
+    monkeypatch.setattr(ssp, "run_wsl_or_raise", lambda *a, **k: _FakeResult())
+
+    copy_calls = []
+    monkeypatch.setattr(ssp, "_copy_latest_to_zero", lambda case_dir_wsl, latest, include_T, log_fn: (
+        copy_calls.append(latest)))
+
+    def fake_run_phase(*a, **k):
+        # Shape matches _run_phase's real return tuple - stopped_via_tinf1=False
+        # is what triggers the raise below (ceiling reached, never stabilized).
+        return ("1500", 1500, np.array([0, 1]), np.array([0.1, 0.2]), False,
+                {"room": (np.array([0, 1]), np.array([0.1, 0.2]))}, False, [None, None], {"flow": {}, "weighted_t": {}})
+    monkeypatch.setattr(ssp, "_run_phase", fake_run_phase)
+
+    with pytest.raises(ssp.Phase1ExtrapolationUndecided):
+        run_steady_state_scenario(
+            str(tmp_path), 4.0, 5.0, 2.7, ach=6.0, Z=6.0,
+            phase1_iterations=1500, phase2_iterations=1500,
+            t_inf_check_interval=400, t_inf_rel_tol=0.02,
+            log_fn=lambda m: None,
+        )
+
+    assert copy_calls == ["1500"]  # the copy ran, using the true final directory name
+
+
 def test_run_phase_rejects_delta_t_with_keep_all_timesteps():
     # This guard must fire before any filesystem/WSL work - called with
     # deliberately-invalid dummy paths to confirm it does.
