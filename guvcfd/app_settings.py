@@ -42,6 +42,22 @@ ADVANCED_SETTINGS_DEFAULTS = {
     "phase-chunk-size": 400,       # iterations
     "phase-write-interval": 200,   # iterations
     "keep-all-timesteps": False,  # opt-in - see steady_state_pipeline.run_steady_state_scenario
+    # Residence-time-scaled deltaT (steady_state_pipeline.compute_scaled_delta_t)
+    # - default production mode as of 2026-07-29. Lets each phase's existing
+    # phaseN-iterations budget cover the paper-cited "4-6 residence times" a
+    # well-mixed room's C(t) needs to approach steady state, by scaling
+    # OpenFOAM's own pseudo-time step instead of running more iterations -
+    # confirmed directly on 3 real cases (ACH=3/6/9) to match a ~2.5-4x
+    # larger deltaT=1 budget's reduction_pct/eACH_uv almost exactly. Purely
+    # additive on top of the existing _settling_iterations-based iteration
+    # floor/safety-multiplier/ceiling (app.py/scenario_runs.py) - deltaT only
+    # ends up above 1 when that iteration budget still isn't enough to cover
+    # the target residence-time span, so a case that already converges fine
+    # at deltaT=1 is unaffected. Disabled automatically whenever
+    # keep-all-timesteps is on (the two aren't compatible - see _run_phase).
+    "deltat-scaling-enabled": True,
+    "deltat-effective-fraction": 0.7,  # measured ACH/eACH_uv usually runs below nominal - conservative derating
+    "deltat-target-fraction": 0.995,  # matches _settling_iterations' own default - ~5.3 residence times
     "oscillation-window": 6,        # chunks - run_pipeline._is_stable_oscillation
     "oscillation-growth-tol": 1.5,  # ratio - run_pipeline._is_stable_oscillation
     "ach-delivery-tol": 10.0,   # % - run_pipeline.check_ach_delivery

@@ -42,6 +42,7 @@ from . import scenario_runs
 from .splice import set_control_dict_start_from, set_control_dict_time
 from .steady_state_pipeline import (
     run_steady_state_scenario, _read_phase1_checkpoint, _clear_phase1_checkpoint, Phase1ExtrapolationUndecided,
+    resolve_phase_delta_ts,
 )
 from .ventilation_control import prepare_ventilation_only_control, finish_ventilation_only_control
 from .visualization import WALL_POSITION_DIMS, center_frac_for_wall, plot_case
@@ -1117,6 +1118,10 @@ def _finish_steady_state(case_dir, room, settings, summary,
              f"phase2={_settling_iterations(ach + eACH_uv)} iterations (ACH+eACH_uv={ach + eACH_uv:.3g}/hr) - "
              f"using the larger of this and the configured value for each phase "
              f"({phase1_iterations}, {phase2_iterations}).")
+    phase1_delta_t, phase2_delta_t = resolve_phase_delta_ts(ach, eACH_uv, phase1_iterations, phase2_iterations, adv)
+    if phase1_delta_t != 1 or phase2_delta_t != 1:
+        _run_log(f"Residence-time-scaled deltaT: phase1={phase1_delta_t}, phase2={phase2_delta_t} "
+                 f"(within the iteration budgets above, not in addition to them).")
 
     patches_to_monitor = ("outlet", "outlet2") if has_outlet2 else ("outlet",)
     result = run_steady_state_scenario(
@@ -1156,6 +1161,7 @@ def _finish_steady_state(case_dir, room, settings, summary,
         patches_to_monitor=patches_to_monitor,
         log_fn=_run_log, should_stop=_should_stop, solver_log_fn=_track_solver_time,
         should_pause=_should_pause,
+        phase1_delta_t=phase1_delta_t, phase2_delta_t=phase2_delta_t,
     )
     result["fluence_mean"] = summary["fluence_mean"]
     result["eACH_uv_well_mixed"] = summary.get("eACH_uv_well_mixed_mean")
@@ -2249,6 +2255,48 @@ settings_modal = dbc.Modal(
                     "iterations", _adv_defaults["phase1-max-iterations-ceiling"],
                 ),
                 html.Hr(className="my-2"),
+                html.Div("Residence-time-scaled deltaT (default mode)", className="small fw-bold text-uppercase mb-1"),
+                html.Div(
+                    "simpleFoam's own U/p/k/omega solve has no time-derivative term at all (pure "
+                    "SIMPLE relaxation) - only T's own equation (a bolt-on function object) uses "
+                    "OpenFOAM's pseudo-time step, and it's solved implicitly (unconditionally "
+                    "stable), so scaling that step up lets a fixed, cheap iteration budget cover "
+                    "more real residence time for low-ACH cases, at no extra compute cost and no "
+                    "risk to the (already-converged, frozen) flow field. Confirmed directly on 3 "
+                    "real cases (ACH=3/6/9): a 1500/1000-iteration run with this scaling matched a "
+                    "4000/2500-iteration run at the historical deltaT=1 almost exactly. Purely "
+                    "additive on top of the iteration budget/safety-margin settings above - a case "
+                    "that already converges fine at deltaT=1 (typically higher-ACH) is unaffected.",
+                    className="small text-muted mb-2",
+                ),
+                _settings_checkbox_field(
+                    "settings-deltat-scaling-enabled", "Scale deltaT for low-ACH cases",
+                    "On by default (recommended, the validated production default). Turn off to "
+                    "fall back to the old deltaT=1/more-iterations-only behavior. Automatically "
+                    "disabled whenever \"Keep all time steps for ParaView\" below is on - the two "
+                    "aren't compatible (that feature's directory renaming assumes directory names "
+                    "and iteration counts share the same units, which only holds at deltaT=1).",
+                    _adv_defaults["deltat-scaling-enabled"],
+                ),
+                _settings_field(
+                    "settings-deltat-effective-fraction", "Effective-rate derating factor",
+                    "Measured ACH/eACH_uv typically runs below the nominal/well-mixed value used to "
+                    "size this - the residence-time target is conservatively based on this fraction "
+                    "of nominal ACH (Phase 1) or nominal ACH + well-mixed eACH_uv (Phase 2), not the "
+                    "full nominal value, so the scaled deltaT doesn't undershoot a room that "
+                    "ventilates/inactivates a bit worse than the idealized estimate.",
+                    "x", _adv_defaults["deltat-effective-fraction"],
+                ),
+                _settings_field(
+                    "settings-deltat-target-fraction", "Target fraction of steady state",
+                    "How close to the true steady state the scaled deltaT targets reaching within "
+                    "each phase's iteration budget - matches the settling-estimate safety margin's "
+                    "own target above (0.995 = ~5.3 residence times, inside the \"4-6 residence "
+                    "times\" criterion a well-mixed room's build-up needs - see \"OpenFOAM settings "
+                    "background.md\").",
+                    "fraction", _adv_defaults["deltat-target-fraction"],
+                ),
+                html.Hr(className="my-2"),
                 html.Div("Steady-state time-step retention", className="small fw-bold text-uppercase mb-1"),
                 html.Div(
                     "By default, a steady-state run only keeps its initial (0/) and final field "
@@ -2852,6 +2900,7 @@ _SETTINGS_FIELD_IDS = [
     "settings-phase-chunk-size", "settings-phase-write-interval",
     "settings-phase1-t-initial", "settings-phase1-extrapolation-streak",
     "settings-phase1-settling-safety-multiplier", "settings-phase1-max-iterations-ceiling",
+    "settings-deltat-scaling-enabled", "settings-deltat-effective-fraction", "settings-deltat-target-fraction",
     "settings-keep-all-timesteps",
     "settings-pimple-delta-t",
     "settings-decay-ach-min-fraction", "settings-decay-each-min-fraction", "settings-decay-each-max-fraction",
@@ -2871,6 +2920,7 @@ _SETTINGS_FIELD_KEYS = [
     "phase-chunk-size", "phase-write-interval",
     "phase1-t-initial", "phase1-extrapolation-streak",
     "phase1-settling-safety-multiplier", "phase1-max-iterations-ceiling",
+    "deltat-scaling-enabled", "deltat-effective-fraction", "deltat-target-fraction",
     "keep-all-timesteps",
     "pimple-delta-t",
     "decay-ach-min-fraction", "decay-each-min-fraction", "decay-each-max-fraction",

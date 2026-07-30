@@ -1,5 +1,42 @@
 # Changelog
 
+## 2026-07-29 — Residence-time-scaled deltaT for steady-state Phase 1/2 (default)
+
+New default behavior: Phase 1/2's `simpleFoam` chunks now scale OpenFOAM's
+own pseudo-time step (`deltaT`) instead of always running more iterations
+for low-ACH cases. `simpleFoam`'s U/p/k/omega solve has no `ddt()` term at
+all (pure SIMPLE relaxation), but `scalarTransport1`'s `T` equation does -
+solved implicitly (unconditionally stable) - so a fixed, cheap iteration
+budget can be made to cover the "4-6 residence times" a well-mixed room's
+`C(t)` needs to approach steady state (see the referenced paper's own
+S1-3 governing equations), without any extra compute cost or risk to the
+frozen flow field.
+
+- New `guvcfd.steady_state_pipeline.compute_scaled_delta_t`/
+  `resolve_phase_delta_ts`, new `_run_phase(delta_t=1)` parameter -
+  scales `end_time`/`write_interval` by an integer `deltaT` (keeping every
+  OpenFOAM time value/directory name an exact integer, no float drift),
+  un-scales the live per-iteration series and true iteration count back to
+  plain iteration units so every downstream consumer is unaffected in
+  meaning.
+- New advanced settings: `deltat-scaling-enabled` (default on),
+  `deltat-effective-fraction` (0.7 - measured ACH/eACH typically runs
+  below nominal, conservative derating), `deltat-target-fraction` (0.995,
+  matching `_settling_iterations`'s own target - ~5.3 residence times).
+  Purely additive on top of the existing `_settling_iterations`-based
+  iteration floor - a case whose configured budget already covers the
+  target span at deltaT=1 is unaffected. Not compatible with
+  `keep-all-timesteps` (falls back to deltaT=1 automatically).
+- Validated on 3 real cases (ACH=3/6/9): a 1500/1000-iteration run with
+  scaled deltaT matched a 4000/2500-iteration deltaT=1 baseline's
+  reduction_pct/eACH_uv almost exactly, including the confirmed-oscillating
+  ACH=6 flow field (landed inside that case's own oscillation noise band).
+  Investigated whether the same trick applies to decay mode - it doesn't:
+  `pimpleFoam`'s U/p have real, Courant-constrained ddt terms there, so
+  `T`'s shared global clock can't be scaled independently without risking
+  the transient flow's own stability/accuracy. See "OpenFOAM settings
+  background.md" for the full writeup.
+
 ## 2026-07-19 — Scenario Runs: batch Z x ACH sweep
 
 New "Scenario Runs" tab: sweeps a steady-state project's current setup

@@ -461,6 +461,7 @@ def test_run_scenario_threads_control_results_into_measured_ventilation_ach(monk
                 "monitoring-enable": False, "source-zone-size": 0.3}
     adv = {"uv-zone-bins": 25, "mesh-cell-size": 0.1,
            "plateau-rel-tol": 1.0, "t-infinity-early-stop-enabled": False, "keep-all-timesteps": False,
+           "deltat-scaling-enabled": False,
            "phase-chunk-size": 400, "phase-write-interval": 200}
 
     sr._run_scenario("case_dir", room, settings, z=6.0, ach=3.0, adv=adv,
@@ -491,6 +492,7 @@ def test_run_scenario_threads_base_summary_into_flow_converged_and_ach_delivery(
                 "monitoring-enable": False, "source-zone-size": 0.3}
     adv = {"uv-zone-bins": 25, "mesh-cell-size": 0.1,
            "plateau-rel-tol": 1.0, "t-infinity-early-stop-enabled": False, "keep-all-timesteps": False,
+           "deltat-scaling-enabled": False,
            "phase-chunk-size": 400, "phase-write-interval": 200}
 
     base_summary = {"flow_converged": True, "ach_delivery": {"measured_ach": 5.9, "ratio": 0.98}, "n_lamps": 4}
@@ -519,6 +521,7 @@ def test_run_scenario_measured_ventilation_ach_none_without_control_results(monk
                 "monitoring-enable": False, "source-zone-size": 0.3}
     adv = {"uv-zone-bins": 25, "mesh-cell-size": 0.1,
            "plateau-rel-tol": 1.0, "t-infinity-early-stop-enabled": False, "keep-all-timesteps": False,
+           "deltat-scaling-enabled": False,
            "phase-chunk-size": 400, "phase-write-interval": 200}
 
     sr._run_scenario("case_dir", room, settings, z=6.0, ach=3.0, adv=adv,
@@ -554,7 +557,8 @@ def test_run_shared_phase1_clones_base_dir_and_runs_phase1_only(tmp_path, monkey
                 "t-ss-window-frac": None, "monitoring-enable": False, "source-zone-size": 0.3}
     adv = {"mesh-cell-size": 0.1, "plateau-rel-tol": 1.0,
            "t-infinity-early-stop-enabled": False, "keep-all-timesteps": False,
-           "phase-chunk-size": 400, "phase-write-interval": 200}
+           "phase-chunk-size": 400, "phase-write-interval": 200,
+           "deltat-scaling-enabled": False}
 
     sr._run_shared_phase1("base_dir", "phase1_dir", ach=3.0, room=room, settings=settings, adv=adv,
                            log_fn=lambda m: None, should_stop=None, solver_log_fn=None)

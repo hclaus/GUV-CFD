@@ -6,8 +6,10 @@ import pytest
 import guvcfd.steady_state_pipeline as ssp
 from guvcfd.steady_state_pipeline import (
     _chunk_write_interval, _clear_phase1_checkpoint, _list_time_dirs, _point_phase_summary,
-    _read_phase1_checkpoint, _rename_chunk_time_dirs, _room_phase_summary, _write_phase1_checkpoint,
+    _read_phase1_checkpoint, _rename_chunk_time_dirs, _room_phase_summary, _run_phase,
+    _write_phase1_checkpoint,
     compute_corrected_eACH_uv, compute_corrected_eACH_uv_from_control,
+    compute_scaled_delta_t, resolve_phase_delta_ts,
     run_steady_state_scenario,
 )
 
@@ -54,6 +56,76 @@ def test_chunk_write_interval_always_evenly_divides_chunk_size():
             result = _chunk_write_interval(write_interval, chunk_size)
             assert chunk_size % result == 0, (write_interval, chunk_size, result)
             assert result <= min(write_interval, chunk_size)
+
+
+def test_compute_scaled_delta_t_stays_at_1_when_budget_already_covers_target():
+    # A high-ACH case (short residence time) already comfortably covers
+    # ~5.3 residence times within its iteration budget at delta_t=1 - must
+    # not be slowed down (regression: never scale below the historical 1).
+    assert compute_scaled_delta_t(effective_rate_per_hr=20.0, n_iterations=8000) == 1
+
+
+def test_compute_scaled_delta_t_scales_up_for_low_rate_short_budget():
+    # ACH=3 case this was validated against: theta=3600/(0.7*3)=1714.3s,
+    # target_cycles=ln(200)=5.298, ideal_dt=5.298*1714.3/1500=6.06 -> 6.
+    dt = compute_scaled_delta_t(effective_rate_per_hr=0.7 * 3.0, n_iterations=1500)
+    assert dt == 6
+
+
+def test_compute_scaled_delta_t_floors_at_1_never_below():
+    # Even a rate so high the ideal deltaT would be a fraction < 1 must
+    # floor at 1, not slow the solver down below its historical default.
+    assert compute_scaled_delta_t(effective_rate_per_hr=1000.0, n_iterations=100) == 1
+
+
+def test_compute_scaled_delta_t_nonpositive_rate_returns_1():
+    # Same fallback _settling_iterations uses for lambda_per_hr <= 0 - not
+    # physically meaningful (would need infinite time), so delta_t can't
+    # help; only a bigger n_iterations budget could.
+    assert compute_scaled_delta_t(effective_rate_per_hr=0.0, n_iterations=1500) == 1
+    assert compute_scaled_delta_t(effective_rate_per_hr=-1.0, n_iterations=1500) == 1
+
+
+def test_compute_scaled_delta_t_returns_int_type():
+    assert isinstance(compute_scaled_delta_t(effective_rate_per_hr=2.0, n_iterations=1500), int)
+
+
+_BASE_ADV = {
+    "deltat-scaling-enabled": True, "deltat-effective-fraction": 0.7,
+    "deltat-target-fraction": 0.995, "keep-all-timesteps": False,
+}
+
+
+def test_resolve_phase_delta_ts_disabled_returns_ones():
+    adv = dict(_BASE_ADV, **{"deltat-scaling-enabled": False})
+    assert resolve_phase_delta_ts(3.0, 15.0, 1500, 1000, adv) == (1, 1)
+
+
+def test_resolve_phase_delta_ts_incompatible_with_keep_all_timesteps():
+    # _run_phase raises if both delta_t != 1 and keep_all_timesteps are
+    # requested together (see its own guard) - resolve this combination to
+    # (1, 1) upstream instead of ever producing a value that would crash.
+    adv = dict(_BASE_ADV, **{"keep-all-timesteps": True})
+    assert resolve_phase_delta_ts(3.0, 15.0, 1500, 1000, adv) == (1, 1)
+
+
+def test_resolve_phase_delta_ts_applies_effective_fraction_to_both_phases():
+    # Phase 1 uses ach alone; Phase 2 uses ach + eACH_uv_well_mixed - both
+    # derated by deltat-effective-fraction before computing residence time.
+    dt1, dt2 = resolve_phase_delta_ts(3.0, 15.0, 1500, 1000, _BASE_ADV)
+    assert dt1 == compute_scaled_delta_t(0.7 * 3.0, 1500, target_fraction=0.995)
+    assert dt2 == compute_scaled_delta_t(0.7 * (3.0 + 15.0), 1000, target_fraction=0.995)
+
+
+def test_run_phase_rejects_delta_t_with_keep_all_timesteps():
+    # This guard must fire before any filesystem/WSL work - called with
+    # deliberately-invalid dummy paths to confirm it does.
+    with pytest.raises(ValueError, match="keep_all_timesteps"):
+        _run_phase(
+            "nonexistent_case_dir", "nonexistent_case_dir_wsl", n_iterations=100, write_interval=50,
+            window_frac=0.15, plateau_rel_tol=0.01, log_fn=_log,
+            keep_all_timesteps=True, delta_t=2,
+        )
 
 
 def test_phase_solver_callback_falls_back_unchanged_without_status_fn():
@@ -109,6 +181,8 @@ def test_run_steady_state_scenario_still_accepts_advanced_settings_params():
     assert params["keep_all_timesteps"].default is False  # opt-in - off keeps case dirs small
     assert params["phase1_only"].default is False  # off by default - normal single/per-Z runs do both phases
     assert params["measured_ventilation_ach"].default is None  # off by default - no control run given
+    assert params["phase1_delta_t"].default == 1  # historical deltaT - callers opt in via resolve_phase_delta_ts
+    assert params["phase2_delta_t"].default == 1
 
 
 def test_compute_corrected_eACH_uv_from_control_matches_manual_mass_balance():

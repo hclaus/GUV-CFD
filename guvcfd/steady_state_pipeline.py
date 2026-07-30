@@ -11,6 +11,7 @@ pipeline only adds the source cellZone and orchestrates the two phases -
 it doesn't redo mesh generation or flow convergence.
 """
 import json
+import math
 import re
 from pathlib import Path
 
@@ -299,6 +300,68 @@ def _chunk_write_interval(write_interval, chunk_size):
     return 1  # unreachable (candidate=1 always divides chunk_size), kept as an explicit floor
 
 
+def compute_scaled_delta_t(effective_rate_per_hr, n_iterations, target_fraction=0.995):
+    """The residence-time-scaled deltaT a phase needs to reach
+    target_fraction of its true steady state within a FIXED n_iterations
+    budget, given the phase's effective removal rate (ACH for Phase 1,
+    ACH+eACH_uv for Phase 2 - see _run_phase's own delta_t docstring for
+    why this works: simpleFoam's flow solve has no ddt() term at all, but
+    scalarTransport1's T equation does, and is solved implicitly, so
+    deltaT can be scaled up freely without any stability penalty).
+
+    Same "how close to steady state" criterion _settling_iterations()
+    already uses (target_fraction=0.995 by default matches its own
+    default) - this is the residence-time-based alternative to that
+    function's "just run more iterations" approach: target_fraction=0.995
+    implies ln(1/(1-0.995)) = ~5.3 residence times, squarely inside the
+    "4-6 residence times" criterion the paper this was validated against
+    states for a well-mixed room's C(t) to approach its steady state (see
+    "OpenFOAM settings background.md").
+
+    Returns max(1, round(...)) - never less than 1 (OpenFOAM's own
+    historical default), so a case whose configured n_iterations budget
+    already comfortably covers the needed residence-time span (e.g. a
+    high-ACH case, where residence time is short) is left completely
+    unaffected rather than slowed down. effective_rate_per_hr <= 0 (not
+    physically meaningful - would need infinite time) also returns 1,
+    leaving n_iterations as the only thing that can help (same fallback
+    _settling_iterations uses for lambda_per_hr <= 0).
+
+    Confirmed directly (three real cases: ACH=3/Z=1.7, ACH=6/Z=6,
+    ACH=9/Z=6): a 1500/1000-iteration run using this scaling matched a
+    4000/2500-iteration deltaT=1 run's reduction_pct/eACH_uv almost
+    exactly, where an unscaled 1500/1000 run badly undershot both.
+    """
+    if effective_rate_per_hr <= 0:
+        return 1
+    theta_s = 3600.0 / effective_rate_per_hr
+    target_cycles = math.log(1.0 / (1.0 - target_fraction))
+    ideal_dt = target_cycles * theta_s / n_iterations
+    return max(1, round(ideal_dt))
+
+
+def resolve_phase_delta_ts(ach, eACH_uv_well_mixed, phase1_iterations, phase2_iterations, adv):
+    """The phase1_delta_t/phase2_delta_t run_steady_state_scenario expects,
+    from a project's ach/eACH_uv_well_mixed and its (already-resolved,
+    possibly _settling_iterations-inflated) iteration budgets - the one
+    place this is computed, shared by app.py's single-run path and
+    scenario_runs.py's sweep paths, so the deltat-* advanced settings mean
+    the same thing everywhere.
+
+    Returns (1, 1) - i.e. the historical deltaT=1 behavior - whenever
+    disabled via "deltat-scaling-enabled", or whenever keep-all-timesteps
+    is on (the two aren't supported together, see _run_phase).
+    """
+    if not adv["deltat-scaling-enabled"] or adv["keep-all-timesteps"]:
+        return 1, 1
+    frac = adv["deltat-effective-fraction"]
+    target_fraction = adv["deltat-target-fraction"]
+    phase1_delta_t = compute_scaled_delta_t(frac * ach, phase1_iterations, target_fraction=target_fraction)
+    phase2_delta_t = compute_scaled_delta_t(frac * (ach + eACH_uv_well_mixed), phase2_iterations,
+                                             target_fraction=target_fraction)
+    return phase1_delta_t, phase2_delta_t
+
+
 def _copy_latest_to_zero(case_dir_wsl, latest, include_T, log_fn):
     fields = "U p k omega nut phi" + (" T" if include_T else "")
     r = run_wsl_or_raise(f"ls {latest}/", case_dir_wsl, "listing converged fields")
@@ -344,7 +407,7 @@ def _run_phase(case_dir, case_dir_wsl, n_iterations, write_interval, window_frac
                 live_patches=(), check_interval=None, t_inf_rel_tol=None, t_inf_streak=3,
                 keep_all_timesteps=False, iteration_offset=0, mass_balance_patches=(),
                 injection_rate_G=None, mass_balance_tol=None, status_fn=None, status_key=None,
-                should_pause=None):
+                should_pause=None, delta_t=1):
     """Run simpleFoam for n_iterations, tracking the room-wide (and any
     monitoring-point) volAverage(T) live, every iteration.
 
@@ -410,7 +473,33 @@ def _run_phase(case_dir, case_dir_wsl, n_iterations, write_interval, window_frac
     exceeds t_inf_rel_tol is treated as if it had failed entirely (never
     contributes to the streak) - a cheap first filter for the second
     failure mode, checked before the (pricier) mass-balance measurement.
+
+    delta_t: OpenFOAM's own pseudo-time step, must be a positive integer
+    (default 1, the historical behavior). simpleFoam's own U/p/k/omega
+    solve has no ddt() term at all (pure SIMPLE relaxation, unaffected by
+    deltaT), but scalarTransport1's T equation does - solved implicitly
+    (unconditionally stable), so scaling deltaT up lets a fixed, cheap
+    iteration budget cover more real residence time for T's own buildup,
+    fully decoupled from the frozen flow field (see compute_scaled_delta_t
+    and the "4-6 residence times" criterion this is built to satisfy -
+    confirmed directly: a 1500/1000-iteration run with scaled deltaT
+    matched a 4000/2500-iteration run at deltaT=1 almost exactly, where an
+    unscaled 1500/1000 run badly undershot). n_iterations/total_run/
+    chunk_size remain real ITERATION counts throughout (unchanged
+    semantics, unchanged compute cost) - delta_t only stretches how much
+    OpenFOAM time each of those iterations represents. Every directory
+    name/OpenFOAM time value this function touches is therefore always an
+    exact multiple of delta_t (end_time and write_interval are scaled by
+    the same integer factor before being handed to set_control_dict_time),
+    so `int()`-based directory-name parsing stays exact - no float drift
+    to guard against. Only 1 (the default) is supported together with
+    keep_all_timesteps=True; combining them raises, since the cumulative-
+    iteration renaming in _rename_chunk_time_dirs assumes directory names
+    and iteration offsets share the same units.
     """
+    if delta_t != 1 and keep_all_timesteps:
+        raise ValueError("_run_phase: keep_all_timesteps is not supported together with delta_t != 1 "
+                          "(cumulative-iteration renaming assumes directory names are iteration counts).")
     check_interval = check_interval or n_iterations
     if not keep_all_timesteps:
         _clean_time_dirs(case_dir_wsl)
@@ -451,8 +540,15 @@ def _run_phase(case_dir, case_dir_wsl, n_iterations, write_interval, window_frac
 
     while total_run < n_iterations:
         chunk_size = min(check_interval, n_iterations - total_run)
-        set_control_dict_time(case_dir, end_time=chunk_size,
-                               write_interval=_chunk_write_interval(write_interval, chunk_size), delta_t=1)
+        # end_time/write_interval are OpenFOAM TIME values, not iteration
+        # counts - scale both by delta_t (an integer, see docstring) so
+        # every value handed to OpenFOAM stays an exact integer, and every
+        # directory this chunk writes lands at an exact multiple of
+        # delta_t.
+        end_time = chunk_size * delta_t
+        chunk_write_interval = _chunk_write_interval(write_interval * delta_t, end_time)
+        set_control_dict_time(case_dir, end_time=end_time,
+                               write_interval=chunk_write_interval, delta_t=delta_t)
         # set_control_dict_time's sweep above touches every writeInterval
         # in the file, including these live blocks (left over from an
         # earlier chunk/phase) - re-pin them to 1 without touching the
@@ -488,14 +584,24 @@ def _run_phase(case_dir, case_dir_wsl, n_iterations, write_interval, window_frac
         # This chunk's own live tracking - every chunk starts fresh at
         # time-label "0" (startFrom/startTime are never changed in this
         # pipeline), so its own postProcessing output only covers this
-        # chunk's iterations - offset by total_run before appending, to
-        # build one continuous global series across chunks.
+        # chunk's iterations. The live blocks are re-pinned to writeInterval=1
+        # above, in OpenFOAM TIME units - with delta_t != 1, their own "t"
+        # column is therefore real OpenFOAM time (0, delta_t, 2*delta_t, ...),
+        # not a raw iteration count. Divide by delta_t first (exact - every
+        # live-tracked step lands at a whole multiple of delta_t) to keep
+        # acc_t/the returned live/decay_curve series in ITERATION units
+        # throughout, unaffected by delta_t (same meaning fit_asymptotic_value/
+        # windowed_stats/result_figures.py already assume), then offset by
+        # total_run before appending, to build one continuous global series
+        # across chunks.
         chunk_t, chunk_T = read_vol_average_dat(f"{case_dir}/postProcessing/volAverageLive1/0/volFieldValue.dat")
+        chunk_t = chunk_t / delta_t
         acc_t, acc_T = accumulated["room"]
         acc_t.extend((chunk_t + total_run).tolist())
         acc_T.extend(chunk_T.tolist())
         for zone in live_monitoring_zones:
             zt, zT = read_vol_average_dat(f"{case_dir}/postProcessing/monitor_{zone}Live/0/volFieldValue.dat")
+            zt = zt / delta_t
             azt, azT = accumulated[zone]
             azt.extend((zt + total_run).tolist())
             azT.extend(zT.tolist())
@@ -518,8 +624,12 @@ def _run_phase(case_dir, case_dir_wsl, n_iterations, write_interval, window_frac
         # count regardless of why it stopped (a normal full chunk writes
         # its final snapshot named after chunk_size exactly, so this is a
         # no-op change for the common case) - trust it, not the request.
+        # latest is an OpenFOAM TIME value (see docstring) - always an exact
+        # multiple of delta_t (SIMPLE's own residualControl, if it ever
+        # triggers an early stop, still only ever writes at a whole pseudo-
+        # time step), so integer division recovers the true iteration count.
         chunk_start = total_run
-        total_run += int(latest)
+        total_run += int(latest) // delta_t
 
         # Attempted on every chunk (including the final one, not just while
         # there's still budget left) - this is the NEW primary readiness
@@ -783,7 +893,7 @@ def run_steady_state_scenario(case_dir, room_x, room_y, room_z, ach, Z, nbins=25
                                fan_entry=None, monitoring_points=None,
                                patches_to_monitor=("outlet",), log_fn=print, should_stop=None,
                                solver_log_fn=None, status_fn=None, phase1_only=False, should_pause=None,
-                               measured_ventilation_ach=None):
+                               measured_ventilation_ach=None, phase1_delta_t=1, phase2_delta_t=1):
     """Run both phases of a continuous-source steady-state scenario against
     an already-converged case (mesh + flow + fluenceRate/kUV must already
     exist - see run_pipeline.setup_case()). Returns a summary dict.
@@ -853,7 +963,18 @@ def run_steady_state_scenario(case_dir, room_x, room_y, room_z, ach, Z, nbins=25
     cumulative iteration count spanning phase 1 then phase 2) instead of
     being deleted down to just the initial/final state - lets ParaView
     play back the whole run. Off by default: a long/fine-grained run can
-    leave a lot of snapshot directories behind, so this is opt-in.
+    leave a lot of snapshot directories behind, so this is opt-in. Not
+    supported together with phase1_delta_t/phase2_delta_t != 1 (see
+    _run_phase) - raises if both are requested at once.
+
+    phase1_delta_t/phase2_delta_t: OpenFOAM pseudo-time step for each
+    phase (default 1 each, the historical behavior) - see _run_phase's
+    own delta_t docstring and compute_scaled_delta_t. Lets a phase's
+    fixed phaseN_iterations budget cover more real residence time for
+    low-ACH cases, without costing any more compute - the caller is
+    expected to compute these via compute_scaled_delta_t (using this
+    phase's effective removal rate: ach for Phase 1, ach+eACH_uv for
+    Phase 2) rather than pass an arbitrary value.
 
     fan_entry: pre-built fvOptions entry text (see fan.fan_fvoptions_entry())
     if a mixing fan should stay active through both phases, same "always
@@ -1001,6 +1122,7 @@ def run_steady_state_scenario(case_dir, room_x, room_y, room_z, ach, Z, nbins=25
                     keep_all_timesteps=keep_all_timesteps, mass_balance_patches=patches_to_monitor,
                     injection_rate_G=G, mass_balance_tol=mass_balance_tol,
                     status_fn=status_fn, status_key=status_key1, should_pause=should_pause,
+                    delta_t=phase1_delta_t,
                 )
             finally:
                 if status_fn is not None:
@@ -1099,6 +1221,7 @@ def run_steady_state_scenario(case_dir, room_x, room_y, room_z, ach, Z, nbins=25
                     keep_all_timesteps=keep_all_timesteps, mass_balance_patches=patches_to_monitor,
                     injection_rate_G=G, mass_balance_tol=mass_balance_tol,
                     status_fn=status_fn, status_key=status_key1, should_pause=should_pause,
+                    delta_t=phase1_delta_t,
                 )
             finally:
                 if status_fn is not None:
@@ -1179,6 +1302,7 @@ def run_steady_state_scenario(case_dir, room_x, room_y, room_z, ach, Z, nbins=25
             check_interval=t_inf_check_interval, t_inf_rel_tol=t_inf_rel_tol, t_inf_streak=t_inf_streak,
             keep_all_timesteps=keep_all_timesteps, iteration_offset=iters1,
             status_fn=status_fn, status_key=status_key2, should_pause=should_pause,
+            delta_t=phase2_delta_t,
         )
     finally:
         if status_fn is not None:

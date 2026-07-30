@@ -45,7 +45,7 @@ from .initial_fields import compute_inlet_velocities
 from .monitoring_points import compute_monitoring_results
 from .run_pipeline import setup_case
 from .splice import set_control_dict_time, splice_fv_options_into_control_dict
-from .steady_state_pipeline import run_steady_state_scenario, _uv_fvoptions_entries
+from .steady_state_pipeline import run_steady_state_scenario, _uv_fvoptions_entries, resolve_phase_delta_ts
 from .ventilation_control import prepare_ventilation_only_control, finish_ventilation_only_control
 from .visualization import center_frac_for_wall
 from .wsl_utils import StoppedByUser, run_wsl_or_raise, run_wsl_streaming, wsl_path
@@ -321,6 +321,7 @@ def _run_scenario(case_dir, room, settings, z, ach, adv, z_summary, log_fn, shou
     eACH_uv = z_summary.get("eACH_uv_well_mixed_mean", 0.0)
     phase1_iterations = max(settings["phase1-iterations"], _settling_iterations(ach))
     phase2_iterations = max(settings["phase2-iterations"], _settling_iterations(ach + eACH_uv))
+    phase1_delta_t, phase2_delta_t = resolve_phase_delta_ts(ach, eACH_uv, phase1_iterations, phase2_iterations, adv)
 
     patches_to_monitor = ("outlet", "outlet2") if has_outlet2 else ("outlet",)
     result = run_steady_state_scenario(
@@ -351,6 +352,7 @@ def _run_scenario(case_dir, room, settings, z, ach, adv, z_summary, log_fn, shou
         log_fn=log_fn, should_stop=should_stop, solver_log_fn=solver_log_fn, should_pause=should_pause,
         status_fn=status_fn,
         measured_ventilation_ach=(control_results or {}).get("total_ach_effective"),
+        phase1_delta_t=phase1_delta_t, phase2_delta_t=phase2_delta_t,
     )
     result["fluence_mean"] = z_summary["fluence_mean"]
     result["eACH_uv_well_mixed"] = z_summary.get("eACH_uv_well_mixed_mean")
@@ -406,6 +408,9 @@ def _run_shared_phase1(base_dir, phase1_dir, ach, room, settings, adv, log_fn, s
     has_outlet2 = bool(settings.get("outlet2-enable"))
 
     phase1_iterations = max(settings["phase1-iterations"], _settling_iterations(ach))
+    # Phase 1 alone has no UV/Z dependency, so eACH_uv_well_mixed=0 here -
+    # phase2_delta_t is discarded (phase1_only=True below runs no Phase 2).
+    phase1_delta_t, _ = resolve_phase_delta_ts(ach, 0.0, phase1_iterations, phase1_iterations, adv)
     patches_to_monitor = ("outlet", "outlet2") if has_outlet2 else ("outlet",)
 
     log_fn(f"=== ACH={ach}: Phase 1 (source only, no UV - shared by every Z at this ACH) ===")
@@ -436,7 +441,7 @@ def _run_shared_phase1(base_dir, phase1_dir, ach, room, settings, adv, log_fn, s
         fan_entry=fan_entry, monitoring_points=_gather_monitoring_points(settings),
         patches_to_monitor=patches_to_monitor,
         log_fn=log_fn, should_stop=should_stop, solver_log_fn=solver_log_fn, should_pause=should_pause,
-        status_fn=status_fn, phase1_only=True,
+        status_fn=status_fn, phase1_only=True, phase1_delta_t=phase1_delta_t,
     )
 
 
