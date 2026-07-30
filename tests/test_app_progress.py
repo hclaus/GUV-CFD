@@ -5,6 +5,45 @@ def _reset():
     guvcfd_app._reset_run_progress("decay")
 
 
+def test_decision_panel_text_handles_flow_convergence_diagnostic():
+    # _oscillation_diagnostic's shape (chunks_available/
+    # chunks_needed_for_oscillation_check/trend/last_chunk_rel_change).
+    decision = {"total_iterations": 1500, "kind": "flow"}
+    diagnostic = {
+        "summary": "trending toward agreement", "chunks_available": 3,
+        "chunks_needed_for_oscillation_check": 8, "trend": "growing",
+        "last_chunk_rel_change": 0.021, "rel_tol": 0.01, "chunk_size": 500,
+    }
+    text = guvcfd_app._decision_panel_text(decision, diagnostic)
+    assert "1500 iterations" in text
+    assert "Chunks available: 3" in text
+    assert "2.1%" in text
+
+
+def test_decision_panel_text_handles_phase1_extrapolation_diagnostic_without_crashing():
+    # Regression: _phase1_extrapolation_diagnostic's dict has a completely
+    # different shape (no chunks_available/chunks_needed_for_oscillation_
+    # check/trend/last_chunk_rel_change - those are _oscillation_diagnostic-
+    # only keys) - the panel-rendering code used to always assume the flow
+    # shape regardless of decision["kind"], raising a KeyError the first
+    # time a real Phase1ExtrapolationUndecided pause was rendered live.
+    decision = {"total_iterations": 1500, "kind": "phase1_extrapolation"}
+    diagnostic = {
+        "summary": "still 3.2% apart (target <= 2%) - trending toward agreement, just not stable enough yet.",
+        "n_attempts": 4, "n_successful_fits": 3, "recent_estimates": [61.2, 60.8, 59.9],
+        "streak_required": 3, "rel_tol": 0.02, "chunk_size": 400, "n_iterations": 1500,
+    }
+    text = guvcfd_app._decision_panel_text(decision, diagnostic)
+    assert "1500 iterations" in text
+    assert "trending toward agreement" in text
+    assert "chunks_available" not in text.lower()  # never touches flow-only keys
+
+
+def test_phase1_decision_iterations_suggestion_uses_chunk_size_times_streak():
+    diagnostic = {"chunk_size": 400, "streak_required": 3}
+    assert guvcfd_app._phase1_decision_iterations_suggestion(diagnostic) == 1200
+
+
 def test_flow_convergence_progress_is_cumulative_across_chunks():
     # Narration (chunk/budget announcements) goes through _run_log, as the
     # pipeline itself emits it; raw solver stdout ("Time = N") goes through

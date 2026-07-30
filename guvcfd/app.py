@@ -3899,6 +3899,43 @@ def _flow_decision_iterations_suggestion(diagnostic):
     return max(chunk_size, missing_chunks * chunk_size)
 
 
+def _phase1_decision_iterations_suggestion(diagnostic):
+    """Same idea as _flow_decision_iterations_suggestion, but for a
+    Phase1ExtrapolationUndecided pause - _phase1_extrapolation_diagnostic's
+    dict has a completely different shape (no chunks_available/
+    chunks_needed_for_oscillation_check/trend/last_chunk_rel_change - those
+    are _oscillation_diagnostic-only keys), so the flow version's KeyError
+    on this diagnostic went uncaught by the panel-rendering code below
+    until a real Phase1ExtrapolationUndecided pause hit it live. Suggest
+    enough chunks for a fresh full streak (chunk_size x streak_required) -
+    the most generous reasonable starting point, always editable.
+    """
+    return diagnostic["chunk_size"] * diagnostic["streak_required"]
+
+
+def _decision_panel_text(decision, diagnostic):
+    """Builds the awaiting_decision panel's text for either pause kind -
+    see _run_pipeline_thread/_handle_flow_convergence_undecided's `kind`.
+    Flow convergence's diagnostic (_oscillation_diagnostic) and Phase 1
+    extrapolation's (_phase1_extrapolation_diagnostic) have different
+    shapes - only `summary`/`chunk_size`/`rel_tol` are common to both, so
+    the flow-specific detail (chunks available/needed, trend, last chunk
+    change) below only applies to kind == "flow".
+    """
+    header = f"Stopped after {decision['total_iterations']} iterations. {diagnostic['summary']}"
+    if decision.get("kind") != "flow":
+        return header
+    return (
+        header + "\n\n"
+        f"Chunks available: {diagnostic['chunks_available']} "
+        f"(need {diagnostic['chunks_needed_for_oscillation_check']} to check for a stable "
+        f"oscillation) | trend: {diagnostic['trend']} | last chunk change: "
+        + (f"{diagnostic['last_chunk_rel_change'] * 100:.3g}%"
+           if diagnostic['last_chunk_rel_change'] is not None else "n/a")
+        + f" (target <= {diagnostic['rel_tol'] * 100:.2g}%)"
+    )
+
+
 @app.callback(
     Output("run-log", "children"),
     Output("run-status-text", "children"),
@@ -3967,16 +4004,9 @@ def _poll_run(n_intervals):
     if status == "awaiting_decision" and decision:
         diagnostic = decision["diagnostic"]
         panel_style = {"display": "block"}
-        panel_text = (
-            f"Stopped after {decision['total_iterations']} iterations. {diagnostic['summary']}\n\n"
-            f"Chunks available: {diagnostic['chunks_available']} "
-            f"(need {diagnostic['chunks_needed_for_oscillation_check']} to check for a stable "
-            f"oscillation) | trend: {diagnostic['trend']} | last chunk change: "
-            + (f"{diagnostic['last_chunk_rel_change'] * 100:.3g}%"
-               if diagnostic['last_chunk_rel_change'] is not None else "n/a")
-            + f" (target <= {diagnostic['rel_tol'] * 100:.2g}%)"
-        )
-        panel_iterations = _flow_decision_iterations_suggestion(diagnostic)
+        panel_text = _decision_panel_text(decision, diagnostic)
+        panel_iterations = (_flow_decision_iterations_suggestion(diagnostic) if decision.get("kind") == "flow"
+                             else _phase1_decision_iterations_suggestion(diagnostic))
     else:
         panel_style = {"display": "none"}
         panel_text = dash.no_update
