@@ -472,6 +472,45 @@ def test_run_scenario_threads_control_results_into_measured_ventilation_ach(monk
     assert calls[-1]["measured_ventilation_ach"] == 2.46
 
 
+def test_run_scenario_deltat_scaling_uses_configured_iterations_not_settling_inflation(monkeypatch):
+    # Regression: _settling_iterations-based inflation and deltaT scaling
+    # solve the same equation for opposite unknowns - confirmed directly on
+    # a real ACH=6 run that composing them (inflate iterations first, THEN
+    # try to scale deltaT against the inflated count) silently discarded
+    # the user's actual configured 1500-iteration budget by inflating it to
+    # ~3179 (_settling_iterations(6) alone), leaving deltaT nothing to do
+    # (rounds back to 1). When deltat-scaling-enabled, phase1_iterations/
+    # phase2_iterations must be passed through exactly as configured, not
+    # floored by _settling_iterations - deltaT alone provides coverage.
+    calls = []
+
+    def fake_run_steady_state_scenario(*a, **k):
+        calls.append(k)
+        return {"reduction_pct": 90.0, "eACH_uv_steady_state": 50.0}
+    monkeypatch.setattr(sr, "run_steady_state_scenario", fake_run_steady_state_scenario)
+
+    room = type("Room", (), {"x": 4.0, "y": 5.0, "z": 2.7})()
+    settings = {"fan-enable": False, "inlet2-enable": False, "outlet2-enable": False,
+                "inlet-wall": "xMin", "inlet-y-input": 1.5, "inlet-z-input": 1.3,
+                "inlet-size-w": 0.3, "inlet-size-h": 0.3,
+                "phase1-iterations": 1500, "phase2-iterations": 1500, "target-t-ss": 1.0,
+                "inject-x-input": 2, "inject-y-input": 2.5, "inject-z-input": 1.3,
+                "monitoring-enable": False, "source-zone-size": 0.3}
+    adv = {"uv-zone-bins": 25, "mesh-cell-size": 0.1,
+           "plateau-rel-tol": 1.0, "t-infinity-early-stop-enabled": False, "keep-all-timesteps": False,
+           "deltat-scaling-enabled": True, "deltat-effective-fraction": 0.7, "deltat-target-fraction": 0.995,
+           "phase-chunk-size": 400, "phase-write-interval": 200}
+
+    sr._run_scenario("case_dir", room, settings, z=6.0, ach=6.0, adv=adv,
+                      z_summary={"eACH_uv_well_mixed_mean": 61.98, "fluence_mean": 1.0}, log_fn=lambda m: None,
+                      should_stop=None, solver_log_fn=None)
+
+    assert calls[-1]["phase1_iterations"] == 1500  # configured value, NOT _settling_iterations(6)=3179
+    assert calls[-1]["phase2_iterations"] == 1500
+    assert calls[-1]["phase1_delta_t"] == 3  # scaling actually engages against the true 1500 budget
+    assert calls[-1]["phase2_delta_t"] == 1  # Phase 2's much higher effective rate needs no scaling
+
+
 def test_run_scenario_threads_base_summary_into_flow_converged_and_ach_delivery(monkeypatch):
     # Regression: run_sweep's build_ach_fn used to call _build_flow_base()
     # without capturing its return value at all, so steady-state sweep

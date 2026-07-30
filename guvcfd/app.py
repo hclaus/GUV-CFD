@@ -1096,32 +1096,47 @@ def _finish_steady_state(case_dir, room, settings, summary,
 
     ach = settings["ach"]
     eACH_uv = summary.get("eACH_uv_well_mixed_mean", 0.0)
-    # Phase 1's naive settling estimate (well-mixed idealization) has been
-    # confirmed to run short of where extrapolation actually stabilizes -
-    # a real case's fitted tau came out ~3x the naive theoretical tau at
-    # the slowest tested ACH. Applying a safety multiplier gives a more
-    # realistic *starting* budget - not a hard cap either way, since
-    # phase1_extrapolation_gate can still raise Phase1ExtrapolationUndecided
-    # and offer to extend further if even this isn't enough.
-    phase1_settling_estimate = round(_settling_iterations(ach) * adv["phase1-settling-safety-multiplier"])
-    # Clamped to the configured ceiling - this is a *starting* budget, not
-    # a promise Phase 1 will actually need this many iterations (the
-    # extrapolation gate below stops as soon as it's confident either way);
-    # the ceiling exists so a first attempt never silently launches a much
-    # bigger run than the user configured as their hard backstop.
-    phase1_iterations = min(max(settings["phase1-iterations"], phase1_settling_estimate),
-                             adv["phase1-max-iterations-ceiling"])
-    phase2_iterations = max(settings["phase2-iterations"], _settling_iterations(ach + eACH_uv))
-    _run_log(f"Settling estimate: phase1={phase1_settling_estimate} iterations (ACH={ach:.3g}/hr alone, "
-             f"{adv['phase1-settling-safety-multiplier']:.1f}x safety margin, capped at "
-             f"{adv['phase1-max-iterations-ceiling']}), "
-             f"phase2={_settling_iterations(ach + eACH_uv)} iterations (ACH+eACH_uv={ach + eACH_uv:.3g}/hr) - "
-             f"using the larger of this and the configured value for each phase "
-             f"({phase1_iterations}, {phase2_iterations}).")
+    if adv["deltat-scaling-enabled"]:
+        # deltaT scaling and the settling-safety-multiplier below solve the
+        # exact same equation (residence times needed within a budget) for
+        # the opposite unknown - composing them is redundant and self-
+        # defeating: inflating the iteration count first (to whatever the
+        # multiplier estimates) leaves deltaT nothing left to do, since that
+        # inflated count already covers the same target span at deltaT=1.
+        # Confirmed directly: at ACH=6 the multiplier inflates a configured
+        # 1500-iteration budget to ~7948, silently discarding the user's
+        # actual requested (and, with deltaT scaling, sufficient) budget -
+        # use it as configured instead, and let deltaT provide coverage.
+        phase1_iterations = settings["phase1-iterations"]
+        phase2_iterations = settings["phase2-iterations"]
+    else:
+        # Phase 1's naive settling estimate (well-mixed idealization) has been
+        # confirmed to run short of where extrapolation actually stabilizes -
+        # a real case's fitted tau came out ~3x the naive theoretical tau at
+        # the slowest tested ACH. Applying a safety multiplier gives a more
+        # realistic *starting* budget - not a hard cap either way, since
+        # phase1_extrapolation_gate can still raise Phase1ExtrapolationUndecided
+        # and offer to extend further if even this isn't enough.
+        phase1_settling_estimate = round(_settling_iterations(ach) * adv["phase1-settling-safety-multiplier"])
+        # Clamped to the configured ceiling - this is a *starting* budget, not
+        # a promise Phase 1 will actually need this many iterations (the
+        # extrapolation gate below stops as soon as it's confident either way);
+        # the ceiling exists so a first attempt never silently launches a much
+        # bigger run than the user configured as their hard backstop.
+        phase1_iterations = min(max(settings["phase1-iterations"], phase1_settling_estimate),
+                                 adv["phase1-max-iterations-ceiling"])
+        phase2_iterations = max(settings["phase2-iterations"], _settling_iterations(ach + eACH_uv))
+        _run_log(f"Settling estimate: phase1={phase1_settling_estimate} iterations (ACH={ach:.3g}/hr alone, "
+                 f"{adv['phase1-settling-safety-multiplier']:.1f}x safety margin, capped at "
+                 f"{adv['phase1-max-iterations-ceiling']}), "
+                 f"phase2={_settling_iterations(ach + eACH_uv)} iterations (ACH+eACH_uv={ach + eACH_uv:.3g}/hr) - "
+                 f"using the larger of this and the configured value for each phase "
+                 f"({phase1_iterations}, {phase2_iterations}).")
     phase1_delta_t, phase2_delta_t = resolve_phase_delta_ts(ach, eACH_uv, phase1_iterations, phase2_iterations, adv)
     if phase1_delta_t != 1 or phase2_delta_t != 1:
-        _run_log(f"Residence-time-scaled deltaT: phase1={phase1_delta_t}, phase2={phase2_delta_t} "
-                 f"(within the iteration budgets above, not in addition to them).")
+        _run_log(f"Residence-time-scaled deltaT: phase1={phase1_delta_t}, phase2={phase2_delta_t}, "
+                 f"iterations phase1={phase1_iterations}/phase2={phase2_iterations} (as configured, not "
+                 f"settling-estimate-inflated - deltaT scaling replaces that mechanism when enabled).")
 
     patches_to_monitor = ("outlet", "outlet2") if has_outlet2 else ("outlet",)
     result = run_steady_state_scenario(

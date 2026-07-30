@@ -319,8 +319,18 @@ def _run_scenario(case_dir, room, settings, z, ach, adv, z_summary, log_fn, shou
     has_outlet2 = bool(settings.get("outlet2-enable"))
 
     eACH_uv = z_summary.get("eACH_uv_well_mixed_mean", 0.0)
-    phase1_iterations = max(settings["phase1-iterations"], _settling_iterations(ach))
-    phase2_iterations = max(settings["phase2-iterations"], _settling_iterations(ach + eACH_uv))
+    if adv["deltat-scaling-enabled"]:
+        # _settling_iterations-based inflation and deltaT scaling solve the
+        # same equation for opposite unknowns - composing them defeats
+        # deltaT scaling's purpose (confirmed directly: at ACH=6 this
+        # inflation alone already pushes a 1500-iteration budget past the
+        # point deltaT would have needed to scale). Use the configured
+        # budget as-is and let deltaT provide residence-time coverage.
+        phase1_iterations = settings["phase1-iterations"]
+        phase2_iterations = settings["phase2-iterations"]
+    else:
+        phase1_iterations = max(settings["phase1-iterations"], _settling_iterations(ach))
+        phase2_iterations = max(settings["phase2-iterations"], _settling_iterations(ach + eACH_uv))
     phase1_delta_t, phase2_delta_t = resolve_phase_delta_ts(ach, eACH_uv, phase1_iterations, phase2_iterations, adv)
 
     patches_to_monitor = ("outlet", "outlet2") if has_outlet2 else ("outlet",)
@@ -407,7 +417,10 @@ def _run_shared_phase1(base_dir, phase1_dir, ach, room, settings, adv, log_fn, s
     inlet2_velocity = velocities[1] if has_inlet2 else None
     has_outlet2 = bool(settings.get("outlet2-enable"))
 
-    phase1_iterations = max(settings["phase1-iterations"], _settling_iterations(ach))
+    if adv["deltat-scaling-enabled"]:
+        phase1_iterations = settings["phase1-iterations"]
+    else:
+        phase1_iterations = max(settings["phase1-iterations"], _settling_iterations(ach))
     # Phase 1 alone has no UV/Z dependency, so eACH_uv_well_mixed=0 here -
     # phase2_delta_t is discarded (phase1_only=True below runs no Phase 2).
     phase1_delta_t, _ = resolve_phase_delta_ts(ach, 0.0, phase1_iterations, phase1_iterations, adv)
