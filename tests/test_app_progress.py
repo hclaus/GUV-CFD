@@ -137,6 +137,107 @@ def test_progress_and_eta_are_separate_lines():
     assert "Simulation time step" not in eta
 
 
+def test_phase_target_pattern_matches_current_steady_state_log_line():
+    # Regression: _PHASE_TARGET_PATTERNS' steady-state entry used to match
+    # "Running simpleFoam (N iterations, writing every" - _run_phase's own
+    # current wording is "Running simpleFoam (801-1200 of 1500 iterations,
+    # writing every 200)...", which that old pattern never matched at all,
+    # silently leaving target_time (and therefore the whole ETA/progress-
+    # pct text) unset for every steady-state Phase 1/2 run.
+    _reset()
+    guvcfd_app._run_log("Running simpleFoam (801-1200 of 1500 iterations, writing every 200)...")
+    assert guvcfd_app._run_state["target_time"] == 1500.0
+
+
+def test_phase_target_patterns_match_scenario_runs_control_and_uvon_messages():
+    # scenario_runs._run_shared_control/_run_scenario log their own,
+    # differently-worded equivalent of the single-run decay line ("Running
+    # pimpleFoam to Xs") - both need their own pattern for sweep-mode ETA
+    # tracking to work at all.
+    progress = guvcfd_app._new_progress_entry()
+    guvcfd_app._update_progress_from_log_line(progress, "  Running pimpleFoam (shared control, 1382s)...")
+    assert progress["target_time"] == 1382.0
+
+    progress = guvcfd_app._new_progress_entry()
+    guvcfd_app._update_progress_from_log_line(progress, "  Running pimpleFoam (UV-on, 640s)...")
+    assert progress["target_time"] == 640.0
+
+
+def _reset_scenario():
+    guvcfd_app._scenario_state.update(live_status={}, progress={})
+
+
+def test_scenario_log_populates_progress_from_prefixed_narration_line():
+    _reset_scenario()
+    guvcfd_app._scenario_log("[ACH=6] Running simpleFoam (1-500 of 1500 iterations, writing every 200)...")
+    assert guvcfd_app._scenario_state["progress"]["ACH=6"]["target_time"] == 1500.0
+
+
+def test_scenario_log_ignores_unprefixed_lines():
+    _reset_scenario()
+    guvcfd_app._scenario_log("Stopped: user requested stop")
+    assert guvcfd_app._scenario_state["progress"] == {}
+
+
+def test_scenario_status_update_populates_current_time_under_stripped_prefix():
+    # status_key is always log_prefix + "/" + a phase suffix (see
+    # _scenario_status_update's own docstring) - current_time must land
+    # under the SAME key _scenario_log's own prefix uses, so a combo's
+    # target_time (from the log line) and current_time (from the solver
+    # status line) end up in one entry an ETA can be computed from.
+    _reset_scenario()
+    guvcfd_app._scenario_status_update("Z=6/ACH=6/Phase2", "Time = 42")
+    assert guvcfd_app._scenario_state["progress"]["Z=6/ACH=6"]["current_time"] == "42"
+
+
+def test_scenario_status_update_none_clears_the_progress_entry():
+    _reset_scenario()
+    guvcfd_app._scenario_status_update("Z=6/ACH=6/Phase2", "Time = 42")
+    guvcfd_app._scenario_status_update("Z=6/ACH=6/Phase2", None)
+    assert "Z=6/ACH=6" not in guvcfd_app._scenario_state["progress"]
+
+
+def test_combo_live_stage_finds_shared_phase1_key_for_every_z():
+    # Regression: Phase 1 is ACH-group-shared (see scenario_runs.
+    # _run_shared_phase1) - its status key ("ACH=6/Phase1") never carries a
+    # Z at all, unlike Phase2/UV-on's per-combo "Z={z}/ACH={ach}/..." keys.
+    # Before this was special-cased, only whichever Z happened to equal the
+    # (irrelevant, placeholder) Z run_steady_state_scenario was called with
+    # would coincidentally match - every other Z sharing that ACH silently
+    # showed no stage at all despite Phase 1 actively running on its
+    # behalf too.
+    _reset_scenario()
+    guvcfd_app._scenario_state["live_status"]["ACH=6/Phase1"] = "Time = 500"
+    assert guvcfd_app._combo_live_stage(1.7, 6) == "Phase 1"
+    assert guvcfd_app._combo_live_stage(99, 6) == "Phase 1"  # any Z sharing this ACH, not just one
+
+
+def test_combo_eta_text_end_to_end_via_scenario_log_and_status_update():
+    _reset_scenario()
+    guvcfd_app._scenario_log("[Z=6/ACH=6] Running simpleFoam (1-500 of 2000 iterations, writing every 200)...")
+    guvcfd_app._scenario_state["live_status"]["Z=6/ACH=6/Phase2"] = "Time = 500"
+    # Freeze phase_start_time 60s in the past so a rate is computable (see
+    # test_progress_and_eta_are_separate_lines' own use of this trick).
+    guvcfd_app._scenario_state["progress"]["Z=6/ACH=6"]["phase_start_time"] -= 60
+    guvcfd_app._scenario_status_update("Z=6/ACH=6/Phase2", "Time = 500")
+
+    assert guvcfd_app._combo_eta_text(6, 6) != ""
+    assert guvcfd_app._combo_eta_text(1.7, 6) == ""  # a different combo, nothing running for it
+
+
+def test_eta_text_from_progress_blank_when_incomplete():
+    assert guvcfd_app._eta_text_from_progress(None) == ""
+    assert guvcfd_app._eta_text_from_progress({}) == ""
+    assert guvcfd_app._eta_text_from_progress(
+        {"current_time": "10", "target_time": None, "phase_start_time": 1.0}) == ""
+
+
+def test_eta_text_from_progress_almost_done_when_already_past_target():
+    import time as _time
+    progress = {"current_time": "100", "target_time": 50.0, "phase_start_time": _time.time() - 10}
+    assert guvcfd_app._eta_text_from_progress(progress) == "almost done"
+
+
 def test_scenario_progress_table_handles_decay_mode_result():
     # Regression: _scenario_progress_table hardcoded detail['reduction_pct']/
     # detail['eACH_uv_steady_state'] - steady-state-only field names - and

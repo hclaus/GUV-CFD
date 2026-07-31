@@ -225,7 +225,21 @@ _run_state = {
 _scenario_state = {
     "status": "idle", "log": [], "combos": [], "results": {},
     "start_time": None, "stop_requested": False, "pause_requested": False, "live_status": {},
+    # One _new_progress_entry() per ACH-group/combo key (e.g. "ACH=6",
+    # "Z=6/ACH=6") - see _update_progress_from_log_line/_status_line and
+    # _combo_eta_text. Keyed the same way live_status/status_fn's own keys
+    # are, MINUS the trailing "/Phase1"/"/Phase2"/"/UV-on"/"/control" phase
+    # suffix (see _scenario_status_update) - one entry per group/combo, not
+    # per phase, since a combo only ever has one phase active at a time.
+    "progress": {},
 }
+
+# Matches _prefixed_log_fn's own "[prefix] message" wrapping (see
+# scenario_runs.py) - lets _scenario_log recover which ACH-group/combo a
+# narration line belongs to, the same way _scenario_status_update's own
+# key already does for solver status lines, so both can update the SAME
+# per-key progress entry (see _scenario_state["progress"]).
+_SCENARIO_LOG_PREFIX_RE = re.compile(r"^\[([^\]]+)\] (.*)$")
 
 
 def _scenario_log(msg):
@@ -235,6 +249,12 @@ def _scenario_log(msg):
     if len(log) > _MAX_LOG_LINES:
         del log[: len(log) - _MAX_LOG_LINES]
 
+    m = _SCENARIO_LOG_PREFIX_RE.match(msg)
+    if m:
+        prefix, rest = m.group(1), m.group(2)
+        progress = _scenario_state["progress"].setdefault(prefix, _new_progress_entry())
+        _update_progress_from_log_line(progress, rest)
+
 
 def _scenario_status_update(key, msg):
     """Per-stream "latest Time = N" status, overwritten in place rather
@@ -243,12 +263,23 @@ def _scenario_status_update(key, msg):
     own Time=N line every step would otherwise flood _scenario_log the
     same way the raw per-iteration residual dump already doesn't. msg=None
     removes the entry (that stream's solve just finished).
+
+    key is always log_prefix + "/" + a phase suffix (e.g. "ACH=6/Phase1",
+    "Z=6/ACH=6/UV-on", "ACH=6/control" - see steady_state_pipeline.py's
+    status_key1/status_key2 and scenario_runs.py's own status_key
+    construction, all of which follow this convention deliberately so this
+    rsplit recovers the SAME prefix _scenario_log's own _SCENARIO_LOG_
+    PREFIX_RE already keys progress entries by).
     """
     live = _scenario_state["live_status"]
+    prefix = key.rsplit("/", 1)[0]
     if msg is None:
         live.pop(key, None)
+        _scenario_state["progress"].pop(prefix, None)
     else:
         live[key] = msg
+        progress = _scenario_state["progress"].setdefault(prefix, _new_progress_entry())
+        _update_progress_from_status_line(progress, msg)
 
 
 def _scenario_should_stop():
@@ -306,8 +337,15 @@ _TIME_RE = re.compile(r"^Time\s*=\s*([\d.eE+-]+)\s*$")
 # so an ETA can be computed from (current Time / target) without threading
 # a separate progress callback through run_pipeline.py/steady_state_pipeline.py.
 _PHASE_TARGET_PATTERNS = [
-    re.compile(r"Running simpleFoam \((\d+) iterations, writing every"),  # steady-state phase
-    re.compile(r"Running pimpleFoam to ([\d.]+)s"),  # decay transient run
+    # steady-state Phase 1/2 chunk (_run_phase's own "N-M of TOTAL
+    # iterations, writing every..." wording - TOTAL is the whole phase's
+    # budget, not just this chunk's).
+    re.compile(r"Running simpleFoam \(\d+-\d+ of (\d+) iterations, writing every"),
+    re.compile(r"Running pimpleFoam to ([\d.]+)s"),  # decay transient run (single-run mode)
+    # scenario_runs._run_shared_control/_run_scenario's own differently-
+    # worded equivalents of the single-run decay line above (sweep mode).
+    re.compile(r"Running pimpleFoam \(shared control, ([\d.]+)s\)"),
+    re.compile(r"Running pimpleFoam \(UV-on, ([\d.]+)s\)"),
 ]
 
 # Flow convergence is special-cased rather than folded into
@@ -362,6 +400,57 @@ def _should_pause():
 _MAX_LOG_LINES = 5000
 
 
+def _new_progress_entry():
+    return {"target_time": None, "phase_start_time": None, "current_time": None, "chunk_base": None}
+
+
+def _update_progress_from_log_line(progress, msg):
+    """Extract target_time/phase_start_time/chunk_base from a phase-
+    narration log line into `progress` (any dict shaped like
+    _new_progress_entry()'s own target_time/phase_start_time/current_time/
+    chunk_base fields) - shared by _run_log (single-run mode, updates
+    _run_state directly) and _scenario_log (sweep mode, one small entry
+    per ACH-group/combo key - see _scenario_state["progress"]) so both
+    derive "Est. time to finish" the same way, from the same log lines the
+    pipeline already emits (see _PHASE_TARGET_PATTERNS/_FLOW_BUDGET_RE/
+    _FLOW_CHUNK_RE's own docstrings for why flow convergence needs the
+    separate budget+chunk-base handling below instead of just being
+    another entry in _PHASE_TARGET_PATTERNS).
+    """
+    m = _FLOW_BUDGET_RE.search(msg)
+    if m:
+        progress["target_time"] = float(m.group(1))
+        progress["phase_start_time"] = time.time()
+        progress["current_time"] = None
+        progress["chunk_base"] = 0
+        return
+    m = _FLOW_CHUNK_RE.search(msg)
+    if m:
+        progress["chunk_base"] = float(m.group(1)) - 1
+        return
+    for pattern in _PHASE_TARGET_PATTERNS:
+        m = pattern.search(msg)
+        if m:
+            progress["target_time"] = float(m.group(1))
+            progress["phase_start_time"] = time.time()
+            progress["current_time"] = None
+            progress["chunk_base"] = None
+            return
+
+
+def _update_progress_from_status_line(progress, msg):
+    """Extract current_time from a solver's raw "Time = N" status line into
+    `progress` - shared by _track_solver_time (single-run) and
+    _scenario_status_update (sweep mode). See
+    _update_progress_from_log_line's own docstring for the shared dict
+    shape both this and that function populate.
+    """
+    m = _TIME_RE.match(msg.strip())
+    if m:
+        base = progress.get("chunk_base")
+        progress["current_time"] = str(float(m.group(1)) + base) if base is not None else m.group(1)
+
+
 def _run_log(msg):
     msg = str(msg)
     log = _run_state["log"]
@@ -372,25 +461,7 @@ def _run_log(msg):
         # memory growth while keeping plenty of scrollback.
         del log[: len(log) - _MAX_LOG_LINES]
 
-    m = _FLOW_BUDGET_RE.search(msg)
-    if m:
-        _run_state["target_time"] = float(m.group(1))
-        _run_state["phase_start_time"] = time.time()
-        _run_state["current_time"] = None
-        _run_state["chunk_base"] = 0
-    else:
-        m = _FLOW_CHUNK_RE.search(msg)
-        if m:
-            _run_state["chunk_base"] = float(m.group(1)) - 1
-        else:
-            for pattern in _PHASE_TARGET_PATTERNS:
-                m = pattern.search(msg)
-                if m:
-                    _run_state["target_time"] = float(m.group(1))
-                    _run_state["phase_start_time"] = time.time()
-                    _run_state["current_time"] = None
-                    _run_state["chunk_base"] = None
-                    break
+    _update_progress_from_log_line(_run_state, msg)
 
     steps = _run_state.get("steps", [])
     for substr, step_name in _run_state.get("markers", []):
@@ -422,10 +493,7 @@ def _track_solver_time(line):
     if stripped.startswith("["):
         _run_log(stripped)
         return
-    m = _TIME_RE.match(stripped)
-    if m:
-        base = _run_state.get("chunk_base")
-        _run_state["current_time"] = str(float(m.group(1)) + base) if base is not None else m.group(1)
+    _update_progress_from_status_line(_run_state, stripped)
 
 
 def _fan_kwargs(settings):
@@ -1790,8 +1858,8 @@ def _checklist_item(step):
 # Flow-convergence decision panel: shown only while _run_state["status"] ==
 # "awaiting_decision" (see FlowConvergenceUndecided/_handle_flow_convergence_
 # undecided) - a run that hit its iteration budget without a clear verdict
-# stops HERE, on the Processing tab where the user is already watching it,
-# with the actual diagnostic numbers and three concrete next actions -
+# stops HERE, on the Run Simulations tab where the user is already watching
+# it, with the actual diagnostic numbers and three concrete next actions -
 # never a dead-end error with no button to press. Hidden (style, toggled by
 # _poll_run) rather than removed from the layout, so its own Input/Button
 # ids always exist for Dash's callback graph regardless of current status.
@@ -1833,9 +1901,18 @@ phase2_resume_panel = dbc.Alert(
     id="phase2-resume-panel", color="light", className="mb-3", style={"display": "none"},
 )
 
-processing_tab = html.Div([
-    flow_decision_panel,
-    phase2_resume_panel,
+# Hidden legacy backing state for the single-run (1-combination) path's
+# poller (_poll_run/run-poll) - no longer a visible tab (see the Run
+# Simulations tab below, which is now the only place a run's progress is
+# actually shown), but _poll_run's own Output/Input component graph still
+# needs every one of these ids to exist somewhere in the layout, so this
+# stays mounted, just invisible, rather than touching every one of
+# _poll_run's (and its many callers') Outputs to remove them one by one -
+# flow_decision_panel/phase2_resume_panel moved OUT of here into
+# scenario_tab below (the only pieces of this a user still needs to see -
+# the decision UX for a stuck flow-convergence/phase2 resume), so this is
+# purely dead-weight bookkeeping the user never looks at.
+_processing_legacy = html.Div([
     dbc.Row([
         dbc.Col([
             html.Div(id="run-status-text", className="fs-5 fw-semibold mb-2"),
@@ -1864,7 +1941,10 @@ processing_tab = html.Div([
 # scenario_runs.py. Every other Project Setup field (inlet/outlet/fan/
 # monitoring/iterations) is reused unchanged from whatever's currently
 # configured there; only z-value/ach vary per combination.
-scenario_tab = dbc.Row([
+scenario_tab = html.Div([
+    flow_decision_panel,
+    phase2_resume_panel,
+    dbc.Row([
     dbc.Col([
         html.Div(
             "Runs the current project's steady-state setup once per Z x ACH "
@@ -1920,7 +2000,8 @@ scenario_tab = dbc.Row([
             "border": "1px solid rgba(127,127,127,0.3)", "whiteSpace": "pre-wrap",
         }),
     ], width=8),
-], className="mt-3")
+    ], className="mt-3"),
+])
 
 # Simulation settings modal (Run Simulations tab): the fields that
 # actually govern how a run behaves, moved out of Project Setup's old
@@ -2199,7 +2280,7 @@ settings_modal = dbc.Modal(
                     "settings-flow-max-iterations", "Flow convergence max iterations",
                     "Budget of simpleFoam/pimpleFoam iterations spent trying to converge the flow "
                     "field before pausing to ask what to do next (continue further, or accept the "
-                    "current state - see the Processing tab if this happens). Lowering this does "
+                    "current state - see the Run Simulations tab if this happens). Lowering this does "
                     "NOT make a case fail faster and safely - it just means you'll be asked sooner, "
                     "possibly before the oscillation-acceptance check below even has enough evidence "
                     "to tell a stable oscillation from a genuinely still-growing one (it needs "
@@ -2384,8 +2465,8 @@ settings_modal = dbc.Modal(
                     "several consecutive T∞ fits agree (the tolerance/streak settings below), even if "
                     "the CV-plateau check already looks fine; hitting the iteration ceiling without "
                     "that pauses the run for a decision (continue more / accept as-is / stop) on the "
-                    "Processing tab - single-run mode only, sweep mode has no resume path for this and "
-                    "will simply fail the affected combination if this triggers there.",
+                    "Run Simulations tab - single-run mode only, sweep mode has no resume path for this "
+                    "and will simply fail the affected combination if this triggers there.",
                     _adv_defaults["phase1-require-stable-extrapolation"],
                 ),
                 _settings_field(
@@ -2587,7 +2668,7 @@ settings_modal = dbc.Modal(
                 html.Hr(className="my-2"),
                 html.Div("Scenario sweep troubleshooting", className="small fw-bold text-uppercase mb-1"),
                 html.Div(
-                    "A scenario sweep (Processing tab) shares one flow-converged base case, "
+                    "A scenario sweep (Run Simulations tab) shares one flow-converged base case, "
                     "Phase 1 run, and UV-off control run across every Z at the same ACH, then "
                     "deletes those shared directories once that ACH group's last Z finishes - "
                     "keeping a run's own working directory small, but also removing the one place "
@@ -2687,10 +2768,10 @@ app.layout = dbc.Container([
     ], align="center", className="g-3 mt-2 mb-3"),
     dbc.Tabs([
         dbc.Tab(project_setup_tab, label="Project Setup", tab_id="project-setup"),
-        dbc.Tab(processing_tab, label="Processing", tab_id="processing"),
         dbc.Tab(scenario_tab, label="Run Simulations", tab_id="scenario-runs"),
         dbc.Tab(analysis_tab, label="Analysis of Results", tab_id="analysis"),
     ], active_tab="project-setup", className="mb-3", id="main-tabs"),
+    html.Div(_processing_legacy, style={"display": "none"}),
 ], fluid=True)
 
 
@@ -3530,7 +3611,7 @@ def _launch_scenario_sweep(guv_path, settings_path, project_dir, room, settings,
 )
 def _start_run(n_clicks, *values):
     if _run_state["status"] == "running":
-        return True, True, False, dash.no_update, "processing", False, dash.no_update
+        return True, True, False, dash.no_update, "scenario-runs", False, dash.no_update
 
     room = _loaded["room"]
     guv_path = _loaded["path"]
@@ -3576,7 +3657,7 @@ def _start_run(n_clicks, *values):
             "total_iterations": pending["total_iterations"], "started_at": datetime.now(), "start": time.time(),
             "kind": "flow",
         }
-        return True, True, False, "", "processing", False, dash.no_update
+        return True, True, False, "", "scenario-runs", False, dash.no_update
 
     # A steady-state case whose setup fully completed (mesh + flow
     # convergence, possibly Phase 1 too) but never reached results.json -
@@ -3602,7 +3683,7 @@ def _start_run(n_clicks, *values):
             "sim_type": sim_type, "guv_path": guv_path, "case_dir": case_dir, "room": room,
             "settings": settings, "detail": detail, "started_at": datetime.now(), "start": time.time(),
         }
-        return True, True, False, "", "processing", False, dash.no_update
+        return True, True, False, "", "scenario-runs", False, dash.no_update
 
     if _case_dir_has_data(case_dir):
         _pending_run.update(sim_type=sim_type, guv_path=guv_path, case_dir=case_dir,
@@ -3613,7 +3694,7 @@ def _start_run(n_clicks, *values):
                 f"directory in place - existing results may be lost. Continue anyway?")
 
     _launch_run(sim_type, guv_path, case_dir, room, settings)
-    return True, True, False, "", "processing", False, dash.no_update
+    return True, True, False, "", "scenario-runs", False, dash.no_update
 
 
 @app.callback(
@@ -3631,7 +3712,7 @@ def _confirm_overwrite_run(submit_n_clicks):
     _launch_run(_pending_run["sim_type"], _pending_run["guv_path"], _pending_run["case_dir"],
                 _pending_run["room"], _pending_run["settings"])
     _pending_run.update(sim_type=None, guv_path=None, case_dir=None, room=None, settings=None)
-    return True, True, False, "processing"
+    return True, True, False, "scenario-runs"
 
 
 @app.callback(
@@ -3650,7 +3731,7 @@ def _confirm_overwrite_run(submit_n_clicks):
 )
 def _start_continue(n_clicks, case_dir, sim_type, end_time, write_interval, *mesh_values):
     if _run_state["status"] == "running":
-        return True, True, False, dash.no_update, "processing"
+        return True, True, False, dash.no_update, "scenario-runs"
 
     if sim_type != "decay":
         return (False, False, True, "Continuing to a longer duration is only supported "
@@ -3681,7 +3762,7 @@ def _start_continue(n_clicks, case_dir, sim_type, end_time, write_interval, *mes
         daemon=True,
     )
     thread.start()
-    return True, True, False, "", "processing"
+    return True, True, False, "", "scenario-runs"
 
 
 def _start_flow_decision(action, additional_iterations, mesh_values):
@@ -3723,7 +3804,7 @@ def _start_flow_decision(action, additional_iterations, mesh_values):
     target = _resume_pipeline_thread if kind == "flow" else _resume_phase1_extrapolation_thread
     thread = threading.Thread(target=target, args=(action, additional_iterations), daemon=True)
     thread.start()
-    return {"display": "none"}, True, True, False, "", "processing"
+    return {"display": "none"}, True, True, False, "", "scenario-runs"
 
 
 @app.callback(
@@ -3809,7 +3890,7 @@ def _start_phase2_resume(n_clicks, *mesh_values):
     _run_state["status"] = "running"
     thread = threading.Thread(target=_resume_phase2_thread, daemon=True)
     thread.start()
-    return {"display": "none"}, True, True, False, "", "processing"
+    return {"display": "none"}, True, True, False, "", "scenario-runs"
 
 
 @app.callback(
@@ -3968,7 +4049,7 @@ def _start_scenario_sweep(n_clicks, z_text, ach_text, *values):
             "total_iterations": pending["total_iterations"], "started_at": datetime.now(), "start": time.time(),
             "kind": "flow",
         }
-        return True, False, False, "", "processing", True, True, False, "", False, _NA
+        return True, False, False, "", "scenario-runs", True, True, False, "", False, _NA
 
     resume_info = case_awaiting_phase2_resume(case_dir)
     if resume_info:
@@ -3987,18 +4068,18 @@ def _start_scenario_sweep(n_clicks, z_text, ach_text, *values):
             "sim_type": sim_type, "guv_path": guv_path, "case_dir": case_dir, "room": room,
             "settings": settings, "detail": detail, "started_at": datetime.now(), "start": time.time(),
         }
-        return True, False, False, "", "processing", True, True, False, "", False, _NA
+        return True, False, False, "", "scenario-runs", True, True, False, "", False, _NA
 
     if _case_dir_has_data(case_dir):
         _pending_run.update(sim_type=sim_type, guv_path=guv_path, case_dir=case_dir,
                              room=room, settings=settings)
-        return (True, False, False, "", "processing", False, False, True, "", True,
+        return (True, False, False, "", "scenario-runs", False, False, True, "", True,
                 f"{case_dir} already has simulation data (results.json and/or solver "
                 f"output). Running will regenerate the mesh and overwrite the case "
                 f"directory in place - existing results may be lost. Continue anyway?")
 
     _launch_run(sim_type, guv_path, case_dir, room, settings)
-    return True, False, False, "", "processing", True, True, False, "", False, _NA
+    return True, False, False, "", "scenario-runs", True, True, False, "", False, _NA
 
 
 @app.callback(
@@ -4057,18 +4138,80 @@ _LIVE_STAGE_SUFFIXES = [("Phase2", "Phase 2"), ("UV-on", "Phase 2"), ("Phase1", 
                         ("control", "Flow convergence"), ("flow", "Flow convergence")]
 
 
+def _combo_live_key(z, ach):
+    """This combo's own currently-active live_status key, or None if
+    nothing's running for it yet - shared by _combo_live_stage (the status
+    label) and _combo_eta_text (the ETA, via this same key's stripped-down
+    progress entry - see _scenario_status_update).
+
+    Phase 1 and the control run are ACH-group-shared (see
+    scenario_runs._run_shared_phase1/_run_shared_control) - their own
+    status keys ("ACH={ach}/Phase1"/"ACH={ach}/control") never carry a Z
+    at all, unlike Phase2/UV-on's per-combo "Z={z}/ACH={ach}/..." keys, so
+    both need their own explicit equality check here rather than the
+    startswith(prefix) check every per-combo phase already matches.
+    """
+    prefix = f"Z={z}/ACH={ach}/"
+    for key in _scenario_state["live_status"]:
+        if key.startswith(prefix) or key in (f"ACH={ach}/control", f"ACH={ach}/Phase1"):
+            return key
+    return None
+
+
 def _combo_live_stage(z, ach):
     """Best-effort current stage for a combo with no results.json yet -
     None if it hasn't started (no matching key in live_status at all).
     """
-    prefix = f"Z={z}/ACH={ach}/"
-    for key in _scenario_state["live_status"]:
-        if key.startswith(prefix) or key == f"ACH={ach}/control":
-            for suffix, label in _LIVE_STAGE_SUFFIXES:
-                if key.endswith(suffix):
-                    return label
-            return "Running"
-    return None
+    key = _combo_live_key(z, ach)
+    if key is None:
+        return None
+    for suffix, label in _LIVE_STAGE_SUFFIXES:
+        if key.endswith(suffix):
+            return label
+    return "Running"
+
+
+def _eta_text_from_progress(progress):
+    """Bare '3:45'/'almost done' ETA text from a progress-shaped dict (see
+    _new_progress_entry) - "" if nothing's active yet, target/current time
+    isn't known, or not enough of the current phase has elapsed to
+    extrapolate a rate from. Shared by _combo_eta_text (sweep mode, one
+    entry per combo - see _scenario_state["progress"]) and
+    _single_run_progress_table (single-run mode, _run_state itself already
+    has this same shape) so both progress tables' "Est. time to finish"
+    column is formatted identically. Same math as _solver_eta_text (the
+    Processing-tab-era full-sentence version, still used by the "Running
+    now" line elsewhere), just returning the bare duration instead of a
+    full sentence, for a table cell.
+    """
+    if not progress:
+        return ""
+    cur, target, phase_start = progress.get("current_time"), progress.get("target_time"), \
+        progress.get("phase_start_time")
+    if not cur or not target or not phase_start:
+        return ""
+    try:
+        cur_val = float(cur)
+    except (TypeError, ValueError):
+        return ""
+    elapsed = time.time() - phase_start
+    if cur_val <= 0 or elapsed <= 0:
+        return ""
+    remaining = (target - cur_val) * (elapsed / cur_val)
+    if remaining <= 0:
+        return "almost done"
+    return _format_mmss(remaining)
+
+
+def _combo_eta_text(z, ach):
+    """'Est. time to finish' cell text for a combo currently running (see
+    _combo_live_key/_eta_text_from_progress) - "" if nothing's active for
+    this combo at all.
+    """
+    key = _combo_live_key(z, ach)
+    if key is None:
+        return ""
+    return _eta_text_from_progress(_scenario_state["progress"].get(key.rsplit("/", 1)[0]))
 
 
 def _scenario_progress_table():
@@ -4089,15 +4232,14 @@ def _scenario_progress_table():
         if entry is None:
             stage = _combo_live_stage(z, ach)
             status = stage if stage else "pending"
+            est_time = _combo_eta_text(z, ach) if stage else ""
         elif entry["status"] == "done":
             status = "Finished"
             metrics = combo_summary_metrics(entry["detail"])
+            est_time = ""
         else:
             status = f"error: {entry['detail']}"
-        # Est. time to finish needs structured per-combo progress tracking
-        # (elapsed/iteration/target) - not available from status_fn's plain
-        # display string today, so left blank rather than guessed.
-        est_time = ""
+            est_time = ""
 
         def _pct(v):
             return f"{v:.1f}%" if v is not None else ("" if entry is None else "n/a")
@@ -4151,8 +4293,9 @@ def _single_run_progress_table():
         html.Th("Total reduction %"), html.Th("Measured ACH eff. %"), html.Th("Measured UV eff. %"),
         html.Th("Est. ACH /hr"), html.Th("Est. eACH /hr"),
     ])
+    est_time = _eta_text_from_progress(_run_state) if status == "running" else ""
     row = html.Tr([
-        html.Td(z), html.Td(ach), html.Td(stage), html.Td(""),
+        html.Td(z), html.Td(ach), html.Td(stage), html.Td(est_time),
         html.Td(_pct(metrics["total_reduction_pct"])), html.Td(_pct(metrics["ach_efficiency_pct"])),
         html.Td(_pct(metrics["uv_efficiency_pct"])), html.Td(_rate(metrics["est_ach_per_hr"])),
         html.Td(_rate(metrics["est_each_per_hr"])),
@@ -4175,11 +4318,12 @@ def _single_run_progress_table():
 )
 def _poll_scenario(n_intervals):
     # A 1-combination run (see _start_scenario_sweep) lives in _run_state,
-    # not _scenario_state - render from whichever is actually active. Once
-    # a decision panel is needed, main-tabs.active_tab already switched to
-    # "processing" at launch time (same as the old Run button always did);
-    # this only covers a plain running/finished/stopped/error single run
-    # while the user stays on this tab watching it.
+    # not _scenario_state - render from whichever is actually active.
+    # flow_decision_panel/phase2_resume_panel now live directly on THIS tab
+    # (see scenario_tab) - their own visibility is toggled by _poll_run
+    # (still firing, just invisible - see _processing_legacy), so this only
+    # needs to cover the plain running/finished/stopped/error text while the
+    # user stays on this tab watching it.
     if _run_state["status"] in _RUN_STATE_ACTIVE_STATUSES or (
             _run_state["status"] != "idle" and _scenario_state["status"] != "running"
             and _run_state.get("case_dir") and _run_state.get("z") is not None):
@@ -4192,8 +4336,8 @@ def _poll_scenario(n_intervals):
             "done": "Finished. 1/1 succeeded.",
             "error": "Failed - see log below.",
             "stopped": "Stopped.",
-            "awaiting_decision": "Paused - awaiting your decision (see Processing tab).",
-            "awaiting_phase2_resume": "Paused - awaiting your decision (see Processing tab).",
+            "awaiting_decision": "Paused - awaiting your decision (see the panel above).",
+            "awaiting_phase2_resume": "Paused - awaiting your decision (see the panel above).",
         }.get(status, "")
         paused = still_running and _run_state.get("pause_requested", False)
         if paused:

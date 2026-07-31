@@ -1111,6 +1111,13 @@ def run_steady_state_scenario(case_dir, room_x, room_y, room_z, ach, Z, nbins=25
     existing checkpoint-detection logic below picks up the already-
     converged state and skips straight to Phase 2, without needing to
     know phase1_only was ever used.
+
+    When True, status_key1 also drops its Z segment (f"ACH={ach}/Phase1"
+    instead of f"Z={Z}/ACH={ach}/Phase1") - the caller only ever passes a
+    placeholder Z here (see the docstring above), and dropping it makes
+    this key match the f"ACH={ach}" prefix _run_shared_phase1's own log_fn
+    already uses, so a per-combo progress/ETA tracker can correlate the
+    two without needing to know a placeholder was involved at all.
     """
     case_dir_wsl = wsl_path(case_dir)
     room_volume = room_x * room_y * room_z
@@ -1194,7 +1201,7 @@ def run_steady_state_scenario(case_dir, room_x, room_y, room_z, ach, Z, nbins=25
                        f"iterations to build a representative window ===")
                 run_check_interval, run_t_inf_rel_tol = None, None
 
-            status_key1 = f"Z={Z}/ACH={ach}/Phase1"
+            status_key1 = f"ACH={ach}/Phase1" if phase1_only else f"Z={Z}/ACH={ach}/Phase1"
             try:
                 latest1, iters1, t1, T1, converged1, live1, stopped_via_tinf1, tinf_history1, mb_flux1 = _run_phase(
                     case_dir, case_dir_wsl, run_iterations, phase1_write_interval,
@@ -1305,7 +1312,7 @@ def run_steady_state_scenario(case_dir, room_x, room_y, room_z, ach, Z, nbins=25
                                          inlet2_velocity=inlet2_velocity, has_outlet2=has_outlet2)
             _write_phase1_pending(case_dir, G, Su, source_volume, n_source_cells)
 
-            status_key1 = f"Z={Z}/ACH={ach}/Phase1"
+            status_key1 = f"ACH={ach}/Phase1" if phase1_only else f"Z={Z}/ACH={ach}/Phase1"
             try:
                 latest1, iters1, t1, T1, converged1, live1, stopped_via_tinf1, tinf_history1, mb_flux1 = _run_phase(
                     case_dir, case_dir_wsl, phase1_iterations, phase1_write_interval,
