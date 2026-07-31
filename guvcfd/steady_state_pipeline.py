@@ -396,7 +396,7 @@ def _copy_latest_to_zero(case_dir_wsl, latest, include_T, log_fn):
 _TIME_LINE_RE = re.compile(r"^Time\s*=\s*[\d.]+\s*$")
 
 
-def _phase_solver_callback(log_fn, solver_log_fn, status_fn, status_key, delta_t=1):
+def _phase_solver_callback(log_fn, solver_log_fn, status_fn, status_key, delta_t=1, iteration_base=0):
     """Wraps a phase's simpleFoam on_line callback.
 
     With no status_fn (single-run mode - progress there comes from
@@ -419,8 +419,19 @@ def _phase_solver_callback(log_fn, solver_log_fn, status_fn, status_key, delta_t
     uses rather than showing a number scaled by a factor the UI never
     otherwise surfaces. Confirmed directly as a real point of confusion:
     at delta_t=3, a 1500-iteration budget showed as "Time = 4500" with no
-    indication of the scaling. solver_log_fn/log_fn still get the raw,
-    unconverted line either way - only status_fn's display is adjusted.
+    indication of the scaling.
+
+    iteration_base: each chunk's own OpenFOAM "Time" restarts from 0 (see
+    _run_phase's "every chunk starts fresh at time-label 0" - the same
+    reason the live per-iteration series gets offset by total_run before
+    being accumulated) - without this, "Iteration N" would be chunk-LOCAL
+    progress (e.g. resetting to a small number every ~400 iterations),
+    not the cumulative total the "iterations of budget" framing everywhere
+    else implies. Pass the chunk's own starting total_run here so the
+    displayed number is always the true cumulative iteration.
+
+    solver_log_fn/log_fn still get the raw, unconverted line either way -
+    only status_fn's display is adjusted.
     """
     if status_fn is None:
         return solver_log_fn or log_fn
@@ -428,9 +439,9 @@ def _phase_solver_callback(log_fn, solver_log_fn, status_fn, status_key, delta_t
     def callback(line):
         stripped = line.strip()
         if _TIME_LINE_RE.match(stripped):
-            if delta_t != 1:
+            if delta_t != 1 or iteration_base:
                 raw_time = float(stripped.split("=", 1)[1])
-                stripped = f"Iteration {round(raw_time / delta_t)}"
+                stripped = f"Iteration {iteration_base + round(raw_time / delta_t)}"
             status_fn(status_key, stripped)
         if solver_log_fn:
             solver_log_fn(line)
@@ -601,7 +612,8 @@ def _run_phase(case_dir, case_dir_wsl, n_iterations, write_interval, window_frac
                f"iterations, writing every {write_interval})...")
         r = run_wsl_streaming(
             "simpleFoam 2>&1 | tee log.simpleFoam", case_dir_wsl,
-            on_line=_phase_solver_callback(log_fn, solver_log_fn, status_fn, status_key, delta_t=delta_t),
+            on_line=_phase_solver_callback(log_fn, solver_log_fn, status_fn, status_key,
+                                           delta_t=delta_t, iteration_base=total_run),
             should_stop=should_stop, kill_pattern="simpleFoam", should_pause=should_pause,
         )
         if should_stop is not None and should_stop():
@@ -746,7 +758,16 @@ def _run_phase(case_dir, case_dir_wsl, n_iterations, write_interval, window_frac
             run_wsl_or_raise("rm -rf postProcessing", case_dir_wsl, "clearing this chunk's postProcessing")
             break
 
-        log_fn(f"  Copying fields from {latest}/ to 0/ so the next chunk continues from here...")
+        # `latest` is an OpenFOAM TIME value (chunk-local - see delta_t's
+        # own docstring), not the cumulative iteration count everywhere
+        # else in this log uses - showing it bare (e.g. "1200/" for a
+        # 400-iteration chunk at delta_t=3) was a real, confirmed point of
+        # confusion once total_run had already moved past it. total_run
+        # here already reflects this chunk (updated above), so it's the
+        # right cumulative number to show; the raw directory name is kept
+        # too, in parentheses, for anyone correlating with the filesystem.
+        log_fn(f"  Copying fields from iteration {total_run} (dir {latest}/) to 0/ so the next "
+               f"chunk continues from here...")
         _copy_latest_to_zero(case_dir_wsl, latest, include_T=True, log_fn=log_fn)
         run_wsl_or_raise("rm -rf postProcessing", case_dir_wsl, "clearing this chunk's postProcessing")
         if keep_all_timesteps:
@@ -936,7 +957,7 @@ def run_steady_state_scenario(case_dir, room_x, room_y, room_z, ach, Z, nbins=25
                                plateau_rel_tol=0.01, window_frac=0.15,
                                t_inf_check_interval=None, t_inf_rel_tol=None, t_inf_streak=3,
                                keep_all_timesteps=False, mass_balance_tol=0.10,
-                               phase1_t_initial=0.0, phase1_extrapolation_gate=True,
+                               phase1_t_initial=0.0, phase1_extrapolation_gate=False,
                                phase1_resume_decision=None, phase1_resume_additional_iterations=None,
                                fan_entry=None, monitoring_points=None,
                                patches_to_monitor=("outlet",), log_fn=print, should_stop=None,
@@ -974,18 +995,32 @@ def run_steady_state_scenario(case_dir, room_x, room_y, room_z, ach, Z, nbins=25
     simpler (closer to the single-exponential shape fit_asymptotic_value
     assumes) and gets trusted sooner despite "starting further away."
 
-    phase1_extrapolation_gate: if True (default), Phase 1 is not accepted
-    until fit_asymptotic_value has produced a stable, accepted
-    extrapolation (t_inf_streak consecutive fits agreeing within
-    t_inf_rel_tol - see _run_phase) - if phase1_iterations is exhausted
-    first, raises Phase1ExtrapolationUndecided rather than silently
-    accepting whatever the CV-plateau check says (confirmed directly: a
-    "plateaued" CV=0.56% verdict at 18000 iterations sat on a curve still
-    genuinely rising, needing ~25000 iterations for mass balance to catch
-    up - the CV-plateau check alone isn't a reliable Phase-1-done signal).
-    If False, falls back to the old behavior (CV-plateau/hard-budget only,
-    T-infinity early-stop purely a speed optimization if enabled) - an
-    escape hatch, not the recommended setting.
+    phase1_extrapolation_gate: opt-in, off by default (see
+    app_settings.ADVANCED_SETTINGS_DEFAULTS' phase1-require-stable-
+    extrapolation). If True, Phase 1 is not accepted until
+    fit_asymptotic_value has produced a stable, accepted extrapolation
+    (t_inf_streak consecutive fits agreeing within t_inf_rel_tol - see
+    _run_phase) - if phase1_iterations is exhausted first, raises
+    Phase1ExtrapolationUndecided instead of accepting whatever the
+    CV-plateau check says. This was the default until residence-time-
+    scaled deltaT existed: a "plateaued" CV=0.56% verdict at 18000
+    iterations once sat on a curve still genuinely rising, needing ~25000
+    iterations for mass balance to catch up (the CV-plateau check alone
+    wasn't a reliable Phase-1-done signal at deltaT=1). deltaT scaling
+    substantially reduces the odds of that specific failure recurring, by
+    fixing its root cause directly - a small configured iteration budget
+    at deltaT=1 could cover a tiny fraction of the true time constant, letting
+    a still-rising curve look flat within the trailing CV window; deltaT
+    scaling targets ~5.3 residence times over the whole run regardless of
+    the case's raw iteration count, so the trailing window is comparable
+    to the time constant itself. This isn't a guarantee (deltaT's own
+    accuracy still depends on the effective-rate estimate used to size
+    it), which is why the CV-plateau verdict stays visible/logged
+    (informational) either way - just no longer a hard, blocking gate.
+    Also confirmed as a real, live issue independent of any single-run UX
+    concern: sweep mode has no resume path for a Phase1ExtrapolationUndecided
+    pause at all (see run_sweep's own docstring) - turning this on for a
+    sweep means a stuck combination just permanently fails, not pauses.
 
     phase1_resume_decision/phase1_resume_additional_iterations: set by a
     caller resuming a Phase1ExtrapolationUndecided decision (see that

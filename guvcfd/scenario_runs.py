@@ -364,6 +364,12 @@ def _run_scenario(case_dir, room, settings, z, ach, adv, z_summary, log_fn, shou
         t_inf_check_interval=adv["phase-chunk-size"] if adv["t-infinity-early-stop-enabled"] else None,
         t_inf_rel_tol=(adv["t-infinity-rel-tol"] / 100.0) if adv["t-infinity-early-stop-enabled"] else None,
         keep_all_timesteps=adv["keep-all-timesteps"],
+        # Explicit, not left to run_steady_state_scenario's own default -
+        # sweep mode has no resume UX for a Phase1ExtrapolationUndecided
+        # pause at all (a stuck combination just permanently fails, see
+        # run_sweep's own docstring), so this must never silently inherit
+        # a True default regardless of what that default currently is.
+        phase1_extrapolation_gate=adv["phase1-require-stable-extrapolation"],
         fan_entry=fan_entry, monitoring_points=_gather_monitoring_points(settings),
         patches_to_monitor=patches_to_monitor,
         log_fn=log_fn, should_stop=should_stop, solver_log_fn=solver_log_fn, should_pause=should_pause,
@@ -459,6 +465,7 @@ def _run_shared_phase1(base_dir, phase1_dir, ach, room, settings, adv, log_fn, s
         t_inf_check_interval=adv["phase-chunk-size"] if adv["t-infinity-early-stop-enabled"] else None,
         t_inf_rel_tol=(adv["t-infinity-rel-tol"] / 100.0) if adv["t-infinity-early-stop-enabled"] else None,
         keep_all_timesteps=adv["keep-all-timesteps"],
+        phase1_extrapolation_gate=adv["phase1-require-stable-extrapolation"],
         fan_entry=fan_entry, monitoring_points=_gather_monitoring_points(settings),
         patches_to_monitor=patches_to_monitor,
         log_fn=log_fn, should_stop=should_stop, solver_log_fn=solver_log_fn, should_pause=should_pause,

@@ -30,8 +30,29 @@ ADVANCED_SETTINGS_DEFAULTS = {
     # tolerance=1) did not - see "OpenFoam settings background.md").
     "scalar-transport-ncorr": 3,        # scalarTransport1's own outer correctors
     "scalar-transport-tolerance": 1e-4,  # scalarTransport1's own initial-residual target
-    "t-infinity-early-stop-enabled": True,  # Phase 1's primary readiness gate - see run_steady_state_scenario
+    # t-infinity-early-stop-enabled is now purely a speed optimization (chunked
+    # early-exit if the T-infinity fit happens to stabilize quickly) - it no
+    # longer gates Phase 1 acceptance on its own; see
+    # phase1-require-stable-extrapolation below for that. Decoupled after a
+    # real ACH=6 case (a genuinely, persistently oscillating flow field - see
+    # ANALYSIS_LOG.md) repeatedly failed to ever produce a stable
+    # extrapolation fit even though the underlying windowed-average
+    # reduction_pct/eACH_uv were already good and stable - residence-time-
+    # scaled deltaT (see compute_scaled_delta_t) substantially reduces the
+    # odds the historical "false CV-plateau" failure this gate was built to
+    # catch recurs, by fixing its root cause (insufficient real residence-
+    # time coverage) rather than requiring a fragile curve fit on top.
+    "t-infinity-early-stop-enabled": True,
     "t-infinity-rel-tol": 2.0,   # % - T-infinity stability tolerance (see check_t_infinity_stability)
+    # The actual Phase 1 acceptance gate (was tied to t-infinity-early-stop-
+    # enabled above) - off by default. Sweep mode has NO resume UX for a
+    # Phase1ExtrapolationUndecided pause at all (a stuck combo just fails,
+    # see scenario_runs.run_sweep's own docstring) - confirmed as a real,
+    # blocking failure on a live 2-combination sweep, not just an interactive-
+    # UI inconvenience. Turn on only if you specifically want the stricter,
+    # curve-fit-verified eACH_uv figure and are prepared to babysit a run
+    # that may need to pause for a decision (single-run mode only).
+    "phase1-require-stable-extrapolation": False,
     # Phase 1/2's own chunk size (was hardcoded 500) and write cadence
     # (was hardcoded 200 for Phase 1 / 100 for Phase 2, unified here) - see
     # _run_phase/_chunk_write_interval in steady_state_pipeline.py. Shorter

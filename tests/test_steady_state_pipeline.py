@@ -155,10 +155,47 @@ def test_phase1_extrapolation_undecided_copies_latest_to_zero_before_raising(tmp
             str(tmp_path), 4.0, 5.0, 2.7, ach=6.0, Z=6.0,
             phase1_iterations=1500, phase2_iterations=1500,
             t_inf_check_interval=400, t_inf_rel_tol=0.02,
+            # Explicit - this test is specifically about the gate's raise-
+            # time behavior, so it must not depend on the function's own
+            # default (now False - see phase1_extrapolation_gate's
+            # docstring) to make the raise happen.
+            phase1_extrapolation_gate=True,
             log_fn=lambda m: None,
         )
 
     assert copy_calls == ["1500"]  # the copy ran, using the true final directory name
+
+
+def test_phase1_extrapolation_gate_defaults_off_does_not_raise(tmp_path, monkeypatch):
+    # The default flipped to False (see phase1_extrapolation_gate's own
+    # docstring) - a case whose extrapolation never stabilized (same
+    # stopped_via_tinf1=False fixture as the raise test above) must now
+    # complete normally by default, not pause. Confirmed as a real, live
+    # blocker on a 2-combination sweep before this fix: sweep mode has no
+    # resume UX for this pause at all, so a stuck combo just failed outright.
+    class _FakeResult:
+        stdout = "cellSet sourceZoneCells now size 64"
+        returncode = 0
+    for fn in ("ensure_simple_fvsolution", "disable_simple_residual_control", "write_vol_average_dict",
+               "write_source_topo_set_dict", "write_fvoptions_file", "restore_boundary_conditions"):
+        monkeypatch.setattr(ssp, fn, lambda *a, **k: None)
+    monkeypatch.setattr(ssp, "splice_fv_options_into_control_dict", lambda *a, **k: (None, 1, 1))
+    monkeypatch.setattr(ssp, "run_wsl_or_raise", lambda *a, **k: _FakeResult())
+    monkeypatch.setattr(ssp, "_copy_latest_to_zero", lambda *a, **k: None)
+
+    def fake_run_phase(*a, **k):
+        return ("1500", 1500, np.array([0, 1]), np.array([0.1, 0.2]), False,
+                {"room": (np.array([0, 1]), np.array([0.1, 0.2]))}, False, [None, None], {"flow": {}, "weighted_t": {}})
+    monkeypatch.setattr(ssp, "_run_phase", fake_run_phase)
+
+    summary = run_steady_state_scenario(
+        str(tmp_path), 4.0, 5.0, 2.7, ach=6.0, Z=6.0,
+        phase1_iterations=1500, phase2_iterations=1500,
+        t_inf_check_interval=400, t_inf_rel_tol=0.02,
+        phase1_only=True,
+        log_fn=lambda m: None,
+    )
+    assert summary["phase1"]["converged"] is False  # plateau CV verdict still visible, just not blocking
 
 
 def test_run_phase_rejects_delta_t_with_keep_all_timesteps():
@@ -226,6 +263,34 @@ def test_phase_solver_callback_leaves_time_unconverted_at_delta_t_one():
         _log, None, lambda k, m: status_calls.append((k, m)), "key", delta_t=1)
     callback("Time = 842")
     assert status_calls == [("key", "Time = 842")]
+
+
+def test_phase_solver_callback_iteration_base_makes_progress_cumulative():
+    # Regression: every chunk's own OpenFOAM "Time" restarts from 0 (see
+    # _run_phase's "every chunk starts fresh at time-label 0") - without
+    # iteration_base, "Iteration N" was chunk-LOCAL progress (resetting to
+    # a small number every ~400 iterations instead of climbing toward the
+    # full budget), inconsistent with the "801-1200 of 1500 iterations"
+    # cumulative framing the surrounding log already uses. Confirmed
+    # directly: at delta_t=3, the 3rd 400-iteration chunk's own "Time = 1161"
+    # (chunk-local) displayed as "Iteration 387" with no indication this
+    # was actually cumulative iteration 800+387=1187.
+    status_calls = []
+    callback = ssp._phase_solver_callback(
+        _log, None, lambda k, m: status_calls.append((k, m)), "key", delta_t=3, iteration_base=800)
+    callback("Time = 1161")
+    assert status_calls == [("key", "Iteration 1187")]
+
+
+def test_phase_solver_callback_iteration_base_applies_even_at_delta_t_one():
+    # A nonzero iteration_base must still make progress cumulative even
+    # when delta_t itself is 1 (Time already equals chunk-local iterations
+    # 1:1, but still needs the chunk's own starting offset added).
+    status_calls = []
+    callback = ssp._phase_solver_callback(
+        _log, None, lambda k, m: status_calls.append((k, m)), "key", delta_t=1, iteration_base=400)
+    callback("Time = 120")
+    assert status_calls == [("key", "Iteration 520")]
 
 
 def _log(msg):
