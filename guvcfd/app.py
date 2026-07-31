@@ -7,6 +7,7 @@ import csv
 import json
 import math
 import re
+import subprocess
 import threading
 import time
 import tkinter as tk
@@ -1420,8 +1421,39 @@ def _continue_pipeline_thread(case_dir, end_time, write_interval):
         _run_state["status"] = "error"
 
 
+# Commit count on this branch at the moment "3.00" was defined (see the
+# commit that introduced APP_VERSION) - every commit since adds 0.01, so
+# the version shown in the title bar increases automatically with no
+# manual bump needed (see _compute_app_version's docstring).
+_VERSION_BASELINE_COMMIT_COUNT = 81
+
+
+def _compute_app_version():
+    """"Version X.YY" shown next to the GUV-CFD title, derived from the
+    total number of commits on the current branch (git rev-list --count
+    HEAD) rather than a manually-maintained version string - guarantees
+    every commit bumps it, with no risk of someone forgetting to. 3.00 was
+    defined at _VERSION_BASELINE_COMMIT_COUNT commits; the shown version is
+    3.(count - baseline), zero-padded to 2 digits. Falls back to a static
+    "3.00" if git isn't available (e.g. a packaged/frozen deployment with
+    no .git directory) or the count ever regresses below the baseline
+    (e.g. a shallow clone).
+    """
+    try:
+        result = subprocess.run(
+            ["git", "rev-list", "--count", "HEAD"],
+            cwd=Path(__file__).resolve().parent, capture_output=True, text=True, timeout=5, check=True,
+        )
+        count = int(result.stdout.strip())
+        return f"3.{max(count - _VERSION_BASELINE_COMMIT_COUNT, 0):02d}"
+    except Exception:
+        return "3.00"
+
+
+APP_VERSION = _compute_app_version()
+
 app = dash.Dash(__name__, external_stylesheets=[dbc.themes.FLATLY])
-app.title = "GUV-CFD"
+app.title = f"GUV-CFD v{APP_VERSION}"
 
 
 def _native_open_file(filetypes, title, initialdir=None):
@@ -2619,7 +2651,10 @@ app.layout = dbc.Container([
     simulation_settings_modal,
     grid_align_modal,
     dbc.Row(
-        dbc.Col(html.H4("GUV-CFD", className="mt-3 mb-1"), width="auto"),
+        dbc.Col(html.H4([
+            "GUV-CFD ",
+            html.Small(f"v{APP_VERSION}", className="text-muted"),
+        ], className="mt-3 mb-1"), width="auto"),
     ),
     dbc.Row(dbc.Col(html.Div(
         "Combining GUV lighting calculation with Open Foam",
