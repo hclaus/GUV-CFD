@@ -161,6 +161,35 @@ def check_plateau_windowed(t, T, frac=0.15, rel_tol=0.01):
     return converged, cv
 
 
+def spatial_coefficient_of_variation(cell_values):
+    """CoV = std(cell_values) / mean(cell_values) - a SPATIAL statistic
+    (across every mesh cell, at one instant) quantifying how uniform a
+    scalar field is across the room right now: 0 for perfectly uniform,
+    higher for more spatially segregated (stagnant pockets, short-
+    circuiting). Standard practice across CFD mixing-uniformity studies
+    (see case_io.read_latest_time_field's own docstring for a reference
+    or two) - a commonly-cited rule of thumb puts CoV above ~0.6 as poor
+    mixing.
+
+    Deliberately distinct from every OTHER "CV"/"mixing" figure already
+    in this codebase, which are all TEMPORAL (room-average tracked across
+    iterations/time, e.g. windowed_stats' own cv, or steady_state_
+    pipeline's T_ss_cv) or RATE-based (decay_analysis.
+    mechanical_mixing_efficiency_pct, comparing measured removal to
+    measured delivered flow) - this is the only one asking "is
+    concentration the same everywhere in the room right now."
+
+    Returns None if the mean is exactly 0 (nothing to normalize by -
+    e.g. a case with zero net contamination, not a real division-by-zero
+    bug).
+    """
+    values = np.asarray(cell_values, dtype=float)
+    mean = values.mean()
+    if not mean:
+        return None
+    return float(values.std() / mean)
+
+
 def windowed_stats(t, T, frac=0.15):
     """Mean/std/CV of the trailing `frac` fraction of `T` (by sample count,
     floored at 2 points so stdev is always defined) - a steadier read of

@@ -19,6 +19,39 @@ def read_openfoam_scalar_field(path):
     return values
 
 
+_NUMERIC_DIR_RE = re.compile(r"^\d+(\.\d+)?$")
+
+
+def latest_time_dir(case_dir):
+    """The highest-numbered time directory directly under case_dir (as a
+    plain string, matching OpenFOAM's own directory-naming convention -
+    e.g. "500", "1500.5") - works whether the case keeps every write-
+    interval snapshot at its own numbered time (decay mode, see
+    _run_decay_pair) or has already copied its final converged state back
+    into 0/ before cleanup (steady-state's Phase 1/2 chunks, see
+    steady_state_pipeline._copy_latest_to_zero) - in the latter case 0
+    is simply the only (and therefore highest) numbered entry present.
+
+    Raises if case_dir has no numbered time directory at all (a case that
+    was never actually run).
+    """
+    entries = [p.name for p in Path(case_dir).iterdir() if p.is_dir() and _NUMERIC_DIR_RE.match(p.name)]
+    if not entries:
+        raise RuntimeError(f"No time directories found in {case_dir}")
+    return max(entries, key=float)
+
+
+def read_latest_time_field(case_dir, field_name="T"):
+    """Read `field_name`'s per-cell values from case_dir's latest time
+    directory (see latest_time_dir) - the case's most advanced/final
+    field state, for spatial (across-cells) analysis like coefficient-
+    of-variation "how well mixed is this room right now," as opposed to
+    decay_analysis.windowed_stats' TEMPORAL (across-iterations, room-
+    average only) statistics.
+    """
+    return read_openfoam_scalar_field(f"{case_dir}/{latest_time_dir(case_dir)}/{field_name}")
+
+
 def read_cell_centers(case_dir, time_dir="0"):
     """Read cell-center coordinates from <case_dir>/<time_dir>/{Cx,Cy,Cz}.
 

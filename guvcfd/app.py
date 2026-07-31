@@ -23,8 +23,8 @@ from dash import Input, Output, State, dcc, html
 from guv_calcs import Project
 
 from .app_settings import ADVANCED_SETTINGS_DEFAULTS, load_advanced_settings, save_advanced_settings
-from .case_io import clear_stale_run_output, read_cell_centers
-from .decay_analysis import write_results_summary, mechanical_mixing_efficiency_pct
+from .case_io import clear_stale_run_output, read_cell_centers, read_latest_time_field
+from .decay_analysis import write_results_summary, mechanical_mixing_efficiency_pct, spatial_coefficient_of_variation
 from .fan import fan_fvoptions_entry
 from .fluence import compute_fluence_at_points, compute_inactivation_rate, compute_well_mixed_eACH
 from . import help_content
@@ -966,6 +966,14 @@ def _finish_decay(case_dir, room, settings, summary):
     _run_log("Running postProcess volAverage...")
     run_wsl_or_raise("postProcess -dict system/volAverageDict", case_dir_wsl, "postProcess volAverage")
 
+    _run_log("Computing spatial coefficient of variation (final concentration field, "
+             "across all cells - how uniformly the room actually cleared, not just on average)...")
+    try:
+        spatial_cov = spatial_coefficient_of_variation(read_latest_time_field(case_dir, "T"))
+    except Exception as e:
+        _run_log(f"  Could not compute spatial CoV: {e}")
+        spatial_cov = None
+
     _run_log("Writing results summary...")
     results = write_results_summary(
         case_dir, f"{case_dir}/results.json", settings["ach"],
@@ -973,6 +981,7 @@ def _finish_decay(case_dir, room, settings, summary):
         extra={
             "n_lamps": summary["n_lamps"], "fluence_mean": summary["fluence_mean"],
             "flow_converged": summary.get("flow_converged"), "ach_delivery": summary.get("ach_delivery"),
+            "spatial_cov_final": spatial_cov,
         },
     )
 
@@ -986,6 +995,7 @@ def _finish_decay(case_dir, room, settings, summary):
         extra={
             "n_lamps": summary["n_lamps"], "fluence_mean": summary["fluence_mean"],
             "flow_converged": summary.get("flow_converged"), "ach_delivery": summary.get("ach_delivery"),
+            "spatial_cov_final": spatial_cov,
         },
         measured_ventilation_ach=control_results["total_ach_effective"],
         measured_ventilation_ach_ci95=control_results.get("total_ach_effective_ci95"),
@@ -1062,8 +1072,16 @@ def _continue_decay(case_dir, end_time, write_interval):
     run_wsl_or_raise("rm -rf postProcessing", case_dir_wsl, "clearing stale postProcessing")
     run_wsl_or_raise("postProcess -dict system/volAverageDict", case_dir_wsl, "postProcess volAverage")
 
+    _run_log("Computing spatial coefficient of variation (final concentration field)...")
+    try:
+        spatial_cov = spatial_coefficient_of_variation(read_latest_time_field(case_dir, "T"))
+    except Exception as e:
+        _run_log(f"  Could not compute spatial CoV: {e}")
+        spatial_cov = None
+
     _run_log("Writing results summary...")
     extra = {k: prior[k] for k in ("n_lamps", "fluence_mean", "flow_converged", "ach_delivery") if k in prior}
+    extra["spatial_cov_final"] = spatial_cov
     results = write_results_summary(
         case_dir, results_path, prior["ventilation_ach"], prior["eACH_uv_well_mixed"],
         extra=extra or None,
@@ -2230,6 +2248,12 @@ def _steady_state_summary(result):
         rows.append(("Measured UV eff. %", f"{uv_efficiency_pct:.1f}%"))
     if result.get("mechanical_mixing_efficiency_pct") is not None:
         rows.append(("Mechanical mixing eff. %", f"{result['mechanical_mixing_efficiency_pct']:.1f}%"))
+    cov1 = p1.get("spatial_cov")
+    cov2 = p2.get("spatial_cov")
+    if cov1 is not None:
+        rows.append(("Spatial CoV, Phase 1 (mechanical mixing, no UV)", f"{cov1 * 100:.1f}%"))
+    if cov2 is not None:
+        rows.append(("Spatial CoV, Phase 2 (mechanical mixing, UV on)", f"{cov2 * 100:.1f}%"))
     rows += _monitoring_summary_rows(result.get("monitoring"))
     return [html.Div([html.Span(k + ": ", className="text-muted"), html.Span(v)], className="mb-1")
             for k, v in rows] + _result_notes(result)
@@ -2256,6 +2280,9 @@ def _decay_summary(result):
                       f"{result['mixing_efficiency_corrected'] * 100:.1f}%"))
     if result.get("mechanical_mixing_efficiency_pct") is not None:
         rows.append(("Mechanical mixing eff. %", f"{result['mechanical_mixing_efficiency_pct']:.1f}%"))
+    if result.get("spatial_cov_final") is not None:
+        rows.append(("Spatial CoV, final state (mechanical mixing)",
+                      f"{result['spatial_cov_final'] * 100:.1f}%"))
     rows += _monitoring_summary_rows(result.get("monitoring"))
     return [html.Div([html.Span(k + ": ", className="text-muted"), html.Span(v)], className="mb-1")
             for k, v in rows] + _result_notes(result)

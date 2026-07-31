@@ -1,6 +1,8 @@
 import pytest
 
-from guvcfd.case_io import clear_stale_run_output, read_patch_face_centers
+from guvcfd.case_io import (
+    clear_stale_run_output, read_patch_face_centers, latest_time_dir, read_latest_time_field,
+)
 
 _POINTS = """FoamFile
 {
@@ -149,3 +151,41 @@ def test_clear_stale_run_output_removes_old_timesteps_and_artifacts(tmp_path):
 
 def test_clear_stale_run_output_on_missing_dir_is_a_noop(tmp_path):
     clear_stale_run_output(str(tmp_path / "does-not-exist"))  # must not raise
+
+
+def _write_scalar_field_file(path, values):
+    body = "\n".join(str(v) for v in values)
+    path.write_text(
+        "FoamFile\n{\n    class volScalarField;\n    object T;\n}\n\n"
+        f"internalField   nonuniform List<scalar>\n{len(values)}\n(\n{body}\n)\n;\n"
+    )
+
+
+def test_latest_time_dir_picks_highest_numbered_entry(tmp_path):
+    for name in ("0", "100", "500", "2000"):
+        (tmp_path / name).mkdir()
+    (tmp_path / "constant").mkdir()  # non-numeric, must be ignored
+    (tmp_path / "postProcessing").mkdir()
+    assert latest_time_dir(str(tmp_path)) == "2000"
+
+
+def test_latest_time_dir_handles_a_single_zero_directory(tmp_path):
+    # Steady-state's own convention: each phase copies its final converged
+    # state back into 0/ before cleanup, so 0 can legitimately be the ONLY
+    # (and therefore correctly "latest") numbered directory present.
+    (tmp_path / "0").mkdir()
+    assert latest_time_dir(str(tmp_path)) == "0"
+
+
+def test_latest_time_dir_raises_with_no_time_directories(tmp_path):
+    (tmp_path / "constant").mkdir()
+    with pytest.raises(RuntimeError):
+        latest_time_dir(str(tmp_path))
+
+
+def test_read_latest_time_field_reads_from_the_highest_numbered_directory(tmp_path):
+    (tmp_path / "50").mkdir()
+    (tmp_path / "100").mkdir()
+    _write_scalar_field_file(tmp_path / "50" / "T", [1.0, 2.0])
+    _write_scalar_field_file(tmp_path / "100" / "T", [3.0, 4.0, 5.0])
+    assert read_latest_time_field(str(tmp_path), "T") == [3.0, 4.0, 5.0]

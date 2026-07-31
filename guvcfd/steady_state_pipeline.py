@@ -17,7 +17,7 @@ from pathlib import Path
 
 import numpy as np
 
-from .case_io import read_openfoam_scalar_field
+from .case_io import read_openfoam_scalar_field, read_latest_time_field
 from .cellzones import bin_decay_rates
 from .contaminant_source import (
     write_source_topo_set_dict, compute_source_strength, source_Su, source_fvoptions_entry,
@@ -26,6 +26,7 @@ from .contaminant_source import (
 from .decay_analysis import (
     read_vol_average_dat, check_plateau_windowed, windowed_stats,
     windowed_stats_detrended, fit_asymptotic_value, check_t_infinity_stability,
+    spatial_coefficient_of_variation,
 )
 from .initial_fields import restore_boundary_conditions, resolve_inlet_velocity
 from .mesh_gen import opening_center, opening_half_extents
@@ -1444,6 +1445,29 @@ def run_steady_state_scenario(case_dir, room_x, room_y, room_z, ach, Z, nbins=25
     # numbered directory (not just "0/") is what lets ParaView show it as
     # a proper timestep rather than the only entry in its time list.
     _copy_latest_to_zero(case_dir_wsl, latest2, include_T=True, log_fn=log_fn)
+
+    # Spatial (across-cells, one instant) coefficient of variation - how
+    # uniform each phase's converged T field actually is, as opposed to
+    # T_ss_cv above (a TEMPORAL statistic of the room average over
+    # iterations) - see decay_analysis.spatial_coefficient_of_variation's
+    # own docstring. Phase 1's own converged field was saved specifically
+    # for this (phase1_T.snapshot, written right after Phase 1 accepts -
+    # see the "for later spatial-mixing analysis" comment above); Phase 2's
+    # is read from the real numbered directory just kept above. Wrapped
+    # defensively - missing on an older case dir (e.g. a checkpoint from
+    # before this existed) shouldn't fail the whole scenario.
+    try:
+        summary["phase1"]["spatial_cov"] = spatial_coefficient_of_variation(
+            read_openfoam_scalar_field(f"{case_dir}/phase1_T.snapshot"))
+    except Exception as e:
+        log_fn(f"  Could not compute Phase 1 spatial CoV: {e}")
+        summary["phase1"]["spatial_cov"] = None
+    try:
+        summary["phase2"]["spatial_cov"] = spatial_coefficient_of_variation(
+            read_latest_time_field(case_dir, "T"))
+    except Exception as e:
+        log_fn(f"  Could not compute Phase 2 spatial CoV: {e}")
+        summary["phase2"]["spatial_cov"] = None
 
     lambda_vent = ach / 3600.0
     T_ss1, T_ss2 = summary["phase1"]["T_ss"], summary["phase2"]["T_ss"]

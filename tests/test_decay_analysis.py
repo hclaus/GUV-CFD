@@ -6,7 +6,7 @@ import numpy as np
 from guvcfd.decay_analysis import (
     compute_effective_eACH, windowed_stats, write_results_summary, check_plateau_windowed,
     windowed_stats_detrended, fit_asymptotic_value, check_t_infinity_stability,
-    mechanical_mixing_efficiency_pct,
+    mechanical_mixing_efficiency_pct, spatial_coefficient_of_variation,
 )
 
 
@@ -169,6 +169,23 @@ def test_write_results_summary_stores_mechanical_mixing_efficiency(tmp_path):
     with open(out_path) as f:
         saved = json.load(f)
     assert saved["mechanical_mixing_efficiency_pct"] == result["mechanical_mixing_efficiency_pct"]
+
+
+def test_spatial_cov_zero_for_perfectly_uniform_field():
+    assert spatial_coefficient_of_variation([1.0, 1.0, 1.0, 1.0]) == 0.0
+
+
+def test_spatial_cov_recovers_known_ratio():
+    # std/mean of [8, 9, 10, 11, 12] (mean=10, population std=sqrt(2)) -
+    # a simple, hand-checkable case rather than just re-deriving the
+    # formula the function itself uses.
+    values = [8.0, 9.0, 10.0, 11.0, 12.0]
+    expected = math.sqrt(2) / 10.0
+    assert math.isclose(spatial_coefficient_of_variation(values), expected, rel_tol=1e-9)
+
+
+def test_spatial_cov_none_for_zero_mean():
+    assert spatial_coefficient_of_variation([-1.0, 0.0, 1.0]) is None
 
 
 def test_windowed_stats_flat_series_has_zero_cv():
