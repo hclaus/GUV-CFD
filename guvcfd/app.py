@@ -2639,7 +2639,7 @@ app.layout = dbc.Container([
     dbc.Tabs([
         dbc.Tab(project_setup_tab, label="Project Setup", tab_id="project-setup"),
         dbc.Tab(processing_tab, label="Processing", tab_id="processing"),
-        dbc.Tab(scenario_tab, label="Scenario Runs", tab_id="scenario-runs"),
+        dbc.Tab(scenario_tab, label="Run Simulations", tab_id="scenario-runs"),
         dbc.Tab(analysis_tab, label="Analysis of Results", tab_id="analysis"),
     ], active_tab="project-setup", className="mb-3", id="main-tabs"),
 ], fluid=True)
