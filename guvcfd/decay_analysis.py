@@ -338,6 +338,40 @@ def check_t_infinity_stability(history, rel_tol=0.02, streak=3):
     return spread <= rel_tol
 
 
+def mechanical_mixing_efficiency_pct(result):
+    """How much of the room's actually-DELIVERED ventilation flow rate
+    (run_pipeline.check_ach_delivery's measured_ach - a pure flow-
+    conservation measurement, reading the solved flux field, nothing to do
+    with mixing) shows up as effective room-average contaminant removal
+    (ventilation_ach_measured - from a decay-curve fit or a dedicated
+    UV-off control run). If air short-circuits (flows from inlet to
+    outlet without properly sweeping the rest of the room), the flow rate
+    itself can measure as fully delivered while the effective removal
+    rate reads lower - that gap IS imperfect mechanical mixing, entirely
+    independent of UV. Conceptually the same comparison ASHRAE Standard
+    129's air-change effectiveness makes (measured age-of-air vs. the
+    nominal/theoretical value for a perfectly-mixed room), just derived
+    here from a CFD decay-curve fit rather than a physical tracer-gas
+    test.
+
+    Distinct from ach_efficiency_pct (measured flow rate vs. the NOMINAL
+    target) and uv_efficiency_pct/mixing_efficiency (real vs. idealized
+    UV-specific removal rate) - this is the one ventilation-only,
+    UV-independent mixing-quality number. None if either input isn't
+    available (e.g. no control run was used, or ach_delivery wasn't
+    computed).
+
+    result: any results.json-shaped dict (decay or steady-state - both
+    use these same two field names) with "ventilation_ach_measured" and
+    "ach_delivery" = {"measured_ach": ..., ...} already present.
+    """
+    ventilation_measured = result.get("ventilation_ach_measured")
+    measured_flow_ach = (result.get("ach_delivery") or {}).get("measured_ach")
+    if ventilation_measured is None or not measured_flow_ach:
+        return None
+    return ventilation_measured / measured_flow_ach * 100
+
+
 def write_results_summary(case_dir, out_path, ventilation_ach, well_mixed_eACH_mean,
                            vol_average_dat="postProcessing/volAverage1/0/volFieldValue.dat",
                            extra=None, measured_ventilation_ach=None,
@@ -419,6 +453,8 @@ def write_results_summary(case_dir, out_path, ventilation_ach, well_mixed_eACH_m
 
     if extra:
         summary.update(extra)
+
+    summary["mechanical_mixing_efficiency_pct"] = mechanical_mixing_efficiency_pct(summary)
 
     with open(out_path, "w") as f:
         json.dump(summary, f, indent=2)

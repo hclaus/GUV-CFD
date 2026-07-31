@@ -39,7 +39,7 @@ import numpy as np
 from .case_io import read_boundary_patch_names, read_openfoam_scalar_field, write_scalar_field
 from .cellzones import bin_decay_rates, write_cellzones
 from .contaminant_source import write_fvoptions_file, write_source_topo_set_dict
-from .decay_analysis import write_results_summary
+from .decay_analysis import write_results_summary, mechanical_mixing_efficiency_pct
 from .fan import fan_fvoptions_entry, write_fan_topo_set_dict
 from .fluence import compute_inactivation_rate, compute_well_mixed_eACH
 from .initial_fields import compute_inlet_velocities
@@ -399,6 +399,7 @@ def _run_scenario(case_dir, room, settings, z, ach, adv, z_summary, log_fn, shou
     result["flow_converged"] = (base_summary or {}).get("flow_converged")
     result["ach_delivery"] = (base_summary or {}).get("ach_delivery")
     result["n_lamps"] = (base_summary or {}).get("n_lamps")
+    result["mechanical_mixing_efficiency_pct"] = mechanical_mixing_efficiency_pct(result)
     return result
 
 
@@ -765,7 +766,7 @@ def _trim_decay_report(result):
 
 
 _SWEEP_SUMMARY_FIELDS = ["Z", "ACH", "total_reduction_pct", "ach_efficiency_pct", "uv_efficiency_pct",
-                         "est_ach_per_hr", "est_each_per_hr"]
+                         "mechanical_mixing_efficiency_pct", "est_ach_per_hr", "est_each_per_hr"]
 
 
 def write_sweep_summary_csv(project_dir, project_name, combos):

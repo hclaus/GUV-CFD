@@ -294,9 +294,9 @@ def _row_cell_texts(table, row_index):
 
 
 # Column order: Z, ACH, Status, Est. time to finish, Total reduction %,
-# Measured ACH eff. %, Measured UV eff. %, Est. ACH /hr, Est. eACH /hr -
-# see app._scenario_progress_table.
-_EACH_COL = 8
+# Measured ACH eff. %, Measured UV eff. %, Mechanical mixing eff. %,
+# Est. ACH /hr, Est. eACH /hr - see app._scenario_progress_table.
+_EACH_COL = 9
 
 
 def test_scenario_progress_table_prefers_corrected_eACH_for_steady_state():

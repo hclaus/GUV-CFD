@@ -15,7 +15,7 @@ from lxml import etree
 from guv_calcs import Project
 
 from .contaminant_source import compute_source_strength
-from .decay_analysis import windowed_stats_detrended
+from .decay_analysis import windowed_stats_detrended, mechanical_mixing_efficiency_pct as _mech_mixing_eff_pct
 from .monitoring_points import mixing_uniformity_note, point_reduction_basis
 from .result_figures import decay_figure, steady_state_figure
 from .system_info import get_system_info
@@ -156,9 +156,10 @@ def combo_summary_metrics(detail):
     result dict (see scenario_runs._trim_report/_trim_decay_report).
 
     Returns a dict with keys total_reduction_pct, ach_efficiency_pct,
-    uv_efficiency_pct, est_ach_per_hr, est_each_per_hr - any value that
-    isn't computable from what's in `detail` (older results.json files,
-    a control run that wasn't used, etc.) is None, not an error.
+    uv_efficiency_pct, mechanical_mixing_efficiency_pct, est_ach_per_hr,
+    est_each_per_hr - any value that isn't computable from what's in
+    `detail` (older results.json files, a control run that wasn't used,
+    etc.) is None, not an error.
 
     ach_efficiency_pct: ach_delivery.ratio*100 - the measured/nominal
     ventilation-delivery ratio (same field either sim type already
@@ -170,6 +171,15 @@ def combo_summary_metrics(detail):
     already computes this directly (mixing_efficiency[_corrected] via
     decay_analysis.write_results_summary); steady-state doesn't store the
     ratio itself, only eACH_uv_well_mixed, so it's computed here instead.
+
+    mechanical_mixing_efficiency_pct: the UV-independent counterpart -
+    measured effective ventilation removal vs. the measured DELIVERED
+    flow rate (see decay_analysis.mechanical_mixing_efficiency_pct's own
+    docstring for why this is a genuinely different question from either
+    of the two above). Both sim types already store this field directly
+    (see write_results_summary/app._finish_steady_state/scenario_runs.
+    _run_scenario) - only recomputed here as a fallback for an
+    older results.json predating this field.
     """
     is_steady_state = "reduction_pct" in detail or "reduction_pct_corrected" in detail
     ach_delivery = detail.get("ach_delivery") or {}
@@ -190,10 +200,15 @@ def combo_summary_metrics(detail):
         mixing_eff = detail.get("mixing_efficiency_corrected", detail.get("mixing_efficiency"))
         uv_efficiency_pct = mixing_eff * 100 if mixing_eff is not None else None
 
+    mechanical_mixing_pct = detail.get("mechanical_mixing_efficiency_pct")
+    if mechanical_mixing_pct is None:
+        mechanical_mixing_pct = _mech_mixing_eff_pct(detail)
+
     return {
         "total_reduction_pct": total_reduction_pct,
         "ach_efficiency_pct": ach_efficiency_pct,
         "uv_efficiency_pct": uv_efficiency_pct,
+        "mechanical_mixing_efficiency_pct": mechanical_mixing_pct,
         "est_ach_per_hr": est_ach_per_hr,
         "est_each_per_hr": est_each_per_hr,
     }

@@ -762,5 +762,5 @@ def test_combo_summary_metrics_decay_mode():
 def test_combo_summary_metrics_missing_fields_are_none_not_errors():
     assert combo_summary_metrics({}) == {
         "total_reduction_pct": None, "ach_efficiency_pct": None, "uv_efficiency_pct": None,
-        "est_ach_per_hr": None, "est_each_per_hr": None,
+        "mechanical_mixing_efficiency_pct": None, "est_ach_per_hr": None, "est_each_per_hr": None,
     }

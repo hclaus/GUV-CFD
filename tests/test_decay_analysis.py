@@ -6,6 +6,7 @@ import numpy as np
 from guvcfd.decay_analysis import (
     compute_effective_eACH, windowed_stats, write_results_summary, check_plateau_windowed,
     windowed_stats_detrended, fit_asymptotic_value, check_t_infinity_stability,
+    mechanical_mixing_efficiency_pct,
 )
 
 
@@ -128,6 +129,46 @@ def test_write_results_summary_adds_corrected_fields_only_when_measured_given(tm
     with open(out_path) as f:
         saved = json.load(f)
     assert saved["ventilation_ach_measured"] == 2.67
+
+
+def test_mechanical_mixing_efficiency_pct_ratio_of_measured_removal_to_delivered_flow():
+    # Distinct from UV-specific mixing_efficiency: this compares the
+    # measured EFFECTIVE removal rate against the measured DELIVERED flow
+    # rate (run_pipeline.check_ach_delivery's own measured_ach) - a purely
+    # mechanical, UV-independent question. Short-circuiting (air flowing
+    # inlet-to-outlet without sweeping the room) would show up as
+    # ventilation_ach_measured reading below the delivered flow rate.
+    result = {"ventilation_ach_measured": 3.75, "ach_delivery": {"measured_ach": 6.0}}
+    assert math.isclose(mechanical_mixing_efficiency_pct(result), 62.5)
+
+
+def test_mechanical_mixing_efficiency_pct_none_when_either_input_missing():
+    assert mechanical_mixing_efficiency_pct({}) is None
+    assert mechanical_mixing_efficiency_pct({"ventilation_ach_measured": 3.75}) is None
+    assert mechanical_mixing_efficiency_pct({"ach_delivery": {"measured_ach": 6.0}}) is None
+    assert mechanical_mixing_efficiency_pct({"ventilation_ach_measured": 3.75, "ach_delivery": {}}) is None
+
+
+def test_write_results_summary_stores_mechanical_mixing_efficiency(tmp_path):
+    case_dir = tmp_path / "case"
+    (case_dir / "postProcessing" / "volAverage1" / "0").mkdir(parents=True)
+    t, T = _synthetic_decay(0.005)
+    dat_path = case_dir / "postProcessing" / "volAverage1" / "0" / "volFieldValue.dat"
+    with open(dat_path, "w") as f:
+        f.write("# Region\n# Cells\n# Volume\n# Time\tvolAverage(T)\n")
+        for ti, Ti in zip(t, T):
+            f.write(f"{ti}\t{Ti}\n")
+
+    out_path = tmp_path / "results.json"
+    result = write_results_summary(
+        str(case_dir), str(out_path), 3.0, 15.0,
+        extra={"ach_delivery": {"measured_ach": 2.9}},
+        measured_ventilation_ach=2.67,
+    )
+    assert result["mechanical_mixing_efficiency_pct"] == mechanical_mixing_efficiency_pct(result)
+    with open(out_path) as f:
+        saved = json.load(f)
+    assert saved["mechanical_mixing_efficiency_pct"] == result["mechanical_mixing_efficiency_pct"]
 
 
 def test_windowed_stats_flat_series_has_zero_cv():

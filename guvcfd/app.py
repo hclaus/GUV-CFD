@@ -24,7 +24,7 @@ from guv_calcs import Project
 
 from .app_settings import ADVANCED_SETTINGS_DEFAULTS, load_advanced_settings, save_advanced_settings
 from .case_io import clear_stale_run_output, read_cell_centers
-from .decay_analysis import write_results_summary
+from .decay_analysis import write_results_summary, mechanical_mixing_efficiency_pct
 from .fan import fan_fvoptions_entry
 from .fluence import compute_fluence_at_points, compute_inactivation_rate, compute_well_mixed_eACH
 from . import help_content
@@ -982,7 +982,11 @@ def _finish_decay(case_dir, room, settings, summary):
              "not nominal, ventilation ACH)...")
     results = write_results_summary(
         case_dir, f"{case_dir}/results.json", settings["ach"],
-        summary["eACH_uv_well_mixed_mean"], extra={"n_lamps": summary["n_lamps"], "fluence_mean": summary["fluence_mean"]},
+        summary["eACH_uv_well_mixed_mean"],
+        extra={
+            "n_lamps": summary["n_lamps"], "fluence_mean": summary["fluence_mean"],
+            "flow_converged": summary.get("flow_converged"), "ach_delivery": summary.get("ach_delivery"),
+        },
         measured_ventilation_ach=control_results["total_ach_effective"],
         measured_ventilation_ach_ci95=control_results.get("total_ach_effective_ci95"),
         measured_ventilation_ach_se_per_s=control_results.get("fit_se_per_s"),
@@ -1059,10 +1063,17 @@ def _continue_decay(case_dir, end_time, write_interval):
     run_wsl_or_raise("postProcess -dict system/volAverageDict", case_dir_wsl, "postProcess volAverage")
 
     _run_log("Writing results summary...")
-    extra = {k: prior[k] for k in ("n_lamps",) if k in prior}
+    extra = {k: prior[k] for k in ("n_lamps", "fluence_mean", "flow_converged", "ach_delivery") if k in prior}
     results = write_results_summary(
         case_dir, results_path, prior["ventilation_ach"], prior["eACH_uv_well_mixed"],
         extra=extra or None,
+        # The control run itself isn't redone here (mesh/flow/UV zones are
+        # untouched - see this function's own docstring), but its earlier
+        # measured ventilation rate is still valid against the extended
+        # curve, so re-supply it here rather than silently reverting to
+        # the nominal-ACH-only ("uncorrected") fields Continue used to.
+        measured_ventilation_ach=prior.get("ventilation_ach_measured"),
+        measured_ventilation_ach_ci95=prior.get("ventilation_ach_measured_ci95"),
     )
     _complete_all_steps()
     _run_log(f"Done. eACH_uv effective={results['eACH_uv_effective']:.4g} /hr "
@@ -1272,6 +1283,7 @@ def _finish_steady_state(case_dir, room, settings, summary,
     # (see the flow-vs-T trust-status discussion), not blended into one.
     result["flow_converged"] = summary.get("flow_converged")
     result["ach_delivery"] = summary.get("ach_delivery")
+    result["mechanical_mixing_efficiency_pct"] = mechanical_mixing_efficiency_pct(result)
     with open(f"{case_dir}/results.json", "w") as f:
         json.dump(result, f, indent=2)
     # Finished end-to-end - nothing left to resume.
@@ -2213,6 +2225,11 @@ def _steady_state_summary(result):
         rows.append((ach_label, f"{result['ventilation_ach_measured']:.4g} /hr{ach_note}"))
         rows.append(("eACH_uv, steady-state CFD-fit (measured ventilation ACH)",
                       f"{result['eACH_uv_steady_state_corrected']:.4g} /hr{ach_note}"))
+    uv_efficiency_pct = combo_summary_metrics(result)["uv_efficiency_pct"]
+    if uv_efficiency_pct is not None:
+        rows.append(("Measured UV eff. %", f"{uv_efficiency_pct:.1f}%"))
+    if result.get("mechanical_mixing_efficiency_pct") is not None:
+        rows.append(("Mechanical mixing eff. %", f"{result['mechanical_mixing_efficiency_pct']:.1f}%"))
     rows += _monitoring_summary_rows(result.get("monitoring"))
     return [html.Div([html.Span(k + ": ", className="text-muted"), html.Span(v)], className="mb-1")
             for k, v in rows] + _result_notes(result)
@@ -2229,14 +2246,16 @@ def _decay_summary(result):
         ("Total ACH, effective", f"{result.get('total_ach_effective', 0):.3g} /hr"),
     ]
     if result.get("mixing_efficiency") is not None:
-        rows.append(("Mixing efficiency", f"{result['mixing_efficiency'] * 100:.1f}%"))
+        rows.append(("Measured UV eff. %", f"{result['mixing_efficiency'] * 100:.1f}%"))
     if result.get("ventilation_ach_measured") is not None:
         rows.append(("Ventilation ACH (measured, UV-off control)",
                       f"{result['ventilation_ach_measured']:.4g} /hr"))
         rows.append(("eACH_uv, CFD-fit (measured ventilation ACH)",
                       f"{result['eACH_uv_effective_corrected']:.4g} /hr"))
-        rows.append(("Mixing efficiency (using measured ventilation ACH)",
+        rows.append(("Measured UV eff. % (using measured ventilation ACH)",
                       f"{result['mixing_efficiency_corrected'] * 100:.1f}%"))
+    if result.get("mechanical_mixing_efficiency_pct") is not None:
+        rows.append(("Mechanical mixing eff. %", f"{result['mechanical_mixing_efficiency_pct']:.1f}%"))
     rows += _monitoring_summary_rows(result.get("monitoring"))
     return [html.Div([html.Span(k + ": ", className="text-muted"), html.Span(v)], className="mb-1")
             for k, v in rows] + _result_notes(result)
@@ -4240,13 +4259,13 @@ def _scenario_progress_table():
     header = html.Tr([
         html.Th("Z"), html.Th("ACH"), html.Th("Status"), html.Th("Est. time to finish"),
         html.Th("Total reduction %"), html.Th("Measured ACH eff. %"), html.Th("Measured UV eff. %"),
-        html.Th("Est. ACH /hr"), html.Th("Est. eACH /hr"),
+        html.Th("Mechanical mixing eff. %"), html.Th("Est. ACH /hr"), html.Th("Est. eACH /hr"),
     ])
     rows = [header]
     for z, ach in combos:
         entry = results.get((z, ach))
         metrics = {"total_reduction_pct": None, "ach_efficiency_pct": None, "uv_efficiency_pct": None,
-                   "est_ach_per_hr": None, "est_each_per_hr": None}
+                   "mechanical_mixing_efficiency_pct": None, "est_ach_per_hr": None, "est_each_per_hr": None}
         if entry is None:
             stage = _combo_live_stage(z, ach)
             status = stage if stage else "pending"
@@ -4268,8 +4287,8 @@ def _scenario_progress_table():
         rows.append(html.Tr([
             html.Td(z), html.Td(ach), html.Td(status), html.Td(est_time),
             html.Td(_pct(metrics["total_reduction_pct"])), html.Td(_pct(metrics["ach_efficiency_pct"])),
-            html.Td(_pct(metrics["uv_efficiency_pct"])), html.Td(_rate(metrics["est_ach_per_hr"])),
-            html.Td(_rate(metrics["est_each_per_hr"])),
+            html.Td(_pct(metrics["uv_efficiency_pct"])), html.Td(_pct(metrics["mechanical_mixing_efficiency_pct"])),
+            html.Td(_rate(metrics["est_ach_per_hr"])), html.Td(_rate(metrics["est_each_per_hr"])),
         ]))
     return dbc.Table(rows, bordered=False, hover=True, size="sm", className="small")
 
@@ -4372,7 +4391,7 @@ def _single_run_progress_table():
             "error": "error", "stopped": "Stopped",
         }.get(status, status)
     metrics = {"total_reduction_pct": None, "ach_efficiency_pct": None, "uv_efficiency_pct": None,
-               "est_ach_per_hr": None, "est_each_per_hr": None}
+               "mechanical_mixing_efficiency_pct": None, "est_ach_per_hr": None, "est_each_per_hr": None}
     if status == "done" and _run_state.get("case_dir"):
         try:
             with open(f"{_run_state['case_dir']}/results.json") as f:
@@ -4389,14 +4408,14 @@ def _single_run_progress_table():
     header = html.Tr([
         html.Th("Z"), html.Th("ACH"), html.Th("Status"), html.Th("Est. time to finish"),
         html.Th("Total reduction %"), html.Th("Measured ACH eff. %"), html.Th("Measured UV eff. %"),
-        html.Th("Est. ACH /hr"), html.Th("Est. eACH /hr"),
+        html.Th("Mechanical mixing eff. %"), html.Th("Est. ACH /hr"), html.Th("Est. eACH /hr"),
     ])
     est_time = _eta_text_from_progress(_run_state) if status == "running" else ""
     row = html.Tr([
         html.Td(z), html.Td(ach), html.Td(stage), html.Td(est_time),
         html.Td(_pct(metrics["total_reduction_pct"])), html.Td(_pct(metrics["ach_efficiency_pct"])),
-        html.Td(_pct(metrics["uv_efficiency_pct"])), html.Td(_rate(metrics["est_ach_per_hr"])),
-        html.Td(_rate(metrics["est_each_per_hr"])),
+        html.Td(_pct(metrics["uv_efficiency_pct"])), html.Td(_pct(metrics["mechanical_mixing_efficiency_pct"])),
+        html.Td(_rate(metrics["est_ach_per_hr"])), html.Td(_rate(metrics["est_each_per_hr"])),
     ])
     return dbc.Table([header, row], bordered=False, hover=True, size="sm", className="small")
 
