@@ -149,6 +149,23 @@ def test_phase_target_pattern_matches_current_steady_state_log_line():
     assert guvcfd_app._run_state["target_time"] == 1500.0
 
 
+def test_phase_target_pattern_matches_single_run_concurrent_decay_launch():
+    # Regression: _finish_decay's "Running pimpleFoam concurrently: UV-on
+    # (Xs) + UV-off control (Ys)..." announcement (the normal, non-Continue
+    # single-run decay path - see _run_decay_pair) matched no pattern at
+    # all - target_time/phase_start_time/chunk_base silently kept
+    # whatever flow convergence left them at, freezing "Running now" at a
+    # stale flow-convergence figure for the rest of the run even though
+    # the log itself kept scrolling live "Time = N" lines throughout.
+    _reset()
+    guvcfd_app._run_state["chunk_base"] = 1049.0  # stale, left over from flow convergence
+    guvcfd_app._run_log("Running pimpleFoam concurrently: UV-on (640s) + UV-off control (1382s)...")
+    assert guvcfd_app._run_state["target_time"] == 640.0
+    assert guvcfd_app._run_state["chunk_base"] is None
+    guvcfd_app._track_solver_time("Time = 5")
+    assert guvcfd_app._run_state["current_time"] == "5"  # not offset by the stale chunk_base anymore
+
+
 def test_phase_target_patterns_match_scenario_runs_control_and_uvon_messages():
     # scenario_runs._run_shared_control/_run_scenario log their own,
     # differently-worded equivalent of the single-run decay line ("Running

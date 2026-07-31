@@ -341,7 +341,17 @@ _PHASE_TARGET_PATTERNS = [
     # iterations, writing every..." wording - TOTAL is the whole phase's
     # budget, not just this chunk's).
     re.compile(r"Running simpleFoam \(\d+-\d+ of (\d+) iterations, writing every"),
-    re.compile(r"Running pimpleFoam to ([\d.]+)s"),  # decay transient run (single-run mode)
+    re.compile(r"Running pimpleFoam to ([\d.]+)s"),  # decay transient run (single-run "Continue")
+    # _finish_decay's own concurrent-launch announcement (single-run mode's
+    # normal, non-Continue path - see _run_decay_pair) - only UV-on's own
+    # "Time = N" lines ever reach _track_solver_time (see that function's
+    # docstring), so this captures UV-on's own duration, not control's.
+    # Missing this pattern entirely was a real, confirmed bug: target_time/
+    # phase_start_time/chunk_base silently kept whatever flow convergence
+    # left them at, so "Running now" froze at a stale flow-convergence
+    # figure for the whole rest of the run even though the log kept
+    # scrolling live Time=N lines the entire time.
+    re.compile(r"Running pimpleFoam concurrently: UV-on \(([\d.]+)s\)"),
     # scenario_runs._run_shared_control/_run_scenario's own differently-
     # worded equivalents of the single-run decay line above (sweep mode).
     re.compile(r"Running pimpleFoam \(shared control, ([\d.]+)s\)"),
