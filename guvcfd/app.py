@@ -1718,15 +1718,13 @@ project_setup_tab = dbc.Row([
         ]),
 
         # sim-type/pimple-end-time/pimple-write-interval/phase1-iterations/
-        # phase2-iterations/t-ss-window-frac now render for real inside the
-        # Run Simulations tab's "Simulation settings" modal (see below) -
-        # not duplicated here. "Suggest" buttons are hidden, not rebuilt in
-        # the modal (suggest-phases-btn is redundant with deltaT scaling -
-        # see compute_scaled_delta_t; suggest-duration-btn wasn't part of
-        # this redesign) - kept only so their existing callbacks
-        # (_suggest_duration/_suggest_phases) still resolve.
+        # phase2-iterations/t-ss-window-frac/suggest-duration-btn now render
+        # for real inside the Run Simulations tab's "Simulation settings"
+        # modal (see below) - not duplicated here. suggest-phases-btn is
+        # hidden, not rebuilt there (redundant with deltaT scaling - see
+        # compute_scaled_delta_t) - kept only so its existing callback
+        # (_suggest_phases) still resolves.
         html.Div([
-            dbc.Button("Suggest", id="suggest-duration-btn"),
             dbc.Button("Suggest settling times (99.5%)", id="suggest-phases-btn"),
         ], style={"display": "none"}),
 
