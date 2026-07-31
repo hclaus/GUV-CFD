@@ -461,7 +461,7 @@ def test_run_scenario_threads_control_results_into_measured_ventilation_ach(monk
                 "monitoring-enable": False, "source-zone-size": 0.3}
     adv = {"uv-zone-bins": 25, "mesh-cell-size": 0.1,
            "plateau-rel-tol": 1.0, "t-infinity-early-stop-enabled": False, "keep-all-timesteps": False,
-           "deltat-scaling-enabled": False,
+           "deltat-scaling-enabled": False, "deltat-effective-fraction": 0.7, "deltat-target-fraction": 0.995,
            "phase-chunk-size": 400, "phase-write-interval": 200}
 
     sr._run_scenario("case_dir", room, settings, z=6.0, ach=3.0, adv=adv,
@@ -531,7 +531,7 @@ def test_run_scenario_threads_base_summary_into_flow_converged_and_ach_delivery(
                 "monitoring-enable": False, "source-zone-size": 0.3}
     adv = {"uv-zone-bins": 25, "mesh-cell-size": 0.1,
            "plateau-rel-tol": 1.0, "t-infinity-early-stop-enabled": False, "keep-all-timesteps": False,
-           "deltat-scaling-enabled": False,
+           "deltat-scaling-enabled": False, "deltat-effective-fraction": 0.7, "deltat-target-fraction": 0.995,
            "phase-chunk-size": 400, "phase-write-interval": 200}
 
     base_summary = {"flow_converged": True, "ach_delivery": {"measured_ach": 5.9, "ratio": 0.98}, "n_lamps": 4}
@@ -560,7 +560,7 @@ def test_run_scenario_measured_ventilation_ach_none_without_control_results(monk
                 "monitoring-enable": False, "source-zone-size": 0.3}
     adv = {"uv-zone-bins": 25, "mesh-cell-size": 0.1,
            "plateau-rel-tol": 1.0, "t-infinity-early-stop-enabled": False, "keep-all-timesteps": False,
-           "deltat-scaling-enabled": False,
+           "deltat-scaling-enabled": False, "deltat-effective-fraction": 0.7, "deltat-target-fraction": 0.995,
            "phase-chunk-size": 400, "phase-write-interval": 200}
 
     sr._run_scenario("case_dir", room, settings, z=6.0, ach=3.0, adv=adv,
@@ -597,7 +597,7 @@ def test_run_shared_phase1_clones_base_dir_and_runs_phase1_only(tmp_path, monkey
     adv = {"mesh-cell-size": 0.1, "plateau-rel-tol": 1.0,
            "t-infinity-early-stop-enabled": False, "keep-all-timesteps": False,
            "phase-chunk-size": 400, "phase-write-interval": 200,
-           "deltat-scaling-enabled": False}
+           "deltat-scaling-enabled": False, "deltat-effective-fraction": 0.7, "deltat-target-fraction": 0.995}
 
     sr._run_shared_phase1("base_dir", "phase1_dir", ach=3.0, room=room, settings=settings, adv=adv,
                            log_fn=lambda m: None, should_stop=None, solver_log_fn=None)
@@ -947,3 +947,37 @@ def test_run_sweep_concurrent_propagates_stopped_by_user():
         sr._run_sweep_concurrent([3], [(2, 3)], should_stop=None,
                                   build_ach_fn=build_ach_fn, run_z_fn=run_z_fn,
                                   cleanup_ach_fn=lambda ctx: None)
+
+
+def test_write_sweep_summary_csv_collects_every_combo_report(tmp_path):
+    import csv as csv_module
+    project_dir = str(tmp_path)
+    project_name = "myproj"
+    combos = [(1.7, 3.0), (6.0, 3.0)]
+    # Only the first combo produced a report - the second (failed/skipped)
+    # has no report.json on disk, matching a real error/skip.
+    report1 = {
+        "reduction_pct_corrected": 85.8, "eACH_uv_steady_state_corrected": 18.2,
+        "eACH_uv_well_mixed": 20.0, "ach_delivery": {"measured_ach": 2.97, "ratio": 0.99},
+    }
+    with open(f"{project_dir}/{project_name}_{sr._subdir_name(1.7, 3.0)}_report.json", "w") as f:
+        json.dump(report1, f)
+
+    csv_path = sr.write_sweep_summary_csv(project_dir, project_name, combos)
+
+    assert csv_path == f"{project_dir}/{project_name}_sweep_summary.csv"
+    with open(csv_path, newline="") as f:
+        rows = list(csv_module.DictReader(f))
+    assert len(rows) == 1  # the missing combo is omitted, not a blank row
+    assert rows[0]["Z"] == "1.7"
+    assert rows[0]["ACH"] == "3.0"
+    assert float(rows[0]["total_reduction_pct"]) == pytest.approx(85.8)
+    assert float(rows[0]["est_each_per_hr"]) == pytest.approx(18.2)
+
+
+def test_write_sweep_summary_csv_handles_no_reports_at_all(tmp_path):
+    csv_path = sr.write_sweep_summary_csv(str(tmp_path), "myproj", [(1.7, 3.0)])
+    with open(csv_path) as f:
+        content = f.read()
+    assert "Z" in content  # header row still written
+    assert len(content.strip().splitlines()) == 1  # no data rows

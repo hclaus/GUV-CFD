@@ -340,6 +340,27 @@ def compute_scaled_delta_t(effective_rate_per_hr, n_iterations, target_fraction=
     return max(1, round(ideal_dt))
 
 
+_PROJECT_DELTAT_KEYS = ("deltat-scaling-enabled", "deltat-effective-fraction", "deltat-target-fraction")
+
+
+def merge_project_deltat_settings(settings, adv):
+    """deltat-scaling-enabled/deltat-effective-fraction/deltat-target-
+    fraction are project settings (saved in the .guvcfd file, so a
+    project's results stay reproducible regardless of what a *different*
+    project's advanced settings get changed to later) - everything else
+    resolve_phase_delta_ts/_run_phase need (keep-all-timesteps) is still a
+    genuine cross-project advanced setting. Returns a dict with adv's
+    other keys plus these 3 overridden from `settings` when present,
+    falling back to adv's own (global-default) values for a project saved
+    before these fields existed - the same shape resolve_phase_delta_ts
+    already expects, so callers just pass this instead of `adv` directly.
+    """
+    merged = dict(adv)
+    for key in _PROJECT_DELTAT_KEYS:
+        merged[key] = settings.get(key, adv[key])
+    return merged
+
+
 def resolve_phase_delta_ts(ach, eACH_uv_well_mixed, phase1_iterations, phase2_iterations, adv):
     """The phase1_delta_t/phase2_delta_t run_steady_state_scenario expects,
     from a project's ach/eACH_uv_well_mixed and its (already-resolved,
@@ -375,7 +396,7 @@ def _copy_latest_to_zero(case_dir_wsl, latest, include_T, log_fn):
 _TIME_LINE_RE = re.compile(r"^Time\s*=\s*[\d.]+\s*$")
 
 
-def _phase_solver_callback(log_fn, solver_log_fn, status_fn, status_key):
+def _phase_solver_callback(log_fn, solver_log_fn, status_fn, status_key, delta_t=1):
     """Wraps a phase's simpleFoam on_line callback.
 
     With no status_fn (single-run mode - progress there comes from
@@ -390,13 +411,27 @@ def _phase_solver_callback(log_fn, solver_log_fn, status_fn, status_key):
     combinations solving at once don't flood the scrolling log the same
     way decay mode's _throttled_solver_callback already avoids. solver_log_fn
     still receives every raw line either way.
+
+    delta_t: OpenFOAM's own "Time" is iteration*delta_t (see _run_phase's
+    own delta_t docstring) - reported to status_fn as "Iteration N" (N
+    divided back out) instead of the raw "Time = N", so this matches the
+    plain iteration-count language Simulation settings/phase1-iterations
+    uses rather than showing a number scaled by a factor the UI never
+    otherwise surfaces. Confirmed directly as a real point of confusion:
+    at delta_t=3, a 1500-iteration budget showed as "Time = 4500" with no
+    indication of the scaling. solver_log_fn/log_fn still get the raw,
+    unconverted line either way - only status_fn's display is adjusted.
     """
     if status_fn is None:
         return solver_log_fn or log_fn
 
     def callback(line):
-        if _TIME_LINE_RE.match(line.strip()):
-            status_fn(status_key, line.strip())
+        stripped = line.strip()
+        if _TIME_LINE_RE.match(stripped):
+            if delta_t != 1:
+                raw_time = float(stripped.split("=", 1)[1])
+                stripped = f"Iteration {round(raw_time / delta_t)}"
+            status_fn(status_key, stripped)
         if solver_log_fn:
             solver_log_fn(line)
     return callback
@@ -566,7 +601,7 @@ def _run_phase(case_dir, case_dir_wsl, n_iterations, write_interval, window_frac
                f"iterations, writing every {write_interval})...")
         r = run_wsl_streaming(
             "simpleFoam 2>&1 | tee log.simpleFoam", case_dir_wsl,
-            on_line=_phase_solver_callback(log_fn, solver_log_fn, status_fn, status_key),
+            on_line=_phase_solver_callback(log_fn, solver_log_fn, status_fn, status_key, delta_t=delta_t),
             should_stop=should_stop, kill_pattern="simpleFoam", should_pause=should_pause,
         )
         if should_stop is not None and should_stop():
@@ -875,8 +910,21 @@ def _clear_phase1_pending(case_dir):
     Path(_phase1_pending_path(case_dir)).unlink(missing_ok=True)
 
 
+# target_T_ss only ever sets the source strength G (compute_source_strength) -
+# the system is linear in G, so both T_ss1 and T_ss2 scale proportionally
+# with it and reduction_pct/eACH_uv (both ratios) are completely
+# independent of its value; it doesn't affect solver convergence speed
+# either (a linear iterative solve's convergence rate depends on the
+# equation's conditioning, not the solution's absolute magnitude). No
+# longer a user-facing project setting - callers pass this fixed reference
+# value instead of asking the user to pick one that has no effect on
+# results (still exposed as a parameter here for anyone reading an
+# absolute concentration, e.g. CFU/m^3, rather than a ratio).
+REFERENCE_TARGET_T_SS = 1.0
+
+
 def run_steady_state_scenario(case_dir, room_x, room_y, room_z, ach, Z, nbins=25,
-                               source_center=None, source_size=0.3, target_T_ss=0.3,
+                               source_center=None, source_size=0.3, target_T_ss=REFERENCE_TARGET_T_SS,
                                cell_size=0.1, inlet_velocity=(0.278, 0, 0),
                                inlet2_velocity=None, has_outlet2=False,
                                inlet_diffuser_type="direct", inlet_wall=None,

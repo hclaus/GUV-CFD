@@ -148,6 +148,57 @@ def _decay_reduction_ratio(eACH, ach):
     return eACH / (ach + eACH) if (ach + eACH) else None
 
 
+def combo_summary_metrics(detail):
+    """The 5 headline numbers shown per combination on the Run Simulations
+    tab's "Simulation results" columns and in the sweep-summary CSV
+    (scenario_runs.write_sweep_summary_csv) - one place computing them so
+    both stay consistent, for either a steady-state or decay-mode trimmed
+    result dict (see scenario_runs._trim_report/_trim_decay_report).
+
+    Returns a dict with keys total_reduction_pct, ach_efficiency_pct,
+    uv_efficiency_pct, est_ach_per_hr, est_each_per_hr - any value that
+    isn't computable from what's in `detail` (older results.json files,
+    a control run that wasn't used, etc.) is None, not an error.
+
+    ach_efficiency_pct: ach_delivery.ratio*100 - the measured/nominal
+    ventilation-delivery ratio (same field either sim type already
+    computes via run_pipeline.check_ach_delivery), i.e. how much of the
+    nominal ACH the room's actual flow field delivers.
+
+    uv_efficiency_pct: the room's real (imperfectly-mixed) eACH_uv versus
+    the idealized well-mixed prediction for the same Z - decay mode
+    already computes this directly (mixing_efficiency[_corrected] via
+    decay_analysis.write_results_summary); steady-state doesn't store the
+    ratio itself, only eACH_uv_well_mixed, so it's computed here instead.
+    """
+    is_steady_state = "reduction_pct" in detail or "reduction_pct_corrected" in detail
+    ach_delivery = detail.get("ach_delivery") or {}
+    ach_efficiency_pct = ach_delivery.get("ratio") * 100 if ach_delivery.get("ratio") is not None else None
+    est_ach_per_hr = ach_delivery.get("measured_ach")
+
+    if is_steady_state:
+        total_reduction_pct = detail.get("reduction_pct_corrected", detail.get("reduction_pct"))
+        est_each_per_hr = detail.get("eACH_uv_steady_state_corrected", detail.get("eACH_uv_steady_state"))
+        well_mixed = detail.get("eACH_uv_well_mixed")
+        uv_efficiency_pct = (est_each_per_hr / well_mixed * 100
+                              if est_each_per_hr is not None and well_mixed else None)
+    else:
+        est_each_per_hr = detail.get("eACH_uv_effective_corrected", detail.get("eACH_uv_effective"))
+        ach_eff = detail.get("ventilation_ach_measured", detail.get("ventilation_ach"))
+        total_reduction_pct = (_decay_reduction_ratio(est_each_per_hr, ach_eff) * 100
+                                if est_each_per_hr is not None and ach_eff is not None else None)
+        mixing_eff = detail.get("mixing_efficiency_corrected", detail.get("mixing_efficiency"))
+        uv_efficiency_pct = mixing_eff * 100 if mixing_eff is not None else None
+
+    return {
+        "total_reduction_pct": total_reduction_pct,
+        "ach_efficiency_pct": ach_efficiency_pct,
+        "uv_efficiency_pct": uv_efficiency_pct,
+        "est_ach_per_hr": est_ach_per_hr,
+        "est_each_per_hr": est_each_per_hr,
+    }
+
+
 def _ci_suffix(ci95):
     """' (95% CI: lo–hi /hr)' for a (lo, hi) tuple in /hr, else ''.
 

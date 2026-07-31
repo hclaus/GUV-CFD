@@ -27,6 +27,7 @@ the handful of small settings-dict-to-kwargs helpers app.py also has
 (_fan_kwargs, _opening_center_frac, etc.) are duplicated locally rather
 than imported, for the same reason.
 """
+import csv
 import json
 import math
 import re
@@ -43,9 +44,13 @@ from .fan import fan_fvoptions_entry, write_fan_topo_set_dict
 from .fluence import compute_inactivation_rate, compute_well_mixed_eACH
 from .initial_fields import compute_inlet_velocities
 from .monitoring_points import compute_monitoring_results
+from .report import combo_summary_metrics
 from .run_pipeline import setup_case
 from .splice import set_control_dict_time, splice_fv_options_into_control_dict
-from .steady_state_pipeline import run_steady_state_scenario, _uv_fvoptions_entries, resolve_phase_delta_ts
+from .steady_state_pipeline import (
+    run_steady_state_scenario, _uv_fvoptions_entries, resolve_phase_delta_ts, merge_project_deltat_settings,
+    REFERENCE_TARGET_T_SS,
+)
 from .ventilation_control import prepare_ventilation_only_control, finish_ventilation_only_control
 from .visualization import center_frac_for_wall
 from .wsl_utils import StoppedByUser, run_wsl_or_raise, run_wsl_streaming, wsl_path
@@ -319,7 +324,8 @@ def _run_scenario(case_dir, room, settings, z, ach, adv, z_summary, log_fn, shou
     has_outlet2 = bool(settings.get("outlet2-enable"))
 
     eACH_uv = z_summary.get("eACH_uv_well_mixed_mean", 0.0)
-    if adv["deltat-scaling-enabled"]:
+    deltat_adv = merge_project_deltat_settings(settings, adv)
+    if deltat_adv["deltat-scaling-enabled"]:
         # _settling_iterations-based inflation and deltaT scaling solve the
         # same equation for opposite unknowns - composing them defeats
         # deltaT scaling's purpose (confirmed directly: at ACH=6 this
@@ -331,13 +337,14 @@ def _run_scenario(case_dir, room, settings, z, ach, adv, z_summary, log_fn, shou
     else:
         phase1_iterations = max(settings["phase1-iterations"], _settling_iterations(ach))
         phase2_iterations = max(settings["phase2-iterations"], _settling_iterations(ach + eACH_uv))
-    phase1_delta_t, phase2_delta_t = resolve_phase_delta_ts(ach, eACH_uv, phase1_iterations, phase2_iterations, adv)
+    phase1_delta_t, phase2_delta_t = resolve_phase_delta_ts(ach, eACH_uv, phase1_iterations, phase2_iterations,
+                                                             deltat_adv)
 
     patches_to_monitor = ("outlet", "outlet2") if has_outlet2 else ("outlet",)
     result = run_steady_state_scenario(
         case_dir, room.x, room.y, room.z, ach, z,
         source_center=(settings["inject-x-input"], settings["inject-y-input"], settings["inject-z-input"]),
-        target_T_ss=settings["target-t-ss"],
+        target_T_ss=REFERENCE_TARGET_T_SS,
         inlet_velocity=inlet_velocity, inlet2_velocity=inlet2_velocity, has_outlet2=has_outlet2,
         inlet_diffuser_type=settings.get("inlet-diffuser-type", "direct"),
         inlet_wall=settings["inlet-wall"], inlet_center=_opening_center_frac(settings, "inlet", room),
@@ -417,13 +424,14 @@ def _run_shared_phase1(base_dir, phase1_dir, ach, room, settings, adv, log_fn, s
     inlet2_velocity = velocities[1] if has_inlet2 else None
     has_outlet2 = bool(settings.get("outlet2-enable"))
 
-    if adv["deltat-scaling-enabled"]:
+    deltat_adv = merge_project_deltat_settings(settings, adv)
+    if deltat_adv["deltat-scaling-enabled"]:
         phase1_iterations = settings["phase1-iterations"]
     else:
         phase1_iterations = max(settings["phase1-iterations"], _settling_iterations(ach))
     # Phase 1 alone has no UV/Z dependency, so eACH_uv_well_mixed=0 here -
     # phase2_delta_t is discarded (phase1_only=True below runs no Phase 2).
-    phase1_delta_t, _ = resolve_phase_delta_ts(ach, 0.0, phase1_iterations, phase1_iterations, adv)
+    phase1_delta_t, _ = resolve_phase_delta_ts(ach, 0.0, phase1_iterations, phase1_iterations, deltat_adv)
     patches_to_monitor = ("outlet", "outlet2") if has_outlet2 else ("outlet",)
 
     log_fn(f"=== ACH={ach}: Phase 1 (source only, no UV - shared by every Z at this ACH) ===")
@@ -433,7 +441,7 @@ def _run_shared_phase1(base_dir, phase1_dir, ach, room, settings, adv, log_fn, s
         # already uses for the shared flow base.
         phase1_dir, room.x, room.y, room.z, ach, settings["z-value"],
         source_center=(settings["inject-x-input"], settings["inject-y-input"], settings["inject-z-input"]),
-        target_T_ss=settings["target-t-ss"],
+        target_T_ss=REFERENCE_TARGET_T_SS,
         inlet_velocity=inlet_velocity, inlet2_velocity=inlet2_velocity, has_outlet2=has_outlet2,
         inlet_diffuser_type=settings.get("inlet-diffuser-type", "direct"),
         inlet_wall=settings["inlet-wall"], inlet_center=_opening_center_frac(settings, "inlet", room),
@@ -705,6 +713,41 @@ def _trim_decay_report(result):
     return trimmed
 
 
+_SWEEP_SUMMARY_FIELDS = ["Z", "ACH", "total_reduction_pct", "ach_efficiency_pct", "uv_efficiency_pct",
+                         "est_ach_per_hr", "est_each_per_hr"]
+
+
+def write_sweep_summary_csv(project_dir, project_name, combos):
+    """Collects every combination's trimmed per-combo report.json (already
+    written by run_sweep/run_decay_sweep next to results.json - see
+    _trim_report/_trim_decay_report) into one combined CSV with the same 5
+    headline numbers shown on the Run Simulations tab (report.
+    combo_summary_metrics), so comparing combinations doesn't require
+    opening every subfolder's own results.json by hand. Called once after
+    a sweep finishes (or is stopped) - combinations that never produced a
+    report.json (failed, skipped, or not yet reached) are simply omitted,
+    not written as blank rows. Returns the CSV's path.
+    """
+    rows = []
+    for z, ach in combos:
+        report_path = f"{project_dir}/{project_name}_{_subdir_name(z, ach)}_report.json"
+        if not Path(report_path).exists():
+            continue
+        try:
+            with open(report_path) as f:
+                detail = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            continue
+        rows.append({"Z": z, "ACH": ach, **combo_summary_metrics(detail)})
+
+    csv_path = f"{project_dir}/{project_name}_sweep_summary.csv"
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=_SWEEP_SUMMARY_FIELDS)
+        writer.writeheader()
+        writer.writerows(rows)
+    return csv_path
+
+
 def _run_sweep_concurrent(achs, combos, should_stop, build_ach_fn, run_z_fn, cleanup_ach_fn):
     """Bounded two-level concurrency shared by run_sweep/run_decay_sweep:
     up to _MAX_CONCURRENT_ACH ACH groups build their flow state at once;
@@ -862,7 +905,10 @@ def run_decay_sweep(guv_path, settings_path, project_dir, room, settings, adv,
             f'rm -rf "{wsl_path(ctx["base_dir"])}" "{wsl_path(ctx["control_dir"])}"', wsl_path(project_dir),
             "cleaning up shared base case and control run")
 
-    _run_sweep_concurrent(achs, combos, should_stop, build_ach_fn, run_z_fn, cleanup_ach_fn)
+    try:
+        _run_sweep_concurrent(achs, combos, should_stop, build_ach_fn, run_z_fn, cleanup_ach_fn)
+    finally:
+        write_sweep_summary_csv(project_dir, project_name, combos)
 
 
 def _trim_report(result):
@@ -1020,4 +1066,9 @@ def run_sweep(guv_path, settings_path, project_dir, room, settings, adv,
             f'rm -rf "{wsl_path(ctx["base_dir"])}" "{wsl_path(ctx["phase1_dir"])}" "{wsl_path(ctx["control_dir"])}"',
             wsl_path(project_dir), "cleaning up shared base case, Phase 1 run, and control run")
 
-    _run_sweep_concurrent(achs, combos, should_stop, build_ach_fn, run_z_fn, cleanup_ach_fn)
+    try:
+        _run_sweep_concurrent(achs, combos, should_stop, build_ach_fn, run_z_fn, cleanup_ach_fn)
+    finally:
+        # Written even on StoppedByUser/a partial sweep - a summary of
+        # whatever combinations did finish is more useful than none.
+        write_sweep_summary_csv(project_dir, project_name, combos)

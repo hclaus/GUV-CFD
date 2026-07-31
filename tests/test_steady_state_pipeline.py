@@ -202,6 +202,32 @@ def test_phase_solver_callback_redirects_time_lines_to_status_fn():
     assert solver_lines == ["Time = 42.5", "smoothSolver:  Solving for Ux, Initial residual = 0.01"]
 
 
+def test_phase_solver_callback_converts_time_to_iteration_when_delta_t_scaled():
+    # Regression: OpenFOAM's own "Time" is iteration*delta_t (see _run_phase's
+    # delta_t docstring) - at delta_t=3 a 1500-iteration budget's raw "Time"
+    # reaches 4500, which doesn't match the plain iteration-count language
+    # elsewhere in the UI. status_fn should see "Iteration N" (N divided back
+    # out), not the raw scaled Time - solver_log_fn still gets the raw line
+    # unconverted either way (matches log.simpleFoam exactly for debugging).
+    solver_lines = []
+    status_calls = []
+    callback = ssp._phase_solver_callback(
+        _log, solver_lines.append, lambda k, m: status_calls.append((k, m)), "Z=6/ACH=6/Phase1", delta_t=3)
+
+    callback("Time = 840")
+
+    assert status_calls == [("Z=6/ACH=6/Phase1", "Iteration 280")]
+    assert solver_lines == ["Time = 840"]  # raw line unconverted
+
+
+def test_phase_solver_callback_leaves_time_unconverted_at_delta_t_one():
+    status_calls = []
+    callback = ssp._phase_solver_callback(
+        _log, None, lambda k, m: status_calls.append((k, m)), "key", delta_t=1)
+    callback("Time = 842")
+    assert status_calls == [("key", "Time = 842")]
+
+
 def _log(msg):
     pass
 

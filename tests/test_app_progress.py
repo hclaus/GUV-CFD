@@ -1,3 +1,5 @@
+import pytest
+
 from guvcfd import app as guvcfd_app
 
 
@@ -172,6 +174,12 @@ def _row_cell_texts(table, row_index):
     return [cell.children for cell in row.children]
 
 
+# Column order: Z, ACH, Status, Est. time to finish, Total reduction %,
+# Measured ACH eff. %, Measured UV eff. %, Est. ACH /hr, Est. eACH /hr -
+# see app._scenario_progress_table.
+_EACH_COL = 8
+
+
 def test_scenario_progress_table_prefers_corrected_eACH_for_steady_state():
     # Regression: this column showed detail['eACH_uv_steady_state'] (the
     # NOMINAL-ACH-based value) unconditionally, while the decay-mode branch
@@ -193,8 +201,8 @@ def test_scenario_progress_table_prefers_corrected_eACH_for_steady_state():
         },
     }
     table = guvcfd_app._scenario_progress_table()
-    z, ach, status, reduction, eACH = _row_cell_texts(table, 1)
-    assert eACH == "19.59 /hr"
+    cells = _row_cell_texts(table, 1)
+    assert cells[_EACH_COL] == "19.59 /hr"
 
 
 def test_scenario_progress_table_falls_back_to_raw_eACH_when_uncorrected():
@@ -209,5 +217,34 @@ def test_scenario_progress_table_falls_back_to_raw_eACH_when_uncorrected():
         },
     }
     table = guvcfd_app._scenario_progress_table()
-    z, ach, status, reduction, eACH = _row_cell_texts(table, 1)
-    assert eACH == "17.73 /hr"
+    cells = _row_cell_texts(table, 1)
+    assert cells[_EACH_COL] == "17.73 /hr"
+
+
+def test_write_single_run_summary_csv(tmp_path):
+    import csv as csv_module
+    import json as json_module
+    case_dir = str(tmp_path)
+    results = {
+        "reduction_pct_corrected": 85.8, "eACH_uv_steady_state_corrected": 18.2,
+        "eACH_uv_well_mixed": 20.0, "ach_delivery": {"measured_ach": 2.97, "ratio": 0.99},
+    }
+    (tmp_path / "results.json").write_text(json_module.dumps(results))
+    guvcfd_app._run_state["z"] = 1.7
+    guvcfd_app._run_state["ach"] = 3.0
+
+    guvcfd_app._write_single_run_summary_csv(case_dir)
+
+    csv_path = tmp_path / "run_summary.csv"
+    assert csv_path.exists()
+    with open(csv_path, newline="") as f:
+        rows = list(csv_module.DictReader(f))
+    assert len(rows) == 1
+    assert rows[0]["Z"] == "1.7"
+    assert rows[0]["ACH"] == "3.0"
+    assert float(rows[0]["total_reduction_pct"]) == pytest.approx(85.8)
+
+
+def test_write_single_run_summary_csv_missing_results_json_is_a_noop(tmp_path):
+    guvcfd_app._write_single_run_summary_csv(str(tmp_path))  # must not raise
+    assert not (tmp_path / "run_summary.csv").exists()

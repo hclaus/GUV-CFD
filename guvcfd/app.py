@@ -3,6 +3,7 @@ scenario type, preview the 3D case setup live, and (eventually) run the
 pipeline. Local single-user tool - run `python -m guvcfd.app` and open
 the printed localhost URL.
 """
+import csv
 import json
 import math
 import re
@@ -31,7 +32,7 @@ from .monitoring_points import compute_monitoring_results, mixing_uniformity_not
 from .paraview_launch import launch_paraview
 from .report import (
     generate_report_docx, T_FIELD_NOTE, _effective_ach_note, _phase_ss_rows, _ach_source_note,
-    _decay_reduction_ratio,
+    combo_summary_metrics,
 )
 from .result_figures import steady_state_figure, decay_figure
 from .run_pipeline import (
@@ -42,7 +43,7 @@ from . import scenario_runs
 from .splice import set_control_dict_start_from, set_control_dict_time
 from .steady_state_pipeline import (
     run_steady_state_scenario, _read_phase1_checkpoint, _clear_phase1_checkpoint, Phase1ExtrapolationUndecided,
-    resolve_phase_delta_ts,
+    resolve_phase_delta_ts, merge_project_deltat_settings, REFERENCE_TARGET_T_SS,
 )
 from .ventilation_control import prepare_ventilation_only_control, finish_ventilation_only_control
 from .visualization import WALL_POSITION_DIMS, center_frac_for_wall, plot_case
@@ -79,8 +80,10 @@ SETTINGS_FIELDS = [
     "fan-enable", "fan-speed", "fan-direction", "fan-radius", "fan-thickness",
     "fan-x-input", "fan-y-input", "fan-z-input",
     "sim-type", "pimple-end-time", "pimple-write-interval",
-    "target-t-ss", "inject-x-input", "inject-y-input", "inject-z-input", "source-zone-size",
+    "inject-x-input", "inject-y-input", "inject-z-input", "source-zone-size",
     "phase1-iterations", "phase2-iterations", "t-ss-window-frac",
+    "deltat-scaling-enabled", "deltat-effective-fraction", "deltat-target-fraction",
+    "scenario-z-values", "scenario-ach-values",
     "monitoring-enable",
     "monitor1-enable", "monitor1-name", "monitor1-x-input", "monitor1-y-input",
     "monitor1-z-input", "monitor1-cells",
@@ -1096,7 +1099,8 @@ def _finish_steady_state(case_dir, room, settings, summary,
 
     ach = settings["ach"]
     eACH_uv = summary.get("eACH_uv_well_mixed_mean", 0.0)
-    if adv["deltat-scaling-enabled"]:
+    deltat_adv = merge_project_deltat_settings(settings, adv)
+    if deltat_adv["deltat-scaling-enabled"]:
         # deltaT scaling and the settling-safety-multiplier below solve the
         # exact same equation (residence times needed within a budget) for
         # the opposite unknown - composing them is redundant and self-
@@ -1132,7 +1136,8 @@ def _finish_steady_state(case_dir, room, settings, summary,
                  f"phase2={_settling_iterations(ach + eACH_uv)} iterations (ACH+eACH_uv={ach + eACH_uv:.3g}/hr) - "
                  f"using the larger of this and the configured value for each phase "
                  f"({phase1_iterations}, {phase2_iterations}).")
-    phase1_delta_t, phase2_delta_t = resolve_phase_delta_ts(ach, eACH_uv, phase1_iterations, phase2_iterations, adv)
+    phase1_delta_t, phase2_delta_t = resolve_phase_delta_ts(ach, eACH_uv, phase1_iterations, phase2_iterations,
+                                                             deltat_adv)
     if phase1_delta_t != 1 or phase2_delta_t != 1:
         _run_log(f"Residence-time-scaled deltaT: phase1={phase1_delta_t}, phase2={phase2_delta_t}, "
                  f"iterations phase1={phase1_iterations}/phase2={phase2_iterations} (as configured, not "
@@ -1142,7 +1147,7 @@ def _finish_steady_state(case_dir, room, settings, summary,
     result = run_steady_state_scenario(
         case_dir, room.x, room.y, room.z, settings["ach"], settings["z-value"],
         source_center=(settings["inject-x-input"], settings["inject-y-input"], settings["inject-z-input"]),
-        target_T_ss=settings["target-t-ss"],
+        target_T_ss=REFERENCE_TARGET_T_SS,
         inlet_velocity=inlet_velocity, inlet2_velocity=inlet2_velocity, has_outlet2=has_outlet2,
         inlet_diffuser_type=settings.get("inlet-diffuser-type", "direct"),
         inlet_wall=settings["inlet-wall"], inlet_center=_opening_center_frac(settings, "inlet", room),
@@ -1241,6 +1246,27 @@ def _handle_flow_convergence_undecided(e, sim_type, guv_path, case_dir, room, se
     }
 
 
+def _write_single_run_summary_csv(case_dir):
+    """Single-run equivalent of scenario_runs.write_sweep_summary_csv - a
+    sweep collects every combo's own compound-named report.json from the
+    project directory, but a single run never writes one of those (its
+    results.json lives directly in case_dir, one run per directory) - so
+    this reads that instead and writes the same 5-metric CSV, for the same
+    reason: comparing without needing to open results.json by hand.
+    """
+    try:
+        with open(f"{case_dir}/results.json") as f:
+            detail = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return
+    metrics = combo_summary_metrics(detail)
+    csv_path = f"{case_dir}/run_summary.csv"
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=["Z", "ACH", *metrics.keys()])
+        writer.writeheader()
+        writer.writerow({"Z": _run_state.get("z"), "ACH": _run_state.get("ach"), **metrics})
+
+
 def _run_pipeline_thread(sim_type, guv_path, case_dir, room, settings):
     started_at = datetime.now()
     start = time.time()
@@ -1251,6 +1277,7 @@ def _run_pipeline_thread(sim_type, guv_path, case_dir, room, settings):
             _run_steady_state(guv_path, case_dir, room, settings)
         _run_state["status"] = "done"
         _record_run_timing(case_dir, started_at, time.time() - start)
+        _write_single_run_summary_csv(case_dir)
     except StoppedByUser as e:
         _run_log(f"Stopped: {e}")
         _run_state["status"] = "stopped"
@@ -1608,14 +1635,20 @@ project_setup_tab = dbc.Row([
             ], className="g-2")),
         ]),
 
-        _card("Ventilation & UV", [
-            _labeled("Air changes per hour (ACH)", dcc.Input(
-                id="ach", type="number", value=3.0, min=0.1, max=20, step=0.1, debounce=True,
-                className="form-control form-control-sm")),
-            _labeled("Z — UV susceptibility (cm²/mJ)", dcc.Input(
-                id="z-value", type="number", value=2.0, min=0.01, max=20, step="any", debounce=True,
-                className="form-control form-control-sm")),
-        ]),
+        # ach/z-value are no longer edited here - the Run Simulations tab's
+        # Z/ACH list fields (scenario-z-values/scenario-ach-values) are now
+        # the only place to set them, since a single value is just a
+        # length-1 list. Kept as hidden inputs (not a visible card) rather
+        # than removed outright: every steady-state/decay call path still
+        # reads settings["ach"]/settings["z-value"] directly for the
+        # single-combination case, and a hidden component still satisfies
+        # every existing Output/State reference to these ids - see
+        # _sync_ach_z_from_run_tab, which keeps them in sync with the Run
+        # tab's list fields whenever those resolve to exactly one value.
+        html.Div([
+            dcc.Input(id="ach", type="number", value=3.0),
+            dcc.Input(id="z-value", type="number", value=2.0),
+        ], style={"display": "none"}),
 
         _card("Inlet", _opening_controls("inlet", "xMin")
               + [_second_opening_controls("inlet2", "Inlet", "ceiling")]),
@@ -1662,71 +1695,55 @@ project_setup_tab = dbc.Row([
             ]),
         ]),
 
-        _card("Simulation type", [
-            dbc.RadioItems(
-                id="sim-type",
-                className="btn-group w-100 mb-2",
-                inputClassName="btn-check",
-                labelClassName="btn btn-outline-primary",
-                labelCheckedClassName="active",
-                options=[
-                    {"label": "Decay", "value": "decay"},
-                    {"label": "Steady state", "value": "steady_state"},
-                ],
-                value="decay",
-            ),
-            html.Div(id="decay-controls", children=[
-                _labeled("Suggested duration (s)", dbc.Row([
-                    dbc.Col(dcc.Input(
-                        id="pimple-end-time", type="number", value=120, min=10, max=7200, step=10,
-                        className="form-control form-control-sm"), width=8),
-                    dbc.Col(dbc.Button("Suggest", id="suggest-duration-btn", size="sm",
-                                       color="secondary", outline=True, className="w-100"), width=4),
-                ], className="g-2"),
-                    help_text="Starting value only - the actual run duration is now computed "
-                              "adaptively per the eACH/ACH fit-target settings (Settings menu) "
-                              "once the well-mixed eACH estimate is known, and overrides this."),
-                _labeled("Write interval (s)", dcc.Input(
-                    id="pimple-write-interval", type="number", value=10, min=1, max=600, step=1,
-                    className="form-control form-control-sm")),
-            ]),
-            html.Div(id="steady-state-controls", children=[
-                _labeled("Target well-mixed steady-state T", dcc.Input(
-                    id="target-t-ss", type="number", value=0.3, min=0.01, max=1.0, step=0.01,
-                    className="form-control form-control-sm"),
-                    help_text="Injection flow (source strength) is calculated automatically "
-                              "from this target and the ACH above."),
-                html.Div("Injection position", className="small fw-semibold text-uppercase mt-3 mb-1"),
-                html.Div(_GRID_SNAP_NOTE, className="form-text small mb-2"),
-                *_injection_position_controls(),
-                _labeled("Source zone size (m)", dcc.Input(
-                    id="source-zone-size", type="number", value=0.3, min=0.05, max=2.0, step=0.05,
-                    className="form-control form-control-sm"),
-                    help_text="Side length of the cube-shaped cellZone the contaminant source "
-                              "injects into. Larger zones dilute the injection over more cells; "
-                              "smaller zones concentrate it into fewer, higher-rate cells."),
-                _labeled("Phase 1 iterations (no UV)", dcc.Input(
-                    id="phase1-iterations", type="number", value=8000, min=500, max=50000, step=500,
-                    className="form-control form-control-sm")),
-                _labeled("Phase 2 iterations (UV on)", dcc.Input(
-                    id="phase2-iterations", type="number", value=3000, min=500, max=50000, step=500,
-                    className="form-control form-control-sm")),
-                dbc.Button("Suggest settling times (99.5%)", id="suggest-phases-btn", size="sm",
-                           color="secondary", outline=True, className="w-100 mt-1"),
-                _labeled("T_ss moving-average window (fraction of samples)", dcc.Input(
-                    id="t-ss-window-frac", type="number", value=0.15, min=0.01, max=0.9, step=0.01,
-                    className="form-control form-control-sm"),
-                    help_text="Room-wide T and every monitoring point report a trailing-window "
-                              "mean/CV over this fraction of the live per-iteration samples, "
-                              "instead of a single last-sample read - see the live-volAverage "
-                              "validation. 0.15 = last 15% of samples."),
-            ]),
+        # Simulation type, decay solver timing, and every steady-state run-
+        # budget field (phase1/2-iterations, T_ss window, deltaT scaling)
+        # moved to the Run Simulations tab's "Simulation settings" modal -
+        # this card only keeps what's genuinely room/problem geometry
+        # (where the source is, how large its zone is), not run tuning.
+        # "Target well-mixed steady-state T" was removed outright (not
+        # moved) - it only sets the source strength G, and the system is
+        # linear in G, so reduction_pct/eACH_uv (both ratios) and solver
+        # convergence speed are completely independent of its value - see
+        # steady_state_pipeline.REFERENCE_TARGET_T_SS.
+        _card("Contaminant source geometry", [
+            html.Div(_GRID_SNAP_NOTE, className="form-text small mb-2"),
+            *_injection_position_controls(),
+            _labeled("Source zone size (m)", dcc.Input(
+                id="source-zone-size", type="number", value=0.3, min=0.05, max=2.0, step=0.05,
+                className="form-control form-control-sm"),
+                help_text="Side length of the cube-shaped cellZone the contaminant source "
+                          "injects into. Larger zones dilute the injection over more cells; "
+                          "smaller zones concentrate it into fewer, higher-rate cells. Only used "
+                          "for steady-state runs."),
         ]),
 
-        dbc.Button("Run simulation", id="run-btn", color="success", className="w-100 mb-2"),
-        dbc.Button("Continue to longer duration", id="continue-btn", color="secondary",
-                   outline=True, className="w-100 mb-2"),
-        html.Div(id="run-validation-msg", className="small text-danger text-center mb-4"),
+        # sim-type/pimple-end-time/pimple-write-interval/phase1-iterations/
+        # phase2-iterations/t-ss-window-frac now render for real inside the
+        # Run Simulations tab's "Simulation settings" modal (see below) -
+        # not duplicated here. "Suggest" buttons are hidden, not rebuilt in
+        # the modal (suggest-phases-btn is redundant with deltaT scaling -
+        # see compute_scaled_delta_t; suggest-duration-btn wasn't part of
+        # this redesign) - kept only so their existing callbacks
+        # (_suggest_duration/_suggest_phases) still resolve.
+        html.Div([
+            dbc.Button("Suggest", id="suggest-duration-btn"),
+            dbc.Button("Suggest settling times (99.5%)", id="suggest-phases-btn"),
+        ], style={"display": "none"}),
+
+        # "Run simulation" is gone - the Run Simulations tab's "Start
+        # simulations" button is now the only launch point (its Z/ACH list
+        # fields, defaulting to a single value each, make a 1-combination
+        # run and a sweep the same code path). "Continue to longer
+        # duration" (decay-only) is hidden, not removed - its callbacks
+        # (_start_continue/_continue_pipeline_thread) stay intact in case
+        # it's needed again later. Both kept as hidden components (not
+        # deleted) since several callbacks still reference their ids via
+        # Output(..., allow_duplicate=True).
+        html.Div([
+            dbc.Button("Run simulation", id="run-btn"),
+            dbc.Button("Continue to longer duration", id="continue-btn"),
+            html.Div(id="run-validation-msg"),
+        ], style={"display": "none"}),
     ], width=4, className="compact-panel", style={"maxHeight": "88vh", "overflowY": "auto"}),
 
     # --- right column: 3D preview ---
@@ -1824,7 +1841,8 @@ scenario_tab = dbc.Row([
             "combination (every Z with every ACH), each into its own subfolder "
             "under the project directory. The flow field is converged once per "
             "distinct ACH and reused for every Z at that ACH, so a longer Z list "
-            "at a fixed ACH is much cheaper than it looks.",
+            "at a fixed ACH is much cheaper than it looks. A single Z and a "
+            "single ACH is just a 1-combination run - no separate mode to pick.",
             className="small text-muted mb-3",
         ),
         _labeled("Z values (comma-separated)",
@@ -1834,17 +1852,24 @@ scenario_tab = dbc.Row([
                  dcc.Input(id="scenario-ach-values", type="text", placeholder="e.g. 3, 6",
                            className="form-control form-control-sm mt-2")),
         html.Div(id="scenario-combo-count", className="small text-muted mt-2 mb-3"),
-        dbc.Button("Run Sweep", id="scenario-run-btn", color="success", className="w-100 mb-2"),
-        dbc.Button("Stop Sweep", id="scenario-stop-btn", color="danger", size="sm",
+        dbc.Button("Simulation settings…", id="scenario-settings-btn", color="secondary",
+                   outline=True, className="w-100 mb-2"),
+        dbc.Button("Start simulations", id="scenario-run-btn", color="success", className="w-100 mb-2"),
+        dbc.Button("Stop simulation", id="scenario-stop-btn", color="danger", size="sm",
                     className="mb-2 me-2", disabled=True),
-        dbc.Button("Pause Sweep", id="scenario-pause-btn", color="warning", size="sm",
+        dbc.Button("Pause simulation", id="scenario-pause-btn", color="warning", size="sm",
                     className="mb-2", disabled=True),
         html.Div(id="scenario-validation-msg", className="small text-danger mb-2"),
         html.Div(id="scenario-status-text", className="fs-6 fw-semibold mb-2"),
         dcc.Interval(id="scenario-poll", interval=2000, n_intervals=0, disabled=True),
     ], width=4),
     dbc.Col([
-        html.Div("Combinations", className="small fw-semibold text-uppercase mb-1"),
+        html.Div("Simulation Progress", className="small fw-semibold text-uppercase mb-1"),
+        html.Div(
+            "Per-monitoring-point results stay under Analysis of Results - this table is "
+            "room-average headline numbers only.",
+            className="small text-muted mb-1",
+        ),
         html.Div(id="scenario-progress-table"),
         html.Div("Running now", className="small fw-semibold text-uppercase mb-1 mt-3"),
         # One line per currently-active ACH/Z solve, overwritten in place
@@ -1866,6 +1891,119 @@ scenario_tab = dbc.Row([
         }),
     ], width=8),
 ], className="mt-3")
+
+# Simulation settings modal (Run Simulations tab): the fields that
+# actually govern how a run behaves, moved out of Project Setup's old
+# "Simulation type" card. Unlike settings_modal (Advanced Settings) below,
+# every field here IS the real, live-bound project-setting component
+# (sim-type, phase1-iterations, ... - same ids SETTINGS_FIELDS already
+# lists) rather than a "settings-"-prefixed shadow copy - so most of this
+# modal needs no Save/Cancel/Populate machinery at all: typing a value
+# already updates the project's settings dict immediately, the same way
+# ach/z-value always have, and it's written to the .guvcfd file the next
+# time the project itself is saved. deltat-scaling-enabled/
+# deltat-effective-fraction/deltat-target-fraction are the one place this
+# differs subtly: they're ALSO project settings now (see
+# steady_state_pipeline.merge_project_deltat_settings), but the Advanced
+# Settings modal keeps its own separate "settings-deltat-*" copies as the
+# fallback default for a brand-new project or one saved before these
+# fields existed - editing one does not edit the other, by design (the
+# user's own choice, accepting the small duplication for simplicity).
+simulation_settings_modal = dbc.Modal(
+    [
+        dbc.ModalHeader(dbc.ModalTitle("Simulation settings")),
+        dbc.ModalBody(
+            [
+                html.Div("Simulation type", className="small fw-bold text-uppercase mb-1"),
+                dbc.RadioItems(
+                    id="sim-type",
+                    className="btn-group w-100 mb-3",
+                    inputClassName="btn-check",
+                    labelClassName="btn btn-outline-primary",
+                    labelCheckedClassName="active",
+                    options=[
+                        {"label": "Decay", "value": "decay"},
+                        {"label": "Steady state", "value": "steady_state"},
+                    ],
+                    value="decay",
+                ),
+                html.Div(id="decay-controls", children=[
+                    html.Div("Decay solver run settings", className="small fw-bold text-uppercase mb-1"),
+                    _labeled("Suggested duration (s)", dbc.Row([
+                        dbc.Col(dcc.Input(
+                            id="pimple-end-time", type="number", value=120, min=10, max=7200, step=10,
+                            className="form-control form-control-sm"), width=8),
+                        dbc.Col(dbc.Button("Suggest", id="suggest-duration-btn", size="sm",
+                                           color="secondary", outline=True, className="w-100"), width=4),
+                    ], className="g-2"),
+                        help_text="Starting value only - the actual run duration is now computed "
+                                  "adaptively per the eACH/ACH fit-target settings (Settings menu) "
+                                  "once the well-mixed eACH estimate is known, and overrides this."),
+                    _labeled("Write interval (s)", dcc.Input(
+                        id="pimple-write-interval", type="number", value=10, min=1, max=600, step=1,
+                        className="form-control form-control-sm")),
+                    html.Hr(className="my-2"),
+                ]),
+                html.Div(id="steady-state-controls", children=[
+                    html.Div("Steady-state run budget", className="small fw-bold text-uppercase mb-1"),
+                    _labeled("Phase 1 iterations (no UV)", dcc.Input(
+                        id="phase1-iterations", type="number", value=8000, min=500, max=50000, step=500,
+                        className="form-control form-control-sm")),
+                    _labeled("Phase 2 iterations (UV on)", dcc.Input(
+                        id="phase2-iterations", type="number", value=3000, min=500, max=50000, step=500,
+                        className="form-control form-control-sm")),
+                    _labeled("T_ss moving-average window (fraction of samples)", dcc.Input(
+                        id="t-ss-window-frac", type="number", value=0.15, min=0.01, max=0.9, step=0.01,
+                        className="form-control form-control-sm"),
+                        help_text="Room-wide T and every monitoring point report a trailing-window "
+                                  "mean/CV over this fraction of the live per-iteration samples, "
+                                  "instead of a single last-sample read. 0.15 = last 15% of samples."),
+                    html.Hr(className="my-2"),
+                    html.Div("Residence-time-scaled deltaT", className="small fw-bold text-uppercase mb-1"),
+                    html.Div(
+                        "Lets the iteration budget above cover enough real residence time to reach a "
+                        "reliable steady state, by scaling OpenFOAM's own pseudo time step instead of "
+                        "running more iterations - simpleFoam's U/p/k/omega solve has no time-derivative "
+                        "term at all, so this doesn't touch flow-field stability.",
+                        className="small text-muted mb-2",
+                    ),
+                    _settings_checkbox_field(
+                        "deltat-scaling-enabled", "Scale time steps automatically",
+                        "On by default. A case that already converges fine at a deltaT of 1 (typically "
+                        "higher-ACH, short residence time) is completely unaffected.",
+                        True,
+                    ),
+                    _settings_field(
+                        "deltat-effective-fraction", "Expected ACH/eACH effectiveness",
+                        "\"Effective\" = real, measured ventilation/UV removal typically runs below the "
+                        "nominal value used to size this room. Lower-ACH rooms need a proportionally "
+                        "larger time-step scale to reach the same real-time coverage within the "
+                        "iteration budget above.",
+                        "x", 0.7,
+                    ),
+                    _settings_field(
+                        "deltat-target-fraction", "Target fraction of steady state",
+                        "How close to true steady state the scaled deltaT targets within the iteration "
+                        "budget above - 0.995 ~= 5.3 residence times.",
+                        "", 0.995,
+                    ),
+                ]),
+                dbc.Alert(
+                    "These settings will be saved the next time the project saves. Everything above is "
+                    "a project setting, same as Z/ACH - no separate file, no ambiguity about which value "
+                    "was actually used for a given project's results.",
+                    color="light", className="small mt-2 mb-0",
+                ),
+            ],
+            style={"maxHeight": "64vh", "overflowY": "auto"},
+        ),
+        dbc.ModalFooter([
+            dbc.Button("Close", id="simulation-settings-close-btn", color="primary"),
+        ]),
+    ],
+    id="simulation-settings-modal", is_open=False, size="lg",
+)
+
 
 def _empty_analysis_figure():
     return go.Figure(layout=dict(
@@ -2466,6 +2604,7 @@ app.layout = dbc.Container([
         id="help-modal", is_open=False, size="lg", scrollable=True,
     ),
     settings_modal,
+    simulation_settings_modal,
     grid_align_modal,
     dbc.Row(
         dbc.Col(html.H4("GUV-CFD", className="mt-3 mb-1"), width="auto"),
@@ -2957,6 +3096,24 @@ def _toggle_settings_modal(_open, _cancel, _save, is_open):
 
 
 @app.callback(
+    Output("simulation-settings-modal", "is_open"),
+    Input("scenario-settings-btn", "n_clicks"),
+    Input("simulation-settings-close-btn", "n_clicks"),
+    State("simulation-settings-modal", "is_open"),
+    prevent_initial_call=True,
+)
+def _toggle_simulation_settings_modal(_open, _close, is_open):
+    # No populate/save round-trip needed (unlike settings-modal above) -
+    # every field in this modal is either a live-bound project setting
+    # (already up to date, saves with the project) or one of the deltat-*
+    # fields, which read their initial value straight from the layout
+    # default/whatever the loaded project already set via SETTINGS_FIELDS -
+    # opening/closing this modal never needs to re-fetch or write anything
+    # itself.
+    return not is_open
+
+
+@app.callback(
     [Output(fid, "value") for fid in _SETTINGS_FIELD_IDS],
     Input("menu-settings", "n_clicks"),
     prevent_initial_call=True,
@@ -3023,6 +3180,10 @@ _NEW_FIELD_DEFAULTS = {
     # project - this is that old global default, for any .guvcfd saved
     # before it moved to a per-project field.
     "source-zone-size": 0.3,
+    # deltaT scaling used to be a global advanced setting too - same
+    # defaults as ADVANCED_SETTINGS_DEFAULTS at the time it moved to a
+    # per-project field, for the same backward-compat reason.
+    "deltat-scaling-enabled": True, "deltat-effective-fraction": 0.7, "deltat-target-fraction": 0.995,
 }
 
 
@@ -3154,7 +3315,20 @@ def _open_project(n_clicks):
     _loaded["settings_path"] = path
     proj_name = path.replace("\\", "/").rsplit("/", 1)[-1]
 
-    field_values = [settings.get(fid, _NEW_FIELD_DEFAULTS.get(fid)) for fid in SETTINGS_FIELDS]
+    # scenario-z-values/scenario-ach-values are the Run Simulations tab's
+    # own Z/ACH list fields (a project's real ach/z-value are still a
+    # single scalar each internally) - for a project saved before these
+    # list fields existed, fall back to that scalar's own string
+    # representation instead of a static default, so the Run tab starts
+    # pre-filled with "the project's ACH/Z" rather than blank.
+    def _field_value(fid):
+        if fid == "scenario-z-values" and fid not in settings:
+            return str(settings.get("z-value", _NEW_FIELD_DEFAULTS.get("z-value", "")))
+        if fid == "scenario-ach-values" and fid not in settings:
+            return str(settings.get("ach", _NEW_FIELD_DEFAULTS.get("ach", "")))
+        return settings.get(fid, _NEW_FIELD_DEFAULTS.get(fid))
+
+    field_values = [_field_value(fid) for fid in SETTINGS_FIELDS]
     max_values = []
     for _prefix, _label, dim, _default_fn, *_rest in POSITION_FIELDS:
         if room is not None:
@@ -3229,6 +3403,11 @@ def _launch_run(sim_type, guv_path, case_dir, room, settings):
     _reset_run_progress(sim_type)
     _run_state["status"] = "running"
     _run_state["case_dir"] = case_dir
+    # For _single_run_progress_table's benefit (see _start_scenario_sweep's
+    # 1-combination branch) - the Run Simulations tab needs a Z/ACH to show
+    # even for a run launched this way, not just Processing's own display.
+    _run_state["z"] = settings.get("z-value")
+    _run_state["ach"] = settings.get("ach")
     thread = threading.Thread(
         target=_run_pipeline_thread,
         args=(sim_type, guv_path, case_dir, room, settings),
@@ -3656,6 +3835,21 @@ def _update_scenario_combo_count(z_text, ach_text):
     Output("scenario-poll", "disabled"),
     Output("scenario-validation-msg", "children"),
     Output("main-tabs", "active_tab", allow_duplicate=True),
+    # A 1-combination "sweep" routes to the exact same single-run mechanism
+    # Processing has always used (_launch_run, plus its paused-flow/
+    # unfinished-Phase2/overwrite checks) instead of scenario_runs.run_sweep -
+    # preserves flow-convergence/Phase1-extrapolation decision-panel support,
+    # which the plain sweep path has no equivalent for (a paused decision
+    # there just fails that combo, see run_sweep's own docstring). These
+    # outputs mirror _start_run's own for exactly that branch; every one is
+    # allow_duplicate since _start_run's callback is still the primary
+    # registration for each (kept, though its own button is now hidden).
+    Output("run-btn", "disabled", allow_duplicate=True),
+    Output("continue-btn", "disabled", allow_duplicate=True),
+    Output("run-poll", "disabled", allow_duplicate=True),
+    Output("run-validation-msg", "children", allow_duplicate=True),
+    Output("overwrite-confirm", "displayed", allow_duplicate=True),
+    Output("overwrite-confirm", "message", allow_duplicate=True),
     Input("scenario-run-btn", "n_clicks"),
     State("scenario-z-values", "value"),
     State("scenario-ach-values", "value"),
@@ -3663,37 +3857,99 @@ def _update_scenario_combo_count(z_text, ach_text):
     prevent_initial_call=True,
 )
 def _start_scenario_sweep(n_clicks, z_text, ach_text, *values):
-    if _scenario_state["status"] == "running":
-        return True, False, False, dash.no_update, dash.no_update
+    # 6 dash.no_update placeholders for the single-run-only outputs below,
+    # reused on every early return that doesn't take the 1-combo branch.
+    _NA = dash.no_update
+    if _scenario_state["status"] == "running" or _run_state["status"] == "running":
+        return True, False, False, dash.no_update, dash.no_update, _NA, _NA, _NA, _NA, _NA, _NA
 
     room = _loaded["room"]
     guv_path = _loaded["path"]
     if room is None or guv_path is None:
         return (False, True, True, "No .guv project loaded - use File > Open Project or "
-                "Load .guv file first.", dash.no_update)
+                "Load .guv file first.", dash.no_update, _NA, _NA, _NA, _NA, _NA, _NA)
 
     settings = dict(zip(SETTINGS_FIELDS, values))
     if not settings.get("case-dir"):
-        return False, True, True, "Set an OpenFOAM project directory first.", dash.no_update
+        return (False, True, True, "Set an OpenFOAM project directory first.", dash.no_update,
+                _NA, _NA, _NA, _NA, _NA, _NA)
 
     try:
         z_values = _parse_number_list(z_text)
         ach_values = _parse_number_list(ach_text)
     except ValueError as e:
-        return False, True, True, f"Can't parse Z/ACH list: {e}", dash.no_update
+        return (False, True, True, f"Can't parse Z/ACH list: {e}", dash.no_update,
+                _NA, _NA, _NA, _NA, _NA, _NA)
     if not z_values or not ach_values:
-        return False, True, True, "Enter at least one Z value and one ACH value.", dash.no_update
+        return (False, True, True, "Enter at least one Z value and one ACH value.", dash.no_update,
+                _NA, _NA, _NA, _NA, _NA, _NA)
 
     missing = _validate_settings(settings)
     if missing:
         return (False, True, True,
                 "Missing required value(s) - fill these in on Project Setup before running: "
-                + ", ".join(missing) + ".", dash.no_update)
+                + ", ".join(missing) + ".", dash.no_update, _NA, _NA, _NA, _NA, _NA, _NA)
 
+    combos = scenario_runs.sweep_combinations(z_values, ach_values)
     adv = load_advanced_settings()
-    _launch_scenario_sweep(guv_path, _loaded.get("settings_path"), settings["case-dir"],
-                            room, settings, adv, z_values, ach_values)
-    return True, False, False, "", "scenario-runs"
+    if len(combos) != 1:
+        _launch_scenario_sweep(guv_path, _loaded.get("settings_path"), settings["case-dir"],
+                                room, settings, adv, z_values, ach_values)
+        return True, False, False, "", "scenario-runs", _NA, _NA, _NA, _NA, _NA, _NA
+
+    # Exactly 1 combination - single-run path (see the Output block's own
+    # comment). ach/z-value themselves stay hidden/unused elsewhere - this
+    # single value is threaded straight into `settings` instead.
+    z, ach = combos[0]
+    settings = dict(settings, ach=ach, **{"z-value": z})
+    case_dir = settings["case-dir"]
+    sim_type = settings["sim-type"]
+
+    pending = case_awaiting_flow_decision(
+        case_dir, oscillation_window=adv["oscillation-window"],
+        oscillation_growth_tol=adv["oscillation-growth-tol"], rel_tol=adv["flow-rel-tol"] / 100.0)
+    if pending:
+        _run_log(f"Found a paused flow convergence in {case_dir} from an earlier session "
+                 f"({pending['total_iterations']} iterations so far) - awaiting your decision "
+                 f"instead of starting a fresh run.")
+        _run_state["status"] = "awaiting_decision"
+        _run_state["decision"] = {
+            "sim_type": sim_type, "guv_path": guv_path, "case_dir": case_dir, "room": room,
+            "settings": settings, "diagnostic": pending["diagnostic"],
+            "total_iterations": pending["total_iterations"], "started_at": datetime.now(), "start": time.time(),
+            "kind": "flow",
+        }
+        return True, False, False, "", "processing", True, True, False, "", False, _NA
+
+    resume_info = case_awaiting_phase2_resume(case_dir)
+    if resume_info:
+        if resume_info["phase1_done"]:
+            detail = (f"Phase 1 of the steady-state scenario already converged "
+                      f"({resume_info['phase1_iterations']} iterations) - resuming will skip "
+                      f"straight into Phase 2.")
+        else:
+            detail = ("Phase 1 hadn't converged yet when this run stopped - resuming will redo "
+                      "Phase 1, but mesh generation and flow convergence (already done, and the "
+                      "more expensive steps) won't be repeated.")
+        _run_log(f"Found an unfinished steady-state run in {case_dir} from an earlier session - "
+                 f"awaiting your decision instead of starting a fresh run. {detail}")
+        _run_state["status"] = "awaiting_phase2_resume"
+        _run_state["phase2_decision"] = {
+            "sim_type": sim_type, "guv_path": guv_path, "case_dir": case_dir, "room": room,
+            "settings": settings, "detail": detail, "started_at": datetime.now(), "start": time.time(),
+        }
+        return True, False, False, "", "processing", True, True, False, "", False, _NA
+
+    if _case_dir_has_data(case_dir):
+        _pending_run.update(sim_type=sim_type, guv_path=guv_path, case_dir=case_dir,
+                             room=room, settings=settings)
+        return (True, False, False, "", "processing", False, False, True, "", True,
+                f"{case_dir} already has simulation data (results.json and/or solver "
+                f"output). Running will regenerate the mesh and overwrite the case "
+                f"directory in place - existing results may be lost. Continue anyway?")
+
+    _launch_run(sim_type, guv_path, case_dir, room, settings)
+    return True, False, False, "", "processing", True, True, False, "", False, _NA
 
 
 @app.callback(
@@ -3702,7 +3958,13 @@ def _start_scenario_sweep(n_clicks, z_text, ach_text, *values):
     prevent_initial_call=True,
 )
 def _stop_scenario_sweep(n_clicks):
-    if _scenario_state["status"] == "running":
+    # A 1-combination "sweep" runs on _run_state, not _scenario_state (see
+    # _start_scenario_sweep) - Stop/Pause need to act on whichever is
+    # actually active.
+    if _run_state["status"] == "running":
+        _run_state["stop_requested"] = True
+        _run_log("Stop requested...")
+    elif _scenario_state["status"] == "running":
         _scenario_state["stop_requested"] = True
         _scenario_log("Stop requested - the sweep will stop before its next combination...")
     return (dash.no_update,)
@@ -3714,6 +3976,15 @@ def _stop_scenario_sweep(n_clicks):
     prevent_initial_call=True,
 )
 def _toggle_pause_scenario_sweep(n_clicks):
+    if _run_state["status"] == "running":
+        if _run_state.get("pause_requested"):
+            _run_state["pause_requested"] = False
+            _run_log("Continue requested - resuming the suspended solver process...")
+        else:
+            _run_state["pause_requested"] = True
+            _run_log("Pause requested - suspending the active solver process in place "
+                     "(no iterations lost)...")
+        return (dash.no_update,)
     if _scenario_state["status"] != "running":
         return (dash.no_update,)
     if _scenario_state.get("pause_requested"):
@@ -3726,53 +3997,118 @@ def _toggle_pause_scenario_sweep(n_clicks):
     return (dash.no_update,)
 
 
+# Live-status key suffixes (see steady_state_pipeline.run_steady_state_
+# scenario's status_key1/status_key2, scenario_runs._run_shared_control/
+# _run_decay_scenario) mapped to the same named stages the single-run
+# checklist already uses - lets a currently-running combo's row show
+# *which* stage it's in using data status_fn already provides, without
+# needing new structured-progress plumbing (see the Est. time to finish
+# column's own placeholder below, which does need that).
+_LIVE_STAGE_SUFFIXES = [("Phase2", "Phase 2"), ("UV-on", "Phase 2"), ("Phase1", "Phase 1"),
+                        ("control", "Flow convergence"), ("flow", "Flow convergence")]
+
+
+def _combo_live_stage(z, ach):
+    """Best-effort current stage for a combo with no results.json yet -
+    None if it hasn't started (no matching key in live_status at all).
+    """
+    prefix = f"Z={z}/ACH={ach}/"
+    for key in _scenario_state["live_status"]:
+        if key.startswith(prefix) or key == f"ACH={ach}/control":
+            for suffix, label in _LIVE_STAGE_SUFFIXES:
+                if key.endswith(suffix):
+                    return label
+            return "Running"
+    return None
+
+
 def _scenario_progress_table():
     combos = _scenario_state["combos"]
     if not combos:
         return html.Div("No sweep run yet.", className="small text-muted")
     results = _scenario_state["results"]
-    header = html.Tr([html.Th("Z"), html.Th("ACH"), html.Th("Status"), html.Th("Reduction"), html.Th("eACH_uv")])
+    header = html.Tr([
+        html.Th("Z"), html.Th("ACH"), html.Th("Status"), html.Th("Est. time to finish"),
+        html.Th("Total reduction %"), html.Th("Measured ACH eff. %"), html.Th("Measured UV eff. %"),
+        html.Th("Est. ACH /hr"), html.Th("Est. eACH /hr"),
+    ])
     rows = [header]
     for z, ach in combos:
         entry = results.get((z, ach))
+        metrics = {"total_reduction_pct": None, "ach_efficiency_pct": None, "uv_efficiency_pct": None,
+                   "est_ach_per_hr": None, "est_each_per_hr": None}
         if entry is None:
-            status, reduction, eACH = "pending", "", ""
+            stage = _combo_live_stage(z, ach)
+            status = stage if stage else "pending"
         elif entry["status"] == "done":
-            detail = entry["detail"]
-            status = "done"
-            if "reduction_pct" in detail:
-                # Prefer the control-measured-ventilation-corrected variants
-                # of both columns when a control run was part of this sweep
-                # (see compute_corrected_eACH_uv_from_control's docstring) -
-                # reduction_pct itself still uses Phase 1's own T_ss1 (which
-                # can be biased low by point-source mixing lag), same reason
-                # eACH_uv_steady_state uses the nominal ACH. Falling back to
-                # the uncorrected fields keeps this working for older
-                # results/single runs that never had a control run. Confirmed
-                # directly: a real steady-state combo showed 39.24 /hr
-                # (nominal) vs 19.59 /hr (corrected) for a room only actually
-                # delivering half its nominal ACH.
-                reduction_val = detail.get("reduction_pct_corrected", detail["reduction_pct"])
-                reduction = f"{reduction_val:.1f}%"
-                eACH_val = detail.get("eACH_uv_steady_state_corrected", detail["eACH_uv_steady_state"])
-                eACH = f"{eACH_val:.4g} /hr"
-            else:
-                # Decay-mode trimmed result (_trim_decay_report) has no
-                # reduction_pct field at all - compute the same analytical
-                # steady-state ratio the .docx report shows (see
-                # report._decay_reduction_ratio), from whichever ACH/eACH
-                # pair is available (measured-corrected if a control run
-                # was used, else the nominal-ACH one).
-                eACH_eff = detail.get("eACH_uv_effective_corrected", detail.get("eACH_uv_effective"))
-                ach_eff = detail.get("ventilation_ach_measured", detail.get("ventilation_ach"))
-                ratio = (_decay_reduction_ratio(eACH_eff, ach_eff)
-                          if eACH_eff is not None and ach_eff is not None else None)
-                reduction = f"{ratio * 100:.1f}%" if ratio is not None else "n/a"
-                eACH = f"{eACH_eff:.4g} /hr" if eACH_eff is not None else "n/a"
+            status = "Finished"
+            metrics = combo_summary_metrics(entry["detail"])
         else:
-            status, reduction, eACH = f"error: {entry['detail']}", "", ""
-        rows.append(html.Tr([html.Td(z), html.Td(ach), html.Td(status), html.Td(reduction), html.Td(eACH)]))
+            status = f"error: {entry['detail']}"
+        # Est. time to finish needs structured per-combo progress tracking
+        # (elapsed/iteration/target) - not available from status_fn's plain
+        # display string today, so left blank rather than guessed.
+        est_time = ""
+
+        def _pct(v):
+            return f"{v:.1f}%" if v is not None else ("" if entry is None else "n/a")
+
+        def _rate(v):
+            return f"{v:.4g} /hr" if v is not None else ("" if entry is None else "n/a")
+
+        rows.append(html.Tr([
+            html.Td(z), html.Td(ach), html.Td(status), html.Td(est_time),
+            html.Td(_pct(metrics["total_reduction_pct"])), html.Td(_pct(metrics["ach_efficiency_pct"])),
+            html.Td(_pct(metrics["uv_efficiency_pct"])), html.Td(_rate(metrics["est_ach_per_hr"])),
+            html.Td(_rate(metrics["est_each_per_hr"])),
+        ]))
     return dbc.Table(rows, bordered=False, hover=True, size="sm", className="small")
+
+
+_RUN_STATE_ACTIVE_STATUSES = ("running", "awaiting_decision", "awaiting_phase2_resume")
+
+
+def _single_run_progress_table():
+    """The Simulation Progress table's content for a 1-combination run
+    (see _start_scenario_sweep) - _run_state has no "combos"/"results" the
+    way _scenario_state does, so this builds the equivalent single row
+    directly from _run_state instead of reusing _scenario_progress_table.
+    """
+    z = _run_state.get("z")
+    ach = _run_state.get("ach")
+    status = _run_state["status"]
+    stage = {
+        "running": "Running", "awaiting_decision": "paused - awaiting decision",
+        "awaiting_phase2_resume": "paused - awaiting decision", "done": "Finished",
+        "error": "error", "stopped": "Stopped",
+    }.get(status, status)
+    metrics = {"total_reduction_pct": None, "ach_efficiency_pct": None, "uv_efficiency_pct": None,
+               "est_ach_per_hr": None, "est_each_per_hr": None}
+    if status == "done" and _run_state.get("case_dir"):
+        try:
+            with open(f"{_run_state['case_dir']}/results.json") as f:
+                metrics = combo_summary_metrics(json.load(f))
+        except Exception:
+            pass
+
+    def _pct(v):
+        return f"{v:.1f}%" if v is not None else ""
+
+    def _rate(v):
+        return f"{v:.4g} /hr" if v is not None else ""
+
+    header = html.Tr([
+        html.Th("Z"), html.Th("ACH"), html.Th("Status"), html.Th("Est. time to finish"),
+        html.Th("Total reduction %"), html.Th("Measured ACH eff. %"), html.Th("Measured UV eff. %"),
+        html.Th("Est. ACH /hr"), html.Th("Est. eACH /hr"),
+    ])
+    row = html.Tr([
+        html.Td(z), html.Td(ach), html.Td(stage), html.Td(""),
+        html.Td(_pct(metrics["total_reduction_pct"])), html.Td(_pct(metrics["ach_efficiency_pct"])),
+        html.Td(_pct(metrics["uv_efficiency_pct"])), html.Td(_rate(metrics["est_ach_per_hr"])),
+        html.Td(_rate(metrics["est_each_per_hr"])),
+    ])
+    return dbc.Table([header, row], bordered=False, hover=True, size="sm", className="small")
 
 
 @app.callback(
@@ -3789,6 +4125,34 @@ def _scenario_progress_table():
     prevent_initial_call=True,
 )
 def _poll_scenario(n_intervals):
+    # A 1-combination run (see _start_scenario_sweep) lives in _run_state,
+    # not _scenario_state - render from whichever is actually active. Once
+    # a decision panel is needed, main-tabs.active_tab already switched to
+    # "processing" at launch time (same as the old Run button always did);
+    # this only covers a plain running/finished/stopped/error single run
+    # while the user stays on this tab watching it.
+    if _run_state["status"] in _RUN_STATE_ACTIVE_STATUSES or (
+            _run_state["status"] != "idle" and _scenario_state["status"] != "running"
+            and _run_state.get("case_dir") and _run_state.get("z") is not None):
+        status = _run_state["status"]
+        log_text = "\n".join(_run_state["log"][-300:])
+        live_text = _solver_progress_text() or "(nothing running)"
+        still_running = status == "running"
+        status_text = {
+            "running": "Running... (1/1 combination)",
+            "done": "Finished. 1/1 succeeded.",
+            "error": "Failed - see log below.",
+            "stopped": "Stopped.",
+            "awaiting_decision": "Paused - awaiting your decision (see Processing tab).",
+            "awaiting_phase2_resume": "Paused - awaiting your decision (see Processing tab).",
+        }.get(status, "")
+        paused = still_running and _run_state.get("pause_requested", False)
+        if paused:
+            status_text = "Paused - solver suspended in place. Click Continue to resume."
+        pause_btn_label = "Continue simulation" if paused else "Pause simulation"
+        return (log_text, live_text, status_text, _single_run_progress_table(),
+                not still_running, still_running, not still_running, not still_running, pause_btn_label)
+
     status = _scenario_state["status"]
     log_text = "\n".join(_scenario_state["log"][-300:])
     live_status = _scenario_state.get("live_status", {})

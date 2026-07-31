@@ -3,7 +3,9 @@ import time
 
 import pytest
 
-from guvcfd.report import generate_report_docx, _format_elapsed, _run_timing, _trust_status_rows
+from guvcfd.report import (
+    generate_report_docx, _format_elapsed, _run_timing, _trust_status_rows, combo_summary_metrics,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -714,3 +716,51 @@ def test_trust_status_rows_reported_in_generated_docx(tmp_path):
     doc = Document(out_path)
     full_text = "\n".join(p.text for p in doc.paragraphs)
     assert "Convergence & Trust" in full_text
+
+
+def test_combo_summary_metrics_steady_state():
+    detail = {
+        "reduction_pct_corrected": 92.7, "eACH_uv_steady_state_corrected": 76.7,
+        "eACH_uv_well_mixed": 124.9,
+        "ach_delivery": {"measured_ach": 5.93, "nominal_ach": 6.0, "ratio": 0.989},
+    }
+    metrics = combo_summary_metrics(detail)
+    assert metrics["total_reduction_pct"] == 92.7
+    assert metrics["est_each_per_hr"] == 76.7
+    assert metrics["ach_efficiency_pct"] == pytest.approx(98.9)
+    assert metrics["est_ach_per_hr"] == 5.93
+    assert metrics["uv_efficiency_pct"] == pytest.approx(76.7 / 124.9 * 100)
+
+
+def test_combo_summary_metrics_steady_state_falls_back_to_uncorrected():
+    # No "_corrected" fields (no control run was used) - falls back to the
+    # plain reduction_pct/eACH_uv_steady_state fields.
+    detail = {"reduction_pct": 85.8, "eACH_uv_steady_state": 18.2, "eACH_uv_well_mixed": 20.0}
+    metrics = combo_summary_metrics(detail)
+    assert metrics["total_reduction_pct"] == 85.8
+    assert metrics["est_each_per_hr"] == 18.2
+    assert metrics["ach_efficiency_pct"] is None  # no ach_delivery present
+    assert metrics["uv_efficiency_pct"] == pytest.approx(18.2 / 20.0 * 100)
+
+
+def test_combo_summary_metrics_decay_mode():
+    # No "reduction_pct" key at all - is_steady_state must be False, using
+    # the analytical _decay_reduction_ratio and decay's own mixing_efficiency.
+    detail = {
+        "eACH_uv_effective_corrected": 8.97, "ventilation_ach_measured": 3.0,
+        "mixing_efficiency_corrected": 0.873,
+        "ach_delivery": {"measured_ach": 2.97, "ratio": 0.99},
+    }
+    metrics = combo_summary_metrics(detail)
+    assert metrics["total_reduction_pct"] == pytest.approx(8.97 / (3.0 + 8.97) * 100)
+    assert metrics["est_each_per_hr"] == 8.97
+    assert metrics["uv_efficiency_pct"] == pytest.approx(87.3)
+    assert metrics["ach_efficiency_pct"] == pytest.approx(99.0)
+    assert metrics["est_ach_per_hr"] == 2.97
+
+
+def test_combo_summary_metrics_missing_fields_are_none_not_errors():
+    assert combo_summary_metrics({}) == {
+        "total_reduction_pct": None, "ach_efficiency_pct": None, "uv_efficiency_pct": None,
+        "est_ach_per_hr": None, "est_each_per_hr": None,
+    }
