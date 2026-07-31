@@ -1,3 +1,4 @@
+import dash
 import pytest
 
 from guvcfd import app as guvcfd_app
@@ -366,3 +367,42 @@ def test_write_single_run_summary_csv(tmp_path):
 def test_write_single_run_summary_csv_missing_results_json_is_a_noop(tmp_path):
     guvcfd_app._write_single_run_summary_csv(str(tmp_path))  # must not raise
     assert not (tmp_path / "run_summary.csv").exists()
+
+
+def test_resync_pollers_reenables_both_for_an_active_single_run():
+    # Regression: a mid-run page refresh resets run-poll/scenario-poll's
+    # own "disabled" prop back to its layout default (True) - _run_state
+    # itself is untouched (it's server-side, independent of any browser
+    # session - confirmed directly: a live decay run's pimpleFoam processes
+    # kept computing normally through a refresh that left the UI blank),
+    # but with nothing to re-enable the poller, the page never resyncs on
+    # its own. Single-run mode needs BOTH re-enabled: scenario-poll drives
+    # the actual visible rendering (see _poll_scenario), but the decision
+    # panels are only ever toggled by run-poll (see _poll_run).
+    _reset()
+    _reset_scenario()
+    guvcfd_app._run_state["status"] = "awaiting_decision"
+    guvcfd_app._scenario_state["status"] = "idle"
+    run_poll_disabled, scenario_poll_disabled = guvcfd_app._resync_pollers(1)
+    assert run_poll_disabled is False
+    assert scenario_poll_disabled is False
+
+
+def test_resync_pollers_reenables_only_scenario_poll_for_an_active_sweep():
+    _reset()
+    _reset_scenario()
+    guvcfd_app._run_state["status"] = "idle"
+    guvcfd_app._scenario_state["status"] = "running"
+    run_poll_disabled, scenario_poll_disabled = guvcfd_app._resync_pollers(1)
+    assert run_poll_disabled is dash.no_update
+    assert scenario_poll_disabled is False
+
+
+def test_resync_pollers_does_nothing_when_nothing_is_running():
+    _reset()
+    _reset_scenario()
+    guvcfd_app._run_state["status"] = "idle"
+    guvcfd_app._scenario_state["status"] = "idle"
+    run_poll_disabled, scenario_poll_disabled = guvcfd_app._resync_pollers(1)
+    assert run_poll_disabled is dash.no_update
+    assert scenario_poll_disabled is dash.no_update

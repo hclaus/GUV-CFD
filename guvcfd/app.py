@@ -1770,8 +1770,8 @@ project_setup_tab = dbc.Row([
             dbc.Checkbox(id="fan-enable", value=False, label="Enable fan", className="mb-2"),
             html.Div(id="fan-controls", children=[
                 _labeled("Speed (m/s), 0.05–0.5 typical", dcc.Slider(
-                    id="fan-speed", min=0.05, max=0.5, step=0.01, value=0.3,
-                    marks={0.05: "0.05", 0.5: "0.5"},
+                    id="fan-speed", min=0.05, max=1.5, step=0.01, value=0.3,
+                    marks={0.05: "0.05", 0.5: "0.5", 1.5: "1.5"},
                     tooltip={"placement": "bottom", "always_visible": True})),
                 _labeled("Direction", dbc.RadioItems(
                     id="fan-direction",
@@ -2728,6 +2728,16 @@ app.layout = dbc.Container([
     dcc.Store(id="results-data"),
     dcc.Store(id="results-case-dir"),
     dcc.Interval(id="run-poll", interval=2000, n_intervals=0, disabled=True),
+    # Fires ONCE, shortly after every page load (including a plain browser
+    # refresh) - run-poll/scenario-poll's own "disabled" state lives only in
+    # the browser (a dcc.Interval prop), always reset back to its layout
+    # default (True) on load, with nothing to re-enable it from the SERVER's
+    # actual _run_state/_scenario_state (a run in progress is tracked
+    # entirely server-side, in a plain module-level dict, completely
+    # independent of any browser session - confirmed directly: a live decay
+    # run's pimpleFoam processes kept computing normally through a page
+    # refresh that left the UI showing nothing). See _resync_pollers below.
+    dcc.Interval(id="resync-check", interval=500, n_intervals=0, max_intervals=1),
     dcc.ConfirmDialog(id="overwrite-confirm"),
     dbc.Modal(
         [
@@ -4265,6 +4275,43 @@ def _scenario_progress_table():
 
 
 _RUN_STATE_ACTIVE_STATUSES = ("running", "awaiting_decision", "awaiting_phase2_resume")
+
+
+@app.callback(
+    Output("run-poll", "disabled", allow_duplicate=True),
+    Output("scenario-poll", "disabled", allow_duplicate=True),
+    Input("resync-check", "n_intervals"),
+    prevent_initial_call=True,
+)
+def _resync_pollers(n_intervals):
+    """Re-enables whichever poller(s) a genuinely in-progress run needs,
+    once, right after every page load - see resync-check's own docstring
+    (app.layout) for why this gap exists at all: _run_state/_scenario_state
+    track a run's progress entirely server-side, completely independent of
+    any browser session, but run-poll/scenario-poll's own "disabled" prop
+    lives only in the browser and always resets to its layout default
+    (True) on load - so a mid-run page refresh left the UI looking
+    completely blank/stuck even though the actual solver kept computing
+    normally the whole time (confirmed directly on a live decay run).
+
+    scenario-poll drives the actual visible rendering for BOTH the sweep
+    table and the unified tab's 1-combination case (see _poll_scenario) -
+    re-enabled whenever EITHER state shows something active. run-poll
+    additionally drives flow-decision-panel/phase2-resume-panel's own
+    visibility (see _poll_run) - those are only ever toggled by run-poll,
+    not scenario-poll, so a single-run decision pause specifically needs
+    run-poll re-enabled too, not just scenario-poll.
+
+    Does nothing (no_update) for whichever poller isn't actually needed -
+    a normal launch already starts from a correctly-disabled state, and
+    this must never turn a poller ON when nothing is running.
+    """
+    run_active = _run_state["status"] in _RUN_STATE_ACTIVE_STATUSES
+    scenario_active = _scenario_state["status"] == "running"
+    return (
+        False if run_active else dash.no_update,
+        False if (run_active or scenario_active) else dash.no_update,
+    )
 
 
 def _single_run_progress_table():
