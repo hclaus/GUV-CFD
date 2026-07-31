@@ -139,8 +139,23 @@ def set_function_object_enabled(case_dir, function_name, enabled):
     return cd_path
 
 
+# PIMPLE (system/fvSolution) runs with nOuterCorrectors 3, specifically so it
+# stays stable well above Co=1 (unlike PISO) - the template's original 0.5
+# left most of that headroom unused, letting a single locally-high-velocity
+# cell (e.g. near a diffuser) throttle deltaT for the entire domain
+# (confirmed directly: a UV-off control run's adaptive deltaT collapsed to
+# ~0.08s, on track for tens of thousands of steps to cover a ~1400s target).
+# Every pimpleFoam use in this pipeline (control runs, decay's UV-on/UV-off
+# runs, LTS-mode flow convergence) only cares about the bulk room-average
+# quantity's RATE (fit via regression, not fine local transient structure),
+# so this is applied unconditionally here - the one common choke point every
+# timing setup already goes through - rather than only in the template,
+# which wouldn't reach a case directory cloned before this fix existed.
+_MAX_CO = 5
+
+
 def set_control_dict_time(case_dir, end_time=None, write_interval=None, delta_t=None):
-    """Set endTime/writeInterval/deltaT in controlDict. Used to give
+    """Set endTime/writeInterval/deltaT/maxCo in controlDict. Used to give
     simpleFoam its own iteration budget separate from pimpleFoam's transient
     duration, since they share this one controlDict but mean completely
     different things (iterations vs. physical seconds).
@@ -151,6 +166,11 @@ def set_control_dict_time(case_dir, end_time=None, write_interval=None, delta_t=
     written on that separate schedule while U/p/k/omega/nut follow the main
     one, leaving T missing from most time directories. endTime/deltaT aren't
     duplicated per-function-object, so those stay first-occurrence-only.
+
+    maxCo is always rewritten to _MAX_CO regardless of the arguments given -
+    simpleFoam doesn't read it at all (harmless no-op there), and every
+    pimpleFoam use in this pipeline wants the same, more permissive value
+    (see _MAX_CO's own comment above).
     """
     cd_path = f"{case_dir}/system/controlDict"
     with open(cd_path) as f:
@@ -161,6 +181,7 @@ def set_control_dict_time(case_dir, end_time=None, write_interval=None, delta_t=
         content = re.sub(r'(\n[ \t]*)writeInterval(\s+)[\d.]+;', rf'\g<1>writeInterval\g<2>{write_interval};', content)
     if delta_t is not None:
         content = re.sub(r'(\n[ \t]*)deltaT(\s+)[\d.]+;', rf'\g<1>deltaT\g<2>{delta_t};', content, count=1)
+    content = re.sub(r'(\n[ \t]*)maxCo(\s+)[\d.]+;', rf'\g<1>maxCo\g<2>{_MAX_CO};', content, count=1)
     with open(cd_path, "w") as f:
         f.write(content)
     return cd_path

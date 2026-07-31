@@ -23,7 +23,17 @@ timePrecision    6;
 runTimeModifiable true;
 
 adjustTimeStep   yes;
-maxCo            0.5;
+// PIMPLE (system/fvSolution) runs with nOuterCorrectors 3, specifically so
+// it stays stable well above Co=1 (unlike PISO) - 0.5 left most of that
+// headroom unused and let a single locally-high-velocity cell (e.g. near a
+// diffuser) throttle deltaT for the whole domain (confirmed directly: a
+// UV-off control run's adaptive deltaT collapsed to ~0.08s, on track for
+// tens of thousands of steps to cover a ~1400s target). Every use of this
+// solver here (control runs, decay's UV-on/UV-off runs) only cares about
+// the bulk room-average concentration's decay RATE (fit via regression -
+// see decay_analysis.fit_effective_decay_rate), not fine local transient
+// flow structure, so trading some of that for speed is the right call.
+maxCo            5;
 maxDeltaT        5;
 
 functions
