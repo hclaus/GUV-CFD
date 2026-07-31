@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 
 import guvcfd.scenario_runs as sr
+import guvcfd.steady_state_pipeline as sspl
 from guvcfd.case_io import read_openfoam_scalar_field, write_scalar_field
 from guvcfd.wsl_utils import StoppedByUser
 
@@ -460,7 +461,7 @@ def test_run_scenario_threads_control_results_into_measured_ventilation_ach(monk
                 "inject-x-input": 2, "inject-y-input": 2.5, "inject-z-input": 1.3,
                 "monitoring-enable": False, "source-zone-size": 0.3}
     adv = {"uv-zone-bins": 25, "mesh-cell-size": 0.1,
-           "plateau-rel-tol": 1.0, "t-infinity-early-stop-enabled": False, "keep-all-timesteps": False,
+           "plateau-rel-tol": 1.0, "t-infinity-early-stop-enabled": False, "phase1-require-stable-extrapolation": False, "keep-all-timesteps": False,
            "deltat-scaling-enabled": False, "deltat-effective-fraction": 0.7, "deltat-target-fraction": 0.995,
            "phase-chunk-size": 400, "phase-write-interval": 200}
 
@@ -497,7 +498,7 @@ def test_run_scenario_deltat_scaling_uses_configured_iterations_not_settling_inf
                 "inject-x-input": 2, "inject-y-input": 2.5, "inject-z-input": 1.3,
                 "monitoring-enable": False, "source-zone-size": 0.3}
     adv = {"uv-zone-bins": 25, "mesh-cell-size": 0.1,
-           "plateau-rel-tol": 1.0, "t-infinity-early-stop-enabled": False, "keep-all-timesteps": False,
+           "plateau-rel-tol": 1.0, "t-infinity-early-stop-enabled": False, "phase1-require-stable-extrapolation": False, "keep-all-timesteps": False,
            "deltat-scaling-enabled": True, "deltat-effective-fraction": 0.7, "deltat-target-fraction": 0.995,
            "phase-chunk-size": 400, "phase-write-interval": 200}
 
@@ -530,7 +531,7 @@ def test_run_scenario_threads_base_summary_into_flow_converged_and_ach_delivery(
                 "inject-x-input": 2, "inject-y-input": 2.5, "inject-z-input": 1.3,
                 "monitoring-enable": False, "source-zone-size": 0.3}
     adv = {"uv-zone-bins": 25, "mesh-cell-size": 0.1,
-           "plateau-rel-tol": 1.0, "t-infinity-early-stop-enabled": False, "keep-all-timesteps": False,
+           "plateau-rel-tol": 1.0, "t-infinity-early-stop-enabled": False, "phase1-require-stable-extrapolation": False, "keep-all-timesteps": False,
            "deltat-scaling-enabled": False, "deltat-effective-fraction": 0.7, "deltat-target-fraction": 0.995,
            "phase-chunk-size": 400, "phase-write-interval": 200}
 
@@ -559,7 +560,7 @@ def test_run_scenario_measured_ventilation_ach_none_without_control_results(monk
                 "inject-x-input": 2, "inject-y-input": 2.5, "inject-z-input": 1.3,
                 "monitoring-enable": False, "source-zone-size": 0.3}
     adv = {"uv-zone-bins": 25, "mesh-cell-size": 0.1,
-           "plateau-rel-tol": 1.0, "t-infinity-early-stop-enabled": False, "keep-all-timesteps": False,
+           "plateau-rel-tol": 1.0, "t-infinity-early-stop-enabled": False, "phase1-require-stable-extrapolation": False, "keep-all-timesteps": False,
            "deltat-scaling-enabled": False, "deltat-effective-fraction": 0.7, "deltat-target-fraction": 0.995,
            "phase-chunk-size": 400, "phase-write-interval": 200}
 
@@ -595,7 +596,7 @@ def test_run_shared_phase1_clones_base_dir_and_runs_phase1_only(tmp_path, monkey
                 "inject-x-input": 2, "inject-y-input": 2.5, "inject-z-input": 1.3,
                 "t-ss-window-frac": None, "monitoring-enable": False, "source-zone-size": 0.3}
     adv = {"mesh-cell-size": 0.1, "plateau-rel-tol": 1.0,
-           "t-infinity-early-stop-enabled": False, "keep-all-timesteps": False,
+           "t-infinity-early-stop-enabled": False, "phase1-require-stable-extrapolation": False, "keep-all-timesteps": False,
            "phase-chunk-size": 400, "phase-write-interval": 200,
            "deltat-scaling-enabled": False, "deltat-effective-fraction": 0.7, "deltat-target-fraction": 0.995}
 
@@ -609,6 +610,98 @@ def test_run_shared_phase1_clones_base_dir_and_runs_phase1_only(tmp_path, monkey
     assert call["ach"] == 3.0
     assert call["Z"] == 6  # placeholder - Phase 1 has no UV, so Z is irrelevant
     assert call["phase1_only"] is True
+
+
+def test_build_flow_base_reuses_existing_resolved_base(tmp_path, monkeypatch):
+    # Regression: a sweep that gets interrupted downstream of flow
+    # convergence (e.g. by the old Phase1ExtrapolationUndecided gate)
+    # left a fully-resolved _base_ACH<n> directory on disk. Re-running the
+    # sweep must not pay for re-meshing/re-converging it - 0/fluenceRate
+    # existing is the same "flow convergence fully resolved" signal
+    # case_awaiting_flow_decision() already relies on.
+    base_dir = tmp_path / "_base_ACH6"
+    (base_dir / "0").mkdir(parents=True)
+    (base_dir / "0" / "fluenceRate").write_text("dummy")
+
+    setup_calls = []
+    monkeypatch.setattr(sr, "setup_case", lambda *a, **k: setup_calls.append((a, k)))
+
+    room = type("Room", (), {"x": 4.0, "y": 5.0, "z": 2.7})()
+    settings = {"z-value": 6, "inlet-wall": "xMin", "inlet-size-w": 0.3, "inlet-size-h": 0.3,
+                "outlet-wall": "xMax", "outlet-size-w": 0.3, "outlet-size-h": 0.3,
+                "fan-enable": False, "inlet2-enable": False, "outlet2-enable": False}
+    adv = {"mesh-cell-size": 0.1, "uv-zone-bins": 25, "flow-rel-tol": 1.0, "flow-max-iterations": 20000,
+           "momentum-relaxation": None, "scalar-relaxation": None,
+           "scalar-transport-ncorr": None, "scalar-transport-tolerance": None}
+
+    result = sr._build_flow_base("guv_path", str(base_dir), room, settings, ach=6.0, adv=adv,
+                                  log_fn=lambda m: None, should_stop=None, solver_log_fn=None)
+
+    assert setup_calls == []
+    assert result["reused"] is True
+
+
+def test_run_shared_phase1_skips_entirely_when_checkpoint_already_exists(tmp_path, monkeypatch):
+    # A checkpoint means Phase 1 already fully converged in an earlier
+    # attempt - every Z clone downstream picks it up via
+    # run_steady_state_scenario's own checkpoint-detection, so there's
+    # nothing left for _run_shared_phase1 to do (and definitely no reason
+    # to wipe phase1_dir via _copy_base_case first).
+    phase1_dir = tmp_path / "_phase1_ACH6"
+    phase1_dir.mkdir()
+    sspl._write_phase1_checkpoint(str(phase1_dir), {"iterations": 1500}, {}, G=1.0, Su=1.0,
+                                   source_volume=0.064, n_source_cells=64)
+
+    copy_calls = []
+    monkeypatch.setattr(sr, "_copy_base_case", lambda base, target, log_fn: copy_calls.append((base, target)))
+    scenario_calls = []
+    monkeypatch.setattr(sr, "run_steady_state_scenario", lambda *a, **k: scenario_calls.append((a, k)))
+
+    room = type("Room", (), {"x": 4.0, "y": 5.0, "z": 2.7})()
+    sr._run_shared_phase1("base_dir", str(phase1_dir), ach=6.0, room=room, settings={}, adv={},
+                           log_fn=lambda m: None, should_stop=None, solver_log_fn=None)
+
+    assert copy_calls == []
+    assert scenario_calls == []
+
+
+def test_run_shared_phase1_resumes_undecided_pending_instead_of_restarting(tmp_path, monkeypatch):
+    # Regression for the real stuck-sweep case: Phase 1 ran its full
+    # budget and left phase1_pending.json (undecided, no checkpoint yet -
+    # e.g. the old phase1_extrapolation_gate raised before checkpointing).
+    # _copy_base_case must NOT run (it would rm -rf phase1_dir and destroy
+    # this progress), and the resume should pass phase1_resume_decision=
+    # "accept" so run_steady_state_scenario finalizes the existing state
+    # instead of re-running the full phase1_iterations budget.
+    phase1_dir = tmp_path / "_phase1_ACH6"
+    phase1_dir.mkdir()
+    sspl._write_phase1_pending(str(phase1_dir), G=1.0, Su=1.0, source_volume=0.064, n_source_cells=64)
+
+    copy_calls = []
+    monkeypatch.setattr(sr, "_copy_base_case", lambda base, target, log_fn: copy_calls.append((base, target)))
+    scenario_calls = []
+    def fake_run_steady_state_scenario(case_dir, room_x, room_y, room_z, ach, Z, **kwargs):
+        scenario_calls.append({"case_dir": case_dir, **kwargs})
+    monkeypatch.setattr(sr, "run_steady_state_scenario", fake_run_steady_state_scenario)
+
+    room = type("Room", (), {"x": 4.0, "y": 5.0, "z": 2.7})()
+    settings = {"fan-enable": False, "inlet2-enable": False, "outlet2-enable": False,
+                "inlet-wall": "xMin", "inlet-y-input": 1.5, "inlet-z-input": 1.3,
+                "inlet-size-w": 0.3, "inlet-size-h": 0.3,
+                "phase1-iterations": 1500, "target-t-ss": 1.0, "z-value": 6,
+                "inject-x-input": 2, "inject-y-input": 2.5, "inject-z-input": 1.3,
+                "t-ss-window-frac": None, "monitoring-enable": False, "source-zone-size": 0.3}
+    adv = {"mesh-cell-size": 0.1, "plateau-rel-tol": 1.0,
+           "t-infinity-early-stop-enabled": False, "phase1-require-stable-extrapolation": False,
+           "keep-all-timesteps": False, "phase-chunk-size": 400, "phase-write-interval": 200,
+           "deltat-scaling-enabled": False, "deltat-effective-fraction": 0.7, "deltat-target-fraction": 0.995}
+
+    sr._run_shared_phase1(str(phase1_dir), str(phase1_dir), ach=6.0, room=room, settings=settings, adv=adv,
+                           log_fn=lambda m: None, should_stop=None, solver_log_fn=None)
+
+    assert copy_calls == []
+    assert len(scenario_calls) == 1
+    assert scenario_calls[0]["phase1_resume_decision"] == "accept"
 
 
 def test_run_sweep_recarves_source_zone_after_apply_z_wipes_it(tmp_path, monkeypatch):

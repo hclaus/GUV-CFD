@@ -49,7 +49,7 @@ from .run_pipeline import setup_case
 from .splice import set_control_dict_time, splice_fv_options_into_control_dict
 from .steady_state_pipeline import (
     run_steady_state_scenario, _uv_fvoptions_entries, resolve_phase_delta_ts, merge_project_deltat_settings,
-    REFERENCE_TARGET_T_SS,
+    REFERENCE_TARGET_T_SS, _read_phase1_checkpoint, _read_phase1_pending,
 )
 from .ventilation_control import prepare_ventilation_only_control, finish_ventilation_only_control
 from .visualization import center_frac_for_wall
@@ -195,7 +195,24 @@ def _build_flow_base(guv_path, base_dir, room, settings, ach, adv, log_fn, shoul
     writes gets overwritten by _apply_z before any subfolder actually
     runs), exactly the same call app._run_steady_state makes for a single
     run, just targeting a temp directory.
+
+    If base_dir already has a resolved flow-convergence result on disk
+    from an earlier attempt at this ACH (a sweep that got interrupted or
+    paused further downstream, e.g. by Phase1ExtrapolationUndecided),
+    reuse it instead of re-meshing and re-running simpleFoam from
+    scratch - confirmed as expensive, real wasted compute on a live run
+    (flow convergence here can be as costly as Phase 1 itself). Detected
+    via 0/fluenceRate, the same signal case_awaiting_flow_decision()
+    already uses: only written by setup_case()'s own _finish_case_setup
+    once flow convergence is fully resolved (converged, accepted via
+    oscillation, or explicitly accepted by a user) - so a case that got
+    interrupted mid-convergence correctly does NOT match this and falls
+    through to a fresh setup_case() call below.
     """
+    if Path(f"{base_dir}/0/fluenceRate").exists():
+        log_fn(f"Found an already flow-converged base case at {Path(base_dir).name}/ from an earlier "
+               f"attempt - reusing it instead of re-meshing/re-converging.")
+        return {"flow_converged": None, "ach_delivery": None, "n_lamps": None, "reused": True}
     return setup_case(
         guv_path, base_dir, template_case_dir=_TEMPLATE_CASE_DIR,
         Z=settings["z-value"], ach=ach,
@@ -412,8 +429,34 @@ def _run_shared_phase1(base_dir, phase1_dir, ach, room, settings, adv, log_fn, s
     carved - has to be re-carved per Z after _apply_z runs (see run_z_fn),
     the same way _apply_z already re-carves the fan zone for the same
     reason.
+
+    If phase1_dir already carries a resolved checkpoint from an earlier
+    attempt (e.g. a sweep that got interrupted after Phase 1 finished but
+    before every Z's Phase 2 completed), this is a no-op - every Z clone
+    below will pick the checkpoint up itself via run_steady_state_
+    scenario's own checkpoint-detection logic, so there's nothing to
+    redo here. If it instead carries an UNDECIDED Phase 1 (phase1_pending.
+    json but no checkpoint - e.g. a run that hit Phase1ExtrapolationUndecided
+    and was never resumed), reuse that in-progress state rather than
+    wiping it via _copy_base_case and paying for the full phase1_iterations
+    budget again: resume with phase1_resume_decision="accept", which
+    samples a small additional window from the current state and finalizes
+    on it (see run_steady_state_scenario's own docstring for that
+    parameter) - correct now that phase1_extrapolation_gate defaults to
+    off, since CV-plateau-alone is the acceptance criterion either way.
     """
-    _copy_base_case(base_dir, phase1_dir, log_fn)
+    if _read_phase1_checkpoint(phase1_dir) is not None:
+        log_fn(f"=== ACH={ach}: found an already-converged Phase 1 checkpoint at "
+               f"{Path(phase1_dir).name}/ from an earlier attempt - reusing it, nothing to redo ===")
+        return
+    phase1_resume_decision = None
+    if _read_phase1_pending(phase1_dir) is not None:
+        log_fn(f"=== ACH={ach}: found an undecided Phase 1 attempt at {Path(phase1_dir).name}/ from an "
+               f"earlier attempt (interrupted before a checkpoint was written) - resuming it instead of "
+               f"starting over ===")
+        phase1_resume_decision = "accept"
+    else:
+        _copy_base_case(base_dir, phase1_dir, log_fn)
 
     fan_entry = None
     if settings.get("fan-enable"):
@@ -470,6 +513,7 @@ def _run_shared_phase1(base_dir, phase1_dir, ach, room, settings, adv, log_fn, s
         patches_to_monitor=patches_to_monitor,
         log_fn=log_fn, should_stop=should_stop, solver_log_fn=solver_log_fn, should_pause=should_pause,
         status_fn=status_fn, phase1_only=True, phase1_delta_t=phase1_delta_t,
+        phase1_resume_decision=phase1_resume_decision,
     )
 
 

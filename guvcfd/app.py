@@ -2318,29 +2318,43 @@ settings_modal = dbc.Modal(
                 html.Div("Phase 1 readiness (T∞ extrapolation)",
                           className="small fw-bold text-uppercase mb-1"),
                 html.Div(
-                    "Phase 1 is accepted once its extrapolated true steady-state value "
-                    "(\"Extrapolated T∞\" - see the report/Analysis tab) has stopped changing "
-                    "across several consecutive checks, rather than trusting the windowed-CV "
-                    "\"plateaued\" check alone - confirmed directly that a plateaued-looking curve "
-                    "(CV=0.56%, under the 1% threshold) was still genuinely rising, needing ~3x its "
-                    "own iteration budget for mass balance to actually catch up, while the SAME "
-                    "run's T∞ extrapolation was already accurate (within 0.2%) at half that. Phase 2 "
-                    "still treats this purely as an early-stop nicety, not a gate. If the iteration "
-                    "ceiling below is reached without a stable extrapolation, the run pauses with a "
-                    "decision (continue more / accept as-is / stop) on the Processing tab - never a "
-                    "silent wrong answer, never an endless run.",
+                    "By default, Phase 1 is accepted on the windowed-CV \"plateaued\" check alone, once "
+                    "residence-time-scaled deltaT (see the Run Parameters / Advanced Settings deltaT "
+                    "section) has sized the run to cover several real residence times - this reliably "
+                    "reveals genuine ongoing drift via CV without needing a separate curve fit. T∞ "
+                    "extrapolation below is still available for two, decoupled purposes: as a pure "
+                    "speed optimization (stop a chunk early once T∞ itself has stabilized, regardless "
+                    "of the CV-plateau verdict), and - only if the checkbox below is also turned on - "
+                    "as an additional hard readiness GATE requiring several consecutive stable T∞ fits "
+                    "before Phase 1 is accepted at all. That gate was the default before deltaT "
+                    "scaling existed (a plateaued-looking CV=0.56% curve was once found still genuinely "
+                    "rising, needing ~3x its iteration budget for mass balance to catch up), but "
+                    "confirmed unreliable on real oscillating flow fields (never stabilizing across "
+                    "resumes) and - critically - sweep-mode combinations have no resume UX for it at "
+                    "all: enabling it there means one oscillating ACH value can silently fail an entire "
+                    "sweep. Leave off unless you have a specific reason to distrust the CV-plateau check "
+                    "for your case.",
                     className="small text-muted mb-2",
                 ),
                 _settings_checkbox_field(
-                    "settings-t-infinity-early-stop-enabled", "Use T∞ extrapolation as Phase 1's readiness gate",
-                    "On by default (recommended) - this is now Phase 1's primary \"are we done\" "
-                    "signal, not just a speed optimization. Turn off to fall back to the old "
-                    "CV-plateau/hard-budget-only behavior (an escape hatch, not recommended - see "
-                    "the note above for why that alone was found unreliable). Currently cannot be "
-                    "combined with \"Keep all time steps for ParaView\" below - a real directory-"
-                    "naming bug was found in that combination (since fixed, but blocked here as a "
-                    "precaution until it's proven out further).",
+                    "settings-t-infinity-early-stop-enabled", "Use T∞ extrapolation as a chunk early-stop",
+                    "Off by default. A speed optimization only - lets a chunk end early once T∞ has "
+                    "stabilized, without changing what counts as \"Phase 1 done\" (see the gate checkbox "
+                    "below for that). Currently cannot be combined with \"Keep all time steps for "
+                    "ParaView\" below - a real directory-naming bug was found in that combination "
+                    "(since fixed, but blocked here as a precaution until it's proven out further).",
                     _adv_defaults["t-infinity-early-stop-enabled"],
+                ),
+                _settings_checkbox_field(
+                    "settings-phase1-require-stable-extrapolation",
+                    "Require a stable T∞ extrapolation before accepting Phase 1 (advanced)",
+                    "Off by default - see the note above. When on, Phase 1 is NOT accepted until "
+                    "several consecutive T∞ fits agree (the tolerance/streak settings below), even if "
+                    "the CV-plateau check already looks fine; hitting the iteration ceiling without "
+                    "that pauses the run for a decision (continue more / accept as-is / stop) on the "
+                    "Processing tab - single-run mode only, sweep mode has no resume path for this and "
+                    "will simply fail the affected combination if this triggers there.",
+                    _adv_defaults["phase1-require-stable-extrapolation"],
                 ),
                 _settings_field(
                     "settings-t-infinity-rel-tol", "T∞ stability tolerance",
@@ -3048,7 +3062,8 @@ _SETTINGS_FIELD_IDS = [
     "settings-plateau-rel-tol", "settings-mass-balance-tol",
     "settings-momentum-relaxation", "settings-scalar-relaxation",
     "settings-scalar-transport-ncorr", "settings-scalar-transport-tolerance",
-    "settings-t-infinity-early-stop-enabled", "settings-t-infinity-rel-tol",
+    "settings-t-infinity-early-stop-enabled", "settings-phase1-require-stable-extrapolation",
+    "settings-t-infinity-rel-tol",
     "settings-phase-chunk-size", "settings-phase-write-interval",
     "settings-phase1-t-initial", "settings-phase1-extrapolation-streak",
     "settings-phase1-settling-safety-multiplier", "settings-phase1-max-iterations-ceiling",
@@ -3068,7 +3083,8 @@ _SETTINGS_FIELD_KEYS = [
     "plateau-rel-tol", "mass-balance-tol",
     "momentum-relaxation", "scalar-relaxation",
     "scalar-transport-ncorr", "scalar-transport-tolerance",
-    "t-infinity-early-stop-enabled", "t-infinity-rel-tol",
+    "t-infinity-early-stop-enabled", "phase1-require-stable-extrapolation",
+    "t-infinity-rel-tol",
     "phase-chunk-size", "phase-write-interval",
     "phase1-t-initial", "phase1-extrapolation-streak",
     "phase1-settling-safety-multiplier", "phase1-max-iterations-ceiling",
