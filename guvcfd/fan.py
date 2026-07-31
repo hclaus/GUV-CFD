@@ -24,7 +24,7 @@ scalarSemiImplicitSource entries elsewhere) works, confirmed by the log's
 force genuinely driving the zone's velocity, not silently ignored.
 """
 
-SPEED_RANGE = (0.05, 0.5)  # m/s, typical ceiling fan induced-velocity range
+SPEED_RANGE = (0.05, 1.5)  # m/s - matches the GUI's own fan-speed slider max (app.py)
 
 
 def fan_topo_set_dict(p1, p2, radius, zone_name="fanZone", cellset_name="fanZoneCells"):
