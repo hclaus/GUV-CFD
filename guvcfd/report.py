@@ -16,7 +16,7 @@ from guv_calcs import Project
 
 from .contaminant_source import compute_source_strength
 from .decay_analysis import windowed_stats_detrended
-from .monitoring_points import mixing_uniformity_note
+from .monitoring_points import mixing_uniformity_note, point_reduction_basis
 from .result_figures import decay_figure, steady_state_figure
 from .system_info import get_system_info
 from .visualization import center_frac_for_wall, plot_case
@@ -678,19 +678,17 @@ def _monitoring_rows(monitoring):
     for name, data in monitoring.items():
         if "phase1" in data:
             p1, p2 = data["phase1"], data["phase2"]
-            # T_ss/T_ss_cv (trailing-window moving average, see
-            # decay_analysis.windowed_stats) when present; falls back to the
-            # old last-sample read for results.json predating live tracking.
-            T1 = p1.get("T_ss", p1["volAverage_T"][-1] if p1["volAverage_T"] else None)
-            T2 = p2.get("T_ss", p2["volAverage_T"][-1] if p2["volAverage_T"] else None)
+            T1, T2, reduction_pct, basis = point_reduction_basis(p1, p2)
             value = f"T_ss1={T1:.4g}, T_ss2={T2:.4g}" if T1 is not None and T2 is not None else "n/a"
+            if basis == "extrapolated_T_infinity":
+                value += " (extrapolated)"
             cv1, cv2 = p1.get("T_ss_cv"), p2.get("T_ss_cv")
             if cv1 is not None or cv2 is not None:
                 cv1_text = f"{cv1 * 100:.1f}%" if cv1 is not None else "n/a"
                 cv2_text = f"{cv2 * 100:.1f}%" if cv2 is not None else "n/a"
                 value += f" (CV1={cv1_text}, CV2={cv2_text})"
-            if T1:
-                value += f", reduction={(1 - T2 / T1) * 100:.1f}%"
+            if reduction_pct is not None:
+                value += f", reduction={reduction_pct:.1f}%"
         else:
             T_final = data["volAverage_T"][-1] if data["volAverage_T"] else None
             value = f"final volAverage(T)={T_final:.4g}" if T_final is not None else "n/a"

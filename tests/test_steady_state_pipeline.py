@@ -440,6 +440,41 @@ def test_point_phase_summary_matches_room_summary_windowing():
     assert point["volAverage_T"] == T.tolist()
 
 
+def test_point_phase_summary_extrapolates_t_infinity_like_room_summary():
+    # Regression: monitoring points used to get only the windowed mean,
+    # never the T-infinity extrapolation the room average already uses -
+    # a real gap, since a point (a small, specific zone, often away from
+    # the main flow) can plausibly take LONGER to settle than the room
+    # average does, making it if anything MORE exposed to the windowed-
+    # average bias the extrapolation exists to correct. Same synthetic
+    # exponential-approach curve test_decay_analysis.py's own
+    # fit_asymptotic_value test uses, run still short of full convergence
+    # (last sample still below the true asymptote) so the windowed mean
+    # and the extrapolation are expected to genuinely differ.
+    true_Tinf, true_A, true_tau = 2.0, 0.5, 200.0
+    t = np.arange(0, 900, 1.0)
+    T = true_Tinf - true_A * np.exp(-t / true_tau)
+
+    point = _point_phase_summary((t, T), window_frac=0.15)
+
+    assert point["T_inf_extrapolated"] is not None
+    assert abs(point["T_inf_extrapolated"] - true_Tinf) < 0.01
+    assert point["T_inf_extrapolation_detail"] is not None
+    assert point["T_ss"] < point["T_inf_extrapolated"]  # windowed mean still below the true asymptote
+
+
+def test_point_phase_summary_extrapolation_none_when_fit_unavailable():
+    # A step function (test_point_phase_summary_matches_room_summary_
+    # windowing's own fixture) has no exponential-approach shape to fit -
+    # T_inf_extrapolated must be None, not crash, exactly like
+    # _room_phase_summary's own "None when the fit doesn't converge" rule.
+    t = np.arange(100, dtype=float)
+    T = np.concatenate([np.zeros(80), np.full(20, 2.0)])
+    point = _point_phase_summary((t, T), window_frac=0.15)
+    assert point["T_inf_extrapolated"] is None
+    assert point["T_inf_extrapolation_detail"] is None
+
+
 # --- Phase 1 checkpoint: resuming without redoing the more expensive phase ---
 
 def test_phase1_checkpoint_round_trips(tmp_path):

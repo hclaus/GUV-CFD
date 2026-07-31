@@ -189,6 +189,47 @@ def compute_monitoring_results(case_dir, points, cell_size=0.1,
 _MIXING_UNIFORMITY_THRESHOLD = 0.15
 
 
+def point_reduction_basis(p1, p2):
+    """(T1, T2, reduction_pct, basis) for one monitoring point's phase1/
+    phase2 entries (steady_state_pipeline._point_phase_summary's shape) -
+    shared by report.py/app.py so both display the same numbers computed
+    the same way.
+
+    Prefers each phase's T_inf_extrapolated (fit_asymptotic_value) over
+    the plain windowed T_ss, mirroring exactly how the room-average
+    reduction_pct already does this (see steady_state_pipeline.
+    run_steady_state_scenario's own "using_extrapolated" logic) - a
+    windowed average is a biased estimate of the true steady state
+    whenever a curve hasn't fully flattened within the run's budget, and a
+    monitoring point (a small, specific zone, often away from the main
+    flow) is if anything MORE exposed to that than the room average is,
+    not less. Only used when BOTH phases extrapolated successfully for
+    THIS point - falls back to the windowed T_ss (both phases) otherwise,
+    the same all-or-nothing rule the room level uses (mixing an
+    extrapolated T1 with a windowed T2, or vice versa, would compare two
+    different bases against each other).
+
+    basis is "extrapolated_T_infinity" or "windowed_average" (matching the
+    room level's own "ach_source" field's wording). Returns (None, None,
+    None, basis) if either phase has no usable T_ss at all.
+    """
+    def _windowed_or_last_sample(p):
+        if p.get("T_ss") is not None:
+            return p["T_ss"]
+        series = p.get("volAverage_T") or []
+        return series[-1] if series else None
+
+    Tinf1, Tinf2 = p1.get("T_inf_extrapolated"), p2.get("T_inf_extrapolated")
+    using_extrapolated = Tinf1 is not None and Tinf2 is not None
+    T1 = Tinf1 if using_extrapolated else _windowed_or_last_sample(p1)
+    T2 = Tinf2 if using_extrapolated else _windowed_or_last_sample(p2)
+    basis = "extrapolated_T_infinity" if using_extrapolated else "windowed_average"
+    if T1 is None or T2 is None:
+        return None, None, None, basis
+    reduction_pct = (1 - T2 / T1) * 100 if T1 else None
+    return T1, T2, reduction_pct, basis
+
+
 def mixing_uniformity_note(result):
     """Compare each monitoring point's final T against the room-average
     final T for the same phase (steady-state) or the same end-of-curve

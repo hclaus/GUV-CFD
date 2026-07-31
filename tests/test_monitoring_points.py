@@ -1,5 +1,6 @@
 from guvcfd.monitoring_points import (
     zone_name, monitoring_topo_set_dict, monitoring_average_dict, mixing_uniformity_note,
+    point_reduction_basis,
 )
 
 
@@ -141,3 +142,50 @@ def test_mixing_uniformity_note_uses_windowed_t_ss_not_last_raw_sample():
         },
     }
     assert mixing_uniformity_note(result) is None
+
+
+def test_point_reduction_basis_prefers_extrapolation_when_both_phases_have_it():
+    p1 = {"T_ss": 0.20, "T_inf_extrapolated": 0.22}
+    p2 = {"T_ss": 0.05, "T_inf_extrapolated": 0.045}
+    T1, T2, reduction_pct, basis = point_reduction_basis(p1, p2)
+    assert basis == "extrapolated_T_infinity"
+    assert T1 == 0.22 and T2 == 0.045
+    assert abs(reduction_pct - (1 - 0.045 / 0.22) * 100) < 1e-9
+
+
+def test_point_reduction_basis_falls_back_to_windowed_when_only_one_phase_extrapolated():
+    # All-or-nothing rule (mirrors the room level): mixing an extrapolated
+    # T1 with a windowed T2 would compare two different bases against each
+    # other, so a partial extrapolation must fall back to windowed for BOTH.
+    p1 = {"T_ss": 0.20, "T_inf_extrapolated": 0.22}
+    p2 = {"T_ss": 0.05, "T_inf_extrapolated": None}
+    T1, T2, reduction_pct, basis = point_reduction_basis(p1, p2)
+    assert basis == "windowed_average"
+    assert T1 == 0.20 and T2 == 0.05
+
+
+def test_point_reduction_basis_falls_back_to_windowed_when_neither_extrapolated():
+    p1 = {"T_ss": 0.20, "T_inf_extrapolated": None}
+    p2 = {"T_ss": 0.05, "T_inf_extrapolated": None}
+    T1, T2, reduction_pct, basis = point_reduction_basis(p1, p2)
+    assert basis == "windowed_average"
+    assert T1 == 0.20 and T2 == 0.05
+    assert abs(reduction_pct - 75.0) < 1e-9
+
+
+def test_point_reduction_basis_falls_back_to_last_raw_sample_for_old_results_json():
+    # results.json predating live windowed tracking has no T_ss/
+    # T_inf_extrapolated at all, only the raw volAverage_T series - same
+    # last-sample fallback report.py/app.py always used before this.
+    p1 = {"volAverage_T": [0.0, 0.1, 0.20]}
+    p2 = {"volAverage_T": [0.20, 0.10, 0.05]}
+    T1, T2, reduction_pct, basis = point_reduction_basis(p1, p2)
+    assert basis == "windowed_average"
+    assert T1 == 0.20 and T2 == 0.05
+
+
+def test_point_reduction_basis_none_when_a_phase_has_no_usable_value():
+    p1 = {"volAverage_T": []}
+    p2 = {"T_ss": 0.05}
+    T1, T2, reduction_pct, basis = point_reduction_basis(p1, p2)
+    assert T1 is None and T2 is None and reduction_pct is None

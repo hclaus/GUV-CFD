@@ -845,16 +845,27 @@ def _room_phase_summary(live_room, window_frac, converged, iterations, sparse_t,
 
 def _point_phase_summary(live_point, window_frac):
     """Same windowed treatment as _room_phase_summary, for one monitoring
-    point's phase1/phase2 entry. Keeps the t_seconds/volAverage_T key names
-    report.py/monitoring_points.mixing_uniformity_note already expect
-    (misnomer for steady-state's pseudo-iteration t, kept for continuity).
+    point's phase1/phase2 entry - including the same T-infinity
+    extrapolation (fit_asymptotic_value), added for the same reason it was
+    added at the room level: a monitoring point covers a small, specific
+    zone (often away from the main flow, e.g. a corner or occupied
+    location) that can plausibly take LONGER to settle than the room
+    average does - if anything, a point is MORE exposed to the windowed-
+    average bias the room-level fix was built to correct, not less, so it
+    shouldn't be left on the older, unextrapolated treatment. Keeps the
+    t_seconds/volAverage_T key names report.py/monitoring_points.
+    mixing_uniformity_note already expect (misnomer for steady-state's
+    pseudo-iteration t, kept for continuity).
     """
     t, T = live_point
     mean, _, _, n, span = windowed_stats(t, T, frac=window_frac)
     _, std, cv, _, _ = windowed_stats_detrended(t, T, frac=window_frac)
+    extrap = fit_asymptotic_value(t, T)
     return {
         "T_ss": mean, "T_ss_std": std, "T_ss_cv": cv, "T_ss_window_span": span,
         "T_ss_window_n": n, "T_ss_window_frac": window_frac,
+        "T_inf_extrapolated": extrap["Tinf"] if extrap else None,
+        "T_inf_extrapolation_detail": extrap,
         "t_seconds": t.tolist(), "volAverage_T": T.tolist(),
     }
 
