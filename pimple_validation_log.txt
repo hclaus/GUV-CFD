@@ -1,0 +1,23 @@
+[20:32:00] Cloning \\wsl.localhost\Ubuntu\home\hclaus\OpenFOAM\hclaus-v2412\run\patient_ward_4B1_v11_simsstate/Z6_ACH6 -> \\wsl.localhost\Ubuntu\home\hclaus\OpenFOAM\hclaus-v2412\run\patient_ward_4B1_v11_simsstate/_pimple_validation_Z6_ACH6 ...
+[20:32:01] Removing every non-0 time directory and stale postProcessing (starting a fresh transient from t=0, not continuing Phase 2's SIMPLE run)...
+[20:32:02] Resetting T to a cold start (uniform 0, same convention Phase 1 already uses); U/p/k/omega/nut internalField left untouched (the converged flow field)...
+[20:32:03] Setting controlDict for a fresh transient pimpleFoam run...
+[20:32:03] === Running pimpleFoam: 0-300s of up to 3600s ===
+[20:35:37]   t=300.0s  n=381  windowed T_ss=0.023214  CV=2.36%  plateaued=False
+[20:35:37] === Running pimpleFoam: 300-600s of up to 3600s ===
+[20:39:14]   t=600.0s  n=773  windowed T_ss=0.024585  CV=1.05%  plateaued=False
+[20:39:14] === Running pimpleFoam: 600-900s of up to 3600s ===
+[20:42:43]   t=900.0s  n=1166  windowed T_ss=0.024892  CV=0.74%  plateaued=True
+[20:42:43] === RESULT ===
+[20:42:43] {
+  "elapsed_seconds": 900,
+  "plateaued": true,
+  "T_ss_pimple_windowed": 0.024891533657142858,
+  "T_ss_pimple_cv_pct": 0.7442349901752817,
+  "eACH_uv_pimple_corrected": 68.56456783074837,
+  "phase2_T_ss_windowed_simple": 0.02826758917777778,
+  "phase2_T_ss_tinf_simple": 0.027631190451271624,
+  "eACH_uv_steady_corrected_simple": 61.39459659057191,
+  "eACH_uv_decay_corrected": 27.259894916136286,
+  "ratio_pimple_over_simple": 0.880567971346882
+}

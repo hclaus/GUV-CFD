@@ -1,0 +1,12 @@
+{
+  "elapsed_seconds": 900,
+  "plateaued": true,
+  "T_ss_pimple_windowed": 0.024891533657142858,
+  "T_ss_pimple_cv_pct": 0.7442349901752817,
+  "eACH_uv_pimple_corrected": 68.56456783074837,
+  "phase2_T_ss_windowed_simple": 0.02826758917777778,
+  "phase2_T_ss_tinf_simple": 0.027631190451271624,
+  "eACH_uv_steady_corrected_simple": 61.39459659057191,
+  "eACH_uv_decay_corrected": 27.259894916136286,
+  "ratio_pimple_over_simple": 0.880567971346882
+}
