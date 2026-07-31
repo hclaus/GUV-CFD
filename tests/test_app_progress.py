@@ -406,3 +406,48 @@ def test_resync_pollers_does_nothing_when_nothing_is_running():
     run_poll_disabled, scenario_poll_disabled = guvcfd_app._resync_pollers(1)
     assert run_poll_disabled is dash.no_update
     assert scenario_poll_disabled is dash.no_update
+
+
+def test_current_stage_label_collapses_checklist_step_to_shared_vocabulary():
+    # "Running" alone didn't distinguish setup/flow-convergence/the actual
+    # measurement - _current_stage_label derives a meaningful label from
+    # whichever checklist step _run_log's own marker logic has already
+    # marked "running", collapsed into Setup/Flow field calc/Decay sim/
+    # Phase 1/Phase 2/Post-processing.
+    _reset()
+    guvcfd_app._run_state["steps"] = guvcfd_app.DECAY_STEPS
+    guvcfd_app._run_state["step_status"] = {s: "pending" for s in guvcfd_app.DECAY_STEPS}
+    guvcfd_app._run_state["step_status"]["Converge flow field"] = "running"
+    assert guvcfd_app._current_stage_label() == "Flow field calc"
+
+    guvcfd_app._run_state["step_status"]["Converge flow field"] = "done"
+    guvcfd_app._run_state["step_status"]["Run pimpleFoam (decay)"] = "running"
+    assert guvcfd_app._current_stage_label() == "Decay sim"
+
+
+def test_current_stage_label_falls_back_to_running_with_no_steps():
+    _reset()
+    guvcfd_app._run_state["steps"] = []
+    guvcfd_app._run_state["step_status"] = {}
+    assert guvcfd_app._current_stage_label() == "Running"
+
+
+def test_combo_live_stage_labels_uvon_as_decay_sim_not_phase_2():
+    # Regression: UV-on's own status-key suffix used to map to the "Phase
+    # 2" label, meaningless for decay mode (which has no phases at all) -
+    # fixed to "Decay sim".
+    _reset_scenario()
+    guvcfd_app._scenario_state["live_status"]["Z=6/ACH=6/UV-on"] = "Time = 100"
+    assert guvcfd_app._combo_live_stage(6, 6) == "Decay sim"
+
+
+def test_with_total_run_time_prepends_line_and_freezes_once_stopped():
+    import time as _time
+    text = guvcfd_app._with_total_run_time(_time.time() - 65, "Finished. 1/1 succeeded.")
+    assert isinstance(text, list)
+    assert text[0].startswith("Total run time: 1:0")  # ~65s -> "1:05"ish
+    assert text[-1] == "Finished. 1/1 succeeded."
+
+
+def test_with_total_run_time_passes_through_when_no_start_time():
+    assert guvcfd_app._with_total_run_time(None, "Running...") == "Running..."

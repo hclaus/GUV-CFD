@@ -4152,8 +4152,8 @@ def _toggle_pause_scenario_sweep(n_clicks):
 # *which* stage it's in using data status_fn already provides, without
 # needing new structured-progress plumbing (see the Est. time to finish
 # column's own placeholder below, which does need that).
-_LIVE_STAGE_SUFFIXES = [("Phase2", "Phase 2"), ("UV-on", "Phase 2"), ("Phase1", "Phase 1"),
-                        ("control", "Flow convergence"), ("flow", "Flow convergence")]
+_LIVE_STAGE_SUFFIXES = [("Phase2", "Phase 2"), ("UV-on", "Decay sim"), ("Phase1", "Phase 1"),
+                        ("control", "Flow field calc"), ("flow", "Flow field calc")]
 
 
 def _combo_live_key(z, ach):
@@ -4314,6 +4314,46 @@ def _resync_pollers(n_intervals):
     )
 
 
+# Collapses DECAY_STEPS/STEADY_STATE_STEPS/CONTINUE_STEPS' more granular
+# checklist step names (see _run_log's marker logic, which already tracks
+# exactly which one is current) into one shared, simpler vocabulary for the
+# Simulation Progress table's Status column - "Running" alone wasn't
+# meaningful enough to tell setup/flow-convergence/the actual measurement
+# apart at a glance.
+_STAGE_LABEL_BY_STEP = {
+    "Generate mesh": "Setup",
+    "Write initial fields": "Setup",
+    "Converge flow field": "Flow field calc",
+    "Compute fluence & UV zones": "Setup",
+    "Run pimpleFoam (decay)": "Decay sim",
+    "Post-process & write results": "Post-processing",
+    "Set up mesh, flow field, and UV zones": "Setup",
+    "Carve contaminant source zone": "Setup",
+    "Phase 1: source only (no UV)": "Phase 1",
+    "Phase 2: source + UV": "Phase 2",
+    "Write results": "Post-processing",
+}
+
+
+def _current_stage_label():
+    """Human-meaningful phase name for a currently-running single run
+    (Setup/Flow field calc/Decay sim/Phase 1/Phase 2/Post-processing),
+    derived from _run_state's own step-tracking checklist rather than a
+    bare "Running". Decay's concurrent UV-on+control pair share ONE step
+    ("Run pimpleFoam (decay)") that's only marked done once BOTH threads
+    finish (see _finish_decay's "Running postProcess volAverage" line,
+    logged only after _run_decay_pair returns) - so this naturally shows
+    "Decay sim" for as long as EITHER is still going, i.e. always the
+    slower one, with no extra parallel-run tracking needed.
+    """
+    steps = _run_state.get("steps") or []
+    step_status = _run_state.get("step_status", {})
+    for s in steps:
+        if step_status.get(s) == "running":
+            return _STAGE_LABEL_BY_STEP.get(s, s)
+    return "Running"
+
+
 def _single_run_progress_table():
     """The Simulation Progress table's content for a 1-combination run
     (see _start_scenario_sweep) - _run_state has no "combos"/"results" the
@@ -4323,11 +4363,14 @@ def _single_run_progress_table():
     z = _run_state.get("z")
     ach = _run_state.get("ach")
     status = _run_state["status"]
-    stage = {
-        "running": "Running", "awaiting_decision": "paused - awaiting decision",
-        "awaiting_phase2_resume": "paused - awaiting decision", "done": "Finished",
-        "error": "error", "stopped": "Stopped",
-    }.get(status, status)
+    if status == "running":
+        stage = _current_stage_label()
+    else:
+        stage = {
+            "awaiting_decision": "paused - awaiting decision",
+            "awaiting_phase2_resume": "paused - awaiting decision", "done": "Finished",
+            "error": "error", "stopped": "Stopped",
+        }.get(status, status)
     metrics = {"total_reduction_pct": None, "ach_efficiency_pct": None, "uv_efficiency_pct": None,
                "est_ach_per_hr": None, "est_each_per_hr": None}
     if status == "done" and _run_state.get("case_dir"):
@@ -4356,6 +4399,22 @@ def _single_run_progress_table():
         html.Td(_rate(metrics["est_each_per_hr"])),
     ])
     return dbc.Table([header, row], bordered=False, hover=True, size="sm", className="small")
+
+
+def _with_total_run_time(start_time, status_text):
+    """Prepends a "Total run time: M:SS" line above the status text (see
+    scenario-status-text) - computed fresh from start_time on every poll
+    (every 2s, comfortably inside the user's own "update every 5 sec or
+    so" ask) rather than a one-shot value, and left showing/still ticking
+    at whatever elapsed time the run finished at once status is no longer
+    "running" (start_time doesn't change, so this naturally freezes at the
+    true total once nothing further updates it - see _poll_scenario's own
+    poll-then-stop behavior once scenario-poll.disabled goes back to True).
+    "" (no line at all) if start_time isn't set yet (nothing has ever run).
+    """
+    if not start_time:
+        return status_text
+    return [f"Total run time: {_format_mmss(time.time() - start_time)}", html.Br(), status_text]
 
 
 @app.callback(
@@ -4398,6 +4457,7 @@ def _poll_scenario(n_intervals):
         if paused:
             status_text = "Paused - solver suspended in place. Click Continue to resume."
         pause_btn_label = "Continue simulation" if paused else "Pause simulation"
+        status_text = _with_total_run_time(_run_state.get("start_time"), status_text)
         return (log_text, live_text, status_text, _single_run_progress_table(),
                 not still_running, still_running, not still_running, not still_running, pause_btn_label)
 
@@ -4425,6 +4485,7 @@ def _poll_scenario(n_intervals):
         status_text = (f"Paused ({n_done + n_error}/{n_total} done) - every active combination's "
                         f"solver is suspended in place. Click Continue to resume.")
     pause_btn_label = "Continue Sweep" if paused else "Pause Sweep"
+    status_text = _with_total_run_time(_scenario_state.get("start_time"), status_text)
     return (log_text, live_text, status_text, _scenario_progress_table(),
             not still_running, still_running, not still_running, not still_running, pause_btn_label)
 
