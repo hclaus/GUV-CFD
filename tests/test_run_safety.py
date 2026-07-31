@@ -165,13 +165,18 @@ def test_validate_settings_requires_fan_fields_when_fan_enabled():
 
 
 def test_validate_settings_ignores_steady_state_fields_for_decay():
-    settings = _full_settings(**{"sim-type": "decay", "target-t-ss": None})
+    settings = _full_settings(**{"sim-type": "decay", "phase1-iterations": None})
     assert _validate_settings(settings) == []
 
 
 def test_validate_settings_requires_steady_state_fields_for_steady_state():
-    settings = _full_settings(**{"sim-type": "steady_state", "target-t-ss": None})
-    assert _validate_settings(settings) == ["Target steady-state T"]
+    # Regression: target-t-ss used to be the field this test exercised, but
+    # it's no longer a settings key at all (see REFERENCE_TARGET_T_SS) - a
+    # stale _STEADY_STATE_REQUIRED_FIELDS entry once caused a real launch
+    # to fail validation for a field that no longer exists anywhere in the
+    # UI, with no way to "fill it in" as the error message demanded.
+    settings = _full_settings(**{"sim-type": "steady_state", "phase1-iterations": None})
+    assert _validate_settings(settings) == ["Phase 1 iterations"]
 
 
 def test_validate_settings_ignores_disabled_monitoring_points():

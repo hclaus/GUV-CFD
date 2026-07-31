@@ -634,7 +634,7 @@ _OUTLET2_REQUIRED_FIELDS = {
     "outlet2-size-w": "2nd outlet width", "outlet2-size-h": "2nd outlet height",
 }
 _STEADY_STATE_REQUIRED_FIELDS = {
-    "target-t-ss": "Target steady-state T",
+    # target-t-ss removed - no longer a UI field, see REFERENCE_TARGET_T_SS.
     "inject-x-input": "Injection X position", "inject-y-input": "Injection Y position",
     "inject-z-input": "Injection Z position", "source-zone-size": "Source zone size",
     "phase1-iterations": "Phase 1 iterations", "phase2-iterations": "Phase 2 iterations",
