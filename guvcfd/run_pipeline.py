@@ -34,6 +34,7 @@ from .splice import (
     set_lts_ddt_scheme,
     set_relaxation_factors,
     set_scalar_transport_correction,
+    set_pressure_reference_cell,
 )
 from .wsl_utils import (
     wsl_path as _wsl_path,
@@ -832,6 +833,11 @@ def setup_case(guv_path, case_dir, template_case_dir=None, cell_size=0.1, Z=2.0,
         if scalar_transport_ncorr is not None or scalar_transport_tolerance is not None:
             set_scalar_transport_correction(case_dir, ncorr=scalar_transport_ncorr,
                                              tolerance=scalar_transport_tolerance)
+        if sealed:
+            log_fn("Sealed room: setting a pressure reference cell (PIMPLE/SIMPLE) - with "
+                   "every boundary now a wall, there's no fixedValue p patch left to pin "
+                   "down the absolute pressure level...")
+            set_pressure_reference_cell(case_dir)
 
     log_fn(f"Loading project {guv_path} ...")
     project = Project.load(guv_path)

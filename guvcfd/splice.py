@@ -345,6 +345,45 @@ def disable_simple_residual_control(case_dir):
     return fvs_path
 
 
+def set_pressure_reference_cell(case_dir, cell_index=0):
+    """Insert pRefCell/pRefValue into both PIMPLE{} and SIMPLE{} - needed
+    for a sealed (zero-ACH) case, see run_pipeline.setup_case's `sealed`.
+
+    With inlet/outlet closed off as walls, EVERY p boundary is zeroGradient
+    - no fixedValue patch anywhere pins down the absolute pressure level
+    (only its gradient is physically meaningful in a fully enclosed
+    volume), and OpenFOAM's setRefCell() FATAL-errors ("Unable to set
+    reference cell for field p") rather than picking one on its own -
+    confirmed: this is exactly what a sealed room hits on its very first
+    simpleFoam chunk. Applies to both blocks since the sealed mesh/BCs are
+    shared by the SIMPLE flow-convergence solve and the later transient
+    PIMPLE decay solve - both need a reference cell, not just one.
+
+    Idempotent - a block that already has pRefCell/pRefPoint (e.g. a
+    re-run on an already-patched fvSolution) is left untouched.
+    """
+    fvs_path = f"{case_dir}/system/fvSolution"
+    with open(fvs_path) as f:
+        content = f.read()
+
+    for block_name in ("PIMPLE", "SIMPLE"):
+        m = re.search(rf'\b{block_name}\s*\n\s*\{{', content)
+        if not m:
+            continue
+        block_open = content.index("{", m.end() - 1)
+        block_close = _find_matching_brace(content, block_open)
+        block = content[block_open:block_close + 1]
+        if "pRefCell" in block or "pRefPoint" in block:
+            continue
+        insertion = f"\n    pRefCell        {cell_index};\n    pRefValue       0;\n"
+        new_block = block[:1] + insertion + block[1:]
+        content = content[:block_open] + new_block + content[block_close + 1:]
+
+    with open(fvs_path, "w") as f:
+        f.write(content)
+    return fvs_path
+
+
 def set_relaxation_factors(case_dir, momentum_factor=None, scalar_factor=None):
     """Overwrite fvSolution's relaxationFactors{}.equations entries for
     U/(k|omega) (momentum_factor) and T (scalar_factor) - GUI-exposed as
