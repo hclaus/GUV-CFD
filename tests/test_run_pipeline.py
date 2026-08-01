@@ -84,6 +84,62 @@ def test_converge_flow_field_returns_converged_flag():
     assert "return str(total_run), converged" in src
 
 
+def test_setup_case_sealed_without_fan_raises_before_any_wsl_call(monkeypatch):
+    # A sealed room (ach<=0) has no driving force at all without a fan -
+    # must fail fast (before touching WSL/OpenFOAM) rather than silently
+    # building a case with no flow forcing whatsoever.
+    def fail(*a, **k):
+        raise AssertionError("must not reach WSL for a rejected sealed setup_case() call")
+
+    monkeypatch.setattr(run_pipeline, "_run_wsl_or_raise", fail)
+    monkeypatch.setattr(run_pipeline, "_run_wsl", fail)
+    try:
+        setup_case("unused.guv", "unused_dir", sealed=True, fan_speed=None)
+        assert False, "expected ValueError"
+    except ValueError as e:
+        assert "fan" in str(e).lower()
+
+
+def test_converge_flow_field_skip_potential_flow_never_runs_potentialfoam(monkeypatch, tmp_path):
+    commands = []
+
+    def fake_run_wsl(cmd, cwd_wsl):
+        commands.append(cmd)
+        return SimpleNamespace(stdout="", stderr="", returncode=0)
+
+    def fake_run_wsl_or_raise(cmd, cwd_wsl, step_name):
+        commands.append(cmd)
+        if "ls -d" in cmd:
+            return SimpleNamespace(stdout="500", returncode=0)
+        if "ls " in cmd and "grep" in cmd:
+            return SimpleNamespace(stdout="U p k omega nut phi", returncode=0)
+        return SimpleNamespace(stdout="", returncode=0)
+
+    def fake_run_wsl_streaming(cmd, cwd_wsl, on_line=None, should_stop=None, kill_pattern=None, should_pause=None):
+        return SimpleNamespace(stdout="", returncode=0)
+
+    monkeypatch.setattr(run_pipeline, "_run_wsl", fake_run_wsl)
+    monkeypatch.setattr(run_pipeline, "_run_wsl_or_raise", fake_run_wsl_or_raise)
+    monkeypatch.setattr(run_pipeline, "_run_wsl_streaming", fake_run_wsl_streaming)
+    monkeypatch.setattr(run_pipeline, "read_vol_average_dat", lambda path: ([0], [0.0]))
+    monkeypatch.setattr(run_pipeline, "set_function_object_enabled", lambda *a, **k: None)
+    monkeypatch.setattr(run_pipeline, "ensure_simple_fvsolution", lambda *a, **k: None)
+    monkeypatch.setattr(run_pipeline, "write_fvoptions_file", lambda *a, **k: None)
+    monkeypatch.setattr(run_pipeline, "set_control_dict_time", lambda *a, **k: None)
+    monkeypatch.setattr(run_pipeline, "write_vol_average_dict", lambda *a, **k: None)
+
+    # A single, never-converging chunk isn't enough evidence for the
+    # oscillation-acceptance check either, so this legitimately raises
+    # FlowConvergenceUndecided - irrelevant here, only whether
+    # potentialFoam ran matters (that call happens before the loop).
+    try:
+        converge_flow_field(str(tmp_path), n_iterations=500, max_iterations=500, skip_potential_flow=True)
+    except run_pipeline.FlowConvergenceUndecided:
+        pass
+
+    assert not any("potentialFoam" in c for c in commands)
+
+
 def _fake_wsl_result(stdout):
     return SimpleNamespace(stdout=stdout, returncode=0)
 

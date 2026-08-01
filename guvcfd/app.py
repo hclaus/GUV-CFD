@@ -720,6 +720,28 @@ _STEADY_STATE_REQUIRED_FIELDS = {
 }
 
 
+def _sealed_room_error(sim_type, ach_values, fan_enabled):
+    """None if fine, else a user-facing message explaining why a "sealed
+    room" (ACH<=0, no ventilation, mixing via fan only - see
+    run_pipeline.setup_case's `sealed`) request can't run.
+
+    ach_values: a single ach value or an iterable of them (a sweep's ACH
+    list) - a sweep is rejected if ANY of its ACH values is sealed and the
+    conditions below aren't met, same as a single run would be.
+    """
+    if isinstance(ach_values, (int, float)):
+        ach_values = [ach_values]
+    if not any(a <= 0 for a in ach_values):
+        return None
+    if sim_type != "decay":
+        return ("Sealed-room / ACH<=0 is only supported in Decay mode - steady-state "
+                "has no sensible zero-ventilation case.")
+    if not fan_enabled:
+        return ("Sealed room (ACH<=0) needs the mixing fan enabled - with no ventilation "
+                "and no fan, there's no way for the flow field to develop.")
+    return None
+
+
 def _validate_settings(settings):
     """Labels of any required-but-missing (None) field, given the current
     sim-type/fan/monitoring toggles. [] if everything a Run would touch is
@@ -799,6 +821,7 @@ def _run_decay(guv_path, case_dir, room, settings):
         scalar_transport_tolerance=adv["scalar-transport-tolerance"],
         log_fn=_run_log, should_stop=_should_stop, solver_log_fn=_track_solver_time,
         should_pause=_should_pause,
+        sealed=settings["ach"] <= 0,
         **_fan_kwargs(settings),
         **_second_opening_kwargs(settings, "inlet2", room),
         **_second_opening_kwargs(settings, "outlet2", room),
@@ -950,6 +973,7 @@ def _finish_decay(case_dir, room, settings, summary):
         inlet2_size=(settings["inlet2-size-w"], settings["inlet2-size-h"])
         if settings.get("inlet2-enable") else None,
         has_outlet2=bool(settings.get("outlet2-enable")),
+        sealed=settings["ach"] <= 0,
         log_fn=_run_log, should_stop=_should_stop,
     )
 
@@ -1132,6 +1156,9 @@ def _settling_iterations(lambda_per_hr, target_fraction=0.995, min_iterations=50
 
 
 def _run_steady_state(guv_path, case_dir, room, settings):
+    if settings["ach"] <= 0:
+        raise ValueError("Sealed-room / ACH<=0 is only supported in Decay mode - "
+                          "steady-state has no sensible zero-ventilation case.")
     adv = load_advanced_settings()
     fan_kwargs = _fan_kwargs(settings)
 
@@ -3697,6 +3724,10 @@ def _start_run(n_clicks, *values):
                 "Missing required value(s) - fill these in before running: "
                 + ", ".join(missing) + ".", dash.no_update, False, dash.no_update)
 
+    sealed_error = _sealed_room_error(sim_type, settings["ach"], settings.get("fan-enable"))
+    if sealed_error:
+        return (False, False, True, sealed_error, dash.no_update, False, dash.no_update)
+
     # A case whose flow convergence paused (FlowConvergenceUndecided) and
     # was never resolved - possibly in an earlier server session that no
     # longer has any memory of it (the whole point of persisting chunk
@@ -4083,6 +4114,10 @@ def _start_scenario_sweep(n_clicks, z_text, ach_text, *values):
         return (False, True, True,
                 "Missing required value(s) - fill these in on Project Setup before running: "
                 + ", ".join(missing) + ".", dash.no_update, _NA, _NA, _NA, _NA, _NA, _NA)
+
+    sealed_error = _sealed_room_error(settings.get("sim-type"), ach_values, settings.get("fan-enable"))
+    if sealed_error:
+        return (False, True, True, sealed_error, dash.no_update, _NA, _NA, _NA, _NA, _NA, _NA)
 
     combos = scenario_runs.sweep_combinations(z_values, ach_values)
     adv = load_advanced_settings()

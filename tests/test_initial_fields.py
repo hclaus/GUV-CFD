@@ -68,6 +68,25 @@ def test_boundary_field_block_outlet2_mirrors_primary_outlet_for_non_U_fields():
     assert "    outlet2\n    {\n            type            fixedValue;\n            value           uniform 0;\n    }" in text
 
 
+def test_boundary_field_block_sealed_uses_wall_spec_for_inlet_and_outlet():
+    # A sealed (zero-ACH) case: inlet/outlet get U's wall spec (noSlip),
+    # not a fixedValue inlet velocity - the velocity value itself must be
+    # ignored entirely.
+    text = boundary_field_block("U", inlet_velocity=(0.5, 0, 0), has_outlet2=True,
+                                 inlet2_velocity=(0, 0, -0.25), sealed=True)
+    assert "0.5" not in text and "-0.25" not in text
+    assert "fixedValue" not in text and "inletOutlet" not in text
+    for patch in ("inlet", "inlet2", "outlet", "outlet2"):
+        block = text.split(f"    {patch}\n    {{")[1].split("    }")[0]
+        assert "noSlip" in block
+
+
+def test_boundary_field_block_sealed_uses_wall_spec_for_k():
+    text = boundary_field_block("k", sealed=True)
+    assert "type            kqRWallFunction;" in text
+    assert "inletOutlet" not in text and "fixedValue" not in text
+
+
 def test_field_file_content_with_both_second_openings_stays_valid_dict_shape():
     content = field_file_content(
         "U", inlet_velocity=(0.5, 0, 0), inlet2_velocity=(0, 0, -0.3), has_outlet2=True,

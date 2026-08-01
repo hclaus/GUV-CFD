@@ -229,20 +229,28 @@ def topo_set_dict(inlet_box, outlet_box, inlet2_box=None, outlet2_box=None):
     return "\n".join(lines)
 
 
-def _patch_entry(name):
+def _patch_entry(name, patch_type="patch"):
     return [
         "    {", f"        name        {name};", "        patchInfo", "        {",
-        "            type patch;", "        }",
+        f"            type {patch_type};", "        }",
         "        constructFrom set;", f"        set         {name}Faces;", "    }",
     ]
 
 
-def create_patch_dict(has_inlet2=False, has_outlet2=False):
-    patches = _patch_entry("inlet") + _patch_entry("outlet")
+def create_patch_dict(has_inlet2=False, has_outlet2=False, sealed=False):
+    """sealed: True closes off inlet/outlet (and inlet2/outlet2, if present)
+    as real `wall` patches instead of passive `patch` ones - a sealed
+    (zero-ACH, fan-only-mixing) decay case has no ventilation at all, so
+    these openings are physically walls, not just zero-velocity inlets/
+    outlets (which is what previously produced a degenerate all-zero-flux
+    system and crashed potentialFoam - see run_pipeline.setup_case's
+    `sealed` docstring)."""
+    patch_type = "wall" if sealed else "patch"
+    patches = _patch_entry("inlet", patch_type) + _patch_entry("outlet", patch_type)
     if has_inlet2:
-        patches += _patch_entry("inlet2")
+        patches += _patch_entry("inlet2", patch_type)
     if has_outlet2:
-        patches += _patch_entry("outlet2")
+        patches += _patch_entry("outlet2", patch_type)
 
     lines = [
         "FoamFile", "{", "    version     2.0;", "    format      ascii;",
@@ -285,7 +293,8 @@ def write_mesh_dicts(case_dir, Lx, Ly, Lz, cell_size=0.1,
                       inlet_wall="xMin", inlet_center=(0.5, 0.85), inlet_size=(0.3, 0.3),
                       outlet_wall="xMax", outlet_center=(0.5, 0.15), outlet_size=(0.3, 0.3),
                       inlet2_wall=None, inlet2_center=None, inlet2_size=None,
-                      outlet2_wall=None, outlet2_center=None, outlet2_size=None):
+                      outlet2_wall=None, outlet2_center=None, outlet2_size=None,
+                      sealed=False):
     """Write blockMeshDict, topoSetDict, createPatchDict into case_dir/system/.
 
     inlet/outlet center/size are fractions of the wall's two in-plane
@@ -294,6 +303,9 @@ def write_mesh_dicts(case_dir, Lx, Ly, Lz, cell_size=0.1,
     of the 6 walls independently of the primary one's wall - None (the
     default) means "no 2nd opening", carving the same 2-patch mesh as
     before this parameter existed.
+
+    sealed: see create_patch_dict - carves the same opening geometry but
+    closes it off as a wall patch instead of a flow patch.
     """
     inlet_box = _opening_box(inlet_wall, Lx, Ly, Lz, inlet_center, inlet_size, cell_size=cell_size)
     outlet_box = _opening_box(outlet_wall, Lx, Ly, Lz, outlet_center, outlet_size, cell_size=cell_size)
@@ -315,7 +327,8 @@ def write_mesh_dicts(case_dir, Lx, Ly, Lz, cell_size=0.1,
 
     cp_path = f"{case_dir}/system/createPatchDict"
     with open(cp_path, "w") as f:
-        f.write(create_patch_dict(has_inlet2=inlet2_box is not None, has_outlet2=outlet2_box is not None))
+        f.write(create_patch_dict(has_inlet2=inlet2_box is not None, has_outlet2=outlet2_box is not None,
+                                   sealed=sealed))
     paths["createPatchDict"] = cp_path
 
     return paths

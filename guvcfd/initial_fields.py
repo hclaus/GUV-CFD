@@ -350,7 +350,7 @@ def _field_spec(field_name, inlet_velocity, T_initial=1):
 
 
 def boundary_field_block(field_name, inlet_velocity=(0.278, 0, 0), T_initial=1,
-                          inlet2_velocity=None, has_outlet2=False):
+                          inlet2_velocity=None, has_outlet2=False, sealed=False):
     """Return just the 'boundaryField { ... }' lines for a field.
 
     inlet2_velocity: if given, emit a 2nd inlet patch block too - same BC
@@ -360,22 +360,35 @@ def boundary_field_block(field_name, inlet_velocity=(0.278, 0, 0), T_initial=1,
     has_outlet2: if True, emit a 2nd outlet patch block, identical to the
     primary outlet in every field (outlets are passive inletOutlet/
     zeroGradient - there's no per-instance value to vary).
+
+    sealed: True for a sealed (zero-ACH, fan-only-mixing) decay case - the
+    inlet/inlet2/outlet/outlet2 patches get the "wall" spec instead of
+    "inlet"/"outlet", matching mesh_gen.create_patch_dict's sealed=True
+    patches (which are real `wall`-typed patches, not passive `patch`
+    ones - see run_pipeline.setup_case's `sealed` docstring). The actual
+    *value* of inlet_velocity/inlet2_velocity is ignored in this case (the
+    patches aren't inlets) - but inlet2_velocity being None vs. not-None
+    still controls whether an inlet2 block is emitted at all, same as
+    always, so a sealed case with a 2nd inlet must still pass some non-None
+    placeholder (e.g. (0,0,0)) to get its inlet2 wall block written.
     """
     spec = _field_spec(field_name, inlet_velocity, T_initial)
+    inlet_key = "wall" if sealed else "inlet"
+    outlet_key = "wall" if sealed else "outlet"
     lines = ["boundaryField", "{", "    inlet", "    {"]
-    lines += ["    " + l for l in _patch_block(spec["inlet"])]
+    lines += ["    " + l for l in _patch_block(spec[inlet_key])]
     lines += ["    }"]
     if inlet2_velocity is not None:
         spec2 = _field_spec(field_name, inlet2_velocity, T_initial)
         lines += ["    inlet2", "    {"]
-        lines += ["    " + l for l in _patch_block(spec2["inlet"])]
+        lines += ["    " + l for l in _patch_block(spec2[inlet_key])]
         lines += ["    }"]
     lines += ["    outlet", "    {"]
-    lines += ["    " + l for l in _patch_block(spec["outlet"])]
+    lines += ["    " + l for l in _patch_block(spec[outlet_key])]
     lines += ["    }"]
     if has_outlet2:
         lines += ["    outlet2", "    {"]
-        lines += ["    " + l for l in _patch_block(spec["outlet"])]
+        lines += ["    " + l for l in _patch_block(spec[outlet_key])]
         lines += ["    }"]
     for patch in _WALL_PATCHES:
         lines += [f"    {patch}", "    {"]
@@ -386,7 +399,7 @@ def boundary_field_block(field_name, inlet_velocity=(0.278, 0, 0), T_initial=1,
 
 
 def field_file_content(field_name, time_dir="0", inlet_velocity=(0.278, 0, 0), T_initial=1,
-                        inlet2_velocity=None, has_outlet2=False):
+                        inlet2_velocity=None, has_outlet2=False, sealed=False):
     spec = _field_spec(field_name, inlet_velocity, T_initial)
     lines = [
         "FoamFile", "{", "    version     2.0;", "    format      ascii;",
@@ -396,11 +409,12 @@ def field_file_content(field_name, time_dir="0", inlet_velocity=(0.278, 0, 0), T
         f"internalField   {spec['internal']};", "",
     ]
     return "\n".join(lines) + "\n" + boundary_field_block(
-        field_name, inlet_velocity, T_initial, inlet2_velocity=inlet2_velocity, has_outlet2=has_outlet2)
+        field_name, inlet_velocity, T_initial, inlet2_velocity=inlet2_velocity, has_outlet2=has_outlet2,
+        sealed=sealed)
 
 
 def write_initial_fields(case_dir, time_dir="0", inlet_velocity=(0.278, 0, 0), T_initial=1,
-                          inlet2_velocity=None, has_outlet2=False):
+                          inlet2_velocity=None, has_outlet2=False, sealed=False):
     """Write U, p, k, omega, nut, T into <case_dir>/<time_dir>/. Returns written paths.
 
     inlet_velocity: (vx, vy, vz) in m/s - see compute_inlet_velocity() to
@@ -408,15 +422,15 @@ def write_initial_fields(case_dir, time_dir="0", inlet_velocity=(0.278, 0, 0), T
     T_initial: T's starting internalField value - 1 for a one-time decay
     scenario (room starts fully contaminated), 0 for a steady-state
     build-up scenario (room starts clean, a continuous source fills it).
-    inlet2_velocity/has_outlet2: an optional 2nd inlet/outlet - see
-    boundary_field_block.
+    inlet2_velocity/has_outlet2/sealed: an optional 2nd inlet/outlet, and a
+    sealed (zero-ACH) case - see boundary_field_block.
     """
     paths = {}
     for field_name in _FIELD_SPECS:
         path = f"{case_dir}/{time_dir}/{field_name}"
         with open(path, "w") as f:
             f.write(field_file_content(field_name, time_dir, inlet_velocity=inlet_velocity, T_initial=T_initial,
-                                        inlet2_velocity=inlet2_velocity, has_outlet2=has_outlet2))
+                                        inlet2_velocity=inlet2_velocity, has_outlet2=has_outlet2, sealed=sealed))
         paths[field_name] = path
     return paths
 
@@ -429,7 +443,7 @@ _FULL_RESET_FIELDS = ("T",)  # scalars representing a scenario's *starting*
 
 
 def restore_boundary_conditions(case_dir, time_dir="0", inlet_velocity=(0.278, 0, 0), T_initial=1,
-                                 inlet2_velocity=None, has_outlet2=False):
+                                 inlet2_velocity=None, has_outlet2=False, sealed=False):
     """Reset the boundaryField{} section of each already-written field file
     back to our own BCs, leaving internalField untouched for flow fields
     (U/p/k/omega/nut) - but fully resetting fields in _FULL_RESET_FIELDS
@@ -453,14 +467,14 @@ def restore_boundary_conditions(case_dir, time_dir="0", inlet_velocity=(0.278, 0
         if field_name in _FULL_RESET_FIELDS:
             with open(path, "w") as f:
                 f.write(field_file_content(field_name, time_dir, inlet_velocity=inlet_velocity, T_initial=T_initial,
-                                            inlet2_velocity=inlet2_velocity, has_outlet2=has_outlet2))
+                                            inlet2_velocity=inlet2_velocity, has_outlet2=has_outlet2, sealed=sealed))
             paths[field_name] = path
             continue
         with open(path) as f:
             content = f.read()
         idx = content.index("boundaryField")
         new_content = content[:idx] + boundary_field_block(
-            field_name, inlet_velocity, inlet2_velocity=inlet2_velocity, has_outlet2=has_outlet2)
+            field_name, inlet_velocity, inlet2_velocity=inlet2_velocity, has_outlet2=has_outlet2, sealed=sealed)
         with open(path, "w") as f:
             f.write(new_content)
         paths[field_name] = path

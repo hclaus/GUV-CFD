@@ -199,7 +199,7 @@ def _is_stable_oscillation(history, window, growth_tol):
 def converge_flow_field(case_dir, n_iterations=500, fan_entry=None, log_fn=print,
                          max_iterations=20000, check_field="p", rel_tol=0.01, should_stop=None,
                          method="simple", oscillation_window=6, oscillation_growth_tol=1.5,
-                         solver_log_fn=None, resume=False, should_pause=None):
+                         solver_log_fn=None, resume=False, should_pause=None, skip_potential_flow=False):
     """Run simpleFoam to actually converge the flow field on this mesh,
     starting from whatever is in 0/ (e.g. a mapFields warm start), then copy
     the result back into 0/ so it becomes pimpleFoam's starting point.
@@ -297,6 +297,16 @@ def converge_flow_field(case_dir, n_iterations=500, fan_entry=None, log_fn=print
     should_pause: forwarded straight to run_wsl_streaming - suspends the
     active solver process in place (no iterations lost, no exception
     raised) instead of killing it, unlike should_stop.
+
+    skip_potential_flow: True to skip potentialFoam even on a genuine cold
+    start (independent of `resume`) - for a sealed (zero-ACH) case, EVERY
+    patch is a zero-flux wall, so potentialFoam's velocity-potential solve
+    is fully degenerate (a pure-Neumann Laplace problem with zero RHS
+    everywhere) and its "approximate pressure field" step reliably crashes
+    with a floating point exception (confirmed: this is what a bare ACH=0
+    run used to hit). potentialFoam also ignores fvOptions entirely, so it
+    can't see a sealed case's only real driving force (the fan) anyway -
+    there's nothing useful for it to compute here, just risk.
     """
     case_dir_wsl = _wsl_path(case_dir)
     solver = "pimpleFoam" if method == "lts" else "simpleFoam"
@@ -324,10 +334,15 @@ def converge_flow_field(case_dir, n_iterations=500, fan_entry=None, log_fn=print
                "for pseudo-transient flow convergence via pimpleFoam...")
         set_lts_ddt_scheme(case_dir, True)
 
-    if resume:
-        log_fn("Resuming: skipping potentialFoam (would overwrite the existing, "
-               "already-developed flow field with a fresh irrotational guess - only "
-               "wanted for a genuine cold start)...")
+    if resume or skip_potential_flow:
+        if resume:
+            log_fn("Resuming: skipping potentialFoam (would overwrite the existing, "
+                   "already-developed flow field with a fresh irrotational guess - only "
+                   "wanted for a genuine cold start)...")
+        else:
+            log_fn("Sealed case (ACH=0): skipping potentialFoam - every patch is a wall, "
+                   "so its irrotational solve is fully degenerate and it ignores the fan "
+                   "anyway. Starting simpleFoam from the uniform-zero initial guess instead.")
     else:
         log_fn("Running potentialFoam for a better initial guess than uniform-zero "
                "(cheap inviscid/irrotational solve, skips most of the 'spin up from "
@@ -689,6 +704,7 @@ def setup_case(guv_path, case_dir, template_case_dir=None, cell_size=0.1, Z=2.0,
                pimple_end_time=120, pimple_write_interval=10, pimple_delta_t=0.5,
                fan_speed=None, fan_center=None, fan_direction=(0, 0, -1),
                fan_disk_radius=0.6, fan_disk_thickness=0.2, fan_height=None,
+               sealed=False,
                log_fn=print, should_stop=None, solver_log_fn=None, should_pause=None):
     """Set up an OpenFOAM case end-to-end from a .guv project. Returns a dict
     summarizing the run (room dims, lamp count, fluence/k ranges, zone count).
@@ -772,7 +788,24 @@ def setup_case(guv_path, case_dir, template_case_dir=None, cell_size=0.1, Z=2.0,
     the UV/source entries, which only apply once scalar transport starts.
     fan_center defaults to room center in x/y, 30cm below the ceiling, if
     not given.
+
+    sealed: True to build a sealed room - no ventilation at all (decay mode
+    only; ach is expected to be <=0, but this must be requested explicitly
+    by the caller, never inferred from ach here, since setup_case is shared
+    with steady-state, which has no sensible zero-ACH case). The inlet/
+    outlet openings (and inlet2/outlet2, if present) are built as real wall
+    patches instead of zero-velocity flow patches (see
+    mesh_gen.create_patch_dict), potentialFoam is skipped (see
+    converge_flow_field's skip_potential_flow), and the post-convergence
+    ACH-delivery check is skipped (there's no ventilation to measure).
+    Requires fan_speed - a sealed room with no fan has no driving force at
+    all.
     """
+    if sealed and fan_speed is None:
+        raise ValueError("A sealed room (ach<=0) needs a mixing fan (fan_speed) - "
+                          "with no ventilation and no fan, there's no way for the "
+                          "flow field to develop at all.")
+
     case_dir_wsl = _wsl_path(case_dir)
     summary = {}
 
@@ -807,12 +840,16 @@ def setup_case(guv_path, case_dir, template_case_dir=None, cell_size=0.1, Z=2.0,
     summary["room"] = (room.x, room.y, room.z, str(room.units))
     summary["n_lamps"] = len(room.lamps)
 
+    if sealed:
+        log_fn("Sealed room (ACH<=0): inlet/outlet openings will be closed off as walls - "
+               "mixing relies entirely on the fan...")
     log_fn("Writing mesh dicts (blockMeshDict/topoSetDict/createPatchDict)...")
     write_mesh_dicts(case_dir, room.x, room.y, room.z, cell_size=cell_size,
                       inlet_wall=inlet_wall, inlet_center=inlet_center, inlet_size=inlet_size,
                       outlet_wall=outlet_wall, outlet_center=outlet_center, outlet_size=outlet_size,
                       inlet2_wall=inlet2_wall, inlet2_center=inlet2_center, inlet2_size=inlet2_size,
-                      outlet2_wall=outlet2_wall, outlet2_center=outlet2_center, outlet2_size=outlet2_size)
+                      outlet2_wall=outlet2_wall, outlet2_center=outlet2_center, outlet2_size=outlet2_size,
+                      sealed=sealed)
 
     log_fn("Running blockMesh...")
     _run_wsl_or_raise("blockMesh", case_dir_wsl, "blockMesh")
@@ -841,46 +878,60 @@ def setup_case(guv_path, case_dir, template_case_dir=None, cell_size=0.1, Z=2.0,
         summary["fan"] = {"center": center, "speed": fan_speed, "direction": fan_direction}
 
     room_volume = room.x * room.y * room.z
-    openings = [(inlet_wall, inlet_size[0] * inlet_size[1])]
-    if inlet2_wall is not None:
-        openings.append((inlet2_wall, inlet2_size[0] * inlet2_size[1]))
-    total_area = sum(a for _, a in openings)
-    v_mag = compute_inlet_velocity(ach, room_volume, total_area)
-
-    # Mesh already exists at this point (blockMesh/topoSet/createPatch
-    # above) - resolve_inlet_velocity() can read the "ceiling" diffuser's
-    # real per-face geometry straight from constant/polyMesh, no need to
-    # wait for the writeCellCentres step further below. Computed once,
-    # reused for every write_initial_fields()/restore_boundary_conditions()
-    # call in this function - stateless/cheap, and mesh geometry doesn't
-    # change mid-run.
-    inlet_velocity = resolve_inlet_velocity(
-        case_dir, "inlet", inlet_wall,
-        opening_center(inlet_wall, room.x, room.y, room.z, inlet_center, inlet_size, cell_size=cell_size),
-        v_mag, diffuser_type=inlet_diffuser_type,
-        half_extents=opening_half_extents(inlet_wall, room.x, room.y, room.z, inlet_center, inlet_size,
-                                           cell_size=cell_size))
-    inlet2_velocity = None
-    if inlet2_wall is not None:
-        inlet2_velocity = resolve_inlet_velocity(
-            case_dir, "inlet2", inlet2_wall,
-            opening_center(inlet2_wall, room.x, room.y, room.z, inlet2_center, inlet2_size, cell_size=cell_size),
-            v_mag, diffuser_type=inlet2_diffuser_type,
-            half_extents=opening_half_extents(inlet2_wall, room.x, room.y, room.z, inlet2_center, inlet2_size,
-                                               cell_size=cell_size))
-    log_fn(f"Writing initial fields (0/{{U,p,k,omega,nut,T}}), ACH={ach} -> "
-           f"inlet velocity magnitude {v_mag:.4g} m/s ({inlet_diffuser_type})"
-           + (f", inlet2 ({inlet2_diffuser_type})" if inlet2_velocity else "")
-           + f" (room volume={room_volume:.3g} m^3, total inlet area="
-           f"{total_area:.3g} m^2)...")
     has_outlet2 = outlet2_wall is not None
+    if sealed:
+        # Inlet/outlet are now wall patches (see write_mesh_dicts above) -
+        # no velocity to compute or resolve. inlet_velocity/inlet2_velocity
+        # are still passed as non-None placeholders below (their VALUE is
+        # ignored by boundary_field_block(sealed=True), but inlet2_velocity
+        # being None vs. not is what controls whether an inlet2 block gets
+        # emitted at all - see its docstring).
+        log_fn(f"Writing initial fields (0/{{U,p,k,omega,nut,T}}), sealed room "
+               f"(room volume={room_volume:.3g} m^3)...")
+        inlet_velocity = (0.0, 0.0, 0.0)
+        inlet2_velocity = (0.0, 0.0, 0.0) if inlet2_wall is not None else None
+    else:
+        openings = [(inlet_wall, inlet_size[0] * inlet_size[1])]
+        if inlet2_wall is not None:
+            openings.append((inlet2_wall, inlet2_size[0] * inlet2_size[1]))
+        total_area = sum(a for _, a in openings)
+        v_mag = compute_inlet_velocity(ach, room_volume, total_area)
+
+        # Mesh already exists at this point (blockMesh/topoSet/createPatch
+        # above) - resolve_inlet_velocity() can read the "ceiling" diffuser's
+        # real per-face geometry straight from constant/polyMesh, no need to
+        # wait for the writeCellCentres step further below. Computed once,
+        # reused for every write_initial_fields()/restore_boundary_conditions()
+        # call in this function - stateless/cheap, and mesh geometry doesn't
+        # change mid-run.
+        inlet_velocity = resolve_inlet_velocity(
+            case_dir, "inlet", inlet_wall,
+            opening_center(inlet_wall, room.x, room.y, room.z, inlet_center, inlet_size, cell_size=cell_size),
+            v_mag, diffuser_type=inlet_diffuser_type,
+            half_extents=opening_half_extents(inlet_wall, room.x, room.y, room.z, inlet_center, inlet_size,
+                                               cell_size=cell_size))
+        inlet2_velocity = None
+        if inlet2_wall is not None:
+            inlet2_velocity = resolve_inlet_velocity(
+                case_dir, "inlet2", inlet2_wall,
+                opening_center(inlet2_wall, room.x, room.y, room.z, inlet2_center, inlet2_size, cell_size=cell_size),
+                v_mag, diffuser_type=inlet2_diffuser_type,
+                half_extents=opening_half_extents(inlet2_wall, room.x, room.y, room.z, inlet2_center, inlet2_size,
+                                                   cell_size=cell_size))
+        log_fn(f"Writing initial fields (0/{{U,p,k,omega,nut,T}}), ACH={ach} -> "
+               f"inlet velocity magnitude {v_mag:.4g} m/s ({inlet_diffuser_type})"
+               + (f", inlet2 ({inlet2_diffuser_type})" if inlet2_velocity else "")
+               + f" (room volume={room_volume:.3g} m^3, total inlet area="
+               f"{total_area:.3g} m^2)...")
     Path(f"{case_dir}/0").mkdir(parents=True, exist_ok=True)
     write_initial_fields(case_dir, inlet_velocity=inlet_velocity, inlet2_velocity=inlet2_velocity,
-                          has_outlet2=has_outlet2)
+                          has_outlet2=has_outlet2, sealed=sealed)
     summary["ach"] = ach
-    summary["inlet_velocity"] = inlet_velocity
-    if inlet2_velocity:
-        summary["inlet2_velocity"] = inlet2_velocity
+    summary["sealed"] = sealed
+    if not sealed:
+        summary["inlet_velocity"] = inlet_velocity
+        if inlet2_velocity:
+            summary["inlet2_velocity"] = inlet2_velocity
 
     log_fn("Running writeCellCentres...")
     _run_wsl_or_raise("postProcess -func writeCellCentres -time 0", case_dir_wsl, "writeCellCentres")
@@ -897,7 +948,7 @@ def setup_case(guv_path, case_dir, template_case_dir=None, cell_size=0.1, Z=2.0,
         log_fn("  restoring our own boundary conditions (mapFields also clobbers fixedValue "
                "patches like inlet with interpolated garbage)...")
         restore_boundary_conditions(case_dir, inlet_velocity=inlet_velocity, inlet2_velocity=inlet2_velocity,
-                                     has_outlet2=has_outlet2)
+                                     has_outlet2=has_outlet2, sealed=sealed)
 
     if converge_flow:
         log_fn(f"Converging flow field ({flow_convergence_method}, chunk size="
@@ -907,18 +958,22 @@ def setup_case(guv_path, case_dir, template_case_dir=None, cell_size=0.1, Z=2.0,
             log_fn=log_fn, should_stop=should_stop, method=flow_convergence_method,
             rel_tol=flow_rel_tol, max_iterations=flow_max_iterations,
             oscillation_window=oscillation_window, oscillation_growth_tol=oscillation_growth_tol,
-            solver_log_fn=solver_log_fn, should_pause=should_pause)
+            solver_log_fn=solver_log_fn, should_pause=should_pause, skip_potential_flow=sealed)
         summary["flow_converged"] = flow_converged
         if should_stop is not None and should_stop():
             raise StoppedByUser("Stopped after flow convergence.")
         log_fn("  restoring our own boundary conditions again (simpleFoam's mesh-derived "
                "boundary values aren't necessarily our fixedValue settings either)...")
         restore_boundary_conditions(case_dir, inlet_velocity=inlet_velocity, inlet2_velocity=inlet2_velocity,
-                                     has_outlet2=has_outlet2)
+                                     has_outlet2=has_outlet2, sealed=sealed)
 
-        outlet_patches = ("outlet", "outlet2") if has_outlet2 else ("outlet",)
-        summary["ach_delivery"] = check_ach_delivery(
-            case_dir, room_volume, ach, outlet_patches=outlet_patches, tol=ach_delivery_tol, log_fn=log_fn)
+        if sealed:
+            log_fn("Skipping ACH-delivery check - sealed room, no ventilation to measure.")
+            summary["ach_delivery"] = None
+        else:
+            outlet_patches = ("outlet", "outlet2") if has_outlet2 else ("outlet",)
+            summary["ach_delivery"] = check_ach_delivery(
+                case_dir, room_volume, ach, outlet_patches=outlet_patches, tol=ach_delivery_tol, log_fn=log_fn)
 
     return _finish_case_setup(case_dir, room, Z, nbins, source_field, fan_entry,
                                pimple_end_time, pimple_write_interval, pimple_delta_t, log_fn, summary)

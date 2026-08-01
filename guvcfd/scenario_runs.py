@@ -90,8 +90,17 @@ def _fmt(value):
     return f"{value:g}"
 
 
+def _ach_label(ach):
+    """Folder-name-safe label for an ACH value - "sealed" for ACH<=0 (no
+    ventilation, fan-only mixing - see run_pipeline.setup_case's `sealed`)
+    instead of "0", so a sealed-room subfolder is never confusable at a
+    glance with a genuinely low but nonzero ACH one.
+    """
+    return "sealed" if ach <= 0 else _fmt(ach)
+
+
 def _subdir_name(z, ach):
-    return _sanitize(f"Z{_fmt(z)}_ACH{_fmt(ach)}")
+    return _sanitize(f"Z{_fmt(z)}_ACH{_ach_label(ach)}")
 
 
 def sweep_combinations(z_values, ach_values):
@@ -189,12 +198,16 @@ def _save_run_settings(case_dir, settings, guv_path, settings_path, z, ach):
 # --- flow-field build/reuse ---
 
 def _build_flow_base(guv_path, base_dir, room, settings, ach, adv, log_fn, should_stop, solver_log_fn,
-                      should_pause=None):
+                      should_pause=None, sealed=False):
     """setup_case() into base_dir at this ACH - the project's currently
     configured Z is used as a placeholder (every Z-dependent file this
     writes gets overwritten by _apply_z before any subfolder actually
     runs), exactly the same call app._run_steady_state makes for a single
     run, just targeting a temp directory.
+
+    sealed: forwarded straight to setup_case - True for a decay-mode ACH<=0
+    (sealed room, fan-only mixing) group; steady-state sweeps never pass
+    this (see run_sweep's own upfront ach>0 validation).
 
     If base_dir already has a resolved flow-convergence result on disk
     from an earlier attempt at this ACH (a sweep that got interrupted or
@@ -229,6 +242,7 @@ def _build_flow_base(guv_path, base_dir, room, settings, ach, adv, log_fn, shoul
         scalar_transport_ncorr=adv["scalar-transport-ncorr"],
         scalar_transport_tolerance=adv["scalar-transport-tolerance"],
         log_fn=log_fn, should_stop=should_stop, solver_log_fn=solver_log_fn, should_pause=should_pause,
+        sealed=sealed,
         **_fan_kwargs(settings),
         **_second_opening_kwargs(settings, "inlet2", room),
         **_second_opening_kwargs(settings, "outlet2", room),
@@ -594,7 +608,7 @@ def _throttled_solver_callback(log_fn, log_prefix, on_line=None, status_fn=None,
 
 
 def _run_shared_control(base_dir, control_dir, ach, room, settings, adv, log_fn, should_stop, solver_log_fn,
-                         status_fn=None, should_pause=None):
+                         status_fn=None, should_pause=None, sealed=False):
     """Run the UV-off control decay ONCE per ACH group, shared across
     every Z sharing that ACH - control's own physics (uniform T=1 initial
     condition, no UV sink, same converged flow field) doesn't depend on Z
@@ -624,6 +638,7 @@ def _run_shared_control(base_dir, control_dir, ach, room, settings, adv, log_fn,
         inlet2_wall=settings["inlet2-wall"] if has_inlet2 else None,
         inlet2_size=(settings["inlet2-size-w"], settings["inlet2-size-h"]) if has_inlet2 else None,
         has_outlet2=bool(settings.get("outlet2-enable")),
+        sealed=sealed,
         log_fn=log_fn, should_stop=should_stop,
     )
 
@@ -894,17 +909,23 @@ def run_decay_sweep(guv_path, settings_path, project_dir, room, settings, adv,
     project_name = _sanitize(Path(project_dir).name)
 
     def build_ach_fn(ach):
+        sealed = ach <= 0
+        if sealed and not settings.get("fan-enable"):
+            raise ValueError(
+                f"ACH={ach}: a sealed room (ACH<=0) needs the mixing fan enabled - "
+                "with no ventilation and no fan, there's no way for the flow field to develop.")
         ach_log_fn = _prefixed_log_fn(log_fn, f"ACH={ach}")
-        base_dir = f"{project_dir}/_base_ACH{_fmt(ach)}"
-        control_dir = f"{project_dir}/_control_ACH{_fmt(ach)}"
+        base_dir = f"{project_dir}/_base_ACH{_ach_label(ach)}"
+        control_dir = f"{project_dir}/_control_ACH{_ach_label(ach)}"
         ach_log_fn("=== converging flow field (shared by every Z at this ACH) ===")
         base_summary = _build_flow_base(guv_path, base_dir, room, settings, ach, adv,
-                                         ach_log_fn, should_stop, solver_log_fn, should_pause=should_pause)
+                                         ach_log_fn, should_stop, solver_log_fn, should_pause=should_pause,
+                                         sealed=sealed)
         # UV-off control is Z-independent (see _run_shared_control) - run
         # it once per ACH here, not once per Z in run_z_fn below.
         control_results = _run_shared_control(base_dir, control_dir, ach, room, settings, adv,
                                                ach_log_fn, should_stop, solver_log_fn, status_fn=status_fn,
-                                               should_pause=should_pause)
+                                               should_pause=should_pause, sealed=sealed)
         return {
             "ach": ach, "base_dir": base_dir, "control_dir": control_dir,
             "base_summary": base_summary, "control_results": control_results,
@@ -1032,6 +1053,10 @@ def run_sweep(guv_path, settings_path, project_dir, room, settings, adv,
     scrolling log - see run_decay_sweep's own docstring for the same
     mechanism.
     """
+    if any(ach <= 0 for ach in ach_values):
+        raise ValueError("Sealed-room / ACH<=0 is only supported in Decay mode - "
+                          "steady-state has no sensible zero-ventilation case.")
+
     combos = sweep_combinations(z_values, ach_values)
     achs = sorted({ach for _, ach in combos})
     project_name = _sanitize(Path(project_dir).name)

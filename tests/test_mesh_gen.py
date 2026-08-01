@@ -76,6 +76,19 @@ def test_create_patch_dict_flags_control_which_patches_appear():
     assert "name        inlet2;" in text2 and "name        outlet2;" in text2
 
 
+def test_create_patch_dict_sealed_closes_openings_as_walls():
+    text = create_patch_dict(sealed=True)
+    assert "type wall;" in text
+    assert "type patch;" not in text
+
+    text2 = create_patch_dict(has_inlet2=True, has_outlet2=True, sealed=True)
+    assert text2.count("type wall;") == 4
+    assert "type patch;" not in text2
+
+    # sealed=False (the default) is untouched.
+    assert "type patch;" in create_patch_dict()
+
+
 def test_write_mesh_dicts_with_second_openings_on_different_walls(tmp_path):
     case_dir = tmp_path
     (case_dir / "system").mkdir()

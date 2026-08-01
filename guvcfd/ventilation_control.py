@@ -23,7 +23,7 @@ def prepare_ventilation_only_control(case_dir, control_dir, ach, room_x, room_y,
                                       inlet_wall, inlet_size, pimple_end_time,
                                       pimple_write_interval, pimple_delta_t=0.5,
                                       inlet2_wall=None, inlet2_size=None, has_outlet2=False,
-                                      log_fn=print, should_stop=None):
+                                      sealed=False, log_fn=print, should_stop=None):
     """Clone case_dir's mesh/converged flow field into control_dir, remove
     every UV source, reset T fresh, and set its own transient-decay duration
     - everything needed before pimpleFoam can run. Split out from actually
@@ -38,6 +38,11 @@ def prepare_ventilation_only_control(case_dir, control_dir, ach, room_x, room_y,
     the original case_dir was actually built with (see setup_case) - the
     mesh is cloned as-is, so these only need to match for the boundary
     condition *values* to come out right, not to change the mesh itself.
+
+    sealed: must match case_dir's own sealed setting (setup_case's) - the
+    cloned mesh already has inlet/outlet built as wall patches if case_dir
+    was a sealed build, so this control run's own BCs need to match (wall
+    spec, not a computed inlet velocity) rather than fight the mesh.
     """
     control_dir_wsl = wsl_path(control_dir)
     case_dir_wsl_src = wsl_path(case_dir)
@@ -64,17 +69,21 @@ def prepare_ventilation_only_control(case_dir, control_dir, ach, room_x, room_y,
     if should_stop is not None and should_stop():
         raise StoppedByUser("Stopped before UV-off control run.")
 
-    room_volume = room_x * room_y * room_z
-    openings = [(inlet_wall, inlet_size[0] * inlet_size[1])]
-    if inlet2_wall is not None:
-        openings.append((inlet2_wall, inlet2_size[0] * inlet2_size[1]))
-    velocities = compute_inlet_velocities(ach, room_volume, openings)
-    inlet_velocity = velocities[0]
-    inlet2_velocity = velocities[1] if inlet2_wall is not None else None
+    if sealed:
+        inlet_velocity = (0.0, 0.0, 0.0)
+        inlet2_velocity = (0.0, 0.0, 0.0) if inlet2_wall is not None else None
+    else:
+        room_volume = room_x * room_y * room_z
+        openings = [(inlet_wall, inlet_size[0] * inlet_size[1])]
+        if inlet2_wall is not None:
+            openings.append((inlet2_wall, inlet2_size[0] * inlet2_size[1]))
+        velocities = compute_inlet_velocities(ach, room_volume, openings)
+        inlet_velocity = velocities[0]
+        inlet2_velocity = velocities[1] if inlet2_wall is not None else None
 
     log_fn("Resetting T to a fresh initial condition (U/p/k/omega/nut untouched)...")
     restore_boundary_conditions(control_dir, inlet_velocity=inlet_velocity,
-                                 inlet2_velocity=inlet2_velocity, has_outlet2=has_outlet2)
+                                 inlet2_velocity=inlet2_velocity, has_outlet2=has_outlet2, sealed=sealed)
 
     log_fn("Writing an empty constant/fvOptions (no UV source - ventilation only)...")
     write_fvoptions_file(control_dir, [])
