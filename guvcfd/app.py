@@ -203,6 +203,16 @@ _run_state = {
     "status": "idle", "log": [], "case_dir": None, "sim_type": None,
     "steps": [], "step_status": {}, "markers": [],
     "current_time": None, "start_time": None, "stop_requested": False, "pause_requested": False,
+    # Per-stream "latest Time = N" status for a run with more than one
+    # concurrently-solving pimpleFoam process (decay mode's UV-on + UV-off
+    # control pair - see _run_decay_pair) - overwritten in place, not
+    # appended, so "Running now" can show both streams' progress without
+    # flooding the scrolling log the way appending every "Time = N" line
+    # used to (see _run_status_update/_throttled_solver_callback). Empty
+    # for every other run type (steady-state, flow convergence, Continue),
+    # which only ever have one solver running at a time and already show
+    # their own progress via current_time/_solver_progress_text() instead.
+    "live_status": {},
     # Set only when status == "awaiting_decision" (see FlowConvergenceUndecided/
     # _run_pipeline_thread) - everything the Processing tab's decision panel
     # needs to display the diagnostic and everything a Continue/Accept button
@@ -391,6 +401,7 @@ def _reset_run_progress(sim_type):
         step_status={s: "pending" for s in steps}, log=[],
         current_time=None, target_time=None, phase_start_time=None, chunk_base=None,
         start_time=time.time(), stop_requested=False, pause_requested=False,
+        live_status={},
     )
 
 
@@ -504,6 +515,19 @@ def _track_solver_time(line):
         _run_log(stripped)
         return
     _update_progress_from_status_line(_run_state, stripped)
+
+
+def _run_status_update(key, msg):
+    """Single-run equivalent of _scenario_status_update - see
+    _run_state["live_status"]'s own docstring for why this exists (decay
+    mode's concurrent UV-on + UV-off control pair, see _run_decay_pair).
+    msg=None removes that stream's entry (its solve just finished).
+    """
+    live = _run_state["live_status"]
+    if msg is None:
+        live.pop(key, None)
+    else:
+        live[key] = msg
 
 
 def _fan_kwargs(settings):
@@ -870,24 +894,30 @@ def _decay_run_durations(ach, eACH_well_mixed_est, adv):
 
 
 def _run_decay_pair(case_dir_wsl, control_dir_wsl):
-    """Run the UV-on and UV-off-control pimpleFoam solves CONCURRENTLY -
-    both only depend on the shared, already-converged flow field prepared
-    before this point, so from here on they're fully independent (see the
-    ACH=1/Z=1.7 vs ACH=6/Z=7 comparisons this session: ~510s concurrent
-    wall-clock for both runs together, vs. what would be roughly double
-    running them back to back).
+    """Run the UV-on and (if control_dir_wsl is given) UV-off-control
+    pimpleFoam solves CONCURRENTLY - both only depend on the shared,
+    already-converged flow field prepared before this point, so from here
+    on they're fully independent (see the ACH=1/Z=1.7 vs ACH=6/Z=7
+    comparisons this session: ~510s concurrent wall-clock for both runs
+    together, vs. what would be roughly double running them back to back).
 
-    Only the main (UV-on) run's output feeds _track_solver_time (which
-    drives the single shared progress bar/ETA display) - interleaving both
-    runs' "Time = N" lines into that same tracker would produce a
-    nonsensical, jumping progress readout, since it assumes one linear
-    sequence. Only each run's own "Time = N" lines reach the visible log
-    (prefixed so they're distinguishable) - the full per-iteration residual
-    dump (Ux/Uy/Uz/p/k/omega, continuity errors - ~8-10 lines per "Time ="
-    line) never did for a single run either (it only ever fed
-    _track_solver_time, silently), so forwarding it here too for BOTH
-    concurrent runs would flood the log with 2x that noise, interleaved
-    and unreadable.
+    control_dir_wsl=None (a sealed room - see setup_case's `sealed`) skips
+    the control run entirely instead of launching a 2nd thread for it -
+    with no ventilation, its own measured baseline is exactly (not just
+    approximately) 0 by construction, so running a whole 2nd pimpleFoam
+    solve to confirm that would be pure wasted compute, not a real
+    measurement (see _finish_decay's own docstring for the full reasoning).
+
+    Neither stream's "Time = N" lines reach the scrolling log - both feed
+    _run_state["live_status"] instead (see _run_status_update), which
+    "Running now" renders live, keyed by stream name - appending both
+    concurrent streams' lines to the log the way an earlier version of
+    this function did flooded it fast enough to scroll real narration
+    (step transitions, convergence summaries, errors) out of view within
+    seconds. Only the main (UV-on) run's output additionally feeds
+    _track_solver_time (drives the single-run ETA estimate, which assumes
+    one linear sequence - interleaving control's own "Time = N" progress
+    into that same tracker would produce a nonsensical, jumping ETA).
 
     should_stop is shared (the single global _should_stop()) - stopping
     the run is meant to stop the whole scenario (both curves), not just
@@ -901,35 +931,29 @@ def _run_decay_pair(case_dir_wsl, control_dir_wsl):
 
     def run_one(name, cwd_wsl, on_line, log_prefix):
         try:
-            def prefixed(line):
-                stripped = line.strip()
-                # "[...]"-wrapped lines are run_wsl_streaming's own
-                # diagnostics (stall/retry notices - see its docstring),
-                # not solver chatter - always shown, never throttled like
-                # routine "Time = N" lines, so a stall/kill is never
-                # silent in the visible log.
-                if _TIME_LINE_RE.match(stripped) or stripped.startswith("["):
-                    _run_log(f"[{log_prefix}] {line}")
-                if on_line:
-                    on_line(line)
+            callback = scenario_runs._throttled_solver_callback(
+                _run_log, log_prefix, on_line=on_line, status_fn=_run_status_update, status_key=log_prefix)
             results[name] = run_wsl_streaming(
                 "pimpleFoam 2>&1 | tee log.pimpleFoam", cwd_wsl,
-                on_line=prefixed, should_stop=_should_stop, kill_pattern="pimpleFoam",
+                on_line=callback, should_stop=_should_stop, kill_pattern="pimpleFoam",
                 should_pause=_should_pause,
             )
         except Exception as e:
             errors[name] = e
+        finally:
+            _run_status_update(log_prefix, None)
 
-    th_uv = threading.Thread(target=run_one, args=("uv", case_dir_wsl, _track_solver_time, "UV-on"))
-    th_control = threading.Thread(target=run_one, args=("control", control_dir_wsl, None, "control"))
-    th_uv.start()
-    th_control.start()
-    th_uv.join()
-    th_control.join()
+    threads = [threading.Thread(target=run_one, args=("uv", case_dir_wsl, _track_solver_time, "UV-on"))]
+    if control_dir_wsl is not None:
+        threads.append(threading.Thread(target=run_one, args=("control", control_dir_wsl, None, "control")))
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join()
 
     if errors:
         raise next(iter(errors.values()))
-    return results["uv"], results["control"]
+    return results["uv"], results.get("control")
 
 
 def _finish_decay(case_dir, room, settings, summary):
@@ -947,42 +971,71 @@ def _finish_decay(case_dir, room, settings, summary):
     practice (a ~35% mixing-efficiency gap showed up on a real case this
     session) - cheap enough now that it always runs concurrently with the
     main UV-on solve.
+
+    Sealed rooms (ach<=0 - see setup_case's `sealed`) are the one
+    exception: the control run is skipped entirely, not just made
+    optional. With every opening closed off, there is no possible path for
+    contaminant MASS to leave the room at all - a mixing fan can only
+    redistribute it, not remove it - so the true ventilation-only decay
+    rate a control run would measure is exactly (not just approximately)
+    zero, by construction, regardless of what a real CFD solve of it would
+    report (numerical/discretization drift only). Running a full 2nd
+    concurrent pimpleFoam solve to confirm a value already known
+    analytically would double this run's compute cost for no new
+    information - `measured_ventilation_ach=0.0` below is passed as an
+    exact value, not an estimate, and is strictly more correct than
+    whatever noisy near-zero number an actual control run would measure.
     """
     adv = load_advanced_settings()
     case_dir_wsl = wsl_path(case_dir)
+    sealed = settings["ach"] <= 0
     control_dir = f"{case_dir}/no_UV"
     control_dir_wsl = wsl_path(control_dir)
 
     combined_end_time, control_end_time = _decay_run_durations(
         settings["ach"], summary["eACH_uv_well_mixed_mean"], adv)
     write_interval = max(1, settings["pimple-write-interval"])
-    _run_log(f"Adaptive run durations: UV-on={combined_end_time}s, UV-off control={control_end_time}s "
-             f"(targets: eACH {adv['decay-each-min-fraction']:.3g}-{adv['decay-each-max-fraction']:.3g}%, "
-             f"ACH {adv['decay-ach-min-fraction']:.3g}%), write interval={write_interval}s (as configured)...")
+    if sealed:
+        _run_log(f"Adaptive run duration: UV-on={combined_end_time}s (sealed room - no UV-off control "
+                 f"needed, see below), write interval={write_interval}s (as configured)...")
+    else:
+        _run_log(f"Adaptive run durations: UV-on={combined_end_time}s, UV-off control={control_end_time}s "
+                 f"(targets: eACH {adv['decay-each-min-fraction']:.3g}-{adv['decay-each-max-fraction']:.3g}%, "
+                 f"ACH {adv['decay-ach-min-fraction']:.3g}%), write interval={write_interval}s (as configured)...")
     set_control_dict_time(case_dir, end_time=combined_end_time,
                            write_interval=write_interval, delta_t=adv["pimple-delta-t"])
 
     if _should_stop():
         raise StoppedByUser("Stopped before pimpleFoam.")
-    _run_log("=== Preparing UV-off control (subfolder \"no_UV\") - clone before either pimpleFoam run ===")
-    prepare_ventilation_only_control(
-        case_dir, control_dir, settings["ach"], room.x, room.y, room.z,
-        settings["inlet-wall"], (settings["inlet-size-w"], settings["inlet-size-h"]),
-        control_end_time, write_interval, pimple_delta_t=adv["pimple-delta-t"],
-        inlet2_wall=settings["inlet2-wall"] if settings.get("inlet2-enable") else None,
-        inlet2_size=(settings["inlet2-size-w"], settings["inlet2-size-h"])
-        if settings.get("inlet2-enable") else None,
-        has_outlet2=bool(settings.get("outlet2-enable")),
-        sealed=settings["ach"] <= 0,
-        log_fn=_run_log, should_stop=_should_stop,
-    )
+    if sealed:
+        _run_log("Skipping the UV-off control run - sealed room, no possible path for contaminant "
+                 "mass to leave (a fan redistributes air but can't remove contaminant from a closed "
+                 "room), so the true ventilation-only decay rate is exactly 0 by construction.")
+    else:
+        _run_log("=== Preparing UV-off control (subfolder \"no_UV\") - clone before either pimpleFoam run ===")
+        prepare_ventilation_only_control(
+            case_dir, control_dir, settings["ach"], room.x, room.y, room.z,
+            settings["inlet-wall"], (settings["inlet-size-w"], settings["inlet-size-h"]),
+            control_end_time, write_interval, pimple_delta_t=adv["pimple-delta-t"],
+            inlet2_wall=settings["inlet2-wall"] if settings.get("inlet2-enable") else None,
+            inlet2_size=(settings["inlet2-size-w"], settings["inlet2-size-h"])
+            if settings.get("inlet2-enable") else None,
+            has_outlet2=bool(settings.get("outlet2-enable")),
+            sealed=False,
+            log_fn=_run_log, should_stop=_should_stop,
+        )
 
-    _run_log(f"Running pimpleFoam concurrently: UV-on ({combined_end_time}s) + "
-             f"UV-off control ({control_end_time}s)...")
-    r_uv, r_control = _run_decay_pair(case_dir_wsl, control_dir_wsl)
+    if sealed:
+        _run_log(f"Running pimpleFoam: UV-on ({combined_end_time}s)...")
+        r_uv, _ = _run_decay_pair(case_dir_wsl, None)
+    else:
+        _run_log(f"Running pimpleFoam concurrently: UV-on ({combined_end_time}s) + "
+                 f"UV-off control ({control_end_time}s)...")
+        r_uv, r_control = _run_decay_pair(case_dir_wsl, control_dir_wsl)
     if _should_stop():
         raise StoppedByUser("Stopped during pimpleFoam.")
-    for label, r in (("UV-on", r_uv), ("UV-off control", r_control)):
+    runs_to_check = [("UV-on", r_uv)] if sealed else [("UV-on", r_uv), ("UV-off control", r_control)]
+    for label, r in runs_to_check:
         if r.returncode != 0 or "FOAM FATAL" in r.stdout or "Floating Point Exception" in r.stdout:
             tail = "\n".join(r.stdout.splitlines()[-25:]) or "(no output captured)"
             raise RuntimeError(f"{label} pimpleFoam failed (exit {r.returncode}):\n{tail}")
@@ -998,20 +1051,24 @@ def _finish_decay(case_dir, room, settings, summary):
         _run_log(f"  Could not compute spatial CoV: {e}")
         spatial_cov = None
 
-    _run_log("Writing results summary...")
-    results = write_results_summary(
-        case_dir, f"{case_dir}/results.json", settings["ach"],
-        summary["eACH_uv_well_mixed_mean"],
-        extra={
-            "n_lamps": summary["n_lamps"], "fluence_mean": summary["fluence_mean"],
-            "flow_converged": summary.get("flow_converged"), "ach_delivery": summary.get("ach_delivery"),
-            "spatial_cov_final": spatial_cov,
-        },
-    )
+    if sealed:
+        control_results = {"total_ach_effective": 0.0}
+    else:
+        _run_log("Writing results summary...")
+        write_results_summary(
+            case_dir, f"{case_dir}/results.json", settings["ach"],
+            summary["eACH_uv_well_mixed_mean"],
+            extra={
+                "n_lamps": summary["n_lamps"], "fluence_mean": summary["fluence_mean"],
+                "flow_converged": summary.get("flow_converged"), "ach_delivery": summary.get("ach_delivery"),
+                "spatial_cov_final": spatial_cov,
+            },
+        )
+        _run_log("=== Post-processing UV-off control ===")
+        control_results = finish_ventilation_only_control(control_dir, settings["ach"], log_fn=_run_log)
 
-    _run_log("=== Post-processing UV-off control ===")
-    control_results = finish_ventilation_only_control(control_dir, settings["ach"], log_fn=_run_log)
-    _run_log("Updating results.json with corrected mixing efficiency (measured, "
+    _run_log("Writing results summary..." if sealed else
+             "Updating results.json with corrected mixing efficiency (measured, "
              "not nominal, ventilation ACH)...")
     results = write_results_summary(
         case_dir, f"{case_dir}/results.json", settings["ach"],
@@ -4524,7 +4581,7 @@ def _poll_scenario(n_intervals):
             and _run_state.get("case_dir") and _run_state.get("z") is not None):
         status = _run_state["status"]
         log_text = "\n".join(_run_state["log"][-300:])
-        live_text = _solver_progress_text() or "(nothing running)"
+        live_text = "\n".join(l for l in (_solver_progress_text(), _run_live_status_text()) if l) or "(nothing running)"
         still_running = status == "running"
         status_text = {
             "running": "Running... (1/1 combination)",
@@ -4640,6 +4697,34 @@ def _solver_eta_text():
     return f"Expected finish of this step in {_format_mmss((target - cur_val) / rate)}"
 
 
+def _interleave_with_br(lines):
+    """Dash children list joining each of `lines` (non-empty strings) with
+    an html.Br() between them - "" for an empty list, so a caller can
+    always just assign this straight to a Div's children without a
+    separate empty-list special case.
+    """
+    if not lines:
+        return ""
+    out = [lines[0]]
+    for l in lines[1:]:
+        out.append(html.Br())
+        out.append(l)
+    return out
+
+
+def _run_live_status_text():
+    """"[stream] Time = N" lines from _run_state["live_status"] - the
+    concurrent UV-off control run's own progress (decay mode's UV-on/
+    control pair - see _run_decay_pair/_run_status_update), which
+    _solver_progress_text()/_solver_eta_text() above don't cover (those
+    only ever track the UV-on stream). "" when nothing else is
+    concurrently running (every other run type - steady-state, flow
+    convergence, Continue - only ever has one solver active at a time).
+    """
+    live = _run_state.get("live_status") or {}
+    return "\n".join(f"[{k}] {live[k]}" for k in sorted(live))
+
+
 def _flow_decision_iterations_suggestion(diagnostic):
     """A reasonable default for the "continue this many more iterations"
     input - enough additional chunks to reach the oscillation-acceptance
@@ -4736,9 +4821,8 @@ def _poll_run(n_intervals):
 
     start = _run_state.get("start_time")
     elapsed = f"Elapsed: {_format_mmss(time.time() - start)}" if start else ""
-    progress_line = _solver_progress_text()
-    eta_line = _solver_eta_text()
-    cur_time_text = [progress_line, html.Br(), eta_line] if progress_line and eta_line else progress_line
+    lines = [l for l in (_solver_progress_text(), _solver_eta_text(), _run_live_status_text()) if l]
+    cur_time_text = lines[0] if len(lines) == 1 else _interleave_with_br(lines)
 
     # Auto-load this run's own results once it finishes, so the Analysis
     # tab has something to show without a separate manual step - polling
@@ -4868,4 +4952,14 @@ if __name__ == "__main__":
     # subprocess, which crashes here (likely the tkinter import or the
     # WSL subprocess call in _compute_default_run_dir() re-running in the
     # forked child) - verified by reproducing with/without it.
-    app.run(debug=True, use_reloader=False)
+    # threaded=True: without it, Flask's dev server handles one HTTP
+    # request at a time - with run-poll/scenario-poll firing every 2s
+    # (plus any button click), a request that lands while the previous one
+    # is still being handled (even briefly - a big progress table, a log
+    # tail, a WSL status read) just queues, and the browser's fetch for it
+    # can come back as "Callback failed: the server did not respond" even
+    # though the app itself is fine and picks it up right after. _run_state/
+    # _scenario_state are already read concurrently from background solver-
+    # monitoring threads regardless of this setting, so handling requests
+    # concurrently here doesn't introduce a new class of race condition.
+    app.run(debug=True, use_reloader=False, threaded=True)

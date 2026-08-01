@@ -921,11 +921,23 @@ def run_decay_sweep(guv_path, settings_path, project_dir, room, settings, adv,
         base_summary = _build_flow_base(guv_path, base_dir, room, settings, ach, adv,
                                          ach_log_fn, should_stop, solver_log_fn, should_pause=should_pause,
                                          sealed=sealed)
-        # UV-off control is Z-independent (see _run_shared_control) - run
-        # it once per ACH here, not once per Z in run_z_fn below.
-        control_results = _run_shared_control(base_dir, control_dir, ach, room, settings, adv,
-                                               ach_log_fn, should_stop, solver_log_fn, status_fn=status_fn,
-                                               should_pause=should_pause, sealed=sealed)
+        if sealed:
+            # No possible path for contaminant MASS to leave a sealed room
+            # (a fan redistributes air but can't remove contaminant from a
+            # closed room) - the true ventilation-only decay rate is
+            # exactly 0 by construction, not just approximately - see
+            # app._finish_decay's identical reasoning. Running a whole 2nd
+            # pimpleFoam solve to confirm that would double this ACH
+            # group's compute cost for no new information.
+            ach_log_fn("Skipping the UV-off control run - sealed room, ventilation-only decay "
+                       "rate is exactly 0 by construction.")
+            control_results = {"total_ach_effective": 0.0}
+        else:
+            # UV-off control is Z-independent (see _run_shared_control) - run
+            # it once per ACH here, not once per Z in run_z_fn below.
+            control_results = _run_shared_control(base_dir, control_dir, ach, room, settings, adv,
+                                                   ach_log_fn, should_stop, solver_log_fn, status_fn=status_fn,
+                                                   should_pause=should_pause, sealed=sealed)
         return {
             "ach": ach, "base_dir": base_dir, "control_dir": control_dir,
             "base_summary": base_summary, "control_results": control_results,
