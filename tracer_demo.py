@@ -4,10 +4,12 @@ Demo script: extract RTD and dose distribution from an OpenFOAM case
 with the new age-of-air tracer field.
 
 Usage:
-    python tracer_demo.py <case_dir> [--ach ACH] [--volume VOLUME] [--k K]
+    python tracer_demo.py <case_dir> [--ach ACH] [--volume VOLUME] [--Z Z]
 
 Example:
-    python tracer_demo.py /path/to/case --ach 6 --volume 30 --k 0.87
+    python tracer_demo.py /path/to/case --ach 6 --volume 30 --Z 6
+
+Note: Z is the sensitivity parameter [cm²/mJ]; k is computed as k = Z * E_avg * 1e-3.
 """
 import argparse
 import json
@@ -68,8 +70,11 @@ def demo_rtd_extraction(case_dir, target_ach=None, room_volume=None):
     return age_values
 
 
-def demo_dose_distribution(case_dir, age_values, k=0.87):
-    """Compute and display dose distribution and inactivation."""
+def demo_dose_distribution(case_dir, age_values, Z=6.0):
+    """Compute and display dose distribution and inactivation.
+
+    Z: sensitivity parameter [cm²/mJ] - k is computed as k = Z * E_avg * 1e-3.
+    """
     print(f"{'='*60}")
     print("DOSE DISTRIBUTION & SEGREGATED-FLOW INACTIVATION")
     print(f"{'='*60}\n")
@@ -92,7 +97,14 @@ def demo_dose_distribution(case_dir, age_values, k=0.87):
 
     # Compute dose
     dose_values = compute_dose_at_cells(fluence_rate, age_values)
-    print(f"Computed {len(dose_values)} cell doses from fluence × age\n")
+    print(f"Computed {len(dose_values)} cell doses from fluence × age")
+
+    # Compute k from Z and mean fluence
+    mean_fluence_uW_cm2 = np.mean(fluence_rate)
+    k = Z * mean_fluence_uW_cm2 * 1e-3  # k [1/s] = Z [cm²/mJ] * E [uW/cm²] * 1e-3
+    print(f"  Mean fluence rate:  {mean_fluence_uW_cm2:.2f} uW/cm²")
+    print(f"  Sensitivity Z:      {Z} cm²/mJ")
+    print(f"  Computed k:         {k:.4f} 1/s\n")
 
     # Dose statistics
     dose_stats = {
@@ -118,7 +130,8 @@ def demo_dose_distribution(case_dir, age_values, k=0.87):
     log_reduction = -np.log10(max(N_over_N0, 1e-10))
 
     print(f"Segregated-Flow Model Inactivation Prediction:")
-    print(f"  Pathogen k:   {k} cm²/mJ")
+    print(f"  Pathogen Z:   {Z} cm²/mJ")
+    print(f"  Computed k:   {k:.4f} 1/s")
     print(f"  N/N₀:         {N_over_N0:.4e}")
     print(f"  Log reduction: {log_reduction:.2f} (i.e., 10^{-log_reduction:.1f} kill)")
     print(f"  Survival:     {100 * N_over_N0:.2%}\n")
@@ -161,8 +174,8 @@ def main():
                         help="Nominal ventilation ACH [1/hr] (for effectiveness calculation)")
     parser.add_argument("--volume", type=float, default=None,
                         help="Room volume [m³] (for effectiveness calculation)")
-    parser.add_argument("--k", type=float, default=0.87,
-                        help="Inactivation rate constant [cm²/mJ] (default: 0.87 for T1 phage)")
+    parser.add_argument("--Z", type=float, default=6.0,
+                        help="Sensitivity parameter [cm²/mJ] (default: 6)")
     args = parser.parse_args()
 
     case_path = Path(args.case_dir)
@@ -176,7 +189,7 @@ def main():
         sys.exit(1)
 
     # Dose distribution and inactivation
-    demo_dose_distribution(case_path, age_values, args.k)
+    demo_dose_distribution(case_path, age_values, args.Z)
 
     print(f"{'='*60}")
     print("Demo complete!")
