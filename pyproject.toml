@@ -21,4 +21,4 @@ dev = [
 ]
 
 [tool.uv]
-package = false
+package = true
