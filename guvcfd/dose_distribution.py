@@ -17,8 +17,6 @@ and (N/N₀)_batch(D) = exp(-k·D) for first-order kinetics with rate constant k
 """
 import numpy as np
 
-from .case_io import read_latest_time_field
-from .fluence import compute_fluence_at_points, compute_inactivation_rate
 from .age_analysis import build_rtd_histogram, rtd_from_histogram
 
 
@@ -132,10 +130,7 @@ def compute_dose_distribution_from_cfd(case_dir, cell_centers, k_or_Z, room_volu
 
     case_dir: path to OpenFOAM case directory
     cell_centers: (N, 3) array of cell center coordinates [m]
-    k_or_Z: either:
-        - k: inactivation rate constant [cm²/mJ] (direct rate constant)
-        - Z: sensitivity parameter [cm²/mJ], for computing k = Z * E_avg [1/s]
-             (see fluence.compute_inactivation_rate)
+    k_or_Z: inactivation rate constant (k) [1/s]
     room_volume: room volume [m³], optional, for eACH_uv computation
 
     Returns dict with:
@@ -144,7 +139,12 @@ def compute_dose_distribution_from_cfd(case_dir, cell_centers, k_or_Z, room_volu
     - dose_distribution: {bin_centers, E_D, bin_widths}
     - inactivation: N/N₀ survival fraction
     - inactivation_log10: log₁₀(N/N₀) (negative = log reduction, or -log CFU/mL)
+
+    Note: This function requires guv_calcs and may not work without lamp geometry.
+    For simpler use cases, compute_dose_at_cells + segregated_flow_inactivation
+    can be called directly with pre-computed fluence rates.
     """
+    from .case_io import read_latest_time_field
     from .fluence import compute_fluence_at_points
     from .age_analysis import read_age_field
 
