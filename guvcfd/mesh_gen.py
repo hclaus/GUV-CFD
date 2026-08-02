@@ -26,11 +26,60 @@ _FACES = {
 }
 
 
-def block_mesh_dict(Lx, Ly, Lz, cell_size=0.1):
-    """Single-block box mesh covering the whole room, before opening carving."""
-    nx = max(1, round(Lx / cell_size))
-    ny = max(1, round(Ly / cell_size))
-    nz = max(1, round(Lz / cell_size))
+def _direction_grading(length, cell_size, wall_cell_size):
+    """3-segment multi-grading spec for one block direction (both ends are
+    walls for every direction in this single-block room mesh): one coarser
+    cell of height wall_cell_size at each end, uniform cell_size cells in
+    between. Used to deliberately raise near-wall y+ for a wall-function
+    RAS mesh - see the "how do we know the correct value of nut" discussion
+    this was built for: y+ = (first-cell height) * u_tau / nu, so a taller
+    first cell raises y+ (the opposite direction from ordinary mesh
+    refinement, which would only push y+ further into the buffer layer).
+
+    Returns (total_n_cells, grading_str) - grading_str is the parenthesized
+    "((lenFrac cellFrac ratio)(lenFrac cellFrac ratio)(lenFrac cellFrac
+    ratio))" block for this one direction. ratio is 1 throughout (each
+    segment's cells are uniform in size; only the two wall segments differ
+    in size from the middle one) - deliberately not a smooth geometric
+    transition, since this is a one-off sensitivity-test mesh, not a
+    production near-wall layer.
+    """
+    interior_length = length - 2 * wall_cell_size
+    if interior_length <= 0:
+        raise ValueError(f"wall_cell_size ({wall_cell_size}) too large for direction length {length}")
+    interior_n = max(1, round(interior_length / cell_size))
+    total_n = interior_n + 2
+    wall_frac_len = wall_cell_size / length
+    interior_frac_len = 1 - 2 * wall_frac_len
+    wall_frac_cells = 1 / total_n
+    interior_frac_cells = interior_n / total_n
+    grading = (
+        f"(({wall_frac_len:.6g} {wall_frac_cells:.6g} 1)"
+        f"({interior_frac_len:.6g} {interior_frac_cells:.6g} 1)"
+        f"({wall_frac_len:.6g} {wall_frac_cells:.6g} 1))"
+    )
+    return total_n, grading
+
+
+def block_mesh_dict(Lx, Ly, Lz, cell_size=0.1, wall_cell_size=None):
+    """Single-block box mesh covering the whole room, before opening carving.
+
+    wall_cell_size: if given, grades the mesh so the single layer of cells
+    against every wall (both ends of all 3 directions - every direction in
+    this room mesh runs wall-to-wall) is this height instead of cell_size,
+    with uniform cell_size cells in between (see _direction_grading). None
+    (the default) keeps today's plain uniform simpleGrading (1 1 1).
+    """
+    if wall_cell_size is not None:
+        nx, gx = _direction_grading(Lx, cell_size, wall_cell_size)
+        ny, gy = _direction_grading(Ly, cell_size, wall_cell_size)
+        nz, gz = _direction_grading(Lz, cell_size, wall_cell_size)
+        grading = f"{gx} {gy} {gz}"
+    else:
+        nx = max(1, round(Lx / cell_size))
+        ny = max(1, round(Ly / cell_size))
+        nz = max(1, round(Lz / cell_size))
+        grading = "1 1 1"
 
     vertices = [(vx * Lx, vy * Ly, vz * Lz) for vx, vy, vz in _HEX_VERTICES]
 
@@ -42,7 +91,7 @@ def block_mesh_dict(Lx, Ly, Lz, cell_size=0.1):
     for v in vertices:
         lines.append(f"    ({v[0]:.6g} {v[1]:.6g} {v[2]:.6g})")
     lines += [");", "", "blocks", "(",
-              f"    hex (0 1 2 3 4 5 6 7) ({nx} {ny} {nz}) simpleGrading (1 1 1)",
+              f"    hex (0 1 2 3 4 5 6 7) ({nx} {ny} {nz}) simpleGrading ({grading})",
               ");", "", "edges", "(", ");", "", "boundary", "("]
     for name, face in _FACES.items():
         lines += [

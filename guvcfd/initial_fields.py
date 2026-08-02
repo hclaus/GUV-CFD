@@ -301,6 +301,14 @@ _FIELD_SPECS = {
         "outlet": ("zeroGradient", None),
         "wall": ("zeroGradient", None),
     },
+    "age": {
+        "foam_class": "volScalarField",
+        "dimensions": "[0 0 1 0 0 0 0]",
+        "internal": "uniform 0",
+        "inlet": ("fixedValue", "uniform 0"),
+        "outlet": ("zeroGradient", None),
+        "wall": ("zeroGradient", None),
+    },
 }
 
 
@@ -435,8 +443,8 @@ def write_initial_fields(case_dir, time_dir="0", inlet_velocity=(0.278, 0, 0), T
     return paths
 
 
-_FULL_RESET_FIELDS = ("T",)  # scalars representing a scenario's *starting*
-# state (e.g. "room fully contaminated") rather than a flow-development
+_FULL_RESET_FIELDS = ("T", "age")  # scalars representing a scenario's *starting*
+# state (e.g. "room fully contaminated", "age field reset") rather than a flow-development
 # quantity - mapFields' internal-field value for these means nothing (it's
 # whatever the source case happened to have, not a "converged" state to
 # reuse), so these get their internalField reset too, not just boundaryField.

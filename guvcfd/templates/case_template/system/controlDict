@@ -89,4 +89,41 @@ functions
         writeControl    adjustableRunTime;
         writeInterval   200;
     }
+
+    scalarTransport2
+    {
+        enabled         true;
+        type            scalarTransport;
+        libs            ("libsolverFunctionObjects.so");
+        field           age;
+        tolerance       1e-4;
+        nCorr           3;
+        phi             phi;
+        nut             nut;
+        alphaD          1;
+        alphaDt         1;
+        fvOptions
+        {
+        ageSource
+        {
+            type            scalarSemiImplicitSource;
+            active          true;
+
+            scalarSemiImplicitSourceCoeffs
+            {
+                selectionMode   all;
+                volumeMode      specific;
+
+                injectionRateSuSp
+                {
+                    age         (1.0 0);
+                }
+            }
+        }
+        }
+        executeControl  timeStep;
+        executeInterval 1;
+        writeControl    adjustableRunTime;
+        writeInterval   200;
+    }
 }

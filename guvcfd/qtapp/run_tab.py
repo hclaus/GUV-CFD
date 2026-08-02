@@ -1,0 +1,285 @@
+"""Run Simulations tab: launch a Z x ACH sweep (a single Z and single ACH
+is just a 1-combination sweep, same as guvcfd.app), watch live progress/
+log, pause/stop it - the native equivalent of guvcfd.app's Run Simulations
+tab.
+
+Simplification vs. the web app (flagged here, not hidden): no resume UX
+for a flow-convergence-undecided / Phase-1-extrapolation-undecided pause -
+a run that hits one surfaces it as an error (log + status), not an
+interactive decision panel. Rerun, or use the web app to resume it.
+"""
+from pathlib import Path
+
+from PySide6.QtCore import QTimer, Signal
+from PySide6.QtWidgets import (
+    QFormLayout, QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPlainTextEdit, QPushButton, QTableWidget,
+    QTableWidgetItem, QVBoxLayout, QWidget,
+)
+
+from ..app_settings import load_advanced_settings
+from ..report import combo_summary_metrics
+from ..scenario_runs import sweep_combinations
+from . import helpers, run_state, sweep_state
+
+_TABLE_HEADERS = ["Z", "ACH", "Status", "Reduction %", "Measured ACH eff. %", "Measured UV eff. %",
+                   "Mechanical mixing eff. %", "Est. ACH /hr", "Est. eACH /hr"]
+
+
+class RunTab(QWidget):
+    run_finished = Signal()  # emitted whenever the active run/sweep reaches done/error/stopped
+
+    def __init__(self, project_setup_tab, parent=None):
+        super().__init__(parent)
+        self.project_setup_tab = project_setup_tab
+        self.state = run_state.RunState()
+        self.sweep_state = sweep_state.SweepState()
+        self._active = None  # "single" or "sweep" - which state currently drives the UI
+        self._last_log_len = 0
+
+        layout = QVBoxLayout(self)
+
+        intro = QLabel(
+            "Runs the current project's setup once per Z x ACH combination (every Z with every "
+            "ACH), each into its own subfolder under the project directory. The flow field is "
+            "converged once per distinct ACH and reused for every Z at that ACH, so a longer Z "
+            "list at a fixed ACH is much cheaper than it looks. A single Z and a single ACH is "
+            "just a 1-combination run - no separate mode to pick.")
+        intro.setWordWrap(True)
+        intro.setStyleSheet("color: gray;")
+        layout.addWidget(intro)
+
+        list_form = QFormLayout()
+        self.z_values_edit = QLineEdit()
+        self.z_values_edit.setPlaceholderText("e.g. 2, 6 (blank = this project's current Z)")
+        self.ach_values_edit = QLineEdit()
+        self.ach_values_edit.setPlaceholderText("e.g. 3, 6 (blank = this project's current ACH)")
+        self.z_values_edit.textChanged.connect(self._update_combo_count)
+        self.ach_values_edit.textChanged.connect(self._update_combo_count)
+        list_form.addRow("Z values (comma-separated)", self.z_values_edit)
+        list_form.addRow("ACH values (comma-separated)", self.ach_values_edit)
+        layout.addLayout(list_form)
+        self.combo_count_label = QLabel("")
+        self.combo_count_label.setStyleSheet("color: gray;")
+        layout.addWidget(self.combo_count_label)
+
+        btn_row = QHBoxLayout()
+        sim_settings_btn = QPushButton("Simulation Settings...")
+        sim_settings_btn.setToolTip("Simulation type, and solver run-duration settings for this project.")
+        sim_settings_btn.clicked.connect(lambda: self.project_setup_tab.simulation_settings_dialog.exec())
+        btn_row.addWidget(sim_settings_btn)
+        self.run_btn = QPushButton("Start simulations")
+        self.run_btn.clicked.connect(self.start_run)
+        btn_row.addWidget(self.run_btn)
+        self.stop_btn = QPushButton("Stop")
+        self.stop_btn.setEnabled(False)
+        self.stop_btn.clicked.connect(self.stop_run)
+        btn_row.addWidget(self.stop_btn)
+        self.pause_btn = QPushButton("Pause")
+        self.pause_btn.setEnabled(False)
+        self.pause_btn.clicked.connect(self.toggle_pause)
+        btn_row.addWidget(self.pause_btn)
+        btn_row.addStretch(1)
+        layout.addLayout(btn_row)
+
+        self.status_label = QLabel("Idle.")
+        layout.addWidget(self.status_label)
+        self.progress_label = QLabel("")
+        layout.addWidget(self.progress_label)
+
+        layout.addWidget(_section_label("Simulation Progress"))
+        note = QLabel("Per-monitoring-point results stay under Analysis of Results - this table "
+                       "is room-average headline numbers only.")
+        note.setStyleSheet("color: gray;")
+        layout.addWidget(note)
+        self.table = QTableWidget(0, len(_TABLE_HEADERS))
+        self.table.setHorizontalHeaderLabels(_TABLE_HEADERS)
+        self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.setMaximumHeight(220)
+        layout.addWidget(self.table)
+
+        layout.addWidget(_section_label("Running now"))
+        self.live_status_label = QPlainTextEdit()
+        self.live_status_label.setReadOnly(True)
+        self.live_status_label.setMaximumHeight(70)
+        self.live_status_label.setStyleSheet("background: rgba(127,127,127,0.08); font-family: monospace;")
+        layout.addWidget(self.live_status_label)
+
+        layout.addWidget(_section_label("Log"))
+        self.log_view = QPlainTextEdit()
+        self.log_view.setReadOnly(True)
+        self.log_view.setMaximumBlockCount(20000)
+        layout.addWidget(self.log_view, 1)
+
+        self.timer = QTimer(self)
+        self.timer.setInterval(500)
+        self.timer.timeout.connect(self._poll)
+
+    # -- Z/ACH list handling --
+
+    def _parse_lists(self):
+        """(z_values, ach_values) from the list fields - a blank field
+        falls back to this project's single current value (unlike
+        guvcfd.app, which requires both fields filled - defaulting to the
+        project's own value avoids redundant re-entry for the common
+        1-combination case)."""
+        tab = self.project_setup_tab
+        z_values = helpers.parse_number_list(self.z_values_edit.text()) or [tab.get_value("z-value")]
+        ach_values = helpers.parse_number_list(self.ach_values_edit.text()) or [tab.get_value("ach")]
+        return z_values, ach_values
+
+    def _update_combo_count(self):
+        try:
+            z_values, ach_values = self._parse_lists()
+        except ValueError as e:
+            self.combo_count_label.setText(f"Can't parse: {e}")
+            return
+        n = len(sweep_combinations(z_values, ach_values))
+        self.combo_count_label.setText(f"{n} combination{'s' if n != 1 else ''} "
+                                        f"({len(z_values)} Z x {len(ach_values)} ACH).")
+
+    # -- launch/stop/pause --
+
+    def start_run(self):
+        tab = self.project_setup_tab
+        if tab.room is None or tab.guv_path is None:
+            QMessageBox.warning(self, "No project loaded", "Load a .guv project first (Project Setup tab).")
+            return
+        settings = tab.gather_settings()
+        if not settings.get("case-dir"):
+            QMessageBox.warning(self, "No project directory", "Set an OpenFOAM project directory first.")
+            return
+        try:
+            z_values, ach_values = self._parse_lists()
+        except ValueError as e:
+            QMessageBox.warning(self, "Can't parse Z/ACH list", str(e))
+            return
+        for ach in ach_values:
+            error = helpers.sealed_room_error(settings["sim-type"], ach, settings.get("fan-enable"))
+            if error:
+                QMessageBox.warning(self, "Can't start this run", f"ACH={ach}: {error}")
+                return
+
+        combos = sweep_combinations(z_values, ach_values)
+        Path(settings["case-dir"]).mkdir(parents=True, exist_ok=True)
+
+        self.log_view.clear()
+        self.table.setRowCount(0)
+        self._last_log_len = 0
+        self.run_btn.setEnabled(False)
+        self.stop_btn.setEnabled(True)
+        self.pause_btn.setEnabled(True)
+        self.pause_btn.setText("Pause")
+
+        if len(combos) == 1:
+            self._active = "single"
+            z, ach = combos[0]
+            settings["z-value"], settings["ach"] = z, ach
+            run_state.launch_run(self.state, tab.guv_path, settings["case-dir"], tab.room, settings)
+        else:
+            self._active = "sweep"
+            adv = load_advanced_settings()
+            sweep_state.launch_sweep(self.sweep_state, tab.guv_path, tab.settings_path,
+                                      settings["case-dir"], tab.room, settings, adv, z_values, ach_values)
+        self.timer.start()
+
+    def stop_run(self):
+        self._current_state().stop_requested = True
+        self.stop_btn.setEnabled(False)
+
+    def toggle_pause(self):
+        state = self._current_state()
+        state.pause_requested = not state.pause_requested
+        self.pause_btn.setText("Continue" if state.pause_requested else "Pause")
+
+    def _current_state(self):
+        return self.state if self._active == "single" else self.sweep_state
+
+    # -- polling --
+
+    def _poll(self):
+        state = self._current_state()
+        if len(state.log) > self._last_log_len:
+            new_lines = state.log[self._last_log_len:]
+            self._last_log_len = len(state.log)
+            self.log_view.appendPlainText("\n".join(new_lines))
+
+        if self._active == "single":
+            # "Running now" blends the overall progress/ETA line with the
+            # per-stream live_status (only ever non-empty during decay
+            # mode's concurrent UV-on + UV-off-control pair - see
+            # RunState.live_status_fn) - showing ONLY live_status here (an
+            # earlier version of this) left it blank for the entire mesh-
+            # gen/flow-convergence portion of a run, looking broken/stuck.
+            lines = [t for t in (state.progress_text(), state.eta_text()) if t]
+            running_now = "\n".join(lines + ([state.live_status_text()] if state.live_status else []))
+            self.live_status_label.setPlainText(running_now)
+            self.progress_label.setText(f"Stage: {state.stage}" if state.status == "running" else "")
+            self._update_single_table(state)
+        else:
+            self.live_status_label.setPlainText(state.live_status_text())
+            self.progress_label.setText("")
+            self._update_sweep_table(state)
+
+        status_text = {
+            "running": "Running...", "done": "Finished.", "error": f"Failed: {state.error}",
+            "stopped": "Stopped.",
+        }.get(state.status, state.status)
+        if getattr(state, "pause_requested", False) and state.status == "running":
+            status_text = "Paused - solver suspended in place. Click Continue to resume."
+        self.status_label.setText(status_text)
+
+        if state.status != "running":
+            self.timer.stop()
+            self.run_btn.setEnabled(True)
+            self.stop_btn.setEnabled(False)
+            self.pause_btn.setEnabled(False)
+            self.pause_btn.setText("Pause")
+            self.run_finished.emit()
+
+    def _update_single_table(self, state):
+        tab = self.project_setup_tab
+        self.table.setRowCount(1)
+        if state.status == "done" and state.results:
+            status, metrics = "Finished", combo_summary_metrics(state.results)
+        elif state.status == "error":
+            status, metrics = f"error: {state.error}", {}
+        elif state.status == "running":
+            status, metrics = state.stage, {}  # e.g. "Setup"/"Flow field calc"/"Decay sim" - not a bare "running"
+        else:
+            status, metrics = state.status, {}
+        self._set_table_row(0, tab.get_value("z-value"), tab.get_value("ach"), status, metrics)
+
+    def _update_sweep_table(self, state):
+        self.table.setRowCount(len(state.combos))
+        for i, (z, ach) in enumerate(state.combos):
+            entry = state.results.get((z, ach))
+            if entry is None:
+                status, metrics = ("pending" if state.status == "running" else state.status), {}
+            elif entry["status"] == "done":
+                status, metrics = "Finished", combo_summary_metrics(entry["detail"])
+            else:
+                status, metrics = f"error: {entry['detail']}", {}
+            self._set_table_row(i, z, ach, status, metrics)
+
+    def _set_table_row(self, row, z, ach, status, metrics):
+        def pct(key):
+            v = metrics.get(key)
+            return f"{v:.1f}%" if v is not None else ""
+
+        def rate(key):
+            v = metrics.get(key)
+            return f"{v:.4g} /hr" if v is not None else ""
+
+        values = [
+            f"{z:g}", f"{ach:g}", status,
+            pct("total_reduction_pct"), pct("ach_efficiency_pct"), pct("uv_efficiency_pct"),
+            pct("mechanical_mixing_efficiency_pct"), rate("est_ach_per_hr"), rate("est_each_per_hr"),
+        ]
+        for col, text in enumerate(values):
+            self.table.setItem(row, col, QTableWidgetItem(text))
+
+
+def _section_label(text):
+    lbl = QLabel(text)
+    lbl.setStyleSheet("font-weight: 600; text-transform: uppercase; font-size: 11px; margin-top: 6px;")
+    return lbl
