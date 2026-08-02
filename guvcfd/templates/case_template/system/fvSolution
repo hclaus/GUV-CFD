@@ -29,14 +29,14 @@ solvers
         relTol          0;
     }
 
-    "(U|k|omega|T)"
+    "(U|k|omega|T|age)"
     {
         solver          smoothSolver;
         smoother        GaussSeidel;
         tolerance       1e-08;
         relTol          0.1;
     }
-    "(U|k|omega|T)Final"
+    "(U|k|omega|T|age)Final"
     {
         $U;
         relTol          0;
@@ -87,5 +87,6 @@ relaxationFactors
         U               0.7;
         "(k|omega)"     0.7;
         T               0.7;
+        age             0.7;
     }
 }
