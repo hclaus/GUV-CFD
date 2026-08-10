@@ -13,6 +13,8 @@ from PySide6.QtWidgets import (
     QVBoxLayout, QWidget,
 )
 
+from ..app_settings import capture_openfoam_settings, load_advanced_settings, PROJECT_OPENFOAM_SETTINGS_KEYS
+from ..visualization import WALL_POSITION_DIMS
 from . import helpers
 from .preview3d import Preview3D
 
@@ -175,7 +177,53 @@ class ProjectSetupTab(QWidget):
         settings = {fid: self.get_value(fid) for fid in self.fields}
         settings["case-dir"] = self.case_dir_edit.text()
         settings["sim-type"] = "decay" if self.sim_type_combo.currentText().startswith("Decay") else "steady_state"
+        # PROJECT_OPENFOAM_SETTINGS_KEYS (max-co, cell size, etc.) have no
+        # registered widget (self.fields) - without this, a value
+        # captured/hand-edited into self.settings_path on disk would never
+        # be seen here, and the next save_project() would silently
+        # overwrite it back to the global default. See app.py's
+        # _collect_settings (the Dash equivalent of this method) for the
+        # same fix.
+        if self.settings_path:
+            try:
+                with open(self.settings_path) as f:
+                    raw = json.load(f)
+                for key in PROJECT_OPENFOAM_SETTINGS_KEYS:
+                    if key in raw:
+                        settings[key] = raw[key]
+            except (OSError, json.JSONDecodeError):
+                pass
         return settings
+
+    def _clamp_position_fields_to_room(self):
+        """Caps every position field's max to the actual loaded room
+        dimension it maps to - mirrors app._register_position_field/
+        _register_opening_wall_axes. A no-op until a project is loaded
+        (self.room is None). Confirmed 2026-08-10 Qt had no equivalent at
+        all - a user could type e.g. Y=40 into a 4m-wide room with no
+        clamp or warning. Opening fields (inlet/outlet/inlet2/outlet2)
+        need re-clamping whenever their own Wall dropdown changes, since
+        Position 1/2 map to different room dimensions depending on which
+        wall the opening is mounted on (see WALL_POSITION_DIMS) - this is
+        connected to every such dropdown's currentTextChanged, not just
+        called once at load time.
+        """
+        if self.room is None:
+            return
+        room = self.room
+        for prefix in ("fan", "inject"):
+            self.fields[f"{prefix}-x-input"].setMaximum(room.x)
+            self.fields[f"{prefix}-y-input"].setMaximum(room.y)
+            self.fields[f"{prefix}-z-input"].setMaximum(room.z)
+        for i in helpers.MONITOR_POINT_IDS:
+            self.fields[f"monitor{i}-x-input"].setMaximum(room.x)
+            self.fields[f"monitor{i}-y-input"].setMaximum(room.y)
+            self.fields[f"monitor{i}-z-input"].setMaximum(room.z)
+        for prefix in ("inlet", "outlet", "inlet2", "outlet2"):
+            wall = self.fields[f"{prefix}-wall"].currentText()
+            dim1, dim2 = WALL_POSITION_DIMS.get(wall, ("y", "z"))
+            self.fields[f"{prefix}-y-input"].setMaximum(getattr(room, dim1))
+            self.fields[f"{prefix}-z-input"].setMaximum(getattr(room, dim2))
 
     def apply_settings(self, settings):
         """Inverse of gather_settings() - restores every field from a saved
@@ -244,6 +292,12 @@ class ProjectSetupTab(QWidget):
         pimple_end.setToolTip("Starting value only - the actual run duration is computed adaptively "
                                "once the well-mixed eACH estimate is known, and overrides this.")
         self._register("pimple-write-interval", _ispin(1, 10000, 10))
+        mech_ach_only = self._register("mech-ach-only", QCheckBox("Run mechanical ACH only (no UV)"))
+        mech_ach_only.setToolTip(
+            "Skips the fluence/UV-inactivation pipeline entirely and measures just the real, "
+            "CFD-delivered ventilation air-change rate - for a pure ventilation study, "
+            "independent of whether the project has lamps. Needs ACH>0 (real ventilation to "
+            "measure). Decay mode only.")
         self._register("phase1-iterations", _ispin(1, 200000, 4000))
         self._register("phase2-iterations", _ispin(1, 200000, 2000))
         t_ss_window = self._register("t-ss-window-frac", _dspin(0.01, 1.0, 0.01, 2, 0.15))
@@ -288,6 +342,7 @@ class ProjectSetupTab(QWidget):
         decay_form = QFormLayout(decay_box)
         _add_row(decay_form, "Suggested duration (s)", self.fields["pimple-end-time"])
         decay_form.addRow("Write interval (s)", self.fields["pimple-write-interval"])
+        decay_form.addRow(self.fields["mech-ach-only"])
         layout.addWidget(decay_box)
 
         ss_box = QGroupBox("Steady-state run budget")
@@ -331,10 +386,11 @@ class ProjectSetupTab(QWidget):
         form.addRow("Wall", self._register(f"{prefix}-wall", wall))
         form.addRow("Position 1 (m)", self._register(f"{prefix}-y-input", _dspin(0, 50, 0.05, 3, 1.5)))
         form.addRow("Position 2 (m)", self._register(f"{prefix}-z-input", _dspin(0, 50, 0.05, 3, 1.5)))
-        size_w = self._register(f"{prefix}-size-w", _dspin(0.01, 20, 0.05, 3, 0.4))
-        size_h = self._register(f"{prefix}-size-h", _dspin(0.01, 20, 0.05, 3, 0.4))
+        size_w = self._register(f"{prefix}-size-w", _dspin(0.05, 2.0, 0.05, 3, 0.4))
+        size_h = self._register(f"{prefix}-size-h", _dspin(0.05, 2.0, 0.05, 3, 0.4))
         _add_row(form, "Width (m)", size_w, _GRID_SNAP_NOTE)
         _add_row(form, "Height (m)", size_h, _GRID_SNAP_NOTE)
+        wall.currentTextChanged.connect(self._clamp_position_fields_to_room)
         if prefix.startswith("inlet"):
             diff = QComboBox()
             diff.addItems(["direct", "ceiling"])
@@ -365,10 +421,11 @@ class ProjectSetupTab(QWidget):
         form.addRow("Wall", self._register(f"{prefix}-wall", wall))
         form.addRow("Position 1 (m)", self._register(f"{prefix}-y-input", _dspin(0, 50, 0.05, 3, 1.5)))
         form.addRow("Position 2 (m)", self._register(f"{prefix}-z-input", _dspin(0, 50, 0.05, 3, 1.5)))
-        size_w = self._register(f"{prefix}-size-w", _dspin(0.01, 20, 0.05, 3, 0.3))
-        size_h = self._register(f"{prefix}-size-h", _dspin(0.01, 20, 0.05, 3, 0.3))
+        size_w = self._register(f"{prefix}-size-w", _dspin(0.05, 2.0, 0.05, 3, 0.3))
+        size_h = self._register(f"{prefix}-size-h", _dspin(0.05, 2.0, 0.05, 3, 0.3))
         _add_row(form, "Width (m)", size_w, _GRID_SNAP_NOTE)
         _add_row(form, "Height (m)", size_h, _GRID_SNAP_NOTE)
+        wall.currentTextChanged.connect(self._clamp_position_fields_to_room)
         if is_inlet:
             diff = QComboBox()
             diff.addItems(["direct", "ceiling"])
@@ -389,8 +446,8 @@ class ProjectSetupTab(QWidget):
         direction.addItems(["down", "up"])
         _add_row(form, "Direction", self._register("fan-direction", direction),
                   "Which way the fan pushes air along its own axis.")
-        form.addRow("Radius (m)", self._register("fan-radius", _dspin(0.05, 5, 0.05, 3, 0.6)))
-        form.addRow("Thickness (m)", self._register("fan-thickness", _dspin(0.02, 2, 0.02, 3, 0.2)))
+        form.addRow("Radius (m)", self._register("fan-radius", _dspin(0.1, 1.5, 0.05, 3, 0.6)))
+        form.addRow("Thickness (m)", self._register("fan-thickness", _dspin(0.05, 1.0, 0.05, 3, 0.2)))
         form.addRow("X position (m)", self._register("fan-x-input", _dspin(0, 50, 0.05, 3, 2.0)))
         form.addRow("Y position (m)", self._register("fan-y-input", _dspin(0, 50, 0.05, 3, 1.5)))
         form.addRow("Z position (m)", self._register("fan-z-input", _dspin(0, 20, 0.05, 3, 2.2)))
@@ -407,7 +464,7 @@ class ProjectSetupTab(QWidget):
         form.addRow("X position (m)", self._register("inject-x-input", _dspin(0, 50, 0.05, 3, 2.0)))
         form.addRow("Y position (m)", self._register("inject-y-input", _dspin(0, 50, 0.05, 3, 1.5)))
         form.addRow("Z position (m)", self._register("inject-z-input", _dspin(0, 20, 0.05, 3, 1.5)))
-        size_field = self._register("source-zone-size", _dspin(0.01, 5, 0.05, 3, 0.3))
+        size_field = self._register("source-zone-size", _dspin(0.05, 2.0, 0.05, 3, 0.3))
         _add_row(form, "Source zone size (m)", size_field,
                   "Side length of the cube-shaped cellZone the contaminant source injects into. "
                   "Larger zones dilute the injection over more cells; smaller zones concentrate it "
@@ -491,6 +548,7 @@ class ProjectSetupTab(QWidget):
             return
         self.guv_path = path
         self.room = room
+        self._clamp_position_fields_to_room()
         self.settings_path = None  # a bare .guv load starts a fresh, never-saved project
         self.project_label.setText(
             f"{Path(path).name} — room {room.x:.2f}×{room.y:.2f}×{room.z:.2f} {room.units}, "
@@ -535,7 +593,9 @@ class ProjectSetupTab(QWidget):
                 f"{Path(guv_path).name} — room {room.x:.2f}×{room.y:.2f}×{room.z:.2f} {room.units}, "
                 f"{len(room.lamps)} lamp(s)")
         self.settings_path = path
+        self._clamp_position_fields_to_room()
         self.apply_settings(settings)
+        self._clamp_position_fields_to_room()
         self._remember_project_path(path)
         self.project_loaded.emit()
 
@@ -554,6 +614,10 @@ class ProjectSetupTab(QWidget):
     def save_project(self, path):
         settings = self.gather_settings()
         settings["guv_path"] = self.guv_path
+        # Backfills any OpenFOAM/meshing/solver setting missing from this
+        # project - see app_settings.capture_openfoam_settings's docstring
+        # and app.py's _save_project (the Dash equivalent of this method).
+        capture_openfoam_settings(settings, load_advanced_settings())
         with open(path, "w") as f:
             json.dump(settings, f, indent=2)
         self.settings_path = path

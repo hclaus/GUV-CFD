@@ -4,8 +4,8 @@ Settings modal. Builds its form from app_settings.ADVANCED_SETTINGS_DEFAULTS
 friendly label + hover tooltip per field from _FIELD_INFO below rather than
 showing raw internal dict keys."""
 from PySide6.QtWidgets import (
-    QCheckBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFormLayout, QLabel, QScrollArea, QSpinBox,
-    QVBoxLayout, QWidget,
+    QCheckBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFormLayout, QLabel, QMessageBox, QScrollArea,
+    QSpinBox, QVBoxLayout, QWidget,
 )
 
 from ..app_settings import ADVANCED_SETTINGS_DEFAULTS, load_advanced_settings, save_advanced_settings
@@ -24,6 +24,12 @@ _FIELD_INFO = {
                          "genuinely settled."),
     "pimple-delta-t": ("Decay solver time step (s)",
                         "The transient decay solver's own time step size."),
+    "max-co": ("Decay solver Courant cap (maxCo)",
+               "Upper bound on the Courant number pimpleFoam's adaptive time step is allowed to "
+               "reach - higher lets the solver take bigger steps (faster) but pushes closer to the "
+               "limit nOuterCorrectors=3 (fixed in the template) can still keep stable/accurate "
+               "each step. 5 is the original conservative default; a live production sweep "
+               "confirmed 10 stays numerically stable - see ANALYSIS_LOG.md before pushing higher."),
     "mesh-cell-size": ("Mesh cell size (m)",
                         "Target grid spacing for the room mesh. Smaller = finer mesh, more accurate, "
                         "much slower."),
@@ -154,5 +160,22 @@ class SettingsDialog(QDialog):
                 values[key] = w.value()
             else:
                 values[key] = w.value()
+        # Defense-in-depth, kept even after fixing the actual bug this guarded
+        # against (steady_state_pipeline._rename_chunk_time_dirs used to rename
+        # every numbered directory on disk, not just the current chunk's own -
+        # confirmed corrupting a real case directory when both these were on
+        # together). Mirrors app._save_settings's identical guard - see that
+        # function's own comment. The two features are independent, and
+        # now-fixed, so this block is deliberately conservative rather than
+        # load-bearing - remove it once the fix has enough runs behind it to
+        # trust the combination.
+        if values.get("t-infinity-early-stop-enabled") and values.get("keep-all-timesteps"):
+            QMessageBox.warning(
+                self, "Not saved",
+                'Not saved - "Enable T∞ early stopping" and "Keep all time steps for ParaView" '
+                "can't both be on at once (a directory-naming bug was found in this combination; "
+                "it's since been fixed, but this block is left in as a precaution for now). "
+                "Turn one off before saving.")
+            return
         save_advanced_settings(values)
         self.accept()

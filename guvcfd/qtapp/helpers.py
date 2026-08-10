@@ -14,6 +14,39 @@ from pathlib import Path
 from ..visualization import center_frac_for_wall
 from ..wsl_utils import run_wsl
 
+# Fields a Run always needs a real numeric value for - mirrors
+# app._ALWAYS_REQUIRED_FIELDS/_FAN_REQUIRED_FIELDS/etc (same rule set, same
+# field ids, since both apps write the same .guvcfd schema). Checked
+# upfront so a missing value (a field cleared while editing, or an
+# older/hand-edited .guvcfd file predating a field) fails fast with a
+# clear message, instead of after mesh generation and flow convergence
+# have already run for real.
+_ALWAYS_REQUIRED_FIELDS = {
+    "ach": "Ventilation ACH", "z-value": "UV inactivation constant Z",
+    "inlet-y-input": "Inlet Y position", "inlet-z-input": "Inlet Z position",
+    "inlet-size-w": "Inlet width", "inlet-size-h": "Inlet height",
+    "outlet-y-input": "Outlet Y position", "outlet-z-input": "Outlet Z position",
+    "outlet-size-w": "Outlet width", "outlet-size-h": "Outlet height",
+    "pimple-end-time": "Simulation end time", "pimple-write-interval": "Write interval",
+}
+_FAN_REQUIRED_FIELDS = {
+    "fan-speed": "Fan speed", "fan-radius": "Fan radius", "fan-thickness": "Fan thickness",
+    "fan-x-input": "Fan X position", "fan-y-input": "Fan Y position", "fan-z-input": "Fan Z position",
+}
+_INLET2_REQUIRED_FIELDS = {
+    "inlet2-y-input": "2nd inlet Y position", "inlet2-z-input": "2nd inlet Z position",
+    "inlet2-size-w": "2nd inlet width", "inlet2-size-h": "2nd inlet height",
+}
+_OUTLET2_REQUIRED_FIELDS = {
+    "outlet2-y-input": "2nd outlet Y position", "outlet2-z-input": "2nd outlet Z position",
+    "outlet2-size-w": "2nd outlet width", "outlet2-size-h": "2nd outlet height",
+}
+_STEADY_STATE_REQUIRED_FIELDS = {
+    "inject-x-input": "Injection X position", "inject-y-input": "Injection Y position",
+    "inject-z-input": "Injection Z position", "source-zone-size": "Source zone size",
+    "phase1-iterations": "Phase 1 iterations", "phase2-iterations": "Phase 2 iterations",
+}
+
 TEMPLATE_CASE_DIR = str(Path(__file__).resolve().parent.parent / "templates" / "case_template")
 
 MONITOR_POINT_IDS = (1, 2, 3)
@@ -168,3 +201,64 @@ def sealed_room_error(sim_type, ach, fan_enabled):
         return ("Sealed room (ACH<=0) needs the mixing fan enabled - with no ventilation "
                 "and no fan, there's no way for the flow field to develop.")
     return None
+
+
+def mechanical_ach_only_error(sim_type, ach, mech_ach_only):
+    """None if fine, else a user-facing message - see
+    app._mechanical_ach_only_error (opposite constraint from sealed_room_error:
+    mechanical ACH only needs real ventilation, ACH>0)."""
+    if not mech_ach_only:
+        return None
+    if sim_type != "decay":
+        return ("Mechanical ACH only is only supported in Decay mode - steady-state has no "
+                "sensible UV-free case.")
+    if ach <= 0:
+        return ("Mechanical ACH only needs real ventilation (ACH>0) - a sealed room has no "
+                "mechanical ventilation to measure.")
+    return None
+
+
+def validate_settings(settings):
+    """Labels of any required-but-missing (None) field, given the current
+    sim-type/fan/monitoring toggles - see app._validate_settings (same
+    rule set, same field ids). [] if everything a Run would touch is
+    present. Confirmed 2026-08-10 this had no Qt equivalent at all - a run
+    could be launched with e.g. a blank inlet width with no named-field
+    error message, unlike guvcfd.app.
+    """
+    required = dict(_ALWAYS_REQUIRED_FIELDS)
+    if settings.get("fan-enable"):
+        required.update(_FAN_REQUIRED_FIELDS)
+    if settings.get("inlet2-enable"):
+        required.update(_INLET2_REQUIRED_FIELDS)
+    if settings.get("outlet2-enable"):
+        required.update(_OUTLET2_REQUIRED_FIELDS)
+    if settings.get("sim-type") == "steady_state":
+        required.update(_STEADY_STATE_REQUIRED_FIELDS)
+    if settings.get("monitoring-enable"):
+        for i in MONITOR_POINT_IDS:
+            if not settings.get(f"monitor{i}-enable"):
+                continue
+            label = settings.get(f"monitor{i}-name") or f"Point {i}"
+            required[f"monitor{i}-x-input"] = f"{label} X position"
+            required[f"monitor{i}-y-input"] = f"{label} Y position"
+            required[f"monitor{i}-z-input"] = f"{label} Z position"
+            required[f"monitor{i}-cells"] = f"{label} cells per side"
+    return [label for field, label in required.items() if settings.get(field) is None]
+
+
+def case_dir_has_data(case_dir):
+    """True if case_dir already looks like it holds a completed or
+    in-progress run (a results.json, or any real solver time directory
+    beyond 0/) - see app._case_dir_has_data (same heuristic). Used to warn
+    before a fresh Run regenerates the mesh and silently overwrites/
+    orphans it. Confirmed 2026-08-10 Qt had no equivalent check at all -
+    start_run() went straight from validation to mkdir+launch.
+    """
+    p = Path(case_dir)
+    if (p / "results.json").exists():
+        return True
+    if not p.exists():
+        return False
+    return any(c.is_dir() and c.name != "0" and re.fullmatch(r"\d+(\.\d+)?", c.name)
+               for c in p.iterdir())

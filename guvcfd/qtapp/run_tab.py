@@ -16,9 +16,9 @@ from PySide6.QtWidgets import (
     QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
-from ..app_settings import load_advanced_settings
+from ..app_settings import load_advanced_settings, merge_project_openfoam_settings
 from ..report import combo_summary_metrics
-from ..scenario_runs import sweep_combinations
+from ..scenario_runs import _MAX_CONCURRENT_Z, sweep_combinations
 from . import helpers, run_state, sweep_state
 
 _TABLE_HEADERS = ["Z", "ACH", "Status", "Reduction %", "Measured ACH eff. %", "Measured UV eff. %",
@@ -100,8 +100,14 @@ class RunTab(QWidget):
         layout.addWidget(_section_label("Running now"))
         self.live_status_label = QPlainTextEdit()
         self.live_status_label.setReadOnly(True)
-        self.live_status_label.setMaximumHeight(70)
         self.live_status_label.setStyleSheet("background: rgba(127,127,127,0.08); font-family: monospace;")
+        # Fixed to fit _MAX_CONCURRENT_Z lines (the most concurrent
+        # combinations a sweep ever runs at once - see scenario_runs.
+        # _run_sweep_concurrent) rather than the old flat 70px, which cut
+        # off a line or two as soon as more than ~4 combinations were
+        # running concurrently. Still scrolls internally beyond that.
+        line_height = self.live_status_label.fontMetrics().lineSpacing()
+        self.live_status_label.setFixedHeight(line_height * _MAX_CONCURRENT_Z + 12)
         layout.addWidget(self.live_status_label)
 
         layout.addWidget(_section_label("Log"))
@@ -158,6 +164,26 @@ class RunTab(QWidget):
             if error:
                 QMessageBox.warning(self, "Can't start this run", f"ACH={ach}: {error}")
                 return
+            error = helpers.mechanical_ach_only_error(settings["sim-type"], ach, settings.get("mech-ach-only"))
+            if error:
+                QMessageBox.warning(self, "Can't start this run", f"ACH={ach}: {error}")
+                return
+
+        missing = helpers.validate_settings(settings)
+        if missing:
+            QMessageBox.warning(self, "Can't start this run",
+                                 "Missing required value(s): " + ", ".join(missing))
+            return
+
+        if helpers.case_dir_has_data(settings["case-dir"]):
+            reply = QMessageBox.question(
+                self, "Overwrite existing results?",
+                f"{settings['case-dir']} already has simulation data (results.json and/or solver "
+                f"output). Running will regenerate the mesh and overwrite the case directory in "
+                f"place - existing results may be lost. Continue anyway?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if reply != QMessageBox.Yes:
+                return
 
         combos = sweep_combinations(z_values, ach_values)
         Path(settings["case-dir"]).mkdir(parents=True, exist_ok=True)
@@ -177,7 +203,7 @@ class RunTab(QWidget):
             run_state.launch_run(self.state, tab.guv_path, settings["case-dir"], tab.room, settings)
         else:
             self._active = "sweep"
-            adv = load_advanced_settings()
+            adv = merge_project_openfoam_settings(settings, load_advanced_settings())
             sweep_state.launch_sweep(self.sweep_state, tab.guv_path, tab.settings_path,
                                       settings["case-dir"], tab.room, settings, adv, z_values, ach_values)
         self.timer.start()

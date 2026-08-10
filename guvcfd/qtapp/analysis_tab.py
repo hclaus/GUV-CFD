@@ -32,10 +32,39 @@ _METRIC_ROWS = [
     ("eACH_uv_steady_state_corrected", "eACH_uv, steady-state (measured)"),
 ]
 
+# Per-field display rules, mirroring guvcfd.app's _steady_state_summary/
+# _decay_summary formatting for these same JSON keys. Some fields are 0-1
+# fractions that need x100 + "%" (mixing_efficiency*, spatial_cov_final -
+# confirmed 2026-08-10 this table was printing them as raw decimals, e.g.
+# "0.834" instead of "83.4%", easy to misread as a much smaller number);
+# some are already 0-100 percentages needing just "%" appended
+# (mechanical_mixing_efficiency_pct, reduction_pct); the rest are rates
+# that get a "/hr" unit suffix, matching Dash's own row text.
+_PERCENT_FRACTION_FIELDS = {"mixing_efficiency", "mixing_efficiency_corrected", "spatial_cov_final"}
+_ALREADY_PERCENT_FIELDS = {"mechanical_mixing_efficiency_pct", "reduction_pct"}
+_RATE_FIELDS = {
+    "ventilation_ach", "ventilation_ach_measured", "eACH_uv_well_mixed",
+    "eACH_uv_effective", "eACH_uv_effective_corrected", "total_ach_effective",
+    "eACH_uv_steady_state", "eACH_uv_steady_state_corrected",
+}
+
+
+def _format_metric_value(key, value):
+    if not isinstance(value, float):
+        return str(value)
+    if key in _PERCENT_FRACTION_FIELDS:
+        return f"{value * 100:.1f}%"
+    if key in _ALREADY_PERCENT_FIELDS:
+        return f"{value:.1f}%"
+    if key in _RATE_FIELDS:
+        return f"{value:.4g} /hr"
+    return f"{value:.4g}"
+
 
 class AnalysisTab(QWidget):
-    def __init__(self, parent=None):
+    def __init__(self, project_setup_tab=None, parent=None):
         super().__init__(parent)
+        self.project_setup_tab = project_setup_tab
         self.case_dir = None
         self.results = None
 
@@ -69,12 +98,15 @@ class AnalysisTab(QWidget):
         splitter.setSizes([420, 500])
 
     def load_dialog(self):
-        # Defaults to wherever a result was last loaded THIS session, or
-        # else the WSL $FOAM_RUN directory every case directory actually
-        # lives under - results.json is always several folders deep in
-        # there, never anywhere an OS-default "Documents"-style start
-        # location would be near.
-        start_dir = self.case_dir or helpers.compute_default_run_dir()
+        # Defaults to (1) wherever a result was last loaded THIS session,
+        # else (2) the current PROJECT's own configured OpenFOAM case
+        # directory (Project Setup tab's "case-dir" field) - results.json
+        # for whatever's currently open is almost always right there or a
+        # combo-subfolder underneath it - else (3) the generic WSL
+        # $FOAM_RUN directory every case directory lives somewhere under,
+        # for when no project is open yet at all.
+        project_case_dir = self.project_setup_tab.case_dir_edit.text() if self.project_setup_tab else ""
+        start_dir = self.case_dir or project_case_dir or helpers.compute_default_run_dir()
         path, _ = QFileDialog.getOpenFileName(
             self, "Open results.json", start_dir, "results.json (results.json);;All files (*)")
         if path:
@@ -99,12 +131,12 @@ class AnalysisTab(QWidget):
             self.chart.plot_decay(results)
 
     def _populate_table(self, results):
-        rows = [(label, results[key]) for key, label in _METRIC_ROWS if key in results and results[key] is not None]
+        rows = [(key, label, results[key]) for key, label in _METRIC_ROWS
+                if key in results and results[key] is not None]
         self.table.setRowCount(len(rows))
-        for i, (label, value) in enumerate(rows):
+        for i, (key, label, value) in enumerate(rows):
             self.table.setItem(i, 0, QTableWidgetItem(label))
-            text = f"{value:.4g}" if isinstance(value, float) else str(value)
-            self.table.setItem(i, 1, QTableWidgetItem(text))
+            self.table.setItem(i, 1, QTableWidgetItem(_format_metric_value(key, value)))
         self.table.resizeColumnsToContents()
 
     def export_report(self):
