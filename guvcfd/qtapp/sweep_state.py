@@ -61,6 +61,46 @@ class SweepState:
         return "\n".join(f"[{k}] {self.live_status[k]}" for k in sorted(self.live_status))
 
 
+def launch_extend(state, case_dirs, end_time, write_interval):
+    """Sequentially extend each decay case_dir to end_time on a background
+    thread - the native equivalent of guvcfd.app's _extend_pipeline_thread
+    (see the "Extend / modify simulations" dialog's own "Extend specific
+    run(s)" action). Reuses SweepState wholesale rather than a dedicated
+    class - its log/combos/results/status fields already have exactly the
+    shape this needs (one entry per (z, ach), a status/detail per entry),
+    so the Run tab's existing sweep-table rendering works unchanged for
+    this too. Not folded into run_sweep_concurrent/scenario_runs.run_sweep,
+    since this is a small, explicit, user-picked list, not a Z x ACH
+    cross-product - see the dialog's own docstring.
+    """
+    state.reset()
+    state.status = "running"
+    state.combos = [(z, ach) for _, z, ach in case_dirs]
+    state.start_time = time.time()
+
+    def worker():
+        for case_dir, z, ach in case_dirs:
+            if state.stop_requested:
+                break
+            state.log_fn(f"[Z={z}/ACH={ach}] Extending to {end_time}s...")
+            try:
+                scenario_runs.continue_decay(
+                    case_dir, end_time, write_interval, log_fn=state.log_fn, should_stop=state.should_stop,
+                    should_pause=state.should_pause,
+                )
+                state.results[(z, ach)] = {"status": "done", "detail": None}
+                state.log_fn(f"[Z={z}/ACH={ach}] Done.")
+            except scenario_runs.StoppedByUser:
+                state.log_fn(f"[Z={z}/ACH={ach}] Stopped.")
+                break
+            except Exception as e:
+                state.log_fn(f"[Z={z}/ACH={ach}] ERROR: {e}")
+                state.results[(z, ach)] = {"status": "error", "detail": str(e)}
+        state.status = "stopped" if state.stop_requested else "done"
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
 def launch_sweep(state, guv_path, settings_path, project_dir, room, settings, adv, z_values, ach_values):
     """Start a sweep on a background daemon thread. state must be idle -
     caller (the Run tab) is responsible for checking that."""

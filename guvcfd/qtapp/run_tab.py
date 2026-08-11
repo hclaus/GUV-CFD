@@ -74,10 +74,9 @@ class RunTab(QWidget):
         self.stop_btn.setEnabled(False)
         self.stop_btn.clicked.connect(self.stop_run)
         btn_row.addWidget(self.stop_btn)
-        self.pause_btn = QPushButton("Pause")
-        self.pause_btn.setEnabled(False)
-        self.pause_btn.clicked.connect(self.toggle_pause)
-        btn_row.addWidget(self.pause_btn)
+        extend_btn = QPushButton("Extend / modify simulations...")
+        extend_btn.clicked.connect(self.open_extend_dialog)
+        btn_row.addWidget(extend_btn)
         btn_row.addStretch(1)
         layout.addLayout(btn_row)
 
@@ -193,8 +192,6 @@ class RunTab(QWidget):
         self._last_log_len = 0
         self.run_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
-        self.pause_btn.setEnabled(True)
-        self.pause_btn.setText("Pause")
 
         if len(combos) == 1:
             self._active = "single"
@@ -212,10 +209,49 @@ class RunTab(QWidget):
         self._current_state().stop_requested = True
         self.stop_btn.setEnabled(False)
 
-    def toggle_pause(self):
-        state = self._current_state()
-        state.pause_requested = not state.pause_requested
-        self.pause_btn.setText("Continue" if state.pause_requested else "Pause")
+    def open_extend_dialog(self):
+        # Lazy import - avoids a circular import at module load time
+        # (extend_modal imports scenario_runs/project_status, which don't
+        # need anything from this module, but importing it at the top of
+        # this file alongside run_state/sweep_state has caused import-order
+        # issues in the past for this app's other dialogs).
+        from .extend_modal import ExtendModifyDialog
+        tab = self.project_setup_tab
+        default_dir = tab.case_dir_edit.text() if tab.room is not None else None
+        dlg = ExtendModifyDialog(self, default_project_dir=default_dir, parent=self)
+        dlg.exec()
+
+    def launch_sweep_from_extend(self, guv_path, settings_path, project_dir, room, settings, adv,
+                                  z_values, ach_values):
+        """Launch a sweep from the "Extend / modify simulations" dialog -
+        same tail-end UI-state setup start_run() does for its own sweep
+        branch, just with the guv_path/settings/room/Z/ACH sourced from
+        that dialog's own loaded project instead of this tab's own fields
+        (which may be a DIFFERENT project than what's currently open in
+        Project Setup)."""
+        self.log_view.clear()
+        self.table.setRowCount(0)
+        self._last_log_len = 0
+        self.run_btn.setEnabled(False)
+        self.stop_btn.setEnabled(True)
+        self._active = "sweep"
+        sweep_state.launch_sweep(self.sweep_state, guv_path, settings_path, project_dir, room, settings, adv,
+                                  z_values, ach_values)
+        self.timer.start()
+
+    def launch_extend_from_extend(self, case_dirs, end_time, write_interval):
+        """Launch the "Extend specific run(s)" action - reuses sweep_state/
+        the sweep table exactly like launch_sweep_from_extend, just via
+        sweep_state.launch_extend (sequential continue_decay calls) instead
+        of a genuine Z x ACH sweep."""
+        self.log_view.clear()
+        self.table.setRowCount(0)
+        self._last_log_len = 0
+        self.run_btn.setEnabled(False)
+        self.stop_btn.setEnabled(True)
+        self._active = "sweep"
+        sweep_state.launch_extend(self.sweep_state, case_dirs, end_time, write_interval)
+        self.timer.start()
 
     def _current_state(self):
         return self.state if self._active == "single" else self.sweep_state
@@ -250,16 +286,12 @@ class RunTab(QWidget):
             "running": "Running...", "done": "Finished.", "error": f"Failed: {state.error}",
             "stopped": "Stopped.",
         }.get(state.status, state.status)
-        if getattr(state, "pause_requested", False) and state.status == "running":
-            status_text = "Paused - solver suspended in place. Click Continue to resume."
         self.status_label.setText(status_text)
 
         if state.status != "running":
             self.timer.stop()
             self.run_btn.setEnabled(True)
             self.stop_btn.setEnabled(False)
-            self.pause_btn.setEnabled(False)
-            self.pause_btn.setText("Pause")
             self.run_finished.emit()
 
     def _update_single_table(self, state):

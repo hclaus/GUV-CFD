@@ -1667,3 +1667,87 @@ def test_write_sweep_summary_csv_includes_monitoring_point_columns(tmp_path):
     with open(f"{project_dir}/{project_name}_sweep_summary.csv", newline="") as f:
         rows = list(csv_module.DictReader(f))
     assert float(rows[0]["Point 1_reduction_pct"]) == pytest.approx(60.0)
+
+
+# --- continue_decay (moved here from app.py 2026-08-10, so both apps share it) ---
+
+class _FakeStreamResult:
+    returncode = 0
+    stdout = ""
+
+
+def _make_case_dir_with_results(tmp_path, prior):
+    case_dir = tmp_path / "case"
+    case_dir.mkdir()
+    (case_dir / "results.json").write_text(json.dumps(prior))
+    return str(case_dir)
+
+
+def test_continue_decay_reads_back_via_the_post_hoc_path_it_wrote(tmp_path, monkeypatch):
+    # Regression guard (2026-08-10): continue_decay runs a POST-HOC
+    # `postProcess -dict system/volAverageDict` (writing to
+    # postProcessing/volAverage1/0/...), but write_results_summary's own
+    # default vol_average_dat points at the LIVE path
+    # (postProcessing/volAverageLive1/...) a normal run's own solve writes
+    # as it goes - without an explicit override, Continue would silently
+    # read a stale/absent live file instead of the curve it just
+    # recomputed.
+    prior = {"ventilation_ach": 3.0, "eACH_uv_well_mixed": 5.0}
+    case_dir = _make_case_dir_with_results(tmp_path, prior)
+
+    monkeypatch.setattr(sr, "wsl_path", lambda p: p)
+    monkeypatch.setattr(sr, "set_control_dict_start_from", lambda *a, **k: None)
+    monkeypatch.setattr(sr, "set_control_dict_time", lambda *a, **k: None)
+    monkeypatch.setattr(sr, "run_wsl_streaming", lambda *a, **k: _FakeStreamResult())
+    monkeypatch.setattr(sr, "run_wsl_or_raise", lambda *a, **k: None)
+    monkeypatch.setattr(sr, "read_latest_time_field", lambda *a, **k: [1.0, 1.0])
+    monkeypatch.setattr(sr, "spatial_coefficient_of_variation", lambda values: 0.0)
+
+    captured = {}
+
+    def fake_write_results_summary(case_dir_, out_path, ventilation_ach, well_mixed_eACH_mean,
+                                    vol_average_dat=None, **kwargs):
+        captured["vol_average_dat"] = vol_average_dat
+        return {"eACH_uv_effective": 1.0, "eACH_uv_well_mixed": well_mixed_eACH_mean}
+
+    monkeypatch.setattr(sr, "write_results_summary", fake_write_results_summary)
+
+    sr.continue_decay(case_dir, end_time=600, write_interval=10, log_fn=lambda m: None, should_stop=lambda: False)
+
+    assert captured["vol_average_dat"] == "postProcessing/volAverage1/0/volFieldValue.dat"
+
+
+def test_continue_decay_raises_when_no_prior_results(tmp_path):
+    case_dir = tmp_path / "empty_case"
+    case_dir.mkdir()
+    with pytest.raises(RuntimeError, match="results.json"):
+        sr.continue_decay(str(case_dir), end_time=600, write_interval=10)
+
+
+def test_continue_decay_raises_stopped_by_user_when_stop_requested_mid_solve(tmp_path, monkeypatch):
+    case_dir = _make_case_dir_with_results(tmp_path, {"ventilation_ach": 3.0, "eACH_uv_well_mixed": 5.0})
+    monkeypatch.setattr(sr, "wsl_path", lambda p: p)
+    monkeypatch.setattr(sr, "set_control_dict_start_from", lambda *a, **k: None)
+    monkeypatch.setattr(sr, "set_control_dict_time", lambda *a, **k: None)
+    monkeypatch.setattr(sr, "run_wsl_streaming", lambda *a, **k: _FakeStreamResult())
+
+    with pytest.raises(StoppedByUser):
+        sr.continue_decay(case_dir, end_time=600, write_interval=10, log_fn=lambda m: None,
+                           should_stop=lambda: True)
+
+
+def test_continue_decay_raises_on_pimplefoam_failure(tmp_path, monkeypatch):
+    case_dir = _make_case_dir_with_results(tmp_path, {"ventilation_ach": 3.0, "eACH_uv_well_mixed": 5.0})
+    monkeypatch.setattr(sr, "wsl_path", lambda p: p)
+    monkeypatch.setattr(sr, "set_control_dict_start_from", lambda *a, **k: None)
+    monkeypatch.setattr(sr, "set_control_dict_time", lambda *a, **k: None)
+
+    class _Failed:
+        returncode = 1
+        stdout = "FOAM FATAL ERROR: boom"
+
+    monkeypatch.setattr(sr, "run_wsl_streaming", lambda *a, **k: _Failed())
+
+    with pytest.raises(RuntimeError, match="pimpleFoam failed"):
+        sr.continue_decay(case_dir, end_time=600, write_interval=10, log_fn=lambda m: None,
+                           should_stop=lambda: False)

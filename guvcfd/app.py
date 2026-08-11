@@ -1185,88 +1185,18 @@ def _finish_decay(case_dir, room, settings, summary):
 
 
 def _continue_decay(case_dir, end_time, write_interval):
-    """Extend an already-completed decay run to a longer duration, reusing
-    the existing mesh/converged flow field/UV zones as-is - only pimpleFoam
-    (and the postProcess/results steps after it) reruns.
-
-    Two controlDict states are needed, not one: startFrom=latestTime makes
-    the *solver* resume from whatever time directory is already on disk
-    (verified: it genuinely continues the physics, not just relabeling t=0).
-    But postProcess -dict system/volAverageDict honors that same setting for
-    its own processing range too - left on latestTime, it only recomputes
-    the single newest time step rather than the whole curve (verified
-    directly: postProcessing/volAverage1/90/ instead of the expected .../0/,
-    containing just one row). So startFrom is switched back to startTime
-    (endTime stays at the new, higher value) before postProcess runs, so it
-    walks the full 0..end_time history and produces one continuous merged
-    decay curve - not something that needs manual stitching in Python.
-    """
-    results_path = f"{case_dir}/results.json"
-    if not Path(results_path).exists():
-        raise RuntimeError(
-            f"No existing results.json in {case_dir} - run a full simulation "
-            f"here first before continuing it."
-        )
-    with open(results_path) as f:
-        prior = json.load(f)
-
-    case_dir_wsl = wsl_path(case_dir)
-    _run_log(f"Resuming from the latest existing time directory, extending to {end_time}s "
-             f"(mesh, flow field, and UV zones are untouched)...")
-    set_control_dict_start_from(case_dir, "latestTime")
-    set_control_dict_time(case_dir, end_time=end_time, write_interval=write_interval)
-
-    _run_log(f"Running pimpleFoam to {end_time}s...")
-    r = run_wsl_streaming(
-        "pimpleFoam 2>&1 | tee -a log.pimpleFoam", case_dir_wsl,
-        on_line=_track_solver_time, should_stop=_should_stop, kill_pattern="pimpleFoam",
-        should_pause=_should_pause,
-    )
-    if _should_stop():
-        raise StoppedByUser("Stopped during pimpleFoam.")
-    if r.returncode != 0 or "FOAM FATAL" in r.stdout or "Floating Point Exception" in r.stdout:
-        tail = "\n".join(r.stdout.splitlines()[-25:]) or "(no output captured)"
-        raise RuntimeError(f"pimpleFoam failed (exit {r.returncode}):\n{tail}")
-
-    _run_log("Running postProcess volAverage (recomputing the full merged decay curve)...")
-    set_control_dict_start_from(case_dir, "startTime")
-    run_wsl_or_raise("rm -rf postProcessing", case_dir_wsl, "clearing stale postProcessing")
-    run_wsl_or_raise("postProcess -dict system/volAverageDict", case_dir_wsl, "postProcess volAverage")
-
-    _run_log("Computing spatial coefficient of variation (final concentration field)...")
-    try:
-        spatial_cov = spatial_coefficient_of_variation(read_latest_time_field(case_dir, "T"))
-    except Exception as e:
-        _run_log(f"  Could not compute spatial CoV: {e}")
-        spatial_cov = None
-
-    _run_log("Writing results summary...")
-    extra = {k: prior[k] for k in ("n_lamps", "fluence_mean", "flow_converged", "ach_delivery") if k in prior}
-    extra["spatial_cov_final"] = spatial_cov
-    results = write_results_summary(
-        case_dir, results_path, prior["ventilation_ach"], prior["eACH_uv_well_mixed"],
-        # write_results_summary's own DEFAULT vol_average_dat points at the
-        # live-volAverage path (postProcessing/volAverageLive1/...) that a
-        # normal run's own solve writes as it goes - this function instead
-        # ran a POST-HOC `postProcess -dict system/volAverageDict` just
-        # above, which writes function object volAverage1's output to
-        # postProcessing/volAverage1/0/... (0, not "latest", since
-        # startFrom was reset to startTime right before running it) - so
-        # this must be pointed there explicitly, or it silently reads a
-        # stale/absent live file instead of the curve just recomputed.
-        vol_average_dat="postProcessing/volAverage1/0/volFieldValue.dat",
-        extra=extra or None,
-        # The control run itself isn't redone here (mesh/flow/UV zones are
-        # untouched - see this function's own docstring), but its earlier
-        # measured ventilation rate is still valid against the extended
-        # curve, so re-supply it here rather than silently reverting to
-        # the nominal-ACH-only ("uncorrected") fields Continue used to.
-        measured_ventilation_ach=prior.get("ventilation_ach_measured"),
-        measured_ventilation_ach_ci95=prior.get("ventilation_ach_measured_ci95"),
+    """Thin wrapper over scenario_runs.continue_decay, supplying this app's
+    own log_fn/should_stop/should_pause/solver_log_fn (moved there
+    2026-08-10 so the Qt app's own "Extend / modify simulations" flow can
+    call the identical logic instead of reimplementing it - see that
+    function's own docstring for the full behavior)."""
+    results = scenario_runs.continue_decay(
+        case_dir, end_time, write_interval,
+        log_fn=_run_log, should_stop=_should_stop, should_pause=_should_pause,
+        solver_log_fn=_track_solver_time,
     )
     _complete_all_steps()
-    _run_log(f"Done. eACH_uv effective={results['eACH_uv_effective']:.4g} /hr "
-             f"(well-mixed={results['eACH_uv_well_mixed']:.4g} /hr)")
+    return results
 
 
 def _estimate_well_mixed_eACH(room, z_value, grid_n=(10, 8, 8)):
