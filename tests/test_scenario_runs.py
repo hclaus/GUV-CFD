@@ -1103,8 +1103,17 @@ def test_build_flow_base_reuses_existing_resolved_base(tmp_path, monkeypatch):
     ach_delivery_calls = []
     monkeypatch.setattr(sr, "check_ach_delivery", lambda *a, **k: ach_delivery_calls.append((a, k)) or
                          {"ratio": 1.0, "measured_ach": 6.0})
+    monkeypatch.setattr(sr, "read_cell_centers", lambda case_dir, time_dir: ["p1", "p2"])
+    fluence_calls = []
+    fake_fluence = np.array([1.0, 2.0])
+    monkeypatch.setattr(sr, "compute_fluence_at_points",
+                         lambda room, points: fluence_calls.append((room, points)) or fake_fluence)
+    write_calls = []
+    monkeypatch.setattr(sr, "write_scalar_field",
+                         lambda case_dir, name, values, patch_names: write_calls.append((case_dir, name, values)))
+    monkeypatch.setattr(sr, "read_boundary_patch_names", lambda case_dir: ["inlet", "outlet"])
 
-    room = type("Room", (), {"x": 4.0, "y": 5.0, "z": 2.7})()
+    room = type("Room", (), {"x": 4.0, "y": 5.0, "z": 2.7, "lamps": ["lampA", "lampB"]})()
     settings = {"z-value": 6, "inlet-wall": "xMin", "inlet-y-input": 2.5, "inlet-z-input": 1.5,
                 "inlet-size-w": 0.3, "inlet-size-h": 0.3,
                 "outlet-wall": "xMax", "outlet-y-input": 2.5, "outlet-z-input": 1.5,
@@ -1120,6 +1129,15 @@ def test_build_flow_base_reuses_existing_resolved_base(tmp_path, monkeypatch):
     assert setup_calls == []
     assert result["reused"] is True
     assert result["inlet_velocity"] is not None
+    assert result["n_lamps"] == 2  # reflects THIS run's room, not left stale as None
+    # Regression guard (2026-08-11): fluenceRate is the one field on this
+    # reuse path that depends on guv_path's lamp positions/power - unlike
+    # every other reused field, it must be recomputed fresh from THIS
+    # run's own room every time, never trusted from whatever .guv file
+    # originally built/seeded this base (see _build_flow_base's own
+    # docstring for the silent-wrong-results bug this closes).
+    assert len(fluence_calls) == 1 and fluence_calls[0][0] is room
+    assert write_calls == [(str(base_dir), "fluenceRate", fake_fluence)]
     # Regression guard (2026-08-10): the reuse path used to hardcode
     # ach_delivery=None, silently dropping ach_efficiency_pct/
     # mechanical_mixing_efficiency_pct from every combo sharing this ACH
@@ -1137,8 +1155,12 @@ def test_build_flow_base_reuse_skips_ach_delivery_check_when_sealed(tmp_path, mo
     monkeypatch.setattr(sr, "setup_case", lambda *a, **k: None)
     ach_delivery_calls = []
     monkeypatch.setattr(sr, "check_ach_delivery", lambda *a, **k: ach_delivery_calls.append(1))
+    monkeypatch.setattr(sr, "read_cell_centers", lambda case_dir, time_dir: [])
+    monkeypatch.setattr(sr, "compute_fluence_at_points", lambda room, points: np.array([]))
+    monkeypatch.setattr(sr, "write_scalar_field", lambda *a, **k: None)
+    monkeypatch.setattr(sr, "read_boundary_patch_names", lambda case_dir: [])
 
-    room = type("Room", (), {"x": 4.0, "y": 5.0, "z": 2.7})()
+    room = type("Room", (), {"x": 4.0, "y": 5.0, "z": 2.7, "lamps": []})()
     settings = {"z-value": 6, "inlet-wall": "xMin", "inlet-y-input": 2.5, "inlet-z-input": 1.5,
                 "inlet-size-w": 0.3, "inlet-size-h": 0.3,
                 "outlet-wall": "xMax", "outlet-y-input": 2.5, "outlet-z-input": 1.5,

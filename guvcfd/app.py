@@ -3037,8 +3037,12 @@ extend_modal = dbc.Modal(
                     dbc.Col(dbc.Button("Browse...", id="extend-uv-browse-btn", size="sm", outline=True,
                                         color="secondary", className="w-100"), width=4),
                 ], className="g-2 mb-2"),
-                _labeled("New Z value", dcc.Input(id="extend-uv-z-value", type="number",
-                                                    className="form-control form-control-sm")),
+                _labeled("Z values (comma-separated)", dcc.Input(id="extend-uv-z-values", type="text",
+                                                                    placeholder="e.g. 2, 6",
+                                                                    className="form-control form-control-sm")),
+                html.P("Prefilled with this project's own Z values - edit the list to re-evaluate "
+                       "different ones under the new design instead.",
+                       className="small text-muted mt-1 mb-0"),
                 html.P("Every ACH already swept in this project will be re-evaluated under the new "
                        "design - any whose flow settings haven't changed reuse the existing flow "
                        "field/control run instead of re-solving them.",
@@ -4134,7 +4138,11 @@ def _refresh_extend_view(project_dir):
     # combo subfolders would fix).
     no_status_at_all = not combos and not (status or {}).get("guv_path")
     rebuild_style = {"display": "block"} if (project_dir and no_status_at_all) else {"display": "none"}
-    return body, (error or ""), sweep_z, sweep_ach, (guv_path or ""), dropdown_options, rebuild_style
+    # Prefilled with this project's own Z values (not left blank) so the
+    # user sees exactly which ones are about to be re-evaluated under a
+    # new .guv design, rather than having to remember/guess what leaving
+    # it empty defaults to.
+    return body, (error or ""), sweep_z, sweep_ach, sweep_z, (guv_path or ""), dropdown_options, rebuild_style
 
 
 @app.callback(
@@ -4144,6 +4152,7 @@ def _refresh_extend_view(project_dir):
     Output("extend-action-msg", "children", allow_duplicate=True),
     Output("extend-sweep-z-values", "value", allow_duplicate=True),
     Output("extend-sweep-ach-values", "value", allow_duplicate=True),
+    Output("extend-uv-z-values", "value", allow_duplicate=True),
     Output("extend-uv-guv-path", "value", allow_duplicate=True),
     Output("extend-combo-dropdown", "options", allow_duplicate=True),
     Output("extend-rebuild-status-wrapper", "style", allow_duplicate=True),
@@ -4153,8 +4162,8 @@ def _refresh_extend_view(project_dir):
 )
 def _open_extend_modal(n_clicks, current_case_dir):
     project_dir = current_case_dir or ""
-    body, msg, sweep_z, sweep_ach, uv_guv, options, rebuild_style = _refresh_extend_view(project_dir)
-    return True, project_dir, body, msg, sweep_z, sweep_ach, uv_guv, options, rebuild_style
+    body, msg, sweep_z, sweep_ach, uv_z, uv_guv, options, rebuild_style = _refresh_extend_view(project_dir)
+    return True, project_dir, body, msg, sweep_z, sweep_ach, uv_z, uv_guv, options, rebuild_style
 
 
 @app.callback(
@@ -4162,6 +4171,7 @@ def _open_extend_modal(n_clicks, current_case_dir):
     Output("extend-action-msg", "children", allow_duplicate=True),
     Output("extend-sweep-z-values", "value", allow_duplicate=True),
     Output("extend-sweep-ach-values", "value", allow_duplicate=True),
+    Output("extend-uv-z-values", "value", allow_duplicate=True),
     Output("extend-uv-guv-path", "value", allow_duplicate=True),
     Output("extend-combo-dropdown", "options", allow_duplicate=True),
     Output("extend-rebuild-status-wrapper", "style", allow_duplicate=True),
@@ -4172,7 +4182,7 @@ def _open_extend_modal(n_clicks, current_case_dir):
 def _load_extend_project(n_clicks, project_dir):
     if not project_dir:
         return (dash.no_update, "Enter a project folder first.", dash.no_update, dash.no_update,
-                dash.no_update, dash.no_update, dash.no_update)
+                dash.no_update, dash.no_update, dash.no_update, dash.no_update)
     return _refresh_extend_view(project_dir)
 
 
@@ -4181,6 +4191,7 @@ def _load_extend_project(n_clicks, project_dir):
     Output("extend-action-msg", "children", allow_duplicate=True),
     Output("extend-sweep-z-values", "value", allow_duplicate=True),
     Output("extend-sweep-ach-values", "value", allow_duplicate=True),
+    Output("extend-uv-z-values", "value", allow_duplicate=True),
     Output("extend-uv-guv-path", "value", allow_duplicate=True),
     Output("extend-combo-dropdown", "options", allow_duplicate=True),
     Output("extend-rebuild-status-wrapper", "style", allow_duplicate=True),
@@ -4198,22 +4209,23 @@ def _create_extend_status_from_disk(n_clicks, project_dir):
     """
     _NA = dash.no_update
     if not project_dir:
-        return _NA, "Enter a project folder first.", _NA, _NA, _NA, _NA, _NA
+        return _NA, "Enter a project folder first.", _NA, _NA, _NA, _NA, _NA, _NA
     guv_path = scenario_runs.find_first_guv_path_on_disk(project_dir)
     if not guv_path:
         return (_NA, "No existing run folders (with their own run_settings.json) were found in "
-                "this location to rebuild a status file from.", _NA, _NA, _NA, _NA, _NA)
+                "this location to rebuild a status file from.", _NA, _NA, _NA, _NA, _NA, _NA)
     try:
         project = Project.load(guv_path)
         room = next(iter(project.rooms.values()))
     except Exception as e:
-        return _NA, f"Found run folders, but failed to load {guv_path}: {e}", _NA, _NA, _NA, _NA, _NA
+        return _NA, f"Found run folders, but failed to load {guv_path}: {e}", _NA, _NA, _NA, _NA, _NA, _NA
 
     project_name = Path(project_dir).name
     n_found = scenario_runs.rebuild_project_status_from_disk(project_dir, project_name, room)
-    body, msg, sweep_z, sweep_ach, uv_guv, options, rebuild_style = _refresh_extend_view(project_dir)
+    body, msg, sweep_z, sweep_ach, uv_z, uv_guv, options, rebuild_style = _refresh_extend_view(project_dir)
     prefix = f"Rebuilt a status file from {n_found} existing run folder(s)."
-    return body, (f"{prefix} {msg}" if msg else prefix), sweep_z, sweep_ach, uv_guv, options, rebuild_style
+    return (body, (f"{prefix} {msg}" if msg else prefix), sweep_z, sweep_ach, uv_z, uv_guv, options,
+            rebuild_style)
 
 
 @app.callback(
@@ -4408,14 +4420,14 @@ def _extend_pipeline_thread(case_dirs, end_time, write_interval):
     Output("scenario-stop-btn", "disabled", allow_duplicate=True),
     Input("extend-run-btn", "n_clicks"),
     State("extend-uv-guv-path", "value"),
-    State("extend-uv-z-value", "value"),
+    State("extend-uv-z-values", "value"),
     State("extend-combo-dropdown", "value"),
     State("extend-duration-input", "value"),
     State("extend-sweep-z-values", "value"),
     State("extend-sweep-ach-values", "value"),
     prevent_initial_call=True,
 )
-def _run_extend_action(n_clicks, uv_guv_path, uv_z_value, extend_combo_keys, extend_end_time,
+def _run_extend_action(n_clicks, uv_guv_path, uv_z_text, extend_combo_keys, extend_end_time,
                         sweep_z_text, sweep_ach_text):
     _NA = dash.no_update
     pending = _pending_extend_modal
@@ -4430,11 +4442,19 @@ def _run_extend_action(n_clicks, uv_guv_path, uv_z_value, extend_combo_keys, ext
     adv = merge_project_openfoam_settings(settings, load_advanced_settings())
 
     if action == "uv":
-        if not uv_guv_path or uv_z_value is None:
-            return _NA, "Pick a .guv file and a Z value first.", _NA, _NA, _NA, _NA
+        if not uv_guv_path:
+            return _NA, "Pick a .guv file first.", _NA, _NA, _NA, _NA
+        try:
+            uv_z_values = _parse_number_list(uv_z_text)
+        except ValueError as e:
+            return _NA, f"Can't parse Z value list: {e}", _NA, _NA, _NA, _NA
+        # Blank field - use every Z value already recorded for this project
+        # (see the note in the modal itself) rather than requiring the user
+        # to retype a list they already swept once.
+        z_values = uv_z_values or sorted({c["z"] for c in combos.values() if "z" in c}) or [settings.get("z-value")]
         ach_values = sorted({c["ach"] for c in combos.values() if "ach" in c}) or [settings.get("ach")]
         _launch_scenario_sweep(uv_guv_path, pending["settings_path"], project_dir, room,
-                                dict(settings, **{"z-value": uv_z_value}), adv, [uv_z_value], ach_values)
+                                dict(settings, **{"z-value": z_values[0]}), adv, z_values, ach_values)
     elif action == "sweep":
         try:
             z_values = _parse_number_list(sweep_z_text)

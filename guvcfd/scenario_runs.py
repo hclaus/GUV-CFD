@@ -39,14 +39,14 @@ import numpy as np
 
 from .app_settings import capture_openfoam_settings
 from .case_io import (
-    read_boundary_patch_names, read_latest_time_field, read_openfoam_scalar_field, write_scalar_field,
-    snapshot_openfoam_settings,
+    read_boundary_patch_names, read_cell_centers, read_latest_time_field, read_openfoam_scalar_field,
+    write_scalar_field, snapshot_openfoam_settings,
 )
 from .cellzones import bin_decay_rates, write_cellzones
 from .contaminant_source import write_fvoptions_file, write_source_topo_set_dict
 from .decay_analysis import write_results_summary, mechanical_mixing_efficiency_pct, spatial_coefficient_of_variation
 from .fan import fan_fvoptions_entry, write_fan_topo_set_dict
-from .fluence import compute_inactivation_rate, compute_well_mixed_eACH
+from .fluence import compute_fluence_at_points, compute_inactivation_rate, compute_well_mixed_eACH
 from .initial_fields import compute_inlet_velocities, resolve_case_inlet_velocities
 from .mesh_gen import opening_actual_area
 from .monitoring import splice_live_vol_average_if_needed
@@ -387,10 +387,38 @@ def _build_flow_base(guv_path, base_dir, room, settings, ach, adv, log_fn, shoul
     from a project's sweep summary the first time this reuse path fired
     for real, since the flow-affecting settings genuinely didn't change,
     so there was nothing wrong to report, just nothing computed either).
+
+    fluenceRate IS recomputed here even on reuse (2026-08-11 fix), unlike
+    every other reused field - see the loud warning at that call site for
+    why: it's the one field on this path that's a function of guv_path's
+    lamp positions/power, not of the flow-affecting settings
+    flow_fingerprint gates reuse on. Confirmed as a real, silent
+    correctness bug in production use: flow_fingerprint deliberately
+    excludes lamp/UV settings (a genuinely correct choice for the flow
+    field and UV-off control run, which really are lamp-independent), but
+    that same reuse gate was ALSO letting a stale fluenceRate survive from
+    whichever .guv file happened to build/seed this base first - every
+    later Z sharing this ACH (see _apply_z's own "read back from the file
+    the base build already wrote rather than recomputed" comment) baked
+    in that first .guv's lamp field regardless of which .guv the CURRENT
+    run actually asked for, silently reproducing the ORIGINAL design's
+    numbers under a newer design's name with no error or warning at all.
     """
     if Path(f"{base_dir}/0/fluenceRate").exists():
         log_fn(f"Found an already flow-converged base case at {Path(base_dir).name}/ from an earlier "
                f"attempt - reusing it instead of re-meshing/re-converging.")
+        # fluenceRate is purely geometric (room + lamp positions/power -
+        # see fluence.compute_fluence_at_points's own docstring), so this
+        # is cheap (no OpenFOAM solve) - but it's the one field on this
+        # reuse path that actually depends on guv_path, so it must be
+        # recomputed fresh from THIS run's room/guv_path, never trusted
+        # from whatever .guv file originally built/seeded this base (see
+        # this function's own docstring for the bug this closes).
+        log_fn("  Recomputing fluence rate from this run's own .guv file (never trusted from an "
+               "earlier design, even when the flow field itself is reused)...")
+        fluence_points = read_cell_centers(base_dir, "0")
+        fluence_values = compute_fluence_at_points(room, fluence_points)
+        write_scalar_field(base_dir, "fluenceRate", fluence_values, read_boundary_patch_names(base_dir))
         has_inlet2 = bool(settings.get("inlet2-enable"))
         inlet_velocity, inlet2_velocity = resolve_case_inlet_velocities(
             base_dir, room, ach, adv["mesh-cell-size"],
@@ -411,7 +439,7 @@ def _build_flow_base(guv_path, base_dir, room, settings, ach, adv, log_fn, shoul
             room_volume = room.x * room.y * room.z
             ach_delivery = check_ach_delivery(base_dir, room_volume, ach, outlet_patches=outlet_patches,
                                                log_fn=log_fn)
-        return {"flow_converged": None, "ach_delivery": ach_delivery, "n_lamps": None, "reused": True,
+        return {"flow_converged": None, "ach_delivery": ach_delivery, "n_lamps": len(room.lamps), "reused": True,
                 "inlet_velocity": inlet_velocity, "inlet2_velocity": inlet2_velocity}
     return setup_case(
         guv_path, base_dir, template_case_dir=_TEMPLATE_CASE_DIR,

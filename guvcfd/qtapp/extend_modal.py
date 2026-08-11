@@ -20,7 +20,7 @@ from pathlib import Path
 from guv_calcs import Project
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
-    QDialog, QDialogButtonBox, QDoubleSpinBox, QFileDialog, QFormLayout, QGroupBox, QHBoxLayout, QLabel,
+    QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QGroupBox, QHBoxLayout, QLabel,
     QLineEdit, QListWidget, QListWidgetItem, QMessageBox, QPushButton, QSpinBox, QTableWidget, QTableWidgetItem,
     QVBoxLayout,
 )
@@ -174,10 +174,14 @@ class ExtendModifyDialog(QDialog):
         uv_browse_btn.clicked.connect(self._browse_uv_guv)
         uv_path_row.addWidget(uv_browse_btn)
         uv_layout.addRow(".guv file", uv_path_row)
-        self.uv_z_spin = QDoubleSpinBox()
-        self.uv_z_spin.setRange(0.0001, 1000.0)
-        self.uv_z_spin.setDecimals(4)
-        uv_layout.addRow("New Z value", self.uv_z_spin)
+        self.uv_z_edit = QLineEdit()
+        self.uv_z_edit.setPlaceholderText("e.g. 2, 6")
+        uv_layout.addRow("Z values (comma-separated)", self.uv_z_edit)
+        uv_z_note = QLabel("Prefilled with this project's own Z values - edit the list to re-evaluate "
+                            "different ones under the new design instead.")
+        uv_z_note.setWordWrap(True)
+        uv_z_note.setStyleSheet("color: gray;")
+        uv_layout.addRow(uv_z_note)
         uv_note = QLabel("Every ACH already swept in this project will be re-evaluated under the new "
                           "design - any whose flow settings haven't changed reuse the existing flow "
                           "field/control run instead of re-solving them.")
@@ -272,6 +276,11 @@ class ExtendModifyDialog(QDialog):
         ach_values = sorted({c["ach"] for c in combos.values() if "ach" in c})
         self.sweep_z_edit.setText(", ".join(f"{v:g}" for v in z_values))
         self.sweep_ach_edit.setText(", ".join(f"{v:g}" for v in ach_values))
+        # Prefilled (not left blank) so the user sees exactly which Z
+        # values are about to be re-evaluated rather than having to
+        # remember/guess what an empty field defaults to - avoids the
+        # confusion a blank-means-"all of them" convention caused.
+        self.uv_z_edit.setText(", ".join(f"{v:g}" for v in z_values))
         if guv_path:
             self.uv_guv_edit.setText(guv_path)
         self._populate_combo_list(combos)
@@ -386,14 +395,23 @@ class ExtendModifyDialog(QDialog):
 
         if self._action == "uv":
             guv_path = self.uv_guv_edit.text().strip()
-            z_value = self.uv_z_spin.value()
             if not guv_path:
                 self.msg_label.setText("Pick a .guv file first.")
                 return
+            try:
+                uv_z_values = helpers.parse_number_list(self.uv_z_edit.text())
+            except ValueError as e:
+                self.msg_label.setText(f"Can't parse Z value list: {e}")
+                return
+            # Blank field - use every Z value already recorded for this
+            # project (see the note in the dialog itself) rather than
+            # requiring the user to retype a list they already swept once.
+            z_values = (uv_z_values or sorted({c["z"] for c in combos.values() if "z" in c})
+                        or [self._settings.get("z-value")])
             ach_values = sorted({c["ach"] for c in combos.values() if "ach" in c}) or [self._settings.get("ach")]
             self.run_tab.launch_sweep_from_extend(
                 guv_path, self._settings_path, self._project_dir, self._room,
-                dict(self._settings, **{"z-value": z_value}), adv, [z_value], ach_values)
+                dict(self._settings, **{"z-value": z_values[0]}), adv, z_values, ach_values)
             self.accept()
         elif self._action == "sweep":
             try:

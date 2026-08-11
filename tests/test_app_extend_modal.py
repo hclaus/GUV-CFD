@@ -50,10 +50,15 @@ def test_refresh_extend_view_prefills_sweep_fields_and_dropdown(tmp_path, monkey
     monkeypatch.setattr(guvcfd_app.Project, "load",
                          staticmethod(lambda path: SimpleNamespace(rooms={"r": fake_room})))
 
-    body, msg, sweep_z, sweep_ach, uv_guv, options, rebuild_style = guvcfd_app._refresh_extend_view(str(tmp_path))
+    body, msg, sweep_z, sweep_ach, uv_z, uv_guv, options, rebuild_style = guvcfd_app._refresh_extend_view(
+        str(tmp_path))
     assert msg == ""
     assert sweep_z == "2, 6"
     assert sweep_ach == "3, 6"
+    # Prefilled with the same Z values as the sweep field (not left blank)
+    # so the user sees exactly which ones are about to be re-evaluated
+    # under a new .guv design.
+    assert uv_z == "2, 6"
     assert uv_guv == "proj.guv"
     assert len(options) == 3
     assert rebuild_style == {"display": "none"}  # combos exist - nothing to rebuild
@@ -62,7 +67,8 @@ def test_refresh_extend_view_prefills_sweep_fields_and_dropdown(tmp_path, monkey
 
 
 def test_refresh_extend_view_offers_rebuild_when_no_status_file_exists(tmp_path):
-    body, msg, sweep_z, sweep_ach, uv_guv, options, rebuild_style = guvcfd_app._refresh_extend_view(str(tmp_path))
+    body, msg, sweep_z, sweep_ach, uv_z, uv_guv, options, rebuild_style = guvcfd_app._refresh_extend_view(
+        str(tmp_path))
     assert rebuild_style == {"display": "block"}
 
 
@@ -121,11 +127,12 @@ def test_create_extend_status_from_disk_rebuilds_and_reloads(tmp_path, monkeypat
     monkeypatch.setattr(guvcfd_app.Project, "load",
                          staticmethod(lambda path: SimpleNamespace(rooms={"r": fake_room})))
 
-    body, msg, sweep_z, sweep_ach, uv_guv, options, rebuild_style = guvcfd_app._create_extend_status_from_disk(
+    body, msg, sweep_z, sweep_ach, uv_z, uv_guv, options, rebuild_style = guvcfd_app._create_extend_status_from_disk(
         1, str(tmp_path))
 
     assert "Rebuilt a status file from 1 existing run folder(s)." in msg
     assert sweep_z == "6" and sweep_ach == "3"
+    assert uv_z == "6"
     assert rebuild_style == {"display": "none"}  # now has combos - nothing left to rebuild
 
 
@@ -256,7 +263,7 @@ def test_run_extend_action_uv_launches_sweep_with_new_guv_and_z(tmp_path, monkey
     monkeypatch.setattr(guvcfd_app, "_launch_scenario_sweep", fake_launch)
 
     is_open, msg, tab, poll_disabled, run_disabled, stop_disabled = guvcfd_app._run_extend_action(
-        1, "new.guv", 8.0, None, None, None, None)
+        1, "new.guv", "8", None, None, None, None)
 
     assert is_open is False and tab == "scenario-runs"
     assert poll_disabled is False and run_disabled is True and stop_disabled is False
@@ -266,7 +273,52 @@ def test_run_extend_action_uv_launches_sweep_with_new_guv_and_z(tmp_path, monkey
     assert guvcfd_app._pending_extend_modal["project_dir"] is None  # cleared after dispatch
 
 
-def test_run_extend_action_uv_requires_guv_path_and_z_value(tmp_path):
+def test_run_extend_action_uv_launches_sweep_with_multiple_z_values(tmp_path, monkeypatch):
+    _reset_run_states()
+    combos = {"Z2_ACH3": {"z": 2.0, "ach": 3.0}}
+    guvcfd_app._pending_extend_modal.update(
+        project_dir=str(tmp_path), settings_path="proj.guvcfd",
+        settings={"sim-type": "decay", "ach": 3}, room=SimpleNamespace(x=1, y=1, z=1),
+        status={"combos": combos}, action="uv",
+    )
+    monkeypatch.setattr(guvcfd_app, "load_advanced_settings", lambda: {})
+    monkeypatch.setattr(guvcfd_app, "merge_project_openfoam_settings", lambda settings, adv: {"mesh-cell-size": 0.1})
+
+    captured = {}
+    monkeypatch.setattr(guvcfd_app, "_launch_scenario_sweep",
+                         lambda guv_path, settings_path, project_dir, room, settings, adv, z_values, ach_values:
+                         captured.update(z_values=z_values))
+
+    guvcfd_app._run_extend_action(1, "new.guv", "2, 6, 6.5", None, None, None, None)
+    assert captured["z_values"] == [2.0, 6.0, 6.5]
+
+
+def test_run_extend_action_uv_blank_z_defaults_to_projects_original_z_values(tmp_path, monkeypatch):
+    # The user-facing rule (per the modal's own note): leaving Z blank
+    # means "re-evaluate every Z already swept in this project", not
+    # "Z=None" or an error - a prior version of this field was a single
+    # required number, forcing the user to retype a list they'd already
+    # swept once just to apply a different lamp design to it.
+    _reset_run_states()
+    combos = {"Z2_ACH3": {"z": 2.0, "ach": 3.0}, "Z6_ACH3": {"z": 6.0, "ach": 3.0}}
+    guvcfd_app._pending_extend_modal.update(
+        project_dir=str(tmp_path), settings_path="proj.guvcfd",
+        settings={"sim-type": "decay", "ach": 3}, room=SimpleNamespace(x=1, y=1, z=1),
+        status={"combos": combos}, action="uv",
+    )
+    monkeypatch.setattr(guvcfd_app, "load_advanced_settings", lambda: {})
+    monkeypatch.setattr(guvcfd_app, "merge_project_openfoam_settings", lambda settings, adv: {"mesh-cell-size": 0.1})
+
+    captured = {}
+    monkeypatch.setattr(guvcfd_app, "_launch_scenario_sweep",
+                         lambda guv_path, settings_path, project_dir, room, settings, adv, z_values, ach_values:
+                         captured.update(z_values=z_values))
+
+    guvcfd_app._run_extend_action(1, "new.guv", "", None, None, None, None)
+    assert captured["z_values"] == [2.0, 6.0]
+
+
+def test_run_extend_action_uv_requires_guv_path(tmp_path):
     _reset_run_states()
     guvcfd_app._pending_extend_modal.update(
         project_dir=str(tmp_path), settings={"sim-type": "decay"}, room=SimpleNamespace(x=1, y=1, z=1),
@@ -274,7 +326,18 @@ def test_run_extend_action_uv_requires_guv_path_and_z_value(tmp_path):
     )
     is_open, msg, tab, poll_disabled, run_disabled, stop_disabled = guvcfd_app._run_extend_action(
         1, None, None, None, None, None, None)
-    assert "Pick a .guv file and a Z value" in msg
+    assert "Pick a .guv file first" in msg
+
+
+def test_run_extend_action_uv_rejects_unparseable_z_list(tmp_path):
+    _reset_run_states()
+    guvcfd_app._pending_extend_modal.update(
+        project_dir=str(tmp_path), settings={"sim-type": "decay"}, room=SimpleNamespace(x=1, y=1, z=1),
+        status={"combos": {}}, action="uv",
+    )
+    is_open, msg, tab, poll_disabled, run_disabled, stop_disabled = guvcfd_app._run_extend_action(
+        1, "new.guv", "not-a-number", None, None, None, None)
+    assert "Can't parse Z value list" in msg
 
 
 def test_run_extend_action_sweep_launches_with_parsed_z_ach(tmp_path, monkeypatch):
