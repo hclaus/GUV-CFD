@@ -11,6 +11,36 @@ def _wait_until_done(state, timeout=5.0):
     assert state.status != "running", "launch_extend's worker never finished"
 
 
+def test_launch_sweep_passes_a_filtering_solver_log_fn(monkeypatch):
+    # Regression guard (2026-08-11): launch_sweep used to pass no
+    # solver_log_fn at all, which run_pipeline._run_phase() defaults back
+    # to log_fn - every raw per-iteration solver line (from every
+    # concurrently-building ACH group) would flood the same log the
+    # coarse "[Z=.../ACH=...] Time = N" narration uses, making the log
+    # view look frozen under real concurrent load even though the solvers
+    # themselves were fine. Matches guvcfd.app._launch_scenario_sweep's
+    # identical fix (filter to lines starting with "[").
+    captured = {}
+
+    def fake_run_sweep(*a, **kwargs):
+        captured.update(kwargs)
+
+    monkeypatch.setattr(sweep_state.scenario_runs, "run_sweep", fake_run_sweep)
+
+    state = sweep_state.SweepState()
+    room = type("Room", (), {"x": 4.0, "y": 5.0, "z": 2.7})()
+    sweep_state.launch_sweep(state, "proj.guv", "proj.guvcfd", "/proj", room,
+                              {"sim-type": "steady_state"}, {}, [6.0], [3.0])
+    _wait_until_done(state)
+
+    solver_log_fn = captured["solver_log_fn"]
+    logged = []
+    monkeypatch.setattr(state, "log_fn", logged.append)
+    solver_log_fn("[ACH=3] Time = 100")
+    solver_log_fn("smoothSolver:  Solving for Ux, Initial residual = 0.01")
+    assert logged == ["[ACH=3] Time = 100"]  # raw solver chatter dropped, status lines kept
+
+
 def test_launch_extend_records_done_and_error_per_combo(monkeypatch):
     def fake_continue_decay(case_dir, end_time, write_interval, log_fn=None, should_stop=None,
                              should_pause=None):

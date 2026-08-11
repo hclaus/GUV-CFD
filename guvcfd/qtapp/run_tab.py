@@ -34,7 +34,7 @@ class RunTab(QWidget):
         self.state = run_state.RunState()
         self.sweep_state = sweep_state.SweepState()
         self._active = None  # "single" or "sweep" - which state currently drives the UI
-        self._last_log_len = 0
+        self._last_log_text = ""
 
         layout = QVBoxLayout(self)
 
@@ -189,7 +189,7 @@ class RunTab(QWidget):
 
         self.log_view.clear()
         self.table.setRowCount(0)
-        self._last_log_len = 0
+        self._last_log_text = ""
         self.run_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
 
@@ -231,7 +231,7 @@ class RunTab(QWidget):
         Project Setup)."""
         self.log_view.clear()
         self.table.setRowCount(0)
-        self._last_log_len = 0
+        self._last_log_text = ""
         self.run_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
         self._active = "sweep"
@@ -246,7 +246,7 @@ class RunTab(QWidget):
         of a genuine Z x ACH sweep."""
         self.log_view.clear()
         self.table.setRowCount(0)
-        self._last_log_len = 0
+        self._last_log_text = ""
         self.run_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
         self._active = "sweep"
@@ -260,10 +260,30 @@ class RunTab(QWidget):
 
     def _poll(self):
         state = self._current_state()
-        if len(state.log) > self._last_log_len:
-            new_lines = state.log[self._last_log_len:]
-            self._last_log_len = len(state.log)
-            self.log_view.appendPlainText("\n".join(new_lines))
+        # Redraw the whole log from state.log every tick, rather than
+        # tracking an incremental "how many lines have I already shown"
+        # offset - RunState/SweepState.log_fn trims state.log from the
+        # FRONT once it exceeds 5000 entries (unbounded log growth on a
+        # long run isn't acceptable either), and an incremental offset
+        # into a list that can shrink desyncs permanently the moment the
+        # log saturates that cap: once len(state.log) plateaus at exactly
+        # 5000 (continuous high-volume output, e.g. several concurrent
+        # solvers), "len(state.log) > self._last_log_len" (both pinned at
+        # 5000) never fires again - confirmed live as a genuine, lasting
+        # freeze (not a rendering-speed issue), not just a temporary lag,
+        # since nothing ever un-sticks it once both sides plateau at the
+        # same value. Matches guvcfd.app's own poller, which was never
+        # exposed to this bug in the first place because it always
+        # re-renders "\n".join(state["log"][-300:]) wholesale instead of
+        # tracking a delta.
+        log_text = "\n".join(state.log)
+        if log_text != self._last_log_text:
+            self._last_log_text = log_text
+            scrollbar = self.log_view.verticalScrollBar()
+            was_at_bottom = scrollbar.value() >= scrollbar.maximum() - 4
+            self.log_view.setPlainText(log_text)
+            if was_at_bottom:
+                scrollbar.setValue(scrollbar.maximum())
 
         if self._active == "single":
             # "Running now" blends the overall progress/ETA line with the

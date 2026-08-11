@@ -117,6 +117,17 @@ def launch_sweep(state, guv_path, settings_path, project_dir, room, settings, ad
                 guv_path, settings_path, project_dir, room, settings, adv, z_values, ach_values,
                 log_fn=state.log_fn, should_stop=state.should_stop, on_combo_done=state.on_combo_done,
                 status_fn=state.status_fn, should_pause=state.should_pause,
+                # Without this, run_pipeline._run_phase()'s on_line=solver_log_fn
+                # falls back to log_fn - every raw per-iteration solver line
+                # (residuals, for every iteration, from every concurrently-
+                # building ACH group) would flood the same log the coarse
+                # narration uses, instead of just the throttled "[Z=.../
+                # ACH=...] Time = N" lines _prefixed_log_fn already produces -
+                # confirmed live: with 3 ACH groups converging at once, this
+                # made the log view look completely frozen (it wasn't - the
+                # solvers were fine, the log was just drowning). Matches
+                # guvcfd.app._launch_scenario_sweep's identical fix exactly.
+                solver_log_fn=lambda line: state.log_fn(line) if line.strip().startswith("[") else None,
             )
             state.status = "stopped" if state.stop_requested else "done"
         except Exception as e:
