@@ -10,15 +10,16 @@ stale and must be re-spliced with the fresh content.
 """
 import re
 
+from .wsl_utils import read_case_file as _read_case_file, write_case_file as _write_case_file
 
-def _read_fvoptions_body(fvoptions_path):
+
+def _read_fvoptions_body(case_dir):
     """Return constant/fvOptions' content with the FoamFile header stripped."""
-    with open(fvoptions_path) as f:
-        content = f.read()
+    content = _read_case_file(case_dir, "constant/fvOptions")
     # Strip the FoamFile{...} header block, keep everything after its closing '}'.
     m = re.search(r'^FoamFile\s*\n\{.*?\n\}\s*\n', content, re.DOTALL | re.MULTILINE)
     if not m:
-        raise RuntimeError(f"Could not find FoamFile header block in {fvoptions_path}")
+        raise RuntimeError(f"Could not find FoamFile header block in {case_dir}/constant/fvOptions")
     return content[m.end():].strip("\n")
 
 
@@ -43,12 +44,11 @@ def splice_fv_options_into_control_dict(case_dir, indent="        "):
     constant/fvOptions content. Returns (controlDict_path, n_open, n_close)
     so the caller can verify brace balance.
     """
-    fv_body = _read_fvoptions_body(f"{case_dir}/constant/fvOptions")
+    fv_body = _read_fvoptions_body(case_dir)
     indented_body = "\n".join(indent + line if line else "" for line in fv_body.splitlines())
 
     cd_path = f"{case_dir}/system/controlDict"
-    with open(cd_path) as f:
-        content = f.read()
+    content = _read_case_file(case_dir, "system/controlDict")
 
     m = re.search(r'\n(\s*)fvOptions\s*\n(\s*)\{', content)
     if not m:
@@ -63,8 +63,7 @@ def splice_fv_options_into_control_dict(case_dir, indent="        "):
         + content[close_brace_pos:]
     )
 
-    with open(cd_path, "w") as f:
-        f.write(new_content)
+    _write_case_file(case_dir, "system/controlDict", new_content)
 
     n_open = new_content.count("{")
     n_close = new_content.count("}")
@@ -80,8 +79,7 @@ def splice_into_functions_block(case_dir, block_text):
     brace balance, same convention as splice_fv_options_into_control_dict.
     """
     cd_path = f"{case_dir}/system/controlDict"
-    with open(cd_path) as f:
-        content = f.read()
+    content = _read_case_file(case_dir, "system/controlDict")
 
     m = re.search(r'\n(\s*)functions\s*\n(\s*)\{', content)
     if not m:
@@ -96,8 +94,7 @@ def splice_into_functions_block(case_dir, block_text):
         + content[close_brace_pos:]
     )
 
-    with open(cd_path, "w") as f:
-        f.write(new_content)
+    _write_case_file(case_dir, "system/controlDict", new_content)
 
     n_open = new_content.count("{")
     n_close = new_content.count("}")
@@ -114,8 +111,7 @@ def set_function_object_enabled(case_dir, function_name, enabled):
     causes a floating-point blowup. Re-enable before running pimpleFoam.
     """
     cd_path = f"{case_dir}/system/controlDict"
-    with open(cd_path) as f:
-        content = f.read()
+    content = _read_case_file(case_dir, "system/controlDict")
 
     m = re.search(rf'\n(\s*){re.escape(function_name)}\s*\n(\s*)\{{', content)
     if not m:
@@ -134,8 +130,7 @@ def set_function_object_enabled(case_dir, function_name, enabled):
         + f"\n{body_indent}enabled         {value};"
         + content[after_open:]
     )
-    with open(cd_path, "w") as f:
-        f.write(new_content)
+    _write_case_file(case_dir, "system/controlDict", new_content)
     return cd_path
 
 
@@ -154,7 +149,7 @@ def set_function_object_enabled(case_dir, function_name, enabled):
 _MAX_CO = 5
 
 
-def set_control_dict_time(case_dir, end_time=None, write_interval=None, delta_t=None):
+def set_control_dict_time(case_dir, end_time=None, write_interval=None, delta_t=None, max_co=None):
     """Set endTime/writeInterval/deltaT/maxCo in controlDict. Used to give
     simpleFoam its own iteration budget separate from pimpleFoam's transient
     duration, since they share this one controlDict but mean completely
@@ -167,23 +162,27 @@ def set_control_dict_time(case_dir, end_time=None, write_interval=None, delta_t=
     one, leaving T missing from most time directories. endTime/deltaT aren't
     duplicated per-function-object, so those stay first-occurrence-only.
 
-    maxCo is always rewritten to _MAX_CO regardless of the arguments given -
-    simpleFoam doesn't read it at all (harmless no-op there), and every
-    pimpleFoam use in this pipeline wants the same, more permissive value
-    (see _MAX_CO's own comment above).
+    maxCo is always rewritten (to `max_co` if given, else _MAX_CO) regardless
+    of end_time/write_interval/delta_t - simpleFoam doesn't read it at all
+    (harmless no-op there), and every pimpleFoam use in this pipeline wants
+    an explicit value (see _MAX_CO's own comment above). `max_co` is a
+    per-project .guvcfd setting (app_settings.PROJECT_OPENFOAM_SETTINGS_KEYS'
+    "max-co") - None keeps the previous hardcoded-_MAX_CO behavior, for
+    callers that don't have a project's resolved settings in scope (e.g.
+    the simpleFoam chunk loop in converge_flow_field, where this write is a
+    no-op anyway).
     """
+    max_co = _MAX_CO if max_co is None else max_co
     cd_path = f"{case_dir}/system/controlDict"
-    with open(cd_path) as f:
-        content = f.read()
+    content = _read_case_file(case_dir, "system/controlDict")
     if end_time is not None:
         content = re.sub(r'(\n[ \t]*)endTime(\s+)[\d.]+;', rf'\g<1>endTime\g<2>{end_time};', content, count=1)
     if write_interval is not None:
         content = re.sub(r'(\n[ \t]*)writeInterval(\s+)[\d.]+;', rf'\g<1>writeInterval\g<2>{write_interval};', content)
     if delta_t is not None:
         content = re.sub(r'(\n[ \t]*)deltaT(\s+)[\d.]+;', rf'\g<1>deltaT\g<2>{delta_t};', content, count=1)
-    content = re.sub(r'(\n[ \t]*)maxCo(\s+)[\d.]+;', rf'\g<1>maxCo\g<2>{_MAX_CO};', content, count=1)
-    with open(cd_path, "w") as f:
-        f.write(content)
+    content = re.sub(r'(\n[ \t]*)maxCo(\s+)[\d.]+;', rf'\g<1>maxCo\g<2>{max_co};', content, count=1)
+    _write_case_file(case_dir, "system/controlDict", content)
     return cd_path
 
 
@@ -196,8 +195,7 @@ def set_function_write_interval(case_dir, function_name, value):
     (much sparser) write_interval - see steady_state_pipeline._run_phase.
     """
     cd_path = f"{case_dir}/system/controlDict"
-    with open(cd_path) as f:
-        content = f.read()
+    content = _read_case_file(case_dir, "system/controlDict")
 
     m = re.search(rf'\n(\s*){re.escape(function_name)}\s*\n(\s*)\{{', content)
     if not m:
@@ -211,8 +209,7 @@ def set_function_write_interval(case_dir, function_name, value):
         raise RuntimeError(f"No writeInterval found inside '{function_name}' block")
 
     new_content = content[:open_brace_pos] + new_body + content[close_brace_pos:]
-    with open(cd_path, "w") as f:
-        f.write(new_content)
+    _write_case_file(case_dir, "system/controlDict", new_content)
     return cd_path
 
 
@@ -230,11 +227,9 @@ def set_control_dict_start_from(case_dir, mode):
     postProcess runs, to get one continuous merged decay curve back.
     """
     cd_path = f"{case_dir}/system/controlDict"
-    with open(cd_path) as f:
-        content = f.read()
+    content = _read_case_file(case_dir, "system/controlDict")
     content = re.sub(r'(\n[ \t]*)startFrom(\s+)\w+;', rf'\g<1>startFrom\g<2>{mode};', content, count=1)
-    with open(cd_path, "w") as f:
-        f.write(content)
+    _write_case_file(case_dir, "system/controlDict", content)
     return cd_path
 
 
@@ -281,12 +276,10 @@ def ensure_simple_fvsolution(case_dir):
     not a toggle like set_function_object_enabled.
     """
     fvs_path = f"{case_dir}/system/fvSolution"
-    with open(fvs_path) as f:
-        content = f.read()
+    content = _read_case_file(case_dir, "system/fvSolution")
     if re.search(r'\nSIMPLE\s*\n\s*\{', content):
         return fvs_path  # already present, nothing to do
-    with open(fvs_path, "w") as f:
-        f.write(content.rstrip("\n") + "\n" + _SIMPLE_BLOCK)
+    _write_case_file(case_dir, "system/fvSolution", content.rstrip("\n") + "\n" + _SIMPLE_BLOCK)
     return fvs_path
 
 
@@ -319,8 +312,7 @@ def disable_simple_residual_control(case_dir):
     the first time PIMPLE.residualControl was added alongside this function).
     """
     fvs_path = f"{case_dir}/system/fvSolution"
-    with open(fvs_path) as f:
-        content = f.read()
+    content = _read_case_file(case_dir, "system/fvSolution")
 
     m = re.search(r'\bSIMPLE\s*\n\s*\{', content)
     if not m:
@@ -340,8 +332,7 @@ def disable_simple_residual_control(case_dir):
     new_simple_block = simple_block[:rc_open + 1] + simple_block[rc_close:]
     new_content = content[:simple_open] + new_simple_block + content[simple_close + 1:]
 
-    with open(fvs_path, "w") as f:
-        f.write(new_content)
+    _write_case_file(case_dir, "system/fvSolution", new_content)
     return fvs_path
 
 
@@ -363,8 +354,7 @@ def set_pressure_reference_cell(case_dir, cell_index=0):
     re-run on an already-patched fvSolution) is left untouched.
     """
     fvs_path = f"{case_dir}/system/fvSolution"
-    with open(fvs_path) as f:
-        content = f.read()
+    content = _read_case_file(case_dir, "system/fvSolution")
 
     for block_name in ("PIMPLE", "SIMPLE"):
         m = re.search(rf'\b{block_name}\s*\n\s*\{{', content)
@@ -379,8 +369,7 @@ def set_pressure_reference_cell(case_dir, cell_index=0):
         new_block = block[:1] + insertion + block[1:]
         content = content[:block_open] + new_block + content[block_close + 1:]
 
-    with open(fvs_path, "w") as f:
-        f.write(content)
+    _write_case_file(case_dir, "system/fvSolution", content)
     return fvs_path
 
 
@@ -405,15 +394,13 @@ def set_relaxation_factors(case_dir, momentum_factor=None, scalar_factor=None):
     has - only touches what's explicitly asked for.
     """
     fvs_path = f"{case_dir}/system/fvSolution"
-    with open(fvs_path) as f:
-        content = f.read()
+    content = _read_case_file(case_dir, "system/fvSolution")
     if momentum_factor is not None:
         content = re.sub(r'(\n[ \t]*U\s+)[\d.]+;', rf'\g<1>{momentum_factor};', content, count=1)
         content = re.sub(r'(\n[ \t]*"\(k\|omega\)"\s+)[\d.]+;', rf'\g<1>{momentum_factor};', content, count=1)
     if scalar_factor is not None:
         content = re.sub(r'(\n[ \t]*T\s+)[\d.]+;', rf'\g<1>{scalar_factor};', content, count=1)
-    with open(fvs_path, "w") as f:
-        f.write(content)
+    _write_case_file(case_dir, "system/fvSolution", content)
     return fvs_path
 
 
@@ -441,8 +428,7 @@ def set_scalar_transport_correction(case_dir, ncorr=None, tolerance=None):
     has - only touches what's explicitly asked for.
     """
     cd_path = f"{case_dir}/system/controlDict"
-    with open(cd_path) as f:
-        content = f.read()
+    content = _read_case_file(case_dir, "system/controlDict")
     if tolerance is not None:
         new_content, n = re.subn(
             r'(scalarTransport1\s*\{[^}]*?\n[ \t]*tolerance\s+)[\d.eE+-]+;',
@@ -461,8 +447,7 @@ def set_scalar_transport_correction(case_dir, ncorr=None, tolerance=None):
                 r'(scalarTransport1\s*\{\s*\n(?:[^\n]*\n)*?\s*field\s+\w+;\s*\n)',
                 rf'\g<1>        nCorr           {ncorr};\n', content, count=1)
         content = new_content
-    with open(cd_path, "w") as f:
-        f.write(content)
+    _write_case_file(case_dir, "system/controlDict", content)
     return cd_path
 
 
@@ -489,14 +474,12 @@ def set_lts_ddt_scheme(case_dir, enabled):
     converted to pimpleFoam+LTS) as a reasonable starting point.
     """
     path = f"{case_dir}/system/fvSchemes"
-    with open(path) as f:
-        content = f.read()
+    content = _read_case_file(case_dir, "system/fvSchemes")
     m = re.search(r'ddtSchemes\s*\{.*?\n\}', content, re.DOTALL)
     if not m:
         raise RuntimeError(f"Could not find ddtSchemes{{}} block in {path}")
     replacement = ("ddtSchemes\n{\n" + _LTS_DDT_DEFAULT + "\n}") if enabled else \
         "ddtSchemes\n{\n    default         Euler;\n}"
     content = content[:m.start()] + replacement + content[m.end():]
-    with open(path, "w") as f:
-        f.write(content)
+    _write_case_file(case_dir, "system/fvSchemes", content)
     return path

@@ -9,6 +9,8 @@ import math
 
 import numpy as np
 
+from .wsl_utils import wsl_path as _wsl_path, write_wsl_text as _write_wsl_text
+
 # Face vertex winding matches GenBlockmesh.py's proven convention (validated
 # against a real solve): v0..v3 at z=0 (floor layer), v4..v7 at z=Lz (ceiling
 # layer), going around (x0,y0) (x1,y0) (x1,y1) (x0,y1) at each layer.
@@ -245,6 +247,121 @@ def opening_grid_alignment(wall, Lx, Ly, Lz, center_frac, size, cell_size):
     return nominal, actual
 
 
+def suggest_opening_size_fix(size, cell_size, fp_tol=1e-9):
+    """(suggested_w, suggested_h): each axis of `size` rounded UP to the
+    next exact multiple of cell_size - unchanged (within fp_tol) if
+    already exact. Pure size-only arithmetic, deliberately NOT coupled to
+    position the way _opening_box's per-edge snap_outward is (that grows
+    an off-grid opening by up to one cell_size PER EDGE; this grows it by
+    up to one cell_size TOTAL) - see suggest_opening_center_fix for the
+    separate, sequential position step meant to run after this one, using
+    this function's own output as its `size` input.
+
+    Mathematically identical to calling snap_outward(v, cell_size, "hi")
+    on each axis value directly - ceil(v/cell_size)*cell_size is the same
+    formula whether v is a position or a length, so this just reuses that
+    already-tested primitive rather than duplicating its fp_tol handling.
+    """
+    return tuple(snap_outward(v, cell_size, "hi", fp_tol=fp_tol) for v in size)
+
+
+def _mod_phase(value, cell_size, fp_tol=1e-9):
+    """value mod cell_size, snapped to exactly 0 or cell_size when within
+    fp_tol of either boundary - guards the same binary floating-point
+    noise snap_outward's own fp_tol guards against (e.g. 0.30000000000000004
+    instead of exactly 0.3), applied to a modulo instead of a floor/ceil.
+    """
+    r = value % cell_size
+    if r < fp_tol or (cell_size - r) < fp_tol:
+        return 0.0
+    return r
+
+
+def _nearest_lattice_point(value, cell_size, phase, bias_point, fp_tol=1e-9):
+    """Nearest point of the lattice {phase + k*cell_size : k in Z} to
+    `value`. On an exact tie (distance cell_size/2 both ways, within
+    fp_tol), picks whichever candidate is closer to bias_point instead of
+    Python's round()-style banker's rounding - banker's rounding on a tie
+    is exactly the kind of "resolves arbitrarily based on incidental
+    parity" behavior snap_outward's own docstring already flags as a real
+    bug class for opening EDGES (a 0.3m opening tie-breaking inward to
+    0.2m); the same failure mode applies here to opening CENTERS, so it
+    gets the same explicit, documented tie-break instead of an implicit
+    language default.
+    """
+    n_lo = math.floor((value - phase) / cell_size + fp_tol)
+    cand_lo = phase + n_lo * cell_size
+    cand_hi = cand_lo + cell_size
+    d_lo, d_hi = abs(value - cand_lo), abs(value - cand_hi)
+    if abs(d_lo - d_hi) <= fp_tol:
+        return cand_lo if abs(cand_lo - bias_point) <= abs(cand_hi - bias_point) else cand_hi
+    return cand_lo if d_lo < d_hi else cand_hi
+
+
+def suggest_opening_center_fix(wall, Lx, Ly, Lz, center_frac, size, cell_size, fp_tol=1e-9):
+    """Given an opening's (width, height) already exact multiples of
+    cell_size (call suggest_opening_size_fix first and pass ITS result as
+    `size` here - see this function's own IMPORTANT note below for why
+    that ordering matters), the nearest grid-aligned absolute center on
+    each in-plane axis (a1, a2 per _WALL_SPECS), biased on exact ties
+    toward that axis's own wall-midpoint (Lx/Ly/Lz /2 on that axis) so
+    repeated snapping can't drift an opening toward a wall edge/corner.
+
+    Returns ((current1_abs, current2_abs), (suggested1_abs, suggested2_abs))
+    in ABSOLUTE meters (center_frac * that axis's room dimension), NOT
+    center_frac - callers write this straight into settings' own
+    {prefix}-y-input/{prefix}-z-input fields, which are already absolute
+    meters, with no back-conversion needed.
+
+    The math: edges land on grid lines exactly when
+    (center - width/2) mod cell_size == 0 - i.e. valid centers form a
+    lattice spaced exactly cell_size apart, offset by
+    phase = (width/2) mod cell_size from the grid origin. For an EVEN
+    cell count (e.g. 0.4m width / 0.1m cells = 4), phase is 0 and valid
+    centers are exact grid lines. For an ODD cell count (e.g. 0.3m / 0.1m
+    = 3), phase is cell_size/2 and valid centers sit at cell-CENTER
+    offsets instead - a naive "round center to nearest cell_size
+    multiple" check gets this case wrong. Either way the max needed shift
+    is bounded at cell_size/2.
+
+    IMPORTANT: only meaningful when `size`'s width/height are already
+    exact cell_size multiples. If either axis's size is NOT an exact
+    multiple, that axis's edges can never both land on the grid no matter
+    what center is chosen (low_edge + width = high_edge, and width itself
+    isn't a clean multiple) - callers must not present this function's
+    output as a real fix for an axis whose size conflict was declined;
+    see run_pipeline.walk_opening_alignment_conflicts's skip-center-on-
+    declined-size rule.
+    """
+    _, _, (a1, a2) = _WALL_SPECS[wall]
+    dims = (Lx, Ly, Lz)
+    cur1, cur2 = center_frac[0] * dims[a1], center_frac[1] * dims[a2]
+    w, h = size
+    phase1, phase2 = _mod_phase(w / 2, cell_size, fp_tol), _mod_phase(h / 2, cell_size, fp_tol)
+    mid1, mid2 = dims[a1] / 2, dims[a2] / 2
+    sug1 = _nearest_lattice_point(cur1, cell_size, phase1, mid1, fp_tol)
+    sug2 = _nearest_lattice_point(cur2, cell_size, phase2, mid2, fp_tol)
+    return (cur1, cur2), (sug1, sug2)
+
+
+def opening_actual_area(wall, Lx, Ly, Lz, center_frac, size, cell_size):
+    """The ACTUAL (grid-snapped) area of an opening, not its nominal
+    (as-typed) area - see opening_grid_alignment. An inlet velocity
+    computed from the nominal area (initial_fields.compute_inlet_velocity)
+    delivers the wrong flow rate whenever the opening doesn't land exactly
+    on the mesh grid: the boundary condition's velocity magnitude gets
+    applied across whatever area blockMesh/topoSet actually carved, not the
+    nominal one used to size it, over/under-delivering by their area ratio
+    (confirmed directly: a 0.3x0.3m inlet outward-snapped to 0.4x0.4m on a
+    0.1m mesh delivered 1.778x its intended flow rate - exactly the ratio
+    check_ach_delivery flagged). Callers computing inlet velocity from ACH
+    should use THIS area, not size[0]*size[1], so the requested ACH is
+    delivered regardless of how the opening happens to snap to the grid.
+    """
+    _, actual = opening_grid_alignment(wall, Lx, Ly, Lz, center_frac, size, cell_size)
+    return actual[0] * actual[1]
+
+
 def _face_set_action(name, box):
     (x0, y0, z0), (x1, y1, z1) = box
     box_str = f"({x0:.6g} {y0:.6g} {z0:.6g}) ({x1:.6g} {y1:.6g} {z1:.6g})"
@@ -333,9 +450,39 @@ def map_fields_dict(patch_names):
 
 def write_map_fields_dict(case_dir, patch_names):
     path = f"{case_dir}/system/mapFieldsDict"
-    with open(path, "w") as f:
-        f.write(map_fields_dict(patch_names))
+    case_dir_wsl = _wsl_path(case_dir)
+    if case_dir_wsl != case_dir:
+        _write_wsl_text(f"{case_dir_wsl}/system/mapFieldsDict", map_fields_dict(patch_names))
+    else:
+        with open(path, "w") as f:
+            f.write(map_fields_dict(patch_names))
     return path
+
+
+def decompose_par_dict(n_subdomains):
+    """decomposeParDict for MPI-parallel decomposePar/mpirun/reconstructPar -
+    scotch method needs no geometric coefficients (unlike simple/
+    hierarchical, which need an explicit (nx ny nz) split), so this is the
+    whole dict - good general-purpose default for an arbitrary room shape.
+    """
+    lines = [
+        "FoamFile", "{", "    version     2.0;", "    format      ascii;",
+        "    class       dictionary;", "    object      decomposeParDict;", "}", "",
+        f"numberOfSubdomains   {n_subdomains};", "",
+        "method          scotch;", "",
+    ]
+    return "\n".join(lines)
+
+
+def write_decompose_par_dict(case_dir, n_subdomains):
+    case_dir_wsl = _wsl_path(case_dir)
+    content = decompose_par_dict(n_subdomains)
+    if case_dir_wsl != case_dir:
+        _write_wsl_text(f"{case_dir_wsl}/system/decomposeParDict", content)
+    else:
+        with open(f"{case_dir}/system/decomposeParDict", "w") as f:
+            f.write(content)
+    return f"{case_dir}/system/decomposeParDict"
 
 
 def write_mesh_dicts(case_dir, Lx, Ly, Lz, cell_size=0.1,
@@ -363,21 +510,33 @@ def write_mesh_dicts(case_dir, Lx, Ly, Lz, cell_size=0.1,
     outlet2_box = _opening_box(outlet2_wall, Lx, Ly, Lz, outlet2_center, outlet2_size, cell_size=cell_size) \
         if outlet2_wall is not None else None
 
+    # Written via a WSL-native process (not Windows-side open()) when
+    # case_dir is an actual \\wsl.localhost\... path - these are the first
+    # files written into a case directory that's brand new this session,
+    # and blockMesh (also WSL-native) reads them right after. See
+    # wsl_utils.write_wsl_text's docstring for why that cross-boundary
+    # handoff isn't reliable for a directory neither side has "warmed up"
+    # to yet. Falls back to a plain write for non-WSL paths (e.g. test
+    # fixtures using local temp dirs), where no such handoff exists.
+    case_dir_wsl = _wsl_path(case_dir)
+    use_wsl_native = case_dir_wsl != case_dir
+
+    def _write(relative_path, content):
+        windows_path = f"{case_dir}/{relative_path}"
+        if use_wsl_native:
+            _write_wsl_text(f"{case_dir_wsl}/{relative_path}", content)
+        else:
+            with open(windows_path, "w") as f:
+                f.write(content)
+        return windows_path
+
     paths = {}
-    bm_path = f"{case_dir}/system/blockMeshDict"
-    with open(bm_path, "w") as f:
-        f.write(block_mesh_dict(Lx, Ly, Lz, cell_size))
-    paths["blockMeshDict"] = bm_path
-
-    ts_path = f"{case_dir}/system/topoSetDict"
-    with open(ts_path, "w") as f:
-        f.write(topo_set_dict(inlet_box, outlet_box, inlet2_box, outlet2_box))
-    paths["topoSetDict"] = ts_path
-
-    cp_path = f"{case_dir}/system/createPatchDict"
-    with open(cp_path, "w") as f:
-        f.write(create_patch_dict(has_inlet2=inlet2_box is not None, has_outlet2=outlet2_box is not None,
-                                   sealed=sealed))
-    paths["createPatchDict"] = cp_path
+    paths["blockMeshDict"] = _write("system/blockMeshDict", block_mesh_dict(Lx, Ly, Lz, cell_size))
+    paths["topoSetDict"] = _write("system/topoSetDict",
+                                   topo_set_dict(inlet_box, outlet_box, inlet2_box, outlet2_box))
+    paths["createPatchDict"] = _write(
+        "system/createPatchDict",
+        create_patch_dict(has_inlet2=inlet2_box is not None, has_outlet2=outlet2_box is not None,
+                           sealed=sealed))
 
     return paths

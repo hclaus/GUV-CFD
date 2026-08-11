@@ -451,3 +451,114 @@ def test_with_total_run_time_prepends_line_and_freezes_once_stopped():
 
 def test_with_total_run_time_passes_through_when_no_start_time():
     assert guvcfd_app._with_total_run_time(None, "Running...") == "Running..."
+
+
+def test_poll_scenario_shows_full_sweep_table_not_stale_single_run_after_finishing():
+    # Regression: a finished multi-combo sweep's own table used to
+    # collapse down to a single stale row whenever ANY earlier single test
+    # run (in this session) had left _run_state non-idle - _scenario_state's
+    # own genuine multi-combo results were completely hidden (the branch
+    # below only checked "_run_state isn't idle", not "which of the two is
+    # actually the more recent one"). Confirmed live: a 4-combo sweep's
+    # table shrank to 1 row right when the sweep finished. See
+    # _poll_scenario's run_is_more_recent comment for the mechanism.
+    _reset()
+    _reset_scenario()
+    # An earlier, unrelated single test run that finished FIRST.
+    guvcfd_app._run_state.update(status="done", case_dir="/some/old/case", z=6.0, ach=3.0,
+                                  start_time=1000.0)
+    # A genuine multi-combo sweep, launched and finished LATER.
+    guvcfd_app._scenario_state.update(
+        status="done", combos=[(6.0, 3.0), (6.0, 6.0), (6.0, 9.0), (8.5, 3.0)], results={},
+        start_time=2000.0, log=[], live_status={})
+
+    table = guvcfd_app._poll_scenario(1)[3]
+    assert len(table.children) == 5  # header + 4 combo rows - the real sweep table, not 1 stale row
+
+
+def test_poll_scenario_still_shows_single_run_table_when_that_is_the_latest_action():
+    # The fix must not break the genuine 1-combination-run case (see
+    # _start_scenario_sweep) - _run_state should still win when it's
+    # actually the most recently launched thing (no sweep has run since).
+    _reset()
+    _reset_scenario()
+    guvcfd_app._run_state.update(status="done", case_dir="/some/case", z=6.0, ach=3.0,
+                                  start_time=2000.0)
+    guvcfd_app._scenario_state.update(status="idle", combos=[], results={}, start_time=None, log=[],
+                                       live_status={})
+
+    table = guvcfd_app._poll_scenario(1)[3]
+    assert len(table.children) == 2  # header + 1 row - the single-run table
+
+
+def _minimal_decay_settings_values(case_dir):
+    """One value per guvcfd_app.SETTINGS_FIELDS entry, in order - a
+    minimal but _validate_settings-passing decay-mode configuration
+    (fan/inlet2/outlet2/monitoring all disabled, so none of their
+    conditionally-required fields matter)."""
+    values = {
+        "project-description": "", "case-dir": str(case_dir), "ach": 6.0, "z-value": 6.0,
+        "inlet-show": True, "inlet-wall": "xMin", "inlet-y-input": 1.5, "inlet-z-input": 2.1,
+        "inlet-size-w": 0.4, "inlet-size-h": 0.4, "inlet-diffuser-type": "direct",
+        "outlet-show": True, "outlet-wall": "xMax", "outlet-y-input": 1.5, "outlet-z-input": 0.4,
+        "outlet-size-w": 0.4, "outlet-size-h": 0.4,
+        "inlet2-enable": False, "inlet2-wall": "ceiling", "inlet2-y-input": 2.0, "inlet2-z-input": 1.5,
+        "inlet2-size-w": 0.3, "inlet2-size-h": 0.3, "inlet2-diffuser-type": "direct",
+        "outlet2-enable": False, "outlet2-wall": "floor", "outlet2-y-input": 2.0, "outlet2-z-input": 1.5,
+        "outlet2-size-w": 0.3, "outlet2-size-h": 0.3,
+        "fan-enable": False, "fan-speed": 0.3, "fan-direction": "down", "fan-radius": 0.6,
+        "fan-thickness": 0.2, "fan-x-input": 2.0, "fan-y-input": 1.5, "fan-z-input": 2.2,
+        "sim-type": "decay", "mech-ach-only": False, "pimple-end-time": 60, "pimple-write-interval": 5,
+        "inject-x-input": 2.0, "inject-y-input": 1.5, "inject-z-input": 1.5, "source-zone-size": 0.3,
+        "phase1-iterations": 1000, "phase2-iterations": 1000, "t-ss-window-frac": 0.15,
+        "deltat-scaling-enabled": True, "deltat-effective-fraction": 0.7, "deltat-target-fraction": 0.995,
+        "scenario-z-values": "6,8.5", "scenario-ach-values": "3,6",
+        "monitoring-enable": False,
+    }
+    for i in (1, 2, 3):
+        values.update({
+            f"monitor{i}-enable": False, f"monitor{i}-name": f"Point {i}",
+            f"monitor{i}-x-input": 2.0, f"monitor{i}-y-input": 1.5, f"monitor{i}-z-input": 1.5,
+            f"monitor{i}-cells": 4,
+        })
+    return [values[fid] for fid in guvcfd_app.SETTINGS_FIELDS]
+
+
+def test_start_scenario_sweep_clears_stale_results_for_a_genuine_multi_combo_sweep(tmp_path, monkeypatch):
+    # Regression: nothing ever cleared results-data/results-case-dir when a
+    # genuine multi-combo sweep launched - only the 1-combination path (via
+    # _poll_run) ever auto-loads its own result, so a result loaded/auto-
+    # loaded from any EARLIER, unrelated run just sat there through and
+    # after the sweep, showing on the Analysis tab as if it belonged to the
+    # sweep that just finished. Confirmed live ("shows results from a run
+    # that has nothing to do with the sweep").
+    _reset()
+    _reset_scenario()
+    monkeypatch.setattr(guvcfd_app, "_launch_scenario_sweep", lambda *a, **k: None)
+    guvcfd_app._loaded["room"] = object()
+    guvcfd_app._loaded["path"] = "dummy.guv"
+
+    values = _minimal_decay_settings_values(tmp_path)
+    result = guvcfd_app._start_scenario_sweep(1, "6,8.5", "3,6", *values)  # 4 combinations
+    assert result[-2:] == (None, None)
+
+
+def test_start_scenario_sweep_leaves_results_alone_for_a_1_combo_run(tmp_path, monkeypatch):
+    # The 1-combination path reuses _run_state/_launch_run, which already
+    # auto-loads its own result once finished (see _poll_run) - clearing
+    # here would just create a pointless blank flash right before that.
+    _reset()
+    _reset_scenario()
+    monkeypatch.setattr(guvcfd_app, "_launch_run", lambda *a, **k: None)
+
+    def _no_pending(*a, **k):
+        return None
+
+    monkeypatch.setattr(guvcfd_app, "case_awaiting_flow_decision", _no_pending)
+    monkeypatch.setattr(guvcfd_app, "case_awaiting_phase2_resume", _no_pending)
+    guvcfd_app._loaded["room"] = object()
+    guvcfd_app._loaded["path"] = "dummy.guv"
+
+    values = _minimal_decay_settings_values(tmp_path / "case")
+    result = guvcfd_app._start_scenario_sweep(1, "6", "3", *values)  # exactly 1 combination
+    assert result[-2:] == (dash.no_update, dash.no_update)

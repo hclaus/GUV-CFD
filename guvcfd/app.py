@@ -7,7 +7,6 @@ import csv
 import json
 import math
 import re
-import subprocess
 import threading
 import time
 import tkinter as tk
@@ -22,12 +21,19 @@ import plotly.graph_objs as go
 from dash import Input, Output, State, dcc, html
 from guv_calcs import Project
 
-from .app_settings import ADVANCED_SETTINGS_DEFAULTS, load_advanced_settings, save_advanced_settings
-from .case_io import clear_stale_run_output, read_cell_centers, read_latest_time_field
+from .app_settings import (
+    ADVANCED_SETTINGS_DEFAULTS, load_advanced_settings, save_advanced_settings,
+    merge_project_openfoam_settings, capture_openfoam_settings, PROJECT_OPENFOAM_SETTINGS_KEYS,
+)
+from .case_io import (
+    clear_stale_run_output, read_cell_centers, read_latest_time_field, snapshot_openfoam_settings,
+)
 from .decay_analysis import write_results_summary, mechanical_mixing_efficiency_pct, spatial_coefficient_of_variation
+from .monitoring import splice_live_vol_average_if_needed
 from .fan import fan_fvoptions_entry
 from .fluence import compute_fluence_at_points, compute_inactivation_rate, compute_well_mixed_eACH
 from . import help_content
+from .version import APP_VERSION
 from .initial_fields import compute_inlet_velocities
 from .monitoring_points import compute_monitoring_results, mixing_uniformity_note, point_reduction_basis
 from .paraview_launch import launch_paraview
@@ -38,9 +44,11 @@ from .report import (
 from .result_figures import steady_state_figure, decay_figure
 from .run_pipeline import (
     setup_case, resume_case_setup, case_awaiting_flow_decision, FlowConvergenceUndecided,
-    check_settings_grid_alignment,
+    check_settings_grid_alignment, walk_opening_alignment_conflicts,
 )
 from . import scenario_runs
+from .mesh_gen import opening_actual_area
+from .project_status import clear_ach_bases, load_project_status
 from .splice import set_control_dict_start_from, set_control_dict_time
 from .steady_state_pipeline import (
     run_steady_state_scenario, _read_phase1_checkpoint, _clear_phase1_checkpoint, Phase1ExtrapolationUndecided,
@@ -80,7 +88,7 @@ SETTINGS_FIELDS = [
     "outlet2-enable", "outlet2-wall", "outlet2-y-input", "outlet2-z-input", "outlet2-size-w", "outlet2-size-h",
     "fan-enable", "fan-speed", "fan-direction", "fan-radius", "fan-thickness",
     "fan-x-input", "fan-y-input", "fan-z-input",
-    "sim-type", "pimple-end-time", "pimple-write-interval",
+    "sim-type", "mech-ach-only", "pimple-end-time", "pimple-write-interval",
     "inject-x-input", "inject-y-input", "inject-z-input", "source-zone-size",
     "phase1-iterations", "phase2-iterations", "t-ss-window-frac",
     "deltat-scaling-enabled", "deltat-effective-fraction", "deltat-target-fraction",
@@ -95,6 +103,35 @@ SETTINGS_FIELDS = [
 ]
 
 MONITOR_POINT_IDS = [1, 2, 3]
+
+
+def _collect_settings(values):
+    """dict(zip(SETTINGS_FIELDS, values)), enriched with any
+    PROJECT_OPENFOAM_SETTINGS_KEYS captured/hand-edited into the
+    currently-loaded .guvcfd file on disk but not present here. Those keys
+    have no Dash UI component (the "JSON-embedded block, no new UI yet"
+    design decision) - without this, dict(zip(SETTINGS_FIELDS, values))
+    alone would never see a hand-edited override (e.g. a copied .guvcfd
+    with max-co changed to try a variant), and worse, the next save would
+    silently overwrite it back to the global default via
+    capture_openfoam_settings (which only backfills a key that's
+    genuinely missing - it can't tell "missing because never captured"
+    from "missing because this dict just never had it wired in").
+    Best-effort: a missing/unreadable file is a no-op enrichment, not a
+    hard requirement.
+    """
+    settings = dict(zip(SETTINGS_FIELDS, values))
+    settings_path = _loaded.get("settings_path")
+    if settings_path:
+        try:
+            with open(settings_path) as f:
+                raw = json.load(f)
+            for key in PROJECT_OPENFOAM_SETTINGS_KEYS:
+                if key in raw:
+                    settings[key] = raw[key]
+        except (OSError, json.JSONDecodeError):
+            pass
+    return settings
 
 # Position-field spec: (prefix, label, room-dimension attr for the slider's
 # max, default-value function of room, initial default/min/max/step used
@@ -766,6 +803,29 @@ def _sealed_room_error(sim_type, ach_values, fan_enabled):
     return None
 
 
+def _mechanical_ach_only_error(sim_type, ach_values, mech_ach_only):
+    """None if fine, else a user-facing message explaining why a
+    "mechanical ACH only" (no UV - see run_pipeline.setup_case's
+    `mechanical_ach_only`) request can't run.
+
+    ach_values: a single ach value or an iterable of them (a sweep's ACH
+    list) - a sweep is rejected if ANY of its ACH values is <=0, same as a
+    single run would be (this is the opposite constraint from sealed's own
+    check - mechanical ACH only needs real ventilation to measure).
+    """
+    if not mech_ach_only:
+        return None
+    if isinstance(ach_values, (int, float)):
+        ach_values = [ach_values]
+    if sim_type != "decay":
+        return ("Mechanical ACH only is only supported in Decay mode - steady-state has no "
+                "sensible UV-free case.")
+    if any(a <= 0 for a in ach_values):
+        return ("Mechanical ACH only needs real ventilation (ACH>0) - a sealed room has no "
+                "mechanical ventilation to measure.")
+    return None
+
+
 def _validate_settings(settings):
     """Labels of any required-but-missing (None) field, given the current
     sim-type/fan/monitoring toggles. [] if everything a Run would touch is
@@ -815,13 +875,14 @@ def _gather_monitoring_points(settings):
 
 
 def _run_decay(guv_path, case_dir, room, settings):
-    adv = load_advanced_settings()
+    adv = merge_project_openfoam_settings(settings, load_advanced_settings())
     # Recorded BEFORE setup_case() runs (not after) so that if flow
     # convergence stops without a verdict (FlowConvergenceUndecided) or the
     # run fails for any other reason, what was actually requested still
     # survives on disk - both for a resume (resume_case_setup needs the
     # SAME mesh-affecting settings _run_decay used) and for Continue's own
     # mismatch check, which previously silently assumed success.
+    capture_openfoam_settings(settings, adv)
     _save_run_settings(case_dir, settings, guv_path=guv_path)
     summary = setup_case(
         guv_path, case_dir, template_case_dir=TEMPLATE_CASE_DIR,
@@ -835,7 +896,7 @@ def _run_decay(guv_path, case_dir, room, settings):
         outlet_size=(settings["outlet-size-w"], settings["outlet-size-h"]),
         pimple_end_time=settings["pimple-end-time"],
         pimple_write_interval=settings["pimple-write-interval"],
-        pimple_delta_t=adv["pimple-delta-t"],
+        pimple_delta_t=adv["pimple-delta-t"], max_co=adv["max-co"],
         cell_size=adv["mesh-cell-size"], nbins=adv["uv-zone-bins"],
         flow_rel_tol=adv["flow-rel-tol"] / 100.0, flow_max_iterations=adv["flow-max-iterations"],
         oscillation_window=adv["oscillation-window"], oscillation_growth_tol=adv["oscillation-growth-tol"],
@@ -845,7 +906,7 @@ def _run_decay(guv_path, case_dir, room, settings):
         scalar_transport_tolerance=adv["scalar-transport-tolerance"],
         log_fn=_run_log, should_stop=_should_stop, solver_log_fn=_track_solver_time,
         should_pause=_should_pause,
-        sealed=settings["ach"] <= 0,
+        sealed=settings["ach"] <= 0, mechanical_ach_only=bool(settings.get("mech-ach-only")),
         **_fan_kwargs(settings),
         **_second_opening_kwargs(settings, "inlet2", room),
         **_second_opening_kwargs(settings, "outlet2", room),
@@ -893,7 +954,7 @@ def _decay_run_durations(ach, eACH_well_mixed_est, adv):
     return combined_end_time, control_end_time
 
 
-def _run_decay_pair(case_dir_wsl, control_dir_wsl):
+def _run_decay_pair(case_dir_wsl, control_dir_wsl, combined_end_time=None, control_end_time=None):
     """Run the UV-on and (if control_dir_wsl is given) UV-off-control
     pimpleFoam solves CONCURRENTLY - both only depend on the shared,
     already-converged flow field prepared before this point, so from here
@@ -929,10 +990,11 @@ def _run_decay_pair(case_dir_wsl, control_dir_wsl):
     results = {}
     errors = {}
 
-    def run_one(name, cwd_wsl, on_line, log_prefix):
+    def run_one(name, cwd_wsl, on_line, log_prefix, total_time):
         try:
             callback = scenario_runs._throttled_solver_callback(
-                _run_log, log_prefix, on_line=on_line, status_fn=_run_status_update, status_key=log_prefix)
+                _run_log, log_prefix, on_line=on_line, status_fn=_run_status_update, status_key=log_prefix,
+                total_time=total_time)
             results[name] = run_wsl_streaming(
                 "pimpleFoam 2>&1 | tee log.pimpleFoam", cwd_wsl,
                 on_line=callback, should_stop=_should_stop, kill_pattern="pimpleFoam",
@@ -943,9 +1005,11 @@ def _run_decay_pair(case_dir_wsl, control_dir_wsl):
         finally:
             _run_status_update(log_prefix, None)
 
-    threads = [threading.Thread(target=run_one, args=("uv", case_dir_wsl, _track_solver_time, "UV-on"))]
+    threads = [threading.Thread(target=run_one,
+                                 args=("uv", case_dir_wsl, _track_solver_time, "UV-on", combined_end_time))]
     if control_dir_wsl is not None:
-        threads.append(threading.Thread(target=run_one, args=("control", control_dir_wsl, None, "control")))
+        threads.append(threading.Thread(target=run_one,
+                                         args=("control", control_dir_wsl, None, "control", control_end_time)))
     for th in threads:
         th.start()
     for th in threads:
@@ -986,24 +1050,28 @@ def _finish_decay(case_dir, room, settings, summary):
     exact value, not an estimate, and is strictly more correct than
     whatever noisy near-zero number an actual control run would measure.
     """
-    adv = load_advanced_settings()
+    adv = merge_project_openfoam_settings(settings, load_advanced_settings())
     case_dir_wsl = wsl_path(case_dir)
     sealed = settings["ach"] <= 0
+    mech_ach_only = bool(settings.get("mech-ach-only"))
+    skip_control = sealed or mech_ach_only
     control_dir = f"{case_dir}/no_UV"
     control_dir_wsl = wsl_path(control_dir)
 
     combined_end_time, control_end_time = _decay_run_durations(
         settings["ach"], summary["eACH_uv_well_mixed_mean"], adv)
     write_interval = max(1, settings["pimple-write-interval"])
-    if sealed:
-        _run_log(f"Adaptive run duration: UV-on={combined_end_time}s (sealed room - no UV-off control "
+    if skip_control:
+        reason = "sealed room" if sealed else "mechanical ACH only"
+        _run_log(f"Adaptive run duration: UV-on={combined_end_time}s ({reason} - no UV-off control "
                  f"needed, see below), write interval={write_interval}s (as configured)...")
     else:
         _run_log(f"Adaptive run durations: UV-on={combined_end_time}s, UV-off control={control_end_time}s "
                  f"(targets: eACH {adv['decay-each-min-fraction']:.3g}-{adv['decay-each-max-fraction']:.3g}%, "
                  f"ACH {adv['decay-ach-min-fraction']:.3g}%), write interval={write_interval}s (as configured)...")
     set_control_dict_time(case_dir, end_time=combined_end_time,
-                           write_interval=write_interval, delta_t=adv["pimple-delta-t"])
+                           write_interval=write_interval, delta_t=adv["pimple-delta-t"], max_co=adv["max-co"])
+    splice_live_vol_average_if_needed(case_dir)
 
     if _should_stop():
         raise StoppedByUser("Stopped before pimpleFoam.")
@@ -1011,37 +1079,35 @@ def _finish_decay(case_dir, room, settings, summary):
         _run_log("Skipping the UV-off control run - sealed room, no possible path for contaminant "
                  "mass to leave (a fan redistributes air but can't remove contaminant from a closed "
                  "room), so the true ventilation-only decay rate is exactly 0 by construction.")
+    elif mech_ach_only:
+        _run_log("Skipping the UV-off control run - mechanical ACH only, this run's own decay curve "
+                 "(empty UV source) already IS the ventilation-only measurement.")
     else:
         _run_log("=== Preparing UV-off control (subfolder \"no_UV\") - clone before either pimpleFoam run ===")
         prepare_ventilation_only_control(
-            case_dir, control_dir, settings["ach"], room.x, room.y, room.z,
-            settings["inlet-wall"], (settings["inlet-size-w"], settings["inlet-size-h"]),
-            control_end_time, write_interval, pimple_delta_t=adv["pimple-delta-t"],
-            inlet2_wall=settings["inlet2-wall"] if settings.get("inlet2-enable") else None,
-            inlet2_size=(settings["inlet2-size-w"], settings["inlet2-size-h"])
-            if settings.get("inlet2-enable") else None,
+            case_dir, control_dir, summary["inlet_velocity"],
+            control_end_time, write_interval, pimple_delta_t=adv["pimple-delta-t"], max_co=adv["max-co"],
+            inlet2_velocity=summary.get("inlet2_velocity") if settings.get("inlet2-enable") else None,
             has_outlet2=bool(settings.get("outlet2-enable")),
             sealed=False,
             log_fn=_run_log, should_stop=_should_stop,
         )
 
-    if sealed:
+    if skip_control:
         _run_log(f"Running pimpleFoam: UV-on ({combined_end_time}s)...")
-        r_uv, _ = _run_decay_pair(case_dir_wsl, None)
+        r_uv, _ = _run_decay_pair(case_dir_wsl, None, combined_end_time=combined_end_time)
     else:
         _run_log(f"Running pimpleFoam concurrently: UV-on ({combined_end_time}s) + "
                  f"UV-off control ({control_end_time}s)...")
-        r_uv, r_control = _run_decay_pair(case_dir_wsl, control_dir_wsl)
+        r_uv, r_control = _run_decay_pair(case_dir_wsl, control_dir_wsl,
+                                           combined_end_time=combined_end_time, control_end_time=control_end_time)
     if _should_stop():
         raise StoppedByUser("Stopped during pimpleFoam.")
-    runs_to_check = [("UV-on", r_uv)] if sealed else [("UV-on", r_uv), ("UV-off control", r_control)]
+    runs_to_check = [("UV-on", r_uv)] if skip_control else [("UV-on", r_uv), ("UV-off control", r_control)]
     for label, r in runs_to_check:
         if r.returncode != 0 or "FOAM FATAL" in r.stdout or "Floating Point Exception" in r.stdout:
             tail = "\n".join(r.stdout.splitlines()[-25:]) or "(no output captured)"
             raise RuntimeError(f"{label} pimpleFoam failed (exit {r.returncode}):\n{tail}")
-
-    _run_log("Running postProcess volAverage...")
-    run_wsl_or_raise("postProcess -dict system/volAverageDict", case_dir_wsl, "postProcess volAverage")
 
     _run_log("Computing spatial coefficient of variation (final concentration field, "
              "across all cells - how uniformly the room actually cleared, not just on average)...")
@@ -1053,6 +1119,8 @@ def _finish_decay(case_dir, room, settings, summary):
 
     if sealed:
         control_results = {"total_ach_effective": 0.0}
+    elif mech_ach_only:
+        control_results = None  # no separate control run - this run's own curve IS the measurement
     else:
         _run_log("Writing results summary...")
         write_results_summary(
@@ -1067,22 +1135,34 @@ def _finish_decay(case_dir, room, settings, summary):
         _run_log("=== Post-processing UV-off control ===")
         control_results = finish_ventilation_only_control(control_dir, settings["ach"], log_fn=_run_log)
 
-    _run_log("Writing results summary..." if sealed else
-             "Updating results.json with corrected mixing efficiency (measured, "
-             "not nominal, ventilation ACH)...")
-    results = write_results_summary(
-        case_dir, f"{case_dir}/results.json", settings["ach"],
-        summary["eACH_uv_well_mixed_mean"],
-        extra={
-            "n_lamps": summary["n_lamps"], "fluence_mean": summary["fluence_mean"],
-            "flow_converged": summary.get("flow_converged"), "ach_delivery": summary.get("ach_delivery"),
-            "spatial_cov_final": spatial_cov,
-        },
-        measured_ventilation_ach=control_results["total_ach_effective"],
-        measured_ventilation_ach_ci95=control_results.get("total_ach_effective_ci95"),
-        measured_ventilation_ach_se_per_s=control_results.get("fit_se_per_s"),
-        measured_ventilation_fit_dof=(control_results["fit_n"] - 2) if control_results.get("fit_n") else None,
-    )
+    if mech_ach_only:
+        _run_log("Writing results summary (mechanical ACH only - no separate control run to "
+                 "correct against; total_ach_effective is this run's own measured rate)...")
+        results = write_results_summary(
+            case_dir, f"{case_dir}/results.json", settings["ach"], 0.0,
+            extra={
+                "n_lamps": summary["n_lamps"], "fluence_mean": summary["fluence_mean"],
+                "flow_converged": summary.get("flow_converged"), "ach_delivery": summary.get("ach_delivery"),
+                "spatial_cov_final": spatial_cov,
+            },
+        )
+    else:
+        _run_log("Writing results summary..." if sealed else
+                 "Updating results.json with corrected mixing efficiency (measured, "
+                 "not nominal, ventilation ACH)...")
+        results = write_results_summary(
+            case_dir, f"{case_dir}/results.json", settings["ach"],
+            summary["eACH_uv_well_mixed_mean"],
+            extra={
+                "n_lamps": summary["n_lamps"], "fluence_mean": summary["fluence_mean"],
+                "flow_converged": summary.get("flow_converged"), "ach_delivery": summary.get("ach_delivery"),
+                "spatial_cov_final": spatial_cov,
+            },
+            measured_ventilation_ach=control_results["total_ach_effective"],
+            measured_ventilation_ach_ci95=control_results.get("total_ach_effective_ci95"),
+            measured_ventilation_ach_se_per_s=control_results.get("fit_se_per_s"),
+            measured_ventilation_fit_dof=(control_results["fit_n"] - 2) if control_results.get("fit_n") else None,
+        )
 
     points = _gather_monitoring_points(settings)
     if points:
@@ -1165,6 +1245,16 @@ def _continue_decay(case_dir, end_time, write_interval):
     extra["spatial_cov_final"] = spatial_cov
     results = write_results_summary(
         case_dir, results_path, prior["ventilation_ach"], prior["eACH_uv_well_mixed"],
+        # write_results_summary's own DEFAULT vol_average_dat points at the
+        # live-volAverage path (postProcessing/volAverageLive1/...) that a
+        # normal run's own solve writes as it goes - this function instead
+        # ran a POST-HOC `postProcess -dict system/volAverageDict` just
+        # above, which writes function object volAverage1's output to
+        # postProcessing/volAverage1/0/... (0, not "latest", since
+        # startFrom was reset to startTime right before running it) - so
+        # this must be pointed there explicitly, or it silently reads a
+        # stale/absent live file instead of the curve just recomputed.
+        vol_average_dat="postProcessing/volAverage1/0/volFieldValue.dat",
         extra=extra or None,
         # The control run itself isn't redone here (mesh/flow/UV zones are
         # untouched - see this function's own docstring), but its earlier
@@ -1216,10 +1306,11 @@ def _run_steady_state(guv_path, case_dir, room, settings):
     if settings["ach"] <= 0:
         raise ValueError("Sealed-room / ACH<=0 is only supported in Decay mode - "
                           "steady-state has no sensible zero-ventilation case.")
-    adv = load_advanced_settings()
+    adv = merge_project_openfoam_settings(settings, load_advanced_settings())
     fan_kwargs = _fan_kwargs(settings)
 
     # Recorded BEFORE setup_case() runs - see _run_decay's identical comment.
+    capture_openfoam_settings(settings, adv)
     _save_run_settings(case_dir, settings, guv_path=guv_path)
 
     _run_log("=== Setting up mesh, flow field, and UV zones ===")
@@ -1240,6 +1331,7 @@ def _run_steady_state(guv_path, case_dir, room, settings):
         momentum_relaxation=adv["momentum-relaxation"], scalar_relaxation=adv["scalar-relaxation"],
         scalar_transport_ncorr=adv["scalar-transport-ncorr"],
         scalar_transport_tolerance=adv["scalar-transport-tolerance"],
+        max_co=adv["max-co"],
         log_fn=_run_log, should_stop=_should_stop, solver_log_fn=_track_solver_time,
         should_pause=_should_pause,
         **fan_kwargs,
@@ -1273,17 +1365,24 @@ def _finish_steady_state(case_dir, room, settings, summary,
     # setup_case()'s mesh generation and flow convergence from scratch.
     _write_setup_summary(case_dir, summary)
 
-    adv = load_advanced_settings()
+    adv = merge_project_openfoam_settings(settings, load_advanced_settings())
     fan_kwargs = _fan_kwargs(settings)
     fan_entry = None
     if settings["fan-enable"]:
         fan_entry = fan_fvoptions_entry(settings["fan-speed"], direction=fan_kwargs["fan_direction"])
 
     room_volume = room.x * room.y * room.z
-    openings = [(settings["inlet-wall"], settings["inlet-size-w"] * settings["inlet-size-h"])]
+    cell_size = adv["mesh-cell-size"]
+    openings = [(settings["inlet-wall"],
+                 opening_actual_area(settings["inlet-wall"], room.x, room.y, room.z,
+                                      _opening_center_frac(settings, "inlet", room),
+                                      (settings["inlet-size-w"], settings["inlet-size-h"]), cell_size))]
     has_inlet2 = bool(settings.get("inlet2-enable"))
     if has_inlet2:
-        openings.append((settings["inlet2-wall"], settings["inlet2-size-w"] * settings["inlet2-size-h"]))
+        openings.append((settings["inlet2-wall"],
+                          opening_actual_area(settings["inlet2-wall"], room.x, room.y, room.z,
+                                               _opening_center_frac(settings, "inlet2", room),
+                                               (settings["inlet2-size-w"], settings["inlet2-size-h"]), cell_size)))
     velocities = compute_inlet_velocities(settings["ach"], room_volume, openings)
     inlet_velocity = velocities[0]
     inlet2_velocity = velocities[1] if has_inlet2 else None
@@ -1386,6 +1485,10 @@ def _finish_steady_state(case_dir, room, settings, summary,
     result["flow_converged"] = summary.get("flow_converged")
     result["ach_delivery"] = summary.get("ach_delivery")
     result["mechanical_mixing_efficiency_pct"] = mechanical_mixing_efficiency_pct(result)
+    try:
+        snapshot_openfoam_settings(case_dir)
+    except Exception:
+        pass  # archival only - never block a results.json write over it
     with open(f"{case_dir}/results.json", "w") as f:
         json.dump(result, f, indent=2)
     # Finished end-to-end - nothing left to resume.
@@ -1499,7 +1602,7 @@ def _resume_pipeline_thread(action, additional_iterations):
     sim_type, guv_path, case_dir = decision["sim_type"], decision["guv_path"], decision["case_dir"]
     room, settings = decision["room"], decision["settings"]
     started_at, start = decision["started_at"], decision["start"]
-    adv = load_advanced_settings()
+    adv = merge_project_openfoam_settings(settings, load_advanced_settings())
     fan_kwargs = _fan_kwargs(settings)
     has_inlet2 = bool(settings.get("inlet2-enable"))
     has_outlet2 = bool(settings.get("outlet2-enable"))
@@ -1522,8 +1625,9 @@ def _resume_pipeline_thread(action, additional_iterations):
             ach_delivery_tol=adv["ach-delivery-tol"] / 100.0,
             pimple_end_time=settings.get("pimple-end-time", 120),
             pimple_write_interval=settings.get("pimple-write-interval", 10),
-            pimple_delta_t=adv["pimple-delta-t"],
+            pimple_delta_t=adv["pimple-delta-t"], max_co=adv["max-co"],
             fan_speed=fan_kwargs.get("fan_speed"), fan_direction=fan_kwargs.get("fan_direction", (0, 0, -1)),
+            mechanical_ach_only=bool(settings.get("mech-ach-only")),
             log_fn=_run_log, should_stop=_should_stop, solver_log_fn=_track_solver_time,
             should_pause=_should_pause,
         )
@@ -1612,37 +1716,6 @@ def _continue_pipeline_thread(case_dir, end_time, write_interval):
         _run_log(f"ERROR: {e}")
         _run_state["status"] = "error"
 
-
-# Commit count on this branch at the moment "3.00" was defined (see the
-# commit that introduced APP_VERSION) - every commit since adds 0.01, so
-# the version shown in the title bar increases automatically with no
-# manual bump needed (see _compute_app_version's docstring).
-_VERSION_BASELINE_COMMIT_COUNT = 81
-
-
-def _compute_app_version():
-    """"Version X.YY" shown next to the GUV-CFD title, derived from the
-    total number of commits on the current branch (git rev-list --count
-    HEAD) rather than a manually-maintained version string - guarantees
-    every commit bumps it, with no risk of someone forgetting to. 3.00 was
-    defined at _VERSION_BASELINE_COMMIT_COUNT commits; the shown version is
-    3.(count - baseline), zero-padded to 2 digits. Falls back to a static
-    "3.00" if git isn't available (e.g. a packaged/frozen deployment with
-    no .git directory) or the count ever regresses below the baseline
-    (e.g. a shallow clone).
-    """
-    try:
-        result = subprocess.run(
-            ["git", "rev-list", "--count", "HEAD"],
-            cwd=Path(__file__).resolve().parent, capture_output=True, text=True, timeout=5, check=True,
-        )
-        count = int(result.stdout.strip())
-        return f"3.{max(count - _VERSION_BASELINE_COMMIT_COUNT, 0):02d}"
-    except Exception:
-        return "3.00"
-
-
-APP_VERSION = _compute_app_version()
 
 app = dash.Dash(__name__, external_stylesheets=[dbc.themes.FLATLY])
 app.title = f"GUV-CFD v{APP_VERSION}"
@@ -2090,9 +2163,9 @@ scenario_tab = html.Div([
                    outline=True, className="w-100 mb-2"),
         dbc.Button("Start simulations", id="scenario-run-btn", color="success", className="w-100 mb-2"),
         dbc.Button("Stop simulation", id="scenario-stop-btn", color="danger", size="sm",
-                    className="mb-2 me-2", disabled=True),
-        dbc.Button("Pause simulation", id="scenario-pause-btn", color="warning", size="sm",
                     className="mb-2", disabled=True),
+        dbc.Button("Extend / modify simulations...", id="extend-modal-open-btn", color="secondary",
+                   outline=True, size="sm", className="w-100 mb-2"),
         html.Div(id="scenario-validation-msg", className="small text-danger mb-2"),
         html.Div(id="scenario-status-text", className="fs-6 fw-semibold mb-2"),
         dcc.Interval(id="scenario-poll", interval=2000, n_intervals=0, disabled=True),
@@ -2177,6 +2250,15 @@ simulation_settings_modal = dbc.Modal(
                     _labeled("Write interval (s)", dcc.Input(
                         id="pimple-write-interval", type="number", value=10, min=1, max=600, step=1,
                         className="form-control form-control-sm")),
+                    dbc.Checkbox(id="mech-ach-only", value=False,
+                                 label="Run mechanical ACH only (no UV)", className="mb-2 mt-2"),
+                    html.Div(
+                        "Skips the fluence/UV-inactivation pipeline entirely and measures just the "
+                        "real, CFD-delivered ventilation air-change rate - for a pure ventilation "
+                        "study, independent of whether the project has lamps. Needs ACH>0 (real "
+                        "ventilation to measure).",
+                        className="small text-muted mb-2",
+                    ),
                     html.Hr(className="my-2"),
                 ]),
                 html.Div(id="steady-state-controls", children=[
@@ -2747,6 +2829,16 @@ settings_modal = dbc.Modal(
                     "s", _adv_defaults["pimple-delta-t"],
                 ),
                 _settings_field(
+                    "settings-max-co", "Decay solver Courant cap (maxCo)",
+                    "Upper bound on the Courant number pimpleFoam's adaptive time step is allowed "
+                    "to reach - higher lets the solver take bigger time steps (faster) but pushes "
+                    "closer to the limit nOuterCorrectors=3 (fixed in the template) can still keep "
+                    "stable/accurate each step. 5 is the original conservative default; a live "
+                    "production sweep confirmed 10 stays stable with flat continuity error - see "
+                    "ANALYSIS_LOG.md before pushing higher.",
+                    "", _adv_defaults["max-co"],
+                ),
+                _settings_field(
                     "settings-decay-ach-min-fraction", "ACH fit target reduction",
                     "How far the UV-off control run (subfolder \"no_UV\", always run alongside the "
                     "main decay - see the removed \"no UV control\" toggle) decays before its "
@@ -2853,6 +2945,207 @@ grid_align_modal = dbc.Modal(
     id="grid-align-modal", is_open=False,
 )
 
+# Sequential, one-conflict-at-a-time counterpart for inlet/outlet/2nd
+# inlet/2nd outlet (see walk_opening_alignment_conflicts, _open_project) -
+# grid_align_modal above stays as the bulk table+Apply/Keep dialog, now
+# scoped to the contaminant source zone alone.
+grid_align_seq_modal = dbc.Modal(
+    [
+        dbc.ModalHeader(dbc.ModalTitle("Mesh grid alignment")),
+        dbc.ModalBody(id="grid-align-seq-modal-body"),
+        dbc.ModalFooter([
+            dbc.Button("Keep this value", id="grid-align-seq-decline-btn", color="secondary", outline=True, size="sm"),
+            dbc.Button("Use suggested value", id="grid-align-seq-agree-btn", color="primary", size="sm"),
+        ]),
+    ],
+    id="grid-align-seq-modal", is_open=False,
+)
+
+# --- "Extend / modify simulations..." modal (2026-08-10) ---
+#
+# Lets a user come back to an ALREADY-RUN project (possibly not the one
+# currently open in Project Setup) and either apply a different UV design
+# to the same room, extend/resume specific already-run combos, or sweep a
+# few more Z/ACH combinations - all three consume the project_status.json
+# fingerprinting work (see project_status.py) rather than blindly redoing
+# everything. Same single-user, module-level pending-state pattern as
+# _pending_grid_fix/_pending_alignment_walk/_pending_run - this is a local
+# desktop tool, not a multi-tenant server.
+_pending_extend_modal = {
+    "project_dir": None, "project_name": None, "guv_path": None, "settings_path": None,
+    "settings": None, "room": None, "status": None, "action": None,
+}
+
+# Every field ANY of the 3 action sub-forms could write into a launch call
+# is declared statically (never generated dynamically via `children`) so
+# Dash's callback graph can address them - only visibility toggles between
+# the 3 sections, matching flow_decision_panel/phase2_resume_panel's own
+# style-toggle pattern rather than _grid_align_seq_body's regenerate-the-
+# whole-body pattern (that one has no user-editable inputs of its own to
+# preserve across renders; these do).
+_EXTEND_SECTION_IDS = ("extend-uv-section", "extend-extend-section", "extend-sweep-section")
+
+
+def _ach_label_for_dirs(ach):
+    """Folder-name-safe ACH label - matches scenario_runs._ach_label /
+    project_status._ach_label exactly, duplicated here rather than
+    imported (same reasoning those two already keep separate copies for:
+    a tiny, stable formatting rule, not worth cross-module coupling).
+    """
+    return "sealed" if ach <= 0 else f"{ach:g}"
+
+
+def _extend_status_table(status, project_dir=None):
+    """dbc.Table (or an explanatory message) for a loaded project_status
+    dict's combos - Z, ACH, status, a simple checkmark for whether each
+    fingerprint is on record (a human doesn't need to see the raw hash -
+    see project_status.py's own combo schema), and whether this combo's
+    ACH group still has a Control run / Phase 1 (steady-state) working
+    copy sitting on disk. Started/finished timestamps are deliberately
+    NOT shown - they're only ever set by a live run, so a status file
+    rebuilt from disk (see rebuild_project_status_from_disk, the common
+    case for a project predating this feature) never has them, making
+    those columns blank far more often than not.
+
+    Control/Phase 1 are checked by plain folder existence under
+    project_dir (_control_ACH<label>/_phase1_ACH<label>), the same
+    informational-only spirit as the Flow/UV columns - NOT a promise
+    those are still valid for the CURRENT project settings (see
+    find_reusable_ach_base for the fingerprint-validated version of that
+    question, used when actually deciding whether to reuse them).
+    project_dir=None (nothing loaded yet) just shows both as blank.
+
+    Empty combos (a project this feature has never touched, or a brand
+    new one) is a real, expected state, not an error - shown plainly.
+    """
+    combos = (status or {}).get("combos") or {}
+    if not combos:
+        return html.P(
+            "No recorded runs for this folder yet. If it's a brand new project directory, the "
+            "3 actions below still work, there's just nothing to show a history of. If it "
+            "already has real runs in it from before this feature existed, use \"Create a "
+            "status file from the runs already in this folder\" below to rebuild one from them.",
+            className="small text-muted mb-0",
+        )
+    rows = []
+    for key in sorted(combos, key=lambda k: (combos[k].get("ach", 0), combos[k].get("z", 0))):
+        c = combos[key]
+        ach = c.get("ach")
+        control_ok = phase1_ok = False
+        if project_dir is not None and ach is not None:
+            label = _ach_label_for_dirs(ach)
+            control_ok = Path(f"{project_dir}/_control_ACH{label}").exists()
+            phase1_ok = Path(f"{project_dir}/_phase1_ACH{label}").exists()
+        rows.append(html.Tr([
+            html.Td(f"{c.get('z')}"), html.Td(f"{c.get('ach')}"), html.Td(c.get("status", "")),
+            html.Td("✓" if c.get("flow_fingerprint") else ""),
+            html.Td("✓" if c.get("uv_fingerprint") else ""),
+            html.Td("✓" if control_ok else ""),
+            html.Td("✓" if phase1_ok else ""),
+        ]))
+    return dbc.Table(
+        [html.Thead(html.Tr([html.Th(h) for h in
+                              ("Z", "ACH", "Status", "Flow", "UV", "Control (ACH)", "Phase 1")]))]
+        + [html.Tbody(rows)],
+        bordered=True, size="sm", className="mb-0",
+    )
+
+
+def _extend_modal_body(status, project_dir=None, message=None):
+    return [
+        html.Div(message, className="small text-danger mb-2") if message else None,
+        _extend_status_table(status, project_dir),
+    ]
+
+
+extend_modal = dbc.Modal(
+    [
+        dbc.ModalHeader(dbc.ModalTitle("Extend / modify existing simulations")),
+        dbc.ModalBody([
+            dbc.Row([
+                dbc.Col(dcc.Input(id="extend-project-dir-input", type="text", placeholder="Project folder...",
+                                   className="form-control form-control-sm"), width=8),
+                dbc.Col(dbc.Button("Browse...", id="extend-browse-btn", size="sm", outline=True,
+                                    color="secondary", className="w-100"), width=2),
+                dbc.Col(dbc.Button("Load", id="extend-load-btn", size="sm", color="primary",
+                                    className="w-100"), width=2),
+            ], className="g-2 mb-3"),
+            html.Div(id="extend-status-table"),
+            html.Div(
+                dbc.Button("Create a status file from the runs already in this folder",
+                           id="extend-rebuild-status-btn", size="sm", outline=True, color="info"),
+                id="extend-rebuild-status-wrapper", style={"display": "none"}, className="mt-2",
+            ),
+            html.Div([
+                html.P(
+                    "Every ACH group's flow field/UV-off control run is kept in a temporary "
+                    "folder here (named _base_ACH<value> / _control_ACH<value> / _phase1_ACH<value>) "
+                    "so a later sweep in this same folder can reuse it instead of re-meshing. "
+                    "These are safe to delete any time - they hold no results of their own, "
+                    "only reusable working copies; your actual Z/ACH simulation results are never "
+                    "touched by this.",
+                    className="small text-muted mb-1",
+                ),
+                dbc.Button("Delete temporary flow-field folders...", id="extend-cleanup-btn",
+                           size="sm", outline=True, color="danger"),
+            ], className="mt-3 mb-2"),
+            html.Hr(),
+            dbc.ButtonGroup([
+                dbc.Button("Apply different UV design to same room", id="extend-action-uv-btn",
+                           size="sm", outline=True, color="secondary"),
+                dbc.Button("Extend specific run(s)", id="extend-action-extend-btn",
+                           size="sm", outline=True, color="secondary"),
+                dbc.Button("Add more Z/ACH sweeps", id="extend-action-sweep-btn",
+                           size="sm", outline=True, color="secondary"),
+            ], className="mb-3 d-flex"),
+
+            # --- "Apply different UV design" sub-form ---
+            html.Div([
+                dbc.Row([
+                    dbc.Col(dcc.Input(id="extend-uv-guv-path", type="text", placeholder=".guv file...",
+                                       className="form-control form-control-sm"), width=8),
+                    dbc.Col(dbc.Button("Browse...", id="extend-uv-browse-btn", size="sm", outline=True,
+                                        color="secondary", className="w-100"), width=4),
+                ], className="g-2 mb-2"),
+                _labeled("New Z value", dcc.Input(id="extend-uv-z-value", type="number",
+                                                    className="form-control form-control-sm")),
+                html.P("Every ACH already swept in this project will be re-evaluated under the new "
+                       "design - any whose flow settings haven't changed reuse the existing flow "
+                       "field/control run instead of re-solving them.",
+                       className="small text-muted mt-2 mb-0"),
+            ], id="extend-uv-section", style={"display": "none"}),
+
+            # --- "Extend specific run(s)" sub-form ---
+            html.Div([
+                _labeled("Combination(s) to extend", dcc.Dropdown(id="extend-combo-dropdown", multi=True)),
+                _labeled("New end time (s) - decay only in this version", dcc.Input(
+                    id="extend-duration-input", type="number", className="form-control form-control-sm")),
+                html.P("Steady-state combinations aren't extendable from this modal yet - use the "
+                       "per-run Resume panel (Run Simulations tab) for those.",
+                       className="small text-muted mt-2 mb-0"),
+            ], id="extend-extend-section", style={"display": "none"}),
+
+            # --- "Add more Z/ACH sweeps" sub-form ---
+            html.Div([
+                _labeled("Z values (comma-separated)", dcc.Input(
+                    id="extend-sweep-z-values", type="text", className="form-control form-control-sm")),
+                _labeled("ACH values (comma-separated)", dcc.Input(
+                    id="extend-sweep-ach-values", type="text", className="form-control form-control-sm mt-2")),
+                html.P("Already-completed combinations are skipped automatically.",
+                       className="small text-muted mt-2 mb-0"),
+            ], id="extend-sweep-section", style={"display": "none"}),
+
+            html.Div(id="extend-action-msg", className="small text-danger mt-2"),
+        ]),
+        dbc.ModalFooter([
+            dbc.Button("Cancel", id="extend-cancel-btn", color="secondary", outline=True, size="sm"),
+            dbc.Button("Run new Sweep(s)", id="extend-run-btn", color="success", size="sm"),
+        ]),
+    ],
+    id="extend-modal", is_open=False, size="lg", scrollable=True,
+)
+
+
 app.layout = dbc.Container([
     dcc.Store(id="fresh-room-load"),
     dcc.Store(id="results-data"),
@@ -2869,6 +3162,7 @@ app.layout = dbc.Container([
     # refresh that left the UI showing nothing). See _resync_pollers below.
     dcc.Interval(id="resync-check", interval=500, n_intervals=0, max_intervals=1),
     dcc.ConfirmDialog(id="overwrite-confirm"),
+    dcc.ConfirmDialog(id="extend-cleanup-confirm"),
     dbc.Modal(
         [
             dbc.ModalHeader(dbc.ModalTitle(id="help-modal-title")),
@@ -2879,6 +3173,8 @@ app.layout = dbc.Container([
     settings_modal,
     simulation_settings_modal,
     grid_align_modal,
+    grid_align_seq_modal,
+    extend_modal,
     dbc.Row(
         dbc.Col(html.H4([
             "GUV-CFD ",
@@ -3266,7 +3562,7 @@ def _render_analysis(data):
 )
 def _save_project(n_save, n_save_as, *values):
     trig = dash.ctx.triggered_id
-    settings = dict(zip(SETTINGS_FIELDS, values))
+    settings = _collect_settings(values)
     settings["guv_path"] = _loaded.get("path")
 
     path = _loaded.get("settings_path")
@@ -3279,6 +3575,15 @@ def _save_project(n_save, n_save_as, *values):
         if not path:
             return dash.no_update
 
+    # Backfills any OpenFOAM/meshing/solver setting (maxCo, cell size,
+    # zone-binning count, relaxation factors, tolerances, iteration
+    # budgets, ...) missing from this project's .guvcfd - see
+    # app_settings.capture_openfoam_settings's docstring. A key already
+    # present (whether auto-captured on an earlier save or hand-edited) is
+    # never overwritten - that's what makes a project's settings pinned
+    # and reproducible regardless of what the *global* advanced settings
+    # later change to.
+    capture_openfoam_settings(settings, load_advanced_settings())
     with open(path, "w") as f:
         json.dump(settings, f, indent=2)
     _loaded["settings_path"] = path
@@ -3290,6 +3595,8 @@ _open_outputs = [
     Output("project-status", "children", allow_duplicate=True),
     Output("grid-align-modal", "is_open", allow_duplicate=True),
     Output("grid-align-modal-body", "children", allow_duplicate=True),
+    Output("grid-align-seq-modal", "is_open", allow_duplicate=True),
+    Output("grid-align-seq-modal-body", "children", allow_duplicate=True),
 ]
 _open_outputs += [Output(fid, "value", allow_duplicate=True) for fid in SETTINGS_FIELDS]
 for _prefix, *_ in POSITION_FIELDS:
@@ -3333,7 +3640,7 @@ _SETTINGS_FIELD_IDS = [
     "settings-phase1-settling-safety-multiplier", "settings-phase1-max-iterations-ceiling",
     "settings-deltat-scaling-enabled", "settings-deltat-effective-fraction", "settings-deltat-target-fraction",
     "settings-keep-all-timesteps",
-    "settings-pimple-delta-t",
+    "settings-pimple-delta-t", "settings-max-co",
     "settings-decay-ach-min-fraction", "settings-decay-each-min-fraction", "settings-decay-each-max-fraction",
     "settings-mesh-cell-size",
     "settings-uv-zone-bins",
@@ -3354,7 +3661,7 @@ _SETTINGS_FIELD_KEYS = [
     "phase1-settling-safety-multiplier", "phase1-max-iterations-ceiling",
     "deltat-scaling-enabled", "deltat-effective-fraction", "deltat-target-fraction",
     "keep-all-timesteps",
-    "pimple-delta-t",
+    "pimple-delta-t", "max-co",
     "decay-ach-min-fraction", "decay-each-min-fraction", "decay-each-max-fraction",
     "mesh-cell-size", "uv-zone-bins",
     "keep-shared-scratch-dirs",
@@ -3466,14 +3773,14 @@ _NEW_FIELD_DEFAULTS = {
 
 
 # Maps check_settings_grid_alignment's "name" back to the actual form
-# field(s) that would need updating to match the mesh-snapped size - the
-# source zone is a single scalar (cube) field, everything else is a
-# separate width/height pair.
+# field. Inlet/Outlet/2nd inlet/2nd outlet moved to the new sequential
+# walk_opening_alignment_conflicts flow (see _open_project,
+# walk_opening_alignment_conflicts's own docstring for why they get a
+# richer size-then-center treatment) - this bulk table+Apply/Keep modal
+# now only ever covers the contaminant source zone, a single symmetric
+# cube with no width/height/position-pair/wall-center-bias distinction
+# for the new per-opening flow to add value to.
 _GRID_ALIGN_FIELD_IDS = {
-    "Inlet": ("inlet-size-w", "inlet-size-h"),
-    "Outlet": ("outlet-size-w", "outlet-size-h"),
-    "2nd inlet": ("inlet2-size-w", "inlet2-size-h"),
-    "2nd outlet": ("outlet2-size-w", "outlet2-size-h"),
     "Contaminant source zone": ("source-zone-size",),
 }
 _GRID_ALIGN_ALL_FIELD_IDS = [fid for fids in _GRID_ALIGN_FIELD_IDS.values() for fid in fids]
@@ -3483,26 +3790,77 @@ _GRID_ALIGN_ALL_FIELD_IDS = [fid for fids in _GRID_ALIGN_FIELD_IDS.values() for 
 # single-user local tool, same pattern as _pending_run.
 _pending_grid_fix = {"mismatches": None}
 
+# Holds the live walk_opening_alignment_conflicts() generator between
+# _open_project priming it and each Agree/Decline button click advancing
+# it - same single-user, module-level pending-state pattern as
+# _pending_grid_fix/_pending_run above (this is a local desktop tool, not
+# a multi-tenant server, so a live, non-serializable generator object
+# living here between callback round-trips is consistent with the
+# existing architecture, not a new class of risk).
+#   walker: the live generator, or None when idle.
+#   current: the conflict dict currently shown in the modal, so the
+#       Agree/Decline callback knows exactly which field to write without
+#       recomputing anything.
+#   any_applied: whether at least one Agree happened during this walk -
+#       the "you must save" reminder should only appear if something
+#       actually changed (a walk can end via a mix of some-agreed/some-
+#       declined steps, unlike the old bulk modal's two fully separate
+#       terminal actions, so this needs to be tracked explicitly).
+_pending_alignment_walk = {"walker": None, "current": None, "any_applied": False}
+
 
 def _check_grid_alignment(settings, room):
-    """Mismatches for this project's inlet/outlet/2nd-inlet/2nd-outlet/
-    source-zone sizes against the current mesh cell size (see
-    run_pipeline.check_settings_grid_alignment's docstring for the real
-    bug this catches early) - empty list if everything's already grid-
-    aligned, or if the check itself can't run (e.g. a hand-edited project
-    file missing a core inlet/outlet field - not worth failing the whole
-    "Open" action over a diagnostic check).
+    """Mismatches for this project's contaminant source zone size against
+    the current mesh cell size (see run_pipeline.check_settings_grid_alignment's
+    docstring for the real bug this catches early) - empty list if
+    already grid-aligned, or if the check itself can't run (e.g. a
+    hand-edited project file missing a core field - not worth failing the
+    whole "Open" action over a diagnostic check). Inlet/outlet/2nd-inlet/
+    2nd-outlet are NOT included here anymore - see
+    walk_opening_alignment_conflicts/_open_project for their own,
+    separate sequential flow.
     """
     try:
-        adv = load_advanced_settings()
-        return check_settings_grid_alignment(
+        adv = merge_project_openfoam_settings(settings, load_advanced_settings())
+        mismatches = check_settings_grid_alignment(
             settings, room, adv["mesh-cell-size"], source_size=settings.get("source-zone-size", 0.3))
+        return [m for m in mismatches if m["name"] == "Contaminant source zone"]
     except Exception:
         return []
 
 
 def _fmt_size(size):
     return "x".join(f"{v:.3g}" for v in size) + "m"
+
+
+def _grid_align_seq_body(conflict):
+    """dbc.ModalBody children for ONE conflict from
+    walk_opening_alignment_conflicts - unlike _grid_align_modal_body
+    (a bulk table of every mismatch at once), this shows exactly one
+    opening/axis at a time, with an explanation tailored to whether it's
+    a size or a center conflict (see walk_opening_alignment_conflicts's
+    own docstring for why those are two different, sequential kinds of
+    fix).
+    """
+    axis_label = conflict["axis_label"]
+    if conflict["kind"] == "size":
+        why = (f"{conflict['current']:.3g} m isn't a multiple of the mesh cell size, "
+               f"so the built opening would end up bigger than what you typed.")
+    else:
+        why = ("At the corrected size, this position won't land the opening's edges on mesh "
+               "cell boundaries. Shifting the center slightly fixes this without changing the "
+               "size any further.")
+    return [
+        html.H6(f"{conflict['opening']} — {axis_label}"),
+        html.P(why, className="small text-muted"),
+        dbc.Table(
+            html.Tbody([
+                html.Tr([html.Td("Current"), html.Td(f"{conflict['current']:.4g} m")]),
+                html.Tr([html.Td("Suggested"), html.Td(f"{conflict['suggested']:.4g} m")]),
+            ]),
+            size="sm", borderless=True, className="mb-0",
+        ),
+    ]
 
 
 def _grid_align_modal_body(mismatches):
@@ -3573,6 +3931,7 @@ def _open_project(n_clicks):
     status = "No .guv file recorded in this project."
     room = None
     modal_open, modal_body = False, dash.no_update
+    seq_modal_open, seq_modal_body = False, dash.no_update
     if guv_path:
         try:
             project = Project.load(guv_path)
@@ -3583,9 +3942,27 @@ def _open_project(n_clicks):
             gname = guv_path.replace("\\", "/").rsplit("/", 1)[-1]
             status = (f"Loaded {gname}: {room.x:.2f} x {room.y:.2f} x {room.z:.2f} "
                       f"{room.units}, {len(room.lamps)} lamp(s)")
+
+            # Contaminant source zone: stash the mismatch (if any) now, but
+            # don't open its modal yet if the inlet/outlet sequential walk
+            # below is about to open its own modal - only one modal should
+            # be visible at a time; see _open_bulk_modal_after_seq_modal_closes
+            # for what opens it once that walk finishes.
             mismatches = _check_grid_alignment(settings, room)
             if mismatches:
                 _pending_grid_fix["mismatches"] = mismatches
+
+            # Inlet/outlet/2nd-inlet/2nd-outlet: new sequential, one-
+            # conflict-at-a-time walk (see walk_opening_alignment_conflicts).
+            adv = merge_project_openfoam_settings(settings, load_advanced_settings())
+            walker = walk_opening_alignment_conflicts(settings, room, adv["mesh-cell-size"])
+            first_conflict = next(walker, None)
+            if first_conflict is not None:
+                _pending_alignment_walk["walker"] = walker
+                _pending_alignment_walk["current"] = first_conflict
+                _pending_alignment_walk["any_applied"] = False
+                seq_modal_open, seq_modal_body = True, _grid_align_seq_body(first_conflict)
+            elif mismatches:
                 modal_open, modal_body = True, _grid_align_modal_body(mismatches)
         except Exception as e:
             status = f"Failed to reload {guv_path}: {e}"
@@ -3615,7 +3992,8 @@ def _open_project(n_clicks):
         else:
             max_values += [dash.no_update, dash.no_update]
 
-    return tuple([proj_name, status, modal_open, modal_body] + field_values + max_values)
+    return tuple([proj_name, status, modal_open, modal_body, seq_modal_open, seq_modal_body]
+                 + field_values + max_values)
 
 
 @app.callback(
@@ -3651,6 +4029,519 @@ def _apply_grid_align_fix(n_clicks, current_status):
 def _keep_grid_align_as_typed(n_clicks):
     _pending_grid_fix["mismatches"] = None
     return False
+
+
+# Every field the sequential opening-alignment walk could possibly write
+# to - Dash requires callback Outputs declared statically, so (like
+# _GRID_ALIGN_ALL_FIELD_IDS above) every field defaults to no_update
+# except the one the current conflict is actually about.
+_SEQ_ALIGN_ALL_FIELD_IDS = [
+    f"{prefix}-{suffix}"
+    for prefix in ("inlet", "outlet", "inlet2", "outlet2")
+    for suffix in ("size-w", "size-h", "y-input", "z-input")
+]
+
+_SEQ_ALIGN_SAVE_NOTE = (" | Grid-alignment fixes applied to the form - this project has changed "
+                        "and must be saved manually (File > Save Project) to keep them.")
+
+
+def _advance_alignment_walk(agree):
+    """Send `agree` into the live walker (see _pending_alignment_walk),
+    returning (still_open, body, field_updates: dict) - shared by the
+    Agree/Decline callbacks below. field_updates is empty for a Decline
+    (agree=False never writes anything - see walk_opening_alignment_conflicts's
+    own docstring on what agreeing/declining means). still_open is False
+    once the generator is exhausted, at which point the caller should
+    check _pending_alignment_walk["any_applied"] to decide whether the
+    "must save" reminder belongs in this response.
+    """
+    walker = _pending_alignment_walk.get("walker")
+    current = _pending_alignment_walk.get("current")
+    field_updates = {}
+    if agree and current is not None:
+        field_updates[current["field_id"]] = round(current["suggested"], 6)
+        _pending_alignment_walk["any_applied"] = True
+    if walker is None:
+        return False, dash.no_update, field_updates
+    try:
+        next_conflict = walker.send(agree)
+    except StopIteration:
+        _pending_alignment_walk["walker"] = None
+        _pending_alignment_walk["current"] = None
+        return False, dash.no_update, field_updates
+    _pending_alignment_walk["current"] = next_conflict
+    return True, _grid_align_seq_body(next_conflict), field_updates
+
+
+@app.callback(
+    Output("grid-align-seq-modal", "is_open", allow_duplicate=True),
+    Output("grid-align-seq-modal-body", "children", allow_duplicate=True),
+    Output("project-status", "children", allow_duplicate=True),
+    [Output(fid, "value", allow_duplicate=True) for fid in _SEQ_ALIGN_ALL_FIELD_IDS],
+    Input("grid-align-seq-agree-btn", "n_clicks"),
+    State("project-status", "children"),
+    prevent_initial_call=True,
+)
+def _grid_align_seq_agree(n_clicks, current_status):
+    still_open, body, field_updates = _advance_alignment_walk(True)
+    updates = {fid: dash.no_update for fid in _SEQ_ALIGN_ALL_FIELD_IDS}
+    updates.update(field_updates)
+    status = current_status
+    if not still_open and _pending_alignment_walk.get("any_applied"):
+        status = (current_status or "") + _SEQ_ALIGN_SAVE_NOTE
+        _pending_alignment_walk["any_applied"] = False
+    # is_open only needs an explicit write on the FINAL step (closing it) -
+    # already True while mid-walk, and writing True again on every
+    # intermediate step would needlessly re-trigger
+    # _open_bulk_modal_after_seq_modal_closes each time (harmless there,
+    # since its own guard no-ops on seq_is_open=True, but wasteful).
+    is_open = dash.no_update if still_open else False
+    return (is_open, body, status) + tuple(updates[fid] for fid in _SEQ_ALIGN_ALL_FIELD_IDS)
+
+
+@app.callback(
+    Output("grid-align-seq-modal", "is_open", allow_duplicate=True),
+    Output("grid-align-seq-modal-body", "children", allow_duplicate=True),
+    Output("project-status", "children", allow_duplicate=True),
+    Input("grid-align-seq-decline-btn", "n_clicks"),
+    State("project-status", "children"),
+    prevent_initial_call=True,
+)
+def _grid_align_seq_decline(n_clicks, current_status):
+    still_open, body, _ = _advance_alignment_walk(False)
+    status = current_status
+    if not still_open and _pending_alignment_walk.get("any_applied"):
+        status = (current_status or "") + _SEQ_ALIGN_SAVE_NOTE
+        _pending_alignment_walk["any_applied"] = False
+    is_open = dash.no_update if still_open else False
+    return is_open, body, status
+
+
+@app.callback(
+    Output("grid-align-modal", "is_open", allow_duplicate=True),
+    Output("grid-align-modal-body", "children", allow_duplicate=True),
+    Input("grid-align-seq-modal", "is_open"),
+    prevent_initial_call=True,
+)
+def _open_bulk_modal_after_seq_modal_closes(seq_is_open):
+    """Opens the (now source-zone-only) bulk modal once the sequential
+    opening-alignment walk finishes - deliberately decoupled from the
+    Agree/Decline callbacks above so neither needs to know about the
+    other's modal; see _open_project's own comment on why the bulk modal
+    isn't opened immediately alongside the sequential one.
+    """
+    if seq_is_open:
+        return dash.no_update, dash.no_update
+    mismatches = _pending_grid_fix.get("mismatches") or []
+    if not mismatches:
+        return dash.no_update, dash.no_update
+    return True, _grid_align_modal_body(mismatches)
+
+
+def _load_extend_status(project_dir):
+    """Load project_status.json for project_dir, plus (if it names a real
+    guv_path/settings_path) the settings dict and Project/room needed to
+    actually launch a new sweep from the "Extend / modify simulations"
+    modal - mirrors _open_project's own load sequence, just without
+    touching any of THIS app's currently-loaded project/form state (the
+    folder picked here can be a different project entirely).
+
+    Returns (status, settings, room, guv_path, settings_path, error) -
+    error is a user-facing string, or None on success. An empty (never-
+    swept) project_dir is NOT an error - status/combos may legitimately
+    be empty; the error case is specifically "there's no status file AND
+    no way to load settings for this folder at all".
+    """
+    project_name = Path(project_dir).name if project_dir else ""
+    status = load_project_status(project_dir, project_name)
+    if not status.get("combos") and not status.get("guv_path"):
+        return status, None, None, None, None, (
+            "No recorded status for this folder yet - open its project via File > Open Project "
+            "first (which creates one), or point this at a folder a sweep has already run in."
+        )
+    guv_path, settings_path = status.get("guv_path"), status.get("settings_path")
+    if not guv_path or not settings_path:
+        return status, None, None, None, None, (
+            "This folder's status file is missing its guv_path/settings_path - re-open the "
+            "project via File > Open Project to backfill it."
+        )
+    try:
+        with open(settings_path) as f:
+            settings = json.load(f)
+        project = Project.load(guv_path)
+        room = next(iter(project.rooms.values()))
+    except Exception as e:
+        return status, None, None, guv_path, settings_path, f"Failed to load {guv_path}/{settings_path}: {e}"
+    return status, settings, room, guv_path, settings_path, None
+
+
+def _refresh_extend_view(project_dir):
+    """(Re)load project_dir's status into _pending_extend_modal and
+    compute everything the modal body needs to render - shared by the
+    Open and Load buttons (see their own callbacks below), since loading
+    a folder means the same thing from either entry point.
+    """
+    status, settings, room, guv_path, settings_path, error = _load_extend_status(project_dir)
+    project_name = Path(project_dir).name if project_dir else None
+    _pending_extend_modal.update(
+        project_dir=project_dir, project_name=project_name, guv_path=guv_path,
+        settings_path=settings_path, settings=settings, room=room, status=status, action=None,
+    )
+    combos = (status or {}).get("combos") or {}
+    z_values = sorted({c["z"] for c in combos.values() if "z" in c})
+    ach_values = sorted({c["ach"] for c in combos.values() if "ach" in c})
+    dropdown_options = [
+        {"label": f"Z={c.get('z')} / ACH={c.get('ach')} ({c.get('status')})", "value": key}
+        for key, c in sorted(combos.items())
+    ]
+    sweep_z = ", ".join(f"{v:g}" for v in z_values)
+    sweep_ach = ", ".join(f"{v:g}" for v in ach_values)
+    body = _extend_modal_body(status, project_dir, error)
+    # Offer the rebuild-from-disk option specifically when there's no
+    # status file to work with AT ALL (no combos, no guv_path) - not for
+    # the other error cases above (a status file that names a guv_path/
+    # settings_path that's since gone missing isn't something rescanning
+    # combo subfolders would fix).
+    no_status_at_all = not combos and not (status or {}).get("guv_path")
+    rebuild_style = {"display": "block"} if (project_dir and no_status_at_all) else {"display": "none"}
+    return body, (error or ""), sweep_z, sweep_ach, (guv_path or ""), dropdown_options, rebuild_style
+
+
+@app.callback(
+    Output("extend-modal", "is_open", allow_duplicate=True),
+    Output("extend-project-dir-input", "value"),
+    Output("extend-status-table", "children", allow_duplicate=True),
+    Output("extend-action-msg", "children", allow_duplicate=True),
+    Output("extend-sweep-z-values", "value", allow_duplicate=True),
+    Output("extend-sweep-ach-values", "value", allow_duplicate=True),
+    Output("extend-uv-guv-path", "value", allow_duplicate=True),
+    Output("extend-combo-dropdown", "options", allow_duplicate=True),
+    Output("extend-rebuild-status-wrapper", "style", allow_duplicate=True),
+    Input("extend-modal-open-btn", "n_clicks"),
+    State("case-dir", "value"),
+    prevent_initial_call=True,
+)
+def _open_extend_modal(n_clicks, current_case_dir):
+    project_dir = current_case_dir or ""
+    body, msg, sweep_z, sweep_ach, uv_guv, options, rebuild_style = _refresh_extend_view(project_dir)
+    return True, project_dir, body, msg, sweep_z, sweep_ach, uv_guv, options, rebuild_style
+
+
+@app.callback(
+    Output("extend-status-table", "children", allow_duplicate=True),
+    Output("extend-action-msg", "children", allow_duplicate=True),
+    Output("extend-sweep-z-values", "value", allow_duplicate=True),
+    Output("extend-sweep-ach-values", "value", allow_duplicate=True),
+    Output("extend-uv-guv-path", "value", allow_duplicate=True),
+    Output("extend-combo-dropdown", "options", allow_duplicate=True),
+    Output("extend-rebuild-status-wrapper", "style", allow_duplicate=True),
+    Input("extend-load-btn", "n_clicks"),
+    State("extend-project-dir-input", "value"),
+    prevent_initial_call=True,
+)
+def _load_extend_project(n_clicks, project_dir):
+    if not project_dir:
+        return (dash.no_update, "Enter a project folder first.", dash.no_update, dash.no_update,
+                dash.no_update, dash.no_update, dash.no_update)
+    return _refresh_extend_view(project_dir)
+
+
+@app.callback(
+    Output("extend-status-table", "children", allow_duplicate=True),
+    Output("extend-action-msg", "children", allow_duplicate=True),
+    Output("extend-sweep-z-values", "value", allow_duplicate=True),
+    Output("extend-sweep-ach-values", "value", allow_duplicate=True),
+    Output("extend-uv-guv-path", "value", allow_duplicate=True),
+    Output("extend-combo-dropdown", "options", allow_duplicate=True),
+    Output("extend-rebuild-status-wrapper", "style", allow_duplicate=True),
+    Input("extend-rebuild-status-btn", "n_clicks"),
+    State("extend-project-dir-input", "value"),
+    prevent_initial_call=True,
+)
+def _create_extend_status_from_disk(n_clicks, project_dir):
+    """Rebuild a project_status.json from the combo subfolders already on
+    disk (see scenario_runs.rebuild_project_status_from_disk) - the
+    action offered whenever _refresh_extend_view finds no status file at
+    all for a loaded folder, so an older project (or one from before this
+    feature existed) isn't a dead end just because nothing's been status-
+    tracked for it yet.
+    """
+    _NA = dash.no_update
+    if not project_dir:
+        return _NA, "Enter a project folder first.", _NA, _NA, _NA, _NA, _NA
+    guv_path = scenario_runs.find_first_guv_path_on_disk(project_dir)
+    if not guv_path:
+        return (_NA, "No existing run folders (with their own run_settings.json) were found in "
+                "this location to rebuild a status file from.", _NA, _NA, _NA, _NA, _NA)
+    try:
+        project = Project.load(guv_path)
+        room = next(iter(project.rooms.values()))
+    except Exception as e:
+        return _NA, f"Found run folders, but failed to load {guv_path}: {e}", _NA, _NA, _NA, _NA, _NA
+
+    project_name = Path(project_dir).name
+    n_found = scenario_runs.rebuild_project_status_from_disk(project_dir, project_name, room)
+    body, msg, sweep_z, sweep_ach, uv_guv, options, rebuild_style = _refresh_extend_view(project_dir)
+    prefix = f"Rebuilt a status file from {n_found} existing run folder(s)."
+    return body, (f"{prefix} {msg}" if msg else prefix), sweep_z, sweep_ach, uv_guv, options, rebuild_style
+
+
+@app.callback(
+    Output("extend-project-dir-input", "value", allow_duplicate=True),
+    Input("extend-browse-btn", "n_clicks"),
+    State("extend-project-dir-input", "value"),
+    prevent_initial_call=True,
+)
+def _browse_extend_project_dir(n_clicks, current_dir):
+    path = _native_choose_dir("Choose a project folder", initialdir=current_dir)
+    return path if path else dash.no_update
+
+
+@app.callback(
+    Output("extend-uv-guv-path", "value", allow_duplicate=True),
+    Input("extend-uv-browse-btn", "n_clicks"),
+    State("extend-uv-guv-path", "value"),
+    prevent_initial_call=True,
+)
+def _browse_extend_uv_guv(n_clicks, current_guv_path):
+    # current_guv_path (if set) names a FILE, not a directory - Tk's
+    # initialdir needs the containing folder, same reasoning
+    # _load_results already applies to its own file-picker field.
+    initialdir = str(Path(current_guv_path).parent) if current_guv_path else None
+    path = _native_open_file([("GUV-CFD project .guv files", "*.guv"), ("All files", "*.*")],
+                              "Choose a .guv file", initialdir=initialdir)
+    return path if path else dash.no_update
+
+
+def _set_extend_action(action):
+    """Record which of the 3 actions is selected and return the 3
+    sections' styles (exactly one shown) - one tiny callback per button
+    below calls this with its own fixed action, rather than one callback
+    reading dash.ctx.triggered_id to figure out which button fired; same
+    outcome, but each button's handler is trivial to call/test directly.
+    """
+    _pending_extend_modal["action"] = action
+    hidden, shown = {"display": "none"}, {"display": "block"}
+    return (shown if action == "uv" else hidden,
+            shown if action == "extend" else hidden,
+            shown if action == "sweep" else hidden)
+
+
+@app.callback(
+    Output("extend-uv-section", "style"),
+    Output("extend-extend-section", "style"),
+    Output("extend-sweep-section", "style"),
+    Input("extend-action-uv-btn", "n_clicks"),
+    prevent_initial_call=True,
+)
+def _select_extend_action_uv(n_clicks):
+    return _set_extend_action("uv")
+
+
+@app.callback(
+    Output("extend-uv-section", "style", allow_duplicate=True),
+    Output("extend-extend-section", "style", allow_duplicate=True),
+    Output("extend-sweep-section", "style", allow_duplicate=True),
+    Input("extend-action-extend-btn", "n_clicks"),
+    prevent_initial_call=True,
+)
+def _select_extend_action_extend(n_clicks):
+    return _set_extend_action("extend")
+
+
+@app.callback(
+    Output("extend-uv-section", "style", allow_duplicate=True),
+    Output("extend-extend-section", "style", allow_duplicate=True),
+    Output("extend-sweep-section", "style", allow_duplicate=True),
+    Input("extend-action-sweep-btn", "n_clicks"),
+    prevent_initial_call=True,
+)
+def _select_extend_action_sweep(n_clicks):
+    return _set_extend_action("sweep")
+
+
+@app.callback(
+    Output("extend-modal", "is_open", allow_duplicate=True),
+    Input("extend-cancel-btn", "n_clicks"),
+    prevent_initial_call=True,
+)
+def _cancel_extend_modal(n_clicks):
+    _pending_extend_modal.update(project_dir=None, project_name=None, guv_path=None, settings_path=None,
+                                  settings=None, room=None, status=None, action=None)
+    return False
+
+
+# Holds the exact list of folders a cleanup click found, between that
+# click and the confirm dialog's own answer - same single-user, module-
+# level pending-state pattern as _pending_run/_pending_extend_modal.
+_pending_extend_cleanup = {"dirs": None}
+
+
+def _extend_ach_scratch_dirs(project_dir, status):
+    """Every _base_ACH*/_control_ACH*/_phase1_ACH* folder this project's
+    own recorded ach_bases entries point at, filtered to ones that still
+    exist on disk - the exact, complete list of what a cleanup click
+    would remove, computed up front so the confirmation prompt can name
+    them explicitly rather than describing them vaguely.
+    """
+    ach_labels = sorted((status.get("ach_bases") or {}).keys())
+    dirs = [f"{project_dir}/_base_ACH{label}" for label in ach_labels]
+    dirs += [f"{project_dir}/_control_ACH{label}" for label in ach_labels]
+    dirs += [f"{project_dir}/_phase1_ACH{label}" for label in ach_labels]  # steady-state only; no-op if absent
+    return [d for d in dirs if Path(d).exists()]
+
+
+@app.callback(
+    Output("extend-cleanup-confirm", "displayed"),
+    Output("extend-cleanup-confirm", "message"),
+    Output("extend-action-msg", "children", allow_duplicate=True),
+    Input("extend-cleanup-btn", "n_clicks"),
+    prevent_initial_call=True,
+)
+def _prompt_extend_cleanup(n_clicks):
+    project_dir = _pending_extend_modal.get("project_dir")
+    if not project_dir:
+        return False, dash.no_update, "Load a project folder first."
+    status = _pending_extend_modal.get("status") or {}
+    existing = _extend_ach_scratch_dirs(project_dir, status)
+    if not existing:
+        return False, dash.no_update, "No temporary flow-field folders found for this project - nothing to delete."
+    _pending_extend_cleanup["dirs"] = existing
+    names = ", ".join(Path(d).name for d in existing)
+    message = (f"This will permanently delete {len(existing)} folder(s) in {project_dir}:\n\n{names}\n\n"
+               f"These hold only reusable working copies of the flow field, never simulation "
+               f"results - your Z/ACH combination folders and their results.json are NOT affected. "
+               f"A future sweep will simply rebuild whatever it needs. Delete these now?")
+    return True, message, dash.no_update
+
+
+@app.callback(
+    Output("extend-status-table", "children", allow_duplicate=True),
+    Output("extend-action-msg", "children", allow_duplicate=True),
+    Input("extend-cleanup-confirm", "submit_n_clicks"),
+    prevent_initial_call=True,
+)
+def _confirm_extend_cleanup(submit_n_clicks):
+    dirs = _pending_extend_cleanup.get("dirs")
+    _pending_extend_cleanup["dirs"] = None
+    project_dir = _pending_extend_modal.get("project_dir")
+    project_name = _pending_extend_modal.get("project_name")
+    if not dirs or not project_dir:
+        return dash.no_update, dash.no_update
+    quoted = " ".join(f'"{wsl_path(d)}"' for d in dirs)
+    run_wsl_or_raise(f"rm -rf {quoted}", wsl_path(project_dir), "deleting temporary flow-field folders")
+    clear_ach_bases(project_dir, project_name)
+    new_status = load_project_status(project_dir, project_name)
+    _pending_extend_modal["status"] = new_status
+    return _extend_status_table(new_status, project_dir), f"Deleted {len(dirs)} temporary flow-field folder(s)."
+
+
+def _extend_pipeline_thread(case_dirs, end_time, write_interval):
+    """Sequentially extend each decay case_dir to end_time - not folded
+    into _run_sweep_concurrent, since this is a small, explicit, user-
+    picked list rather than a Z x ACH cross-product (see the plan's own
+    "Extend specific run(s)" design). Reuses _scenario_state/_scenario_log
+    so progress shows on the same Run Simulations tab the ordinary sweep
+    path already renders to.
+    """
+    _scenario_state.update(status="running", log=[], combos=[], results={},
+                            start_time=time.time(), stop_requested=False, live_status={})
+    for case_dir, z, ach in case_dirs:
+        _scenario_state["combos"].append((z, ach))
+        _scenario_log(f"[Z={z}/ACH={ach}] Extending to {end_time}s...")
+        try:
+            _continue_decay(case_dir, end_time, write_interval)
+            _scenario_state["results"][(z, ach)] = {"status": "done", "detail": None}
+            _scenario_log(f"[Z={z}/ACH={ach}] Done.")
+        except Exception as e:
+            _scenario_log(f"[Z={z}/ACH={ach}] ERROR: {e}")
+            _scenario_state["results"][(z, ach)] = {"status": "error", "detail": str(e)}
+    _scenario_state["status"] = "done"
+
+
+@app.callback(
+    Output("extend-modal", "is_open", allow_duplicate=True),
+    Output("extend-action-msg", "children", allow_duplicate=True),
+    Output("main-tabs", "active_tab", allow_duplicate=True),
+    # Without these, a launch from this modal starts the sweep/extend job
+    # just fine server-side (_scenario_state/_run_state genuinely go
+    # "running"), but the Run Simulations tab's own log/live-status/table
+    # never update - scenario-poll's dcc.Interval keeps whatever
+    # disabled state it already had (there's no OTHER trigger that would
+    # flip it), so nothing appears to happen until a second launch attempt
+    # gets rejected with "already running" - confirmed as a real incident.
+    # scenario-run-btn/scenario-stop-btn mirror _start_scenario_sweep's own
+    # multi-combo-launch outputs, so the Run Simulations tab looks exactly
+    # as "mid-sweep" as it would from its own Start button.
+    Output("scenario-poll", "disabled", allow_duplicate=True),
+    Output("scenario-run-btn", "disabled", allow_duplicate=True),
+    Output("scenario-stop-btn", "disabled", allow_duplicate=True),
+    Input("extend-run-btn", "n_clicks"),
+    State("extend-uv-guv-path", "value"),
+    State("extend-uv-z-value", "value"),
+    State("extend-combo-dropdown", "value"),
+    State("extend-duration-input", "value"),
+    State("extend-sweep-z-values", "value"),
+    State("extend-sweep-ach-values", "value"),
+    prevent_initial_call=True,
+)
+def _run_extend_action(n_clicks, uv_guv_path, uv_z_value, extend_combo_keys, extend_end_time,
+                        sweep_z_text, sweep_ach_text):
+    _NA = dash.no_update
+    pending = _pending_extend_modal
+    action = pending.get("action")
+    project_dir, settings, room = pending.get("project_dir"), pending.get("settings"), pending.get("room")
+    if not project_dir or settings is None or room is None:
+        return _NA, "Load a valid project folder first.", _NA, _NA, _NA, _NA
+    if _scenario_state["status"] == "running" or _run_state["status"] == "running":
+        return _NA, "A simulation is already running - stop it first.", _NA, _NA, _NA, _NA
+
+    combos = (pending.get("status") or {}).get("combos") or {}
+    adv = merge_project_openfoam_settings(settings, load_advanced_settings())
+
+    if action == "uv":
+        if not uv_guv_path or uv_z_value is None:
+            return _NA, "Pick a .guv file and a Z value first.", _NA, _NA, _NA, _NA
+        ach_values = sorted({c["ach"] for c in combos.values() if "ach" in c}) or [settings.get("ach")]
+        _launch_scenario_sweep(uv_guv_path, pending["settings_path"], project_dir, room,
+                                dict(settings, **{"z-value": uv_z_value}), adv, [uv_z_value], ach_values)
+    elif action == "sweep":
+        try:
+            z_values = _parse_number_list(sweep_z_text)
+            ach_values = _parse_number_list(sweep_ach_text)
+        except ValueError as e:
+            return _NA, f"Can't parse Z/ACH list: {e}", _NA, _NA, _NA, _NA
+        if not z_values or not ach_values:
+            return _NA, "Enter at least one Z value and one ACH value.", _NA, _NA, _NA, _NA
+        _launch_scenario_sweep(pending["guv_path"], pending["settings_path"], project_dir, room,
+                                settings, adv, z_values, ach_values)
+    elif action == "extend":
+        if not extend_combo_keys:
+            return _NA, "Pick at least one combination to extend.", _NA, _NA, _NA, _NA
+        if extend_end_time is None:
+            return _NA, "Enter a new end time first.", _NA, _NA, _NA, _NA
+        if settings.get("sim-type") != "decay":
+            return _NA, "Extending is only supported for decay projects in this version.", _NA, _NA, _NA, _NA
+        write_interval = max(1, settings.get("pimple-write-interval", 1))
+        case_dirs = []
+        for key in extend_combo_keys:
+            combo = combos.get(key)
+            if not combo:
+                continue
+            z, ach = combo["z"], combo["ach"]
+            case_dirs.append((f"{project_dir}/{scenario_runs._subdir_name(z, ach)}", z, ach))
+        thread = threading.Thread(target=_extend_pipeline_thread,
+                                   args=(case_dirs, extend_end_time, write_interval), daemon=True)
+        thread.start()
+        _pending_extend_modal.update(project_dir=None, project_name=None, guv_path=None, settings_path=None,
+                                      settings=None, room=None, status=None, action=None)
+        return False, "", "scenario-runs", False, True, False
+    else:
+        return _NA, "Choose one of the 3 actions above first.", _NA, _NA, _NA, _NA
+
+    _pending_extend_modal.update(project_dir=None, project_name=None, guv_path=None, settings_path=None,
+                                  settings=None, room=None, status=None, action=None)
+    return False, "", "scenario-runs", False, True, False
 
 
 def _case_dir_has_data(case_dir):
@@ -3767,7 +4658,7 @@ def _start_run(n_clicks, *values):
         return (False, False, True, "No .guv project loaded - use File > Open Project or "
                 "Load .guv file first.", dash.no_update, False, dash.no_update)
 
-    settings = dict(zip(SETTINGS_FIELDS, values))
+    settings = _collect_settings(values)
     case_dir = settings["case-dir"]
     if not case_dir:
         return (False, False, True, "Set an OpenFOAM project directory first.",
@@ -3784,6 +4675,9 @@ def _start_run(n_clicks, *values):
     sealed_error = _sealed_room_error(sim_type, settings["ach"], settings.get("fan-enable"))
     if sealed_error:
         return (False, False, True, sealed_error, dash.no_update, False, dash.no_update)
+    mech_ach_only_error = _mechanical_ach_only_error(sim_type, settings["ach"], settings.get("mech-ach-only"))
+    if mech_ach_only_error:
+        return (False, False, True, mech_ach_only_error, dash.no_update, False, dash.no_update)
 
     # A case whose flow convergence paused (FlowConvergenceUndecided) and
     # was never resolved - possibly in an earlier server session that no
@@ -3794,7 +4688,7 @@ def _start_run(n_clicks, *values):
     # even catch this case (a paused flow convergence leaves no
     # results.json and no leftover time directories, both cleaned up after
     # every chunk), so this check must come first.
-    adv = load_advanced_settings()
+    adv = merge_project_openfoam_settings(settings, load_advanced_settings())
     pending = case_awaiting_flow_decision(
         case_dir, oscillation_window=adv["oscillation-window"],
         oscillation_growth_tol=adv["oscillation-growth-tol"], rel_tol=adv["flow-rel-tol"] / 100.0)
@@ -4132,6 +5026,15 @@ def _update_scenario_combo_count(z_text, ach_text):
     Output("run-validation-msg", "children", allow_duplicate=True),
     Output("overwrite-confirm", "displayed", allow_duplicate=True),
     Output("overwrite-confirm", "message", allow_duplicate=True),
+    # Cleared (not left stale) specifically when a genuine multi-combo sweep
+    # launches - see that branch below for why: nothing else ever populates
+    # these for a multi-combo sweep (only the 1-combo path, via _poll_run,
+    # auto-loads its own single result), so without this, Analysis silently
+    # kept showing whatever unrelated result happened to be loaded from
+    # before the sweep started - confirmed live ("shows results from a run
+    # that has nothing to do with the sweep").
+    Output("results-data", "data", allow_duplicate=True),
+    Output("results-case-dir", "data", allow_duplicate=True),
     Input("scenario-run-btn", "n_clicks"),
     State("scenario-z-values", "value"),
     State("scenario-ach-values", "value"),
@@ -4139,49 +5042,54 @@ def _update_scenario_combo_count(z_text, ach_text):
     prevent_initial_call=True,
 )
 def _start_scenario_sweep(n_clicks, z_text, ach_text, *values):
-    # 6 dash.no_update placeholders for the single-run-only outputs below,
-    # reused on every early return that doesn't take the 1-combo branch.
+    # 8 dash.no_update placeholders for the single-run-only/results outputs
+    # below, reused on every early return that doesn't take the 1-combo or
+    # multi-combo launch branch.
     _NA = dash.no_update
     if _scenario_state["status"] == "running" or _run_state["status"] == "running":
-        return True, False, False, dash.no_update, dash.no_update, _NA, _NA, _NA, _NA, _NA, _NA
+        return True, False, False, dash.no_update, dash.no_update, _NA, _NA, _NA, _NA, _NA, _NA, _NA, _NA
 
     room = _loaded["room"]
     guv_path = _loaded["path"]
     if room is None or guv_path is None:
         return (False, True, True, "No .guv project loaded - use File > Open Project or "
-                "Load .guv file first.", dash.no_update, _NA, _NA, _NA, _NA, _NA, _NA)
+                "Load .guv file first.", dash.no_update, _NA, _NA, _NA, _NA, _NA, _NA, _NA, _NA)
 
-    settings = dict(zip(SETTINGS_FIELDS, values))
+    settings = _collect_settings(values)
     if not settings.get("case-dir"):
         return (False, True, True, "Set an OpenFOAM project directory first.", dash.no_update,
-                _NA, _NA, _NA, _NA, _NA, _NA)
+                _NA, _NA, _NA, _NA, _NA, _NA, _NA, _NA)
 
     try:
         z_values = _parse_number_list(z_text)
         ach_values = _parse_number_list(ach_text)
     except ValueError as e:
         return (False, True, True, f"Can't parse Z/ACH list: {e}", dash.no_update,
-                _NA, _NA, _NA, _NA, _NA, _NA)
+                _NA, _NA, _NA, _NA, _NA, _NA, _NA, _NA)
     if not z_values or not ach_values:
         return (False, True, True, "Enter at least one Z value and one ACH value.", dash.no_update,
-                _NA, _NA, _NA, _NA, _NA, _NA)
+                _NA, _NA, _NA, _NA, _NA, _NA, _NA, _NA)
 
     missing = _validate_settings(settings)
     if missing:
         return (False, True, True,
                 "Missing required value(s) - fill these in on Project Setup before running: "
-                + ", ".join(missing) + ".", dash.no_update, _NA, _NA, _NA, _NA, _NA, _NA)
+                + ", ".join(missing) + ".", dash.no_update, _NA, _NA, _NA, _NA, _NA, _NA, _NA, _NA)
 
     sealed_error = _sealed_room_error(settings.get("sim-type"), ach_values, settings.get("fan-enable"))
     if sealed_error:
-        return (False, True, True, sealed_error, dash.no_update, _NA, _NA, _NA, _NA, _NA, _NA)
+        return (False, True, True, sealed_error, dash.no_update, _NA, _NA, _NA, _NA, _NA, _NA, _NA, _NA)
+    mech_ach_only_error = _mechanical_ach_only_error(
+        settings.get("sim-type"), ach_values, settings.get("mech-ach-only"))
+    if mech_ach_only_error:
+        return (False, True, True, mech_ach_only_error, dash.no_update, _NA, _NA, _NA, _NA, _NA, _NA, _NA, _NA)
 
     combos = scenario_runs.sweep_combinations(z_values, ach_values)
-    adv = load_advanced_settings()
+    adv = merge_project_openfoam_settings(settings, load_advanced_settings())
     if len(combos) != 1:
         _launch_scenario_sweep(guv_path, _loaded.get("settings_path"), settings["case-dir"],
                                 room, settings, adv, z_values, ach_values)
-        return True, False, False, "", "scenario-runs", _NA, _NA, _NA, _NA, _NA, _NA
+        return True, False, False, "", "scenario-runs", _NA, _NA, _NA, _NA, _NA, _NA, None, None
 
     # Exactly 1 combination - single-run path (see the Output block's own
     # comment). ach/z-value themselves stay hidden/unused elsewhere - this
@@ -4205,7 +5113,7 @@ def _start_scenario_sweep(n_clicks, z_text, ach_text, *values):
             "total_iterations": pending["total_iterations"], "started_at": datetime.now(), "start": time.time(),
             "kind": "flow",
         }
-        return True, False, False, "", "scenario-runs", True, True, False, "", False, _NA
+        return True, False, False, "", "scenario-runs", True, True, False, "", False, _NA, _NA, _NA
 
     resume_info = case_awaiting_phase2_resume(case_dir)
     if resume_info:
@@ -4224,7 +5132,7 @@ def _start_scenario_sweep(n_clicks, z_text, ach_text, *values):
             "sim_type": sim_type, "guv_path": guv_path, "case_dir": case_dir, "room": room,
             "settings": settings, "detail": detail, "started_at": datetime.now(), "start": time.time(),
         }
-        return True, False, False, "", "scenario-runs", True, True, False, "", False, _NA
+        return True, False, False, "", "scenario-runs", True, True, False, "", False, _NA, _NA, _NA
 
     if _case_dir_has_data(case_dir):
         _pending_run.update(sim_type=sim_type, guv_path=guv_path, case_dir=case_dir,
@@ -4232,10 +5140,10 @@ def _start_scenario_sweep(n_clicks, z_text, ach_text, *values):
         return (True, False, False, "", "scenario-runs", False, False, True, "", True,
                 f"{case_dir} already has simulation data (results.json and/or solver "
                 f"output). Running will regenerate the mesh and overwrite the case "
-                f"directory in place - existing results may be lost. Continue anyway?")
+                f"directory in place - existing results may be lost. Continue anyway?", _NA, _NA)
 
     _launch_run(sim_type, guv_path, case_dir, room, settings)
-    return True, False, False, "", "scenario-runs", True, True, False, "", False, _NA
+    return True, False, False, "", "scenario-runs", True, True, False, "", False, _NA, _NA, _NA
 
 
 @app.callback(
@@ -4245,41 +5153,14 @@ def _start_scenario_sweep(n_clicks, z_text, ach_text, *values):
 )
 def _stop_scenario_sweep(n_clicks):
     # A 1-combination "sweep" runs on _run_state, not _scenario_state (see
-    # _start_scenario_sweep) - Stop/Pause need to act on whichever is
-    # actually active.
+    # _start_scenario_sweep) - Stop needs to act on whichever is actually
+    # active.
     if _run_state["status"] == "running":
         _run_state["stop_requested"] = True
         _run_log("Stop requested...")
     elif _scenario_state["status"] == "running":
         _scenario_state["stop_requested"] = True
         _scenario_log("Stop requested - the sweep will stop before its next combination...")
-    return (dash.no_update,)
-
-
-@app.callback(
-    Output("scenario-log", "children", allow_duplicate=True),
-    Input("scenario-pause-btn", "n_clicks"),
-    prevent_initial_call=True,
-)
-def _toggle_pause_scenario_sweep(n_clicks):
-    if _run_state["status"] == "running":
-        if _run_state.get("pause_requested"):
-            _run_state["pause_requested"] = False
-            _run_log("Continue requested - resuming the suspended solver process...")
-        else:
-            _run_state["pause_requested"] = True
-            _run_log("Pause requested - suspending the active solver process in place "
-                     "(no iterations lost)...")
-        return (dash.no_update,)
-    if _scenario_state["status"] != "running":
-        return (dash.no_update,)
-    if _scenario_state.get("pause_requested"):
-        _scenario_state["pause_requested"] = False
-        _scenario_log("Continue requested - resuming every suspended combination...")
-    else:
-        _scenario_state["pause_requested"] = True
-        _scenario_log("Pause requested - suspending every active combination's solver process "
-                      "in place (no iterations lost)...")
     return (dash.no_update,)
 
 
@@ -4563,8 +5444,6 @@ def _with_total_run_time(start_time, status_text):
     Output("scenario-poll", "disabled", allow_duplicate=True),
     Output("scenario-run-btn", "disabled", allow_duplicate=True),
     Output("scenario-stop-btn", "disabled", allow_duplicate=True),
-    Output("scenario-pause-btn", "disabled", allow_duplicate=True),
-    Output("scenario-pause-btn", "children"),
     Input("scenario-poll", "n_intervals"),
     prevent_initial_call=True,
 )
@@ -4576,8 +5455,25 @@ def _poll_scenario(n_intervals):
     # (still firing, just invisible - see _processing_legacy), so this only
     # needs to cover the plain running/finished/stopped/error text while the
     # user stays on this tab watching it.
+    #
+    # The "was the last thing launched a 1-combo run?" check below must
+    # compare start_time, not just "_run_state isn't idle" - _run_state is
+    # never reset to idle by launching a genuine multi-combo sweep (only
+    # len(combos)==1 ever touches it, see _start_scenario_sweep), so a
+    # single test run from earlier in the session (left "done") would
+    # otherwise permanently hijack this display the moment ANY later
+    # multi-combo sweep finishes (_scenario_state["status"] leaving
+    # "running" satisfies the rest of the condition) - confirmed live: a
+    # finished multi-combo sweep's table collapsed down to a single
+    # unrelated leftover row from an earlier single run.
+    run_is_more_recent = (
+        _run_state.get("start_time") is not None
+        and (_scenario_state.get("start_time") is None
+             or _run_state["start_time"] >= _scenario_state["start_time"])
+    )
     if _run_state["status"] in _RUN_STATE_ACTIVE_STATUSES or (
-            _run_state["status"] != "idle" and _scenario_state["status"] != "running"
+            run_is_more_recent
+            and _run_state["status"] != "idle" and _scenario_state["status"] != "running"
             and _run_state.get("case_dir") and _run_state.get("z") is not None):
         status = _run_state["status"]
         log_text = "\n".join(_run_state["log"][-300:])
@@ -4591,13 +5487,9 @@ def _poll_scenario(n_intervals):
             "awaiting_decision": "Paused - awaiting your decision (see the panel above).",
             "awaiting_phase2_resume": "Paused - awaiting your decision (see the panel above).",
         }.get(status, "")
-        paused = still_running and _run_state.get("pause_requested", False)
-        if paused:
-            status_text = "Paused - solver suspended in place. Click Continue to resume."
-        pause_btn_label = "Continue simulation" if paused else "Pause simulation"
         status_text = _with_total_run_time(_run_state.get("start_time"), status_text)
         return (log_text, live_text, status_text, _single_run_progress_table(),
-                not still_running, still_running, not still_running, not still_running, pause_btn_label)
+                not still_running, still_running, not still_running)
 
     status = _scenario_state["status"]
     log_text = "\n".join(_scenario_state["log"][-300:])
@@ -4612,20 +5504,15 @@ def _poll_scenario(n_intervals):
     n_error = sum(1 for r in _scenario_state["results"].values() if r["status"] == "error")
     n_total = len(_scenario_state["combos"])
     still_running = status == "running"
-    paused = still_running and _scenario_state.get("pause_requested", False)
     status_text = {
         "running": f"Running... ({n_done + n_error}/{n_total} combinations done)",
         "done": f"Finished. {n_done}/{n_total} succeeded, {n_error} failed.",
         "error": "Failed - see log below.",
         "stopped": f"Stopped. {n_done}/{n_total} succeeded, {n_error} failed.",
     }.get(status, "")
-    if paused:
-        status_text = (f"Paused ({n_done + n_error}/{n_total} done) - every active combination's "
-                        f"solver is suspended in place. Click Continue to resume.")
-    pause_btn_label = "Continue Sweep" if paused else "Pause Sweep"
     status_text = _with_total_run_time(_scenario_state.get("start_time"), status_text)
     return (log_text, live_text, status_text, _scenario_progress_table(),
-            not still_running, still_running, not still_running, not still_running, pause_btn_label)
+            not still_running, still_running, not still_running)
 
 
 def _render_checklist():

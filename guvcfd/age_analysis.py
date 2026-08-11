@@ -117,11 +117,14 @@ def rtd_from_age_field(age_values, n_bins=50):
     }
 
 
-def ashrae_air_change_effectiveness(age_values, target_ach, room_volume):
+def ashrae_air_change_effectiveness(age_values, target_ach):
     """Compute ASHRAE 129 air-change effectiveness ε_a.
 
     For a given nominal ACH target, the "effective" (or "real") ACH implied by
-    the actual age distribution is (room_volume / mean_age). The ratio
+    the actual age distribution is 3600 / mean_age - independent of room
+    volume, since mean_age [s] = room_volume [m^3] / exit_flow_rate [m^3/s]
+    and ACH [1/hr] = exit_flow_rate * 3600 / room_volume already has volume
+    canceling out: ACH = 3600 / mean_age. The ratio
 
         ε_a = effective_ACH / target_ACH
 
@@ -131,7 +134,6 @@ def ashrae_air_change_effectiveness(age_values, target_ach, room_volume):
 
     age_values: (N,) array of per-cell ages [s]
     target_ach: nominal ventilation air-change rate [1/hr]
-    room_volume: room volume [m^3]
 
     Returns dict with:
     - effective_ach: actual ACH implied by age distribution [1/hr]
@@ -143,14 +145,7 @@ def ashrae_air_change_effectiveness(age_values, target_ach, room_volume):
     if mean_age <= 0:
         raise ValueError("Mean age must be positive")
 
-    # Mean age [s] = room_volume [m^3] / exit_flow_rate [m^3/s]
-    # For a room with target ACH [1/hr]:
-    #   ACH = (exit_flow_rate [m^3/s] * 3600 [s/hr]) / room_volume [m^3]
-    #   exit_flow_rate = ACH * room_volume / 3600
-    # So:
-    #   effective_ACH = (room_volume / mean_age) * 3600 [s/hr]
-
-    effective_ach = (room_volume / mean_age) * 3600.0
+    effective_ach = 3600.0 / mean_age
     effectiveness = effective_ach / target_ach if target_ach > 0 else None
 
     return {
@@ -160,13 +155,12 @@ def ashrae_air_change_effectiveness(age_values, target_ach, room_volume):
     }
 
 
-def write_rtd_summary(case_dir, out_path, target_ach=None, room_volume=None, n_bins=50):
+def write_rtd_summary(case_dir, out_path, target_ach=None, n_bins=50):
     """Extract age field and write RTD analysis to a JSON-compatible dict.
 
     case_dir: path to OpenFOAM case
     out_path: path to write summary (currently not used - returns dict only)
     target_ach: nominal ventilation ACH [1/hr], if known (for effectiveness calc)
-    room_volume: room volume [m^3], if known (for effectiveness calc)
     n_bins: number of RTD histogram bins
 
     Returns dict with RTD and mixing metrics, suitable for JSON serialization
@@ -183,8 +177,8 @@ def write_rtd_summary(case_dir, out_path, target_ach=None, room_volume=None, n_b
         },
     }
 
-    if target_ach is not None and room_volume is not None:
-        mixing = ashrae_air_change_effectiveness(age_values, target_ach, room_volume)
+    if target_ach is not None:
+        mixing = ashrae_air_change_effectiveness(age_values, target_ach)
         summary["ashrae_effectiveness"] = mixing
 
     return summary

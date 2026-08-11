@@ -28,6 +28,7 @@ the handful of small settings-dict-to-kwargs helpers app.py also has
 than imported, for the same reason.
 """
 import csv
+import io
 import json
 import math
 import re
@@ -36,16 +37,26 @@ from pathlib import Path
 
 import numpy as np
 
-from .case_io import read_boundary_patch_names, read_openfoam_scalar_field, write_scalar_field
+from .app_settings import capture_openfoam_settings
+from .case_io import (
+    read_boundary_patch_names, read_latest_time_field, read_openfoam_scalar_field, write_scalar_field,
+    snapshot_openfoam_settings,
+)
 from .cellzones import bin_decay_rates, write_cellzones
 from .contaminant_source import write_fvoptions_file, write_source_topo_set_dict
-from .decay_analysis import write_results_summary, mechanical_mixing_efficiency_pct
+from .decay_analysis import write_results_summary, mechanical_mixing_efficiency_pct, spatial_coefficient_of_variation
 from .fan import fan_fvoptions_entry, write_fan_topo_set_dict
 from .fluence import compute_inactivation_rate, compute_well_mixed_eACH
-from .initial_fields import compute_inlet_velocities
-from .monitoring_points import compute_monitoring_results
+from .initial_fields import compute_inlet_velocities, resolve_case_inlet_velocities
+from .mesh_gen import opening_actual_area
+from .monitoring import splice_live_vol_average_if_needed
+from .monitoring_points import compute_monitoring_results, point_reduction_basis
+from .project_status import (
+    compute_flow_fingerprint, compute_uv_fingerprint, find_reusable_ach_base, get_ach_base_record,
+    load_project_status, now_iso, update_ach_base_status, update_combo_status,
+)
 from .report import combo_summary_metrics
-from .run_pipeline import setup_case
+from .run_pipeline import check_ach_delivery, setup_case
 from .splice import set_control_dict_time, splice_fv_options_into_control_dict
 from .steady_state_pipeline import (
     run_steady_state_scenario, _uv_fvoptions_entries, resolve_phase_delta_ts, merge_project_deltat_settings,
@@ -53,7 +64,10 @@ from .steady_state_pipeline import (
 )
 from .ventilation_control import prepare_ventilation_only_control, finish_ventilation_only_control
 from .visualization import center_frac_for_wall
-from .wsl_utils import StoppedByUser, run_wsl_or_raise, run_wsl_streaming, wsl_path
+from .wsl_utils import (
+    StoppedByUser, run_wsl_or_raise, run_wsl_streaming, wsl_path, write_case_file,
+    read_case_file as _read_case_file,
+)
 
 _TEMPLATE_CASE_DIR = str(Path(__file__).resolve().parent / "templates" / "case_template")
 
@@ -191,14 +205,137 @@ def _save_run_settings(case_dir, settings, guv_path, settings_path, z, ach):
             settings.get("inject-x-input"), settings.get("inject-y-input"),
             settings.get("inject-z-input"),
         )
-    with open(f"{case_dir}/run_settings.json", "w") as f:
-        json.dump(data, f, indent=2)
+    write_case_file(case_dir, "run_settings.json", json.dumps(data, indent=2))
+
+
+def _update_combo_status_safe(project_dir, project_name, z, ach, **fields):
+    """update_combo_status, but never lets a bug/edge-case in this
+    tracking feature break an actual production sweep - archival/
+    bookkeeping only, same "never block the real work over it" contract
+    as snapshot_openfoam_settings.
+    """
+    try:
+        update_combo_status(project_dir, project_name, z, ach, **fields)
+    except Exception:
+        pass
+
+
+def _update_ach_base_status_safe(project_dir, project_name, ach, flow_fingerprint, base_dir, control_dir,
+                                  control_results, guv_path=None, settings_path=None, sim_type=None):
+    """update_ach_base_status, but never lets a bug/edge-case in this
+    tracking feature break an actual production sweep - same contract as
+    _update_combo_status_safe above.
+    """
+    try:
+        update_ach_base_status(project_dir, project_name, ach, flow_fingerprint, base_dir, control_dir,
+                                control_results, guv_path=guv_path, settings_path=settings_path,
+                                sim_type=sim_type)
+    except Exception:
+        pass
+
+
+def _discard_stale_ach_scratch_if_mismatched(project_dir, project_name, ach, flow_fingerprint, dirs, log_fn):
+    """If this ACH already has a recorded flow_fingerprint (from an
+    earlier sweep launch on this same project_dir) that does NOT match
+    the current one, the flow-affecting settings changed since then - any
+    of `dirs` still on disk (typically _base_ACH*/_control_ACH*, and for
+    steady-state _phase1_ACH* too) are known stale, not just unvalidated,
+    so discard them here before _build_flow_base/_run_shared_control/
+    _run_shared_phase1 get a chance to wrongly reuse them by file presence
+    alone - none of their own reuse checks are fingerprint-aware, which is
+    exactly what makes blindly trusting file presence across separate
+    sweep launches unsafe without this.
+
+    If there's no recorded fingerprint for this ACH at all (a project
+    from before this feature existed, or its first-ever build at this
+    ACH), this is a no-op - an unfingerprinted directory might still be
+    perfectly valid, and it isn't this function's place to guess either
+    way.
+    """
+    try:
+        record = get_ach_base_record(project_dir, project_name, ach)
+    except Exception:
+        return
+    if record is None or record.get("flow_fingerprint") == flow_fingerprint:
+        return
+    log_fn("Flow-affecting settings changed since the last run at this ACH - discarding "
+           "the stale shared scratch directories before rebuilding...")
+    existing = [d for d in dirs if Path(d).exists()]
+    if existing:
+        quoted = " ".join(f'"{wsl_path(d)}"' for d in existing)
+        run_wsl_or_raise(f"rm -rf {quoted}", wsl_path(project_dir), "discarding stale shared scratch dirs")
+
+
+def _find_done_combo_case_dir_for_ach(project_dir, project_name, ach, flow_fingerprint):
+    """The case_dir of an existing "done" combo at this ACH whose own
+    recorded flow_fingerprint matches, or None - a fallback flow-base
+    source for build_ach_fn when no dedicated _base_ACH*/ach_bases record
+    survives (see _seed_ach_base_from_existing_combo's own docstring for
+    why this is a physically valid source, not an approximation): every Z
+    sharing an ACH has an identical flow field baked into its own combo
+    directory, that's the whole premise this module's ACH-major reuse
+    already optimizes around - it just isn't pre-extracted into a
+    dedicated scratch folder the way a fresh sweep's own base_dir is.
+    """
+    try:
+        status = load_project_status(project_dir, project_name)
+    except Exception:
+        return None
+    for combo in status.get("combos", {}).values():
+        if (combo.get("ach") == ach and combo.get("status") == "done"
+                and combo.get("flow_fingerprint") == flow_fingerprint and "z" in combo):
+            return f"{project_dir}/{_subdir_name(combo['z'], combo['ach'])}"
+    return None
+
+
+def _seed_ach_base_from_existing_combo(source_case_dir, base_dir, log_fn):
+    """Copy an existing, completed combo's own case_dir into base_dir and
+    strip that combo's Z-specific leftovers - its own postProcessing
+    output, 0/kUV, and any solved time-directory beyond 0/ - so it can
+    stand in for a dedicated flow-base scratch folder (see build_ach_fn
+    and _find_done_combo_case_dir_for_ach above). _apply_z rewrites
+    cellZones/fvOptions/0/kUV from scratch regardless of what's already
+    there when it runs against this seeded base for the NEW Z, so only
+    the leftovers it does NOT itself touch need stripping here - after
+    this, base_dir has exactly the shape _build_flow_base's own existing
+    "already flow-converged, reuse it" branch (0/fluenceRate present)
+    expects, so that branch fires naturally without any special-casing on
+    build_ach_fn's side.
+    """
+    source_wsl, base_wsl = wsl_path(source_case_dir), wsl_path(base_dir)
+    parent_wsl = wsl_path(str(Path(base_dir).parent))
+    log_fn(f"  Found an already-converged flow field inside an existing, completed "
+           f"combo ({Path(source_case_dir).name}/) for this ACH - reusing it as the "
+           f"shared flow base instead of re-meshing/re-converging from scratch...")
+    run_wsl_or_raise(
+        f'rm -rf "{base_wsl}" && cp -r "{source_wsl}" "{base_wsl}" && cd "{base_wsl}" && '
+        f'rm -rf postProcessing "0/kUV" && '
+        f'find . -maxdepth 1 -regextype posix-extended -regex "\\./[0-9]+(\\.[0-9]+)?" -exec rm -rf {{}} +',
+        parent_wsl, "seeding this ACH's flow base from an existing completed combo")
+
+
+def _seed_ach_base_if_no_scratch_survives(project_dir, project_name, ach, flow_fingerprint, base_dir, log_fn):
+    """Called only when find_reusable_ach_base already found nothing (no
+    ach_bases record, or one that no longer resolves) - if base_dir
+    itself doesn't already have a flow-converged 0/fluenceRate sitting in
+    it either (i.e. _build_flow_base's OWN presence check has nothing to
+    find), look for an already-done combo at this ACH to seed it from
+    instead of paying for a full re-mesh - see _find_done_combo_case_dir_
+    for_ach/_seed_ach_base_from_existing_combo above. A no-op (not an
+    error) if neither exists - build_ach_fn's normal fresh-build path
+    handles that case exactly as it always has.
+    """
+    if Path(f"{base_dir}/0/fluenceRate").exists():
+        return  # _build_flow_base's own presence check will already reuse this
+    donor = _find_done_combo_case_dir_for_ach(project_dir, project_name, ach, flow_fingerprint)
+    if donor is not None:
+        _seed_ach_base_from_existing_combo(donor, base_dir, log_fn)
 
 
 # --- flow-field build/reuse ---
 
 def _build_flow_base(guv_path, base_dir, room, settings, ach, adv, log_fn, should_stop, solver_log_fn,
-                      should_pause=None, sealed=False):
+                      should_pause=None, sealed=False, mechanical_ach_only=False):
     """setup_case() into base_dir at this ACH - the project's currently
     configured Z is used as a placeholder (every Z-dependent file this
     writes gets overwritten by _apply_z before any subfolder actually
@@ -209,23 +346,60 @@ def _build_flow_base(guv_path, base_dir, room, settings, ach, adv, log_fn, shoul
     (sealed room, fan-only mixing) group; steady-state sweeps never pass
     this (see run_sweep's own upfront ach>0 validation).
 
+    mechanical_ach_only: forwarded straight to setup_case - skips the
+    fluence/UV pipeline entirely (see run_pipeline._finish_case_setup).
+    Decay sweeps only, mirroring sealed above.
+
     If base_dir already has a resolved flow-convergence result on disk
     from an earlier attempt at this ACH (a sweep that got interrupted or
-    paused further downstream, e.g. by Phase1ExtrapolationUndecided),
-    reuse it instead of re-meshing and re-running simpleFoam from
-    scratch - confirmed as expensive, real wasted compute on a live run
-    (flow convergence here can be as costly as Phase 1 itself). Detected
-    via 0/fluenceRate, the same signal case_awaiting_flow_decision()
-    already uses: only written by setup_case()'s own _finish_case_setup
-    once flow convergence is fully resolved (converged, accepted via
-    oscillation, or explicitly accepted by a user) - so a case that got
-    interrupted mid-convergence correctly does NOT match this and falls
-    through to a fresh setup_case() call below.
+    paused further downstream, e.g. by Phase1ExtrapolationUndecided, OR
+    seeded from an existing done combo - see
+    _seed_ach_base_if_no_scratch_survives above), reuse it instead of
+    re-meshing and re-running simpleFoam from scratch - confirmed as
+    expensive, real wasted compute on a live run (flow convergence here
+    can be as costly as Phase 1 itself). Detected via 0/fluenceRate, the
+    same signal case_awaiting_flow_decision() already uses: only written
+    by setup_case()'s own _finish_case_setup once flow convergence is
+    fully resolved (converged, accepted via oscillation, or explicitly
+    accepted by a user) - so a case that got interrupted mid-convergence
+    correctly does NOT match this and falls through to a fresh
+    setup_case() call below.
+
+    ach_delivery is still measured on this path (not just left None) -
+    check_ach_delivery only reads already-solved fields (a few seconds,
+    no new solve - see its own docstring), so it's just as cheap to run
+    against a reused/seeded base as a freshly-converged one, and skipping
+    it here would silently drop a real, independent sanity check from
+    every combo sharing this ACH (confirmed as a real gap: it went missing
+    from a project's sweep summary the first time this reuse path fired
+    for real, since the flow-affecting settings genuinely didn't change,
+    so there was nothing wrong to report, just nothing computed either).
     """
     if Path(f"{base_dir}/0/fluenceRate").exists():
         log_fn(f"Found an already flow-converged base case at {Path(base_dir).name}/ from an earlier "
                f"attempt - reusing it instead of re-meshing/re-converging.")
-        return {"flow_converged": None, "ach_delivery": None, "n_lamps": None, "reused": True}
+        has_inlet2 = bool(settings.get("inlet2-enable"))
+        inlet_velocity, inlet2_velocity = resolve_case_inlet_velocities(
+            base_dir, room, ach, adv["mesh-cell-size"],
+            settings["inlet-wall"], _opening_center_frac(settings, "inlet", room),
+            (settings["inlet-size-w"], settings["inlet-size-h"]),
+            inlet_diffuser_type=settings.get("inlet-diffuser-type", "direct"),
+            inlet2_wall=settings["inlet2-wall"] if has_inlet2 else None,
+            inlet2_center=_opening_center_frac(settings, "inlet2", room) if has_inlet2 else None,
+            inlet2_size=(settings["inlet2-size-w"], settings["inlet2-size-h"]) if has_inlet2 else None,
+            inlet2_diffuser_type=settings.get("inlet2-diffuser-type", "direct"),
+            sealed=sealed,
+        )
+        if sealed:
+            log_fn("Skipping ACH-delivery check - sealed room, no ventilation to measure.")
+            ach_delivery = None
+        else:
+            outlet_patches = ("outlet", "outlet2") if settings.get("outlet2-enable") else ("outlet",)
+            room_volume = room.x * room.y * room.z
+            ach_delivery = check_ach_delivery(base_dir, room_volume, ach, outlet_patches=outlet_patches,
+                                               log_fn=log_fn)
+        return {"flow_converged": None, "ach_delivery": ach_delivery, "n_lamps": None, "reused": True,
+                "inlet_velocity": inlet_velocity, "inlet2_velocity": inlet2_velocity}
     return setup_case(
         guv_path, base_dir, template_case_dir=_TEMPLATE_CASE_DIR,
         Z=settings["z-value"], ach=ach,
@@ -241,8 +415,9 @@ def _build_flow_base(guv_path, base_dir, room, settings, ach, adv, log_fn, shoul
         momentum_relaxation=adv["momentum-relaxation"], scalar_relaxation=adv["scalar-relaxation"],
         scalar_transport_ncorr=adv["scalar-transport-ncorr"],
         scalar_transport_tolerance=adv["scalar-transport-tolerance"],
+        max_co=adv["max-co"],
         log_fn=log_fn, should_stop=should_stop, solver_log_fn=solver_log_fn, should_pause=should_pause,
-        sealed=sealed,
+        sealed=sealed, mechanical_ach_only=mechanical_ach_only,
         **_fan_kwargs(settings),
         **_second_opening_kwargs(settings, "inlet2", room),
         **_second_opening_kwargs(settings, "outlet2", room),
@@ -345,10 +520,17 @@ def _run_scenario(case_dir, room, settings, z, ach, adv, z_summary, log_fn, shou
         fan_entry = fan_fvoptions_entry(settings["fan-speed"], direction=direction)
 
     room_volume = room.x * room.y * room.z
-    openings = [(settings["inlet-wall"], settings["inlet-size-w"] * settings["inlet-size-h"])]
+    cell_size = adv["mesh-cell-size"]
+    openings = [(settings["inlet-wall"],
+                 opening_actual_area(settings["inlet-wall"], room.x, room.y, room.z,
+                                      _opening_center_frac(settings, "inlet", room),
+                                      (settings["inlet-size-w"], settings["inlet-size-h"]), cell_size))]
     has_inlet2 = bool(settings.get("inlet2-enable"))
     if has_inlet2:
-        openings.append((settings["inlet2-wall"], settings["inlet2-size-w"] * settings["inlet2-size-h"]))
+        openings.append((settings["inlet2-wall"],
+                          opening_actual_area(settings["inlet2-wall"], room.x, room.y, room.z,
+                                               _opening_center_frac(settings, "inlet2", room),
+                                               (settings["inlet2-size-w"], settings["inlet2-size-h"]), cell_size)))
     velocities = compute_inlet_velocities(ach, room_volume, openings)
     inlet_velocity = velocities[0]
     inlet2_velocity = velocities[1] if has_inlet2 else None
@@ -479,10 +661,17 @@ def _run_shared_phase1(base_dir, phase1_dir, ach, room, settings, adv, log_fn, s
         fan_entry = fan_fvoptions_entry(settings["fan-speed"], direction=direction)
 
     room_volume = room.x * room.y * room.z
-    openings = [(settings["inlet-wall"], settings["inlet-size-w"] * settings["inlet-size-h"])]
+    cell_size = adv["mesh-cell-size"]
+    openings = [(settings["inlet-wall"],
+                 opening_actual_area(settings["inlet-wall"], room.x, room.y, room.z,
+                                      _opening_center_frac(settings, "inlet", room),
+                                      (settings["inlet-size-w"], settings["inlet-size-h"]), cell_size))]
     has_inlet2 = bool(settings.get("inlet2-enable"))
     if has_inlet2:
-        openings.append((settings["inlet2-wall"], settings["inlet2-size-w"] * settings["inlet2-size-h"]))
+        openings.append((settings["inlet2-wall"],
+                          opening_actual_area(settings["inlet2-wall"], room.x, room.y, room.z,
+                                               _opening_center_frac(settings, "inlet2", room),
+                                               (settings["inlet2-size-w"], settings["inlet2-size-h"]), cell_size)))
     velocities = compute_inlet_velocities(ach, room_volume, openings)
     inlet_velocity = velocities[0]
     inlet2_velocity = velocities[1] if has_inlet2 else None
@@ -498,7 +687,7 @@ def _run_shared_phase1(base_dir, phase1_dir, ach, room, settings, adv, log_fn, s
     phase1_delta_t, _ = resolve_phase_delta_ts(ach, 0.0, phase1_iterations, phase1_iterations, deltat_adv)
     patches_to_monitor = ("outlet", "outlet2") if has_outlet2 else ("outlet",)
 
-    log_fn(f"=== ACH={ach}: Phase 1 (source only, no UV - shared by every Z at this ACH) ===")
+    log_fn(f"=== ACH={ach}: Phase 1 (source only, no UV - once per ACH) ===")
     run_steady_state_scenario(
         # Z is a placeholder here (Phase 1 has no UV, so its value is
         # irrelevant) - same convention _build_flow_base's own docstring
@@ -570,7 +759,8 @@ def _prefixed_log_fn(log_fn, prefix):
     return lambda msg: log_fn(f"[{prefix}] {msg}")
 
 
-def _throttled_solver_callback(log_fn, log_prefix, on_line=None, status_fn=None, status_key=None):
+def _throttled_solver_callback(log_fn, log_prefix, on_line=None, status_fn=None, status_key=None,
+                                total_time=None):
     """Wraps a solver's on_line callback so only "Time = N" banner lines
     and run_wsl_streaming's own "[...]"-wrapped stall/retry diagnostics
     reach the visible log - the full per-iteration residual dump (~8-10
@@ -588,6 +778,15 @@ def _throttled_solver_callback(log_fn, log_prefix, on_line=None, status_fn=None,
     dump. "[...]" diagnostics always still go to log_fn - those are rare
     and important enough to want scrolling, not overwritten away.
 
+    total_time: this run's own target end time [s] (control_end_time or
+    combined_end_time - whatever the caller computed BEFORE launching the
+    solve, the same value set_control_dict_time's end_time was given) -
+    appended as "Time = N of total_time total seconds" so status_fn's
+    display always shows a comparable elapsed-vs-total pair, in the same
+    units, for every run - decay/control, single-run or sweep, alike.
+    None (rare - only if a caller genuinely doesn't have this value
+    handy) just omits the suffix rather than raising.
+
     The status_fn branch deliberately does NOT prefix the line with
     log_prefix - status_key already carries that (and the combo's Z/ACH
     identity too), and the caller renders "[{key}] {value}" itself (see
@@ -597,7 +796,8 @@ def _throttled_solver_callback(log_fn, log_prefix, on_line=None, status_fn=None,
         stripped = line.strip()
         if _TIME_LINE_RE.match(stripped):
             if status_fn is not None:
-                status_fn(status_key, stripped)
+                display = f"{stripped} of {total_time} total seconds" if total_time is not None else stripped
+                status_fn(status_key, display)
             else:
                 log_fn(f"[{log_prefix}] {line}")
         elif stripped.startswith("["):
@@ -608,7 +808,7 @@ def _throttled_solver_callback(log_fn, log_prefix, on_line=None, status_fn=None,
 
 
 def _run_shared_control(base_dir, control_dir, ach, room, settings, adv, log_fn, should_stop, solver_log_fn,
-                         status_fn=None, should_pause=None, sealed=False):
+                         base_summary, status_fn=None, should_pause=None, sealed=False):
     """Run the UV-off control decay ONCE per ACH group, shared across
     every Z sharing that ACH - control's own physics (uniform T=1 initial
     condition, no UV sink, same converged flow field) doesn't depend on Z
@@ -623,6 +823,11 @@ def _run_shared_control(base_dir, control_dir, ach, room, settings, adv, log_fn,
     ACH group's own _build_flow_base built - cloned here before any Z's
     own UV fvOptions get applied, so this control run is genuinely
     Z-independent from the start, not just coincidentally so.
+
+    base_summary: base_dir's own setup_case() summary (from
+    _build_flow_base) - its inlet_velocity/inlet2_velocity are reused
+    directly rather than recomputed from nominal opening size (see
+    ventilation_control.prepare_ventilation_only_control's docstring).
     """
     control_dir_wsl = wsl_path(control_dir)
     _, control_end_time = _decay_run_durations(ach, 0.0, adv)
@@ -630,13 +835,11 @@ def _run_shared_control(base_dir, control_dir, ach, room, settings, adv, log_fn,
     has_inlet2 = bool(settings.get("inlet2-enable"))
 
     log_fn(f"=== ACH={ach}: preparing shared UV-off control ({control_end_time}s, "
-           f"once for every Z at this ACH) ===")
+           f"once per ACH) ===")
     prepare_ventilation_only_control(
-        base_dir, control_dir, ach, room.x, room.y, room.z,
-        settings["inlet-wall"], (settings["inlet-size-w"], settings["inlet-size-h"]),
-        control_end_time, write_interval, pimple_delta_t=adv["pimple-delta-t"],
-        inlet2_wall=settings["inlet2-wall"] if has_inlet2 else None,
-        inlet2_size=(settings["inlet2-size-w"], settings["inlet2-size-h"]) if has_inlet2 else None,
+        base_dir, control_dir, base_summary["inlet_velocity"],
+        control_end_time, write_interval, pimple_delta_t=adv["pimple-delta-t"], max_co=adv["max-co"],
+        inlet2_velocity=base_summary.get("inlet2_velocity") if has_inlet2 else None,
         has_outlet2=bool(settings.get("outlet2-enable")),
         sealed=sealed,
         log_fn=log_fn, should_stop=should_stop,
@@ -649,7 +852,8 @@ def _run_shared_control(base_dir, control_dir, ach, room, settings, adv, log_fn,
     try:
         r = run_wsl_streaming(
             "pimpleFoam 2>&1 | tee log.pimpleFoam", control_dir_wsl,
-            on_line=_throttled_solver_callback(log_fn, "control", status_fn=status_fn, status_key=status_key),
+            on_line=_throttled_solver_callback(log_fn, "control", status_fn=status_fn, status_key=status_key,
+                                                total_time=control_end_time),
             should_stop=should_stop, kill_pattern="pimpleFoam", should_pause=should_pause,
         )
     finally:
@@ -708,7 +912,8 @@ def _run_decay_scenario(case_dir, room, settings, z, ach, adv, z_summary, log_fn
     log_fn(f"  Adaptive duration: UV-on={combined_end_time}s, write interval={write_interval}s "
            f"(as configured) - UV-off control is shared for this ACH, not re-run here...")
     set_control_dict_time(case_dir, end_time=combined_end_time,
-                           write_interval=write_interval, delta_t=adv["pimple-delta-t"])
+                           write_interval=write_interval, delta_t=adv["pimple-delta-t"], max_co=adv["max-co"])
+    splice_live_vol_average_if_needed(case_dir)
 
     if should_stop is not None and should_stop():
         raise StoppedByUser("Stopped before pimpleFoam.")
@@ -718,7 +923,8 @@ def _run_decay_scenario(case_dir, room, settings, z, ach, adv, z_summary, log_fn
         r_uv = run_wsl_streaming(
             "pimpleFoam 2>&1 | tee log.pimpleFoam", case_dir_wsl,
             on_line=_throttled_solver_callback(log_fn, "UV-on", solver_log_fn,
-                                                status_fn=status_fn, status_key=status_key),
+                                                status_fn=status_fn, status_key=status_key,
+                                                total_time=combined_end_time),
             should_stop=should_stop, kill_pattern="pimpleFoam", should_pause=should_pause,
         )
     finally:
@@ -730,8 +936,13 @@ def _run_decay_scenario(case_dir, room, settings, z, ach, adv, z_summary, log_fn
         tail = "\n".join(r_uv.stdout.splitlines()[-25:]) or "(no output captured)"
         raise RuntimeError(f"UV-on pimpleFoam failed (exit {r_uv.returncode}):\n{tail}")
 
-    log_fn("  Running postProcess volAverage...")
-    run_wsl_or_raise("postProcess -dict system/volAverageDict", case_dir_wsl, "postProcess volAverage")
+    log_fn("  Computing spatial coefficient of variation (final concentration field, "
+           "across all cells - how uniformly the room actually cleared, not just on average)...")
+    try:
+        spatial_cov = spatial_coefficient_of_variation(read_latest_time_field(case_dir, "T"))
+    except Exception as e:
+        log_fn(f"  Could not compute spatial CoV: {e}")
+        spatial_cov = None
 
     log_fn("  Writing results summary...")
     result = write_results_summary(
@@ -741,6 +952,7 @@ def _run_decay_scenario(case_dir, room, settings, z, ach, adv, z_summary, log_fn
             "flow_converged": (base_summary or {}).get("flow_converged"),
             "ach_delivery": (base_summary or {}).get("ach_delivery"),
             "n_lamps": (base_summary or {}).get("n_lamps"),
+            "spatial_cov_final": spatial_cov,
         },
         measured_ventilation_ach=control_results["total_ach_effective"],
         measured_ventilation_ach_ci95=control_results.get("total_ach_effective_ci95"),
@@ -755,8 +967,7 @@ def _run_decay_scenario(case_dir, room, settings, z, ach, adv, z_summary, log_fn
         log_fn("  Computing monitoring locations...")
         result["monitoring"] = compute_monitoring_results(
             case_dir, points, cell_size=adv["mesh-cell-size"], ventilation_ach=ach, log_fn=log_fn)
-        with open(f"{case_dir}/results.json", "w") as f:
-            json.dump(result, f, indent=2)
+        write_case_file(case_dir, "results.json", json.dumps(result, indent=2))
     return result
 
 
@@ -784,34 +995,92 @@ _SWEEP_SUMMARY_FIELDS = ["Z", "ACH", "total_reduction_pct", "ach_efficiency_pct"
                          "mechanical_mixing_efficiency_pct", "est_ach_per_hr", "est_each_per_hr"]
 
 
-def write_sweep_summary_csv(project_dir, project_name, combos):
-    """Collects every combination's trimmed per-combo report.json (already
-    written by run_sweep/run_decay_sweep next to results.json - see
-    _trim_report/_trim_decay_report) into one combined CSV with the same 5
-    headline numbers shown on the Run Simulations tab (report.
-    combo_summary_metrics), so comparing combinations doesn't require
-    opening every subfolder's own results.json by hand. Called once after
-    a sweep finishes (or is stopped) - combinations that never produced a
-    report.json (failed, skipped, or not yet reached) are simply omitted,
-    not written as blank rows. Returns the CSV's path.
+def _monitoring_summary_columns(detail):
+    """One column per configured monitoring point's own headline metric -
+    "{name}_reduction_pct" (steady-state, via point_reduction_basis on its
+    phase1/phase2 entries - the same computation report.py/app.py already
+    use to show per-point reduction) or "{name}_eACH_uv" (decay,
+    monitoring_points.compute_monitoring_results already computes this
+    directly per point) - added to the sweep summary CSV alongside the
+    room-average metrics combo_summary_metrics provides. A point missing
+    the data it needs (e.g. only one phase present) is just omitted from
+    the returned dict for that row, not an error - csv.DictWriter leaves
+    a row's missing fieldnames blank rather than failing.
     """
-    rows = []
-    for z, ach in combos:
-        report_path = f"{project_dir}/{project_name}_{_subdir_name(z, ach)}_report.json"
-        if not Path(report_path).exists():
-            continue
-        try:
-            with open(report_path) as f:
-                detail = json.load(f)
-        except (json.JSONDecodeError, OSError):
-            continue
-        rows.append({"Z": z, "ACH": ach, **combo_summary_metrics(detail)})
+    monitoring = detail.get("monitoring") or {}
+    is_steady_state = "reduction_pct" in detail or "reduction_pct_corrected" in detail
+    columns = {}
+    for name, point in monitoring.items():
+        if is_steady_state:
+            p1, p2 = point.get("phase1"), point.get("phase2")
+            if p1 and p2:
+                try:
+                    _, _, reduction_pct, _ = point_reduction_basis(p1, p2)
+                    columns[f"{name}_reduction_pct"] = reduction_pct
+                except Exception:
+                    pass
+        elif point.get("eACH_uv_effective") is not None:
+            columns[f"{name}_eACH_uv"] = point["eACH_uv_effective"]
+    return columns
 
-    csv_path = f"{project_dir}/{project_name}_sweep_summary.csv"
-    with open(csv_path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=_SWEEP_SUMMARY_FIELDS)
-        writer.writeheader()
-        writer.writerows(rows)
+
+def write_sweep_summary_csv(project_dir, project_name):
+    """Collects every DONE combination's trimmed per-combo report.json
+    (already written by run_sweep/run_decay_sweep next to results.json -
+    see _trim_report/_trim_decay_report) into one combined CSV with the
+    same 5 headline numbers shown on the Run Simulations tab (report.
+    combo_summary_metrics), plus one column per configured monitoring
+    point's own headline metric (see _monitoring_summary_columns) - so
+    comparing combinations doesn't require opening every subfolder's own
+    results.json by hand.
+
+    Reads the FULL set of combos from project_status.json rather than
+    being handed a specific list by the caller - a later, narrower sweep
+    (e.g. "add one more Z" via the Extend/modify modal, covering only one
+    ACH) must not silently overwrite this summary down to just that
+    call's own combos, dropping every previously-recorded row not part of
+    it (confirmed as a real incident: a 9-row summary got overwritten
+    down to 3 rows by a follow-up sweep that only touched one ACH).
+    Combinations that never produced a report.json (failed, skipped, or
+    not yet reached) are simply omitted, not written as blank rows.
+    Returns the CSV's path.
+    """
+    try:
+        status = load_project_status(project_dir, project_name)
+    except Exception:
+        status = {"combos": {}}
+    combos = sorted(
+        {(c["z"], c["ach"]) for c in status.get("combos", {}).values()
+         if c.get("status") == "done" and "z" in c and "ach" in c},
+        key=lambda zc: (zc[1], zc[0]),
+    )
+
+    rows = []
+    monitoring_columns = set()
+    for z, ach in combos:
+        report_relative = f"{project_name}_{_subdir_name(z, ach)}_report.json"
+        try:
+            detail = json.loads(_read_case_file(project_dir, report_relative))
+        except (json.JSONDecodeError, OSError, RuntimeError):
+            # Missing (failed/skipped/not-yet-reached combo), unreadable, or
+            # malformed - read via _read_case_file (not a plain Windows-side
+            # Path.exists()+open()) since this file was written by a
+            # WSL-native process (see write_case_file) and a Windows-side
+            # existence check on it isn't reliable - see wsl_utils's own
+            # cross-boundary-visibility docstrings.
+            continue
+        row = {"Z": z, "ACH": ach, **combo_summary_metrics(detail), **_monitoring_summary_columns(detail)}
+        monitoring_columns.update(row.keys() - set(_SWEEP_SUMMARY_FIELDS))
+        rows.append(row)
+
+    fieldnames = _SWEEP_SUMMARY_FIELDS + sorted(monitoring_columns)
+    csv_relative = f"{project_name}_sweep_summary.csv"
+    csv_path = f"{project_dir}/{csv_relative}"
+    buf = io.StringIO(newline="")
+    writer = csv.DictWriter(buf, fieldnames=fieldnames)
+    writer.writeheader()
+    writer.writerows(rows)
+    write_case_file(project_dir, csv_relative, buf.getvalue())
     return csv_path
 
 
@@ -868,12 +1137,16 @@ def _skip_if_combo_already_done(case_dir, subdir, combo_log_fn, trim_fn, on_comb
     combination that isn't actually finished on disk always just re-runs,
     the same as a fresh sweep would.
     """
-    result_path = f"{case_dir}/results.json"
-    if not Path(result_path).exists():
+    try:
+        content = _read_case_file(case_dir, "results.json")
+    except Exception as e:
+        if isinstance(e, FileNotFoundError) or "No such file" in str(e):
+            return False  # no results.json yet - first attempt at this combo, nothing to report
+        combo_log_fn(f"  {subdir} has a results.json from an earlier attempt, but it couldn't be "
+                     f"read ({e}) - re-running from scratch.")
         return False
     try:
-        with open(result_path) as f:
-            result = json.load(f)
+        result = json.loads(content)
         trimmed = trim_fn(result)
     except Exception as e:
         combo_log_fn(f"  {subdir} has a results.json from an earlier attempt, but it couldn't be "
@@ -884,6 +1157,93 @@ def _skip_if_combo_already_done(case_dir, subdir, combo_log_fn, trim_fn, on_comb
     if on_combo_done:
         on_combo_done(z, ach, "done", trimmed)
     return True
+
+
+def _iter_combo_dirs(project_dir):
+    """Every immediate subfolder of project_dir that looks like a combo
+    directory (see _subdir_name - "Z<...>_ACH<...>") - used by the status-
+    file-rebuild helpers below, not by the sweep functions themselves
+    (which always know their own combo dirs directly).
+    """
+    base = Path(project_dir)
+    if not base.is_dir():
+        return
+    for entry in sorted(base.iterdir()):
+        if entry.is_dir() and entry.name.startswith("Z"):
+            yield entry
+
+
+def find_first_guv_path_on_disk(project_dir):
+    """The first guv_path found in any combo subfolder's own
+    run_settings.json under project_dir, or None if none have one -
+    used to resolve a Project/room for rebuild_project_status_from_disk
+    when a project directory predates project_status.json entirely (so
+    there's no status file to read guv_path from directly), but its own
+    combo subfolders (each written by _save_run_settings) still record it.
+    """
+    for entry in _iter_combo_dirs(project_dir):
+        try:
+            run_settings = json.loads(_read_case_file(str(entry), "run_settings.json"))
+        except Exception:
+            continue
+        guv_path = run_settings.get("guv_path")
+        if guv_path:
+            return guv_path
+    return None
+
+
+def rebuild_project_status_from_disk(project_dir, project_name, room):
+    """Reconstruct a project_status.json from what's actually already on
+    disk, for a project directory that predates this feature - real
+    completed/incomplete runs exist, they just were never status-tracked.
+
+    Scans every combo subfolder for its own run_settings.json (written by
+    _save_run_settings - the exact settings that combo actually ran with,
+    including every FLOW_FINGERPRINT_FIELDS value at the time, which is
+    what makes recomputing flow_fingerprint here meaningful rather than
+    just guessing) and results.json (its presence means "done"; its
+    absence means the combo started setup but never finished, recorded as
+    "incomplete" - descriptive only, nothing downstream currently branches
+    on that exact string). uv_fingerprint is recomputed from the
+    subfolder's own 0/kUV if still present.
+
+    Deliberately does NOT try to recover ach_bases (the shared
+    _base_ACH*/_control_ACH* scratch dirs) - a project predating this
+    feature predates keep-shared-scratch-dirs defaulting True too, so
+    those are very unlikely to still be on disk; find_reusable_ach_base's
+    own existence check already degrades gracefully to "nothing to reuse"
+    without a record, so there's nothing incorrect about leaving it empty.
+
+    Returns the number of combo subfolders successfully read (0 means
+    nothing here to rebuild from, not a bug).
+    """
+    n_found = 0
+    for entry in _iter_combo_dirs(project_dir):
+        try:
+            run_settings = json.loads(_read_case_file(str(entry), "run_settings.json"))
+        except Exception:
+            continue
+        z, ach = run_settings.get("z-value"), run_settings.get("ach")
+        if z is None or ach is None:
+            continue
+        n_found += 1
+        try:
+            flow_fingerprint = compute_flow_fingerprint(run_settings, room)
+        except Exception:
+            flow_fingerprint = None
+        try:
+            uv_fingerprint = compute_uv_fingerprint(str(entry))
+        except Exception:
+            uv_fingerprint = None
+        has_results = Path(f"{entry}/results.json").exists()
+        update_combo_status(
+            project_dir, project_name, z, ach,
+            guv_path=run_settings.get("guv_path"), settings_path=run_settings.get("settings_path"),
+            sim_type=run_settings.get("sim-type"),
+            status="done" if has_results else "incomplete",
+            flow_fingerprint=flow_fingerprint, uv_fingerprint=uv_fingerprint,
+        )
+    return n_found
 
 
 def run_decay_sweep(guv_path, settings_path, project_dir, room, settings, adv,
@@ -908,19 +1268,39 @@ def run_decay_sweep(guv_path, settings_path, project_dir, room, settings, adv,
     achs = sorted({ach for _, ach in combos})
     project_name = _sanitize(Path(project_dir).name)
 
+    mechanical_ach_only = bool(settings.get("mech-ach-only"))
+
     def build_ach_fn(ach):
         sealed = ach <= 0
         if sealed and not settings.get("fan-enable"):
             raise ValueError(
                 f"ACH={ach}: a sealed room (ACH<=0) needs the mixing fan enabled - "
                 "with no ventilation and no fan, there's no way for the flow field to develop.")
+        if mechanical_ach_only and sealed:
+            raise ValueError(
+                f"ACH={ach}: mechanical-ACH-only needs real ventilation (ACH>0) - a sealed room "
+                "has no mechanical ventilation to measure.")
         ach_log_fn = _prefixed_log_fn(log_fn, f"ACH={ach}")
         base_dir = f"{project_dir}/_base_ACH{_ach_label(ach)}"
         control_dir = f"{project_dir}/_control_ACH{_ach_label(ach)}"
-        ach_log_fn("=== converging flow field (shared by every Z at this ACH) ===")
+        flow_fingerprint = compute_flow_fingerprint(settings, room)
+
+        # Sealed rooms never share a control run (see the sealed branch
+        # below) and their flow base is Z/UV-independent already for a
+        # different reason - reuse detection here is only meaningful for
+        # the ordinary, ventilated case.
+        reusable = None if sealed else find_reusable_ach_base(project_dir, project_name, ach, flow_fingerprint)
+        if reusable is None:
+            _discard_stale_ach_scratch_if_mismatched(project_dir, project_name, ach, flow_fingerprint,
+                                                       [base_dir, control_dir], ach_log_fn)
+            if not sealed:
+                _seed_ach_base_if_no_scratch_survives(project_dir, project_name, ach, flow_fingerprint,
+                                                       base_dir, ach_log_fn)
+
+        ach_log_fn("=== converging flow field (once per ACH) ===")
         base_summary = _build_flow_base(guv_path, base_dir, room, settings, ach, adv,
                                          ach_log_fn, should_stop, solver_log_fn, should_pause=should_pause,
-                                         sealed=sealed)
+                                         sealed=sealed, mechanical_ach_only=mechanical_ach_only)
         if sealed:
             # No possible path for contaminant MASS to leave a sealed room
             # (a fan redistributes air but can't remove contaminant from a
@@ -932,12 +1312,21 @@ def run_decay_sweep(guv_path, settings_path, project_dir, room, settings, adv,
             ach_log_fn("Skipping the UV-off control run - sealed room, ventilation-only decay "
                        "rate is exactly 0 by construction.")
             control_results = {"total_ach_effective": 0.0}
+        elif reusable is not None:
+            ach_log_fn("Reusing this ACH's already-run UV-off control decay (unchanged flow "
+                       "settings since an earlier sweep) - skipping a repeat pimpleFoam run.")
+            control_results = reusable["control_results"]
         else:
             # UV-off control is Z-independent (see _run_shared_control) - run
             # it once per ACH here, not once per Z in run_z_fn below.
             control_results = _run_shared_control(base_dir, control_dir, ach, room, settings, adv,
-                                                   ach_log_fn, should_stop, solver_log_fn, status_fn=status_fn,
+                                                   ach_log_fn, should_stop, solver_log_fn, base_summary,
+                                                   status_fn=status_fn,
                                                    should_pause=should_pause, sealed=sealed)
+        if not sealed:
+            _update_ach_base_status_safe(project_dir, project_name, ach, flow_fingerprint, base_dir,
+                                          control_dir, control_results, guv_path=guv_path,
+                                          settings_path=settings_path, sim_type="decay")
         return {
             "ach": ach, "base_dir": base_dir, "control_dir": control_dir,
             "base_summary": base_summary, "control_results": control_results,
@@ -954,27 +1343,52 @@ def run_decay_sweep(guv_path, settings_path, project_dir, room, settings, adv,
         combo_log_fn(f"--- -> {subdir} ---")
         if _skip_if_combo_already_done(case_dir, subdir, combo_log_fn, _trim_decay_report, on_combo_done, z, ach):
             return
+        flow_fingerprint = compute_flow_fingerprint(settings, room)
+        _update_combo_status_safe(project_dir, project_name, z, ach, guv_path=guv_path,
+                                   settings_path=settings_path, sim_type="decay", status="running",
+                                   started_at=now_iso(), flow_fingerprint=flow_fingerprint)
         try:
             _copy_base_case(ctx["base_dir"], case_dir, combo_log_fn)
-            z_summary = _apply_z(case_dir, z, adv["uv-zone-bins"], ctx["fan_kw"], combo_log_fn)
-            result = _run_decay_scenario(case_dir, room, settings, z, ach, adv,
-                                          z_summary, combo_log_fn, should_stop, solver_log_fn,
-                                          ctx["control_results"], base_summary=ctx["base_summary"],
-                                          status_fn=status_fn, should_pause=should_pause)
+            if mechanical_ach_only:
+                # No UV at all - Z is physically irrelevant (nothing in the
+                # case depends on it), and the shared per-ACH control run
+                # (ctx["control_results"]) already IS the measurement this
+                # combination wants: re-running _apply_z/_run_decay_scenario
+                # here would just be pimpleFoam solving the exact same
+                # empty-fvOptions physics a second (or third...) time.
+                combo_log_fn("  Mechanical ACH only - reusing this ACH's shared control result "
+                             "(no UV, so Z has no effect)...")
+                control_dir_content = _read_case_file(ctx["control_dir"], "results.json")
+                write_case_file(case_dir, "results.json", control_dir_content)
+                result = json.loads(control_dir_content)
+                uv_fingerprint = None  # no UV/lamp physics involved at all in this mode
+            else:
+                z_summary = _apply_z(case_dir, z, adv["uv-zone-bins"], ctx["fan_kw"], combo_log_fn)
+                uv_fingerprint = compute_uv_fingerprint(case_dir)
+                result = _run_decay_scenario(case_dir, room, settings, z, ach, adv,
+                                              z_summary, combo_log_fn, should_stop, solver_log_fn,
+                                              ctx["control_results"], base_summary=ctx["base_summary"],
+                                              status_fn=status_fn, should_pause=should_pause)
+            capture_openfoam_settings(settings, adv)
             _save_run_settings(case_dir, settings, guv_path, settings_path, z, ach)
 
             trimmed = _trim_decay_report(result)
-            report_path = f"{project_dir}/{project_name}_{subdir}_report.json"
-            with open(report_path, "w") as f:
-                json.dump(trimmed, f, indent=2)
+            report_relative = f"{project_name}_{subdir}_report.json"
+            report_path = f"{project_dir}/{report_relative}"
+            write_case_file(project_dir, report_relative, json.dumps(trimmed, indent=2))
             combo_log_fn(f"  Done. eACH_uv effective={result['eACH_uv_effective']:.4g} /hr "
                          f"(well-mixed={result['eACH_uv_well_mixed']:.4g} /hr)")
+            _update_combo_status_safe(project_dir, project_name, z, ach, status="done",
+                                       finished_at=now_iso(), uv_fingerprint=uv_fingerprint)
             if on_combo_done:
                 on_combo_done(z, ach, "done", trimmed)
         except StoppedByUser:
+            _update_combo_status_safe(project_dir, project_name, z, ach, status="stopped", finished_at=now_iso())
             raise
         except Exception as e:
             combo_log_fn(f"ERROR: {e}")
+            _update_combo_status_safe(project_dir, project_name, z, ach, status="error",
+                                       error_message=str(e), finished_at=now_iso())
             if on_combo_done:
                 on_combo_done(z, ach, "error", str(e))
 
@@ -993,7 +1407,7 @@ def run_decay_sweep(guv_path, settings_path, project_dir, room, settings, adv,
     try:
         _run_sweep_concurrent(achs, combos, should_stop, build_ach_fn, run_z_fn, cleanup_ach_fn)
     finally:
-        write_sweep_summary_csv(project_dir, project_name, combos)
+        write_sweep_summary_csv(project_dir, project_name)
 
 
 def _trim_report(result):
@@ -1078,22 +1492,43 @@ def run_sweep(guv_path, settings_path, project_dir, room, settings, adv,
         base_dir = f"{project_dir}/_base_ACH{_fmt(ach)}"
         phase1_dir = f"{project_dir}/_phase1_ACH{_fmt(ach)}"
         control_dir = f"{project_dir}/_control_ACH{_fmt(ach)}"
-        ach_log_fn("=== converging flow field (shared by every Z at this ACH) ===")
+        flow_fingerprint = compute_flow_fingerprint(settings, room)
+
+        reusable = find_reusable_ach_base(project_dir, project_name, ach, flow_fingerprint)
+        if reusable is None:
+            _discard_stale_ach_scratch_if_mismatched(project_dir, project_name, ach, flow_fingerprint,
+                                                       [base_dir, phase1_dir, control_dir], ach_log_fn)
+            _seed_ach_base_if_no_scratch_survives(project_dir, project_name, ach, flow_fingerprint,
+                                                   base_dir, ach_log_fn)
+
+        ach_log_fn("=== converging flow field (once per ACH) ===")
         base_summary = _build_flow_base(guv_path, base_dir, room, settings, ach, adv, ach_log_fn, should_stop,
                                          solver_log_fn, should_pause=should_pause)
         # Phase 1 ("source only, no UV") is Z-independent (see
         # _run_shared_phase1) - run it once per ACH here, not once per Z
-        # in run_z_fn below.
+        # in run_z_fn below. Its own reuse check (checkpoint/pending on
+        # disk) isn't fingerprint-aware either, but the stale-discard
+        # above already removed phase1_dir if it belonged to a mismatched
+        # fingerprint, so whatever's left here (if anything) is safe.
         _run_shared_phase1(base_dir, phase1_dir, ach, room, settings, adv, ach_log_fn, should_stop, solver_log_fn,
                             status_fn=status_fn, should_pause=should_pause)
-        # A dedicated UV-off control run (same one decay mode already uses)
-        # measures the actual ventilation rate directly, without Phase 1's
-        # point-source mixing-transport lag - see
-        # compute_corrected_eACH_uv_from_control's docstring for why that
-        # matters. Shared per ACH, same as the flow base and Phase 1.
-        control_results = _run_shared_control(base_dir, control_dir, ach, room, settings, adv,
-                                               ach_log_fn, should_stop, solver_log_fn, status_fn=status_fn,
-                                               should_pause=should_pause)
+        if reusable is not None:
+            ach_log_fn("Reusing this ACH's already-run UV-off control decay (unchanged flow "
+                       "settings since an earlier sweep) - skipping a repeat pimpleFoam run.")
+            control_results = reusable["control_results"]
+        else:
+            # A dedicated UV-off control run (same one decay mode already uses)
+            # measures the actual ventilation rate directly, without Phase 1's
+            # point-source mixing-transport lag - see
+            # compute_corrected_eACH_uv_from_control's docstring for why that
+            # matters. Shared per ACH, same as the flow base and Phase 1.
+            control_results = _run_shared_control(base_dir, control_dir, ach, room, settings, adv,
+                                                   ach_log_fn, should_stop, solver_log_fn, base_summary,
+                                                   status_fn=status_fn,
+                                                   should_pause=should_pause)
+        _update_ach_base_status_safe(project_dir, project_name, ach, flow_fingerprint, base_dir, control_dir,
+                                      control_results, guv_path=guv_path, settings_path=settings_path,
+                                      sim_type="steady_state")
         return {"ach": ach, "base_dir": base_dir, "phase1_dir": phase1_dir, "control_dir": control_dir,
                 "base_summary": base_summary, "control_results": control_results, "fan_kw": _fan_kwargs(settings)}
 
@@ -1107,9 +1542,14 @@ def run_sweep(guv_path, settings_path, project_dir, room, settings, adv,
         combo_log_fn(f"--- -> {subdir} ---")
         if _skip_if_combo_already_done(case_dir, subdir, combo_log_fn, _trim_report, on_combo_done, z, ach):
             return
+        flow_fingerprint = compute_flow_fingerprint(settings, room)
+        _update_combo_status_safe(project_dir, project_name, z, ach, guv_path=guv_path,
+                                   settings_path=settings_path, sim_type="steady_state", status="running",
+                                   started_at=now_iso(), flow_fingerprint=flow_fingerprint)
         try:
             _copy_base_case(ctx["phase1_dir"], case_dir, combo_log_fn)
             z_summary = _apply_z(case_dir, z, adv["uv-zone-bins"], ctx["fan_kw"], combo_log_fn)
+            uv_fingerprint = compute_uv_fingerprint(case_dir)
             # _apply_z's write_cellzones() rewrites cellZones from scratch,
             # wiping the source cellZone _run_shared_phase1 already carved
             # into phase1_dir (the same reason _apply_z itself re-carves
@@ -1124,22 +1564,31 @@ def run_sweep(guv_path, settings_path, project_dir, room, settings, adv,
                                     z_summary, combo_log_fn, should_stop, solver_log_fn,
                                     status_fn=status_fn, control_results=ctx["control_results"],
                                     base_summary=ctx["base_summary"], should_pause=should_pause)
-            with open(f"{case_dir}/results.json", "w") as f:
-                json.dump(result, f, indent=2)
+            try:
+                snapshot_openfoam_settings(case_dir)
+            except Exception:
+                pass  # archival only - never block a results.json write over it
+            write_case_file(case_dir, "results.json", json.dumps(result, indent=2))
+            capture_openfoam_settings(settings, adv)
             _save_run_settings(case_dir, settings, guv_path, settings_path, z, ach)
 
             trimmed = _trim_report(result)
-            report_path = f"{project_dir}/{project_name}_{subdir}_report.json"
-            with open(report_path, "w") as f:
-                json.dump(trimmed, f, indent=2)
+            report_relative = f"{project_name}_{subdir}_report.json"
+            report_path = f"{project_dir}/{report_relative}"
+            write_case_file(project_dir, report_relative, json.dumps(trimmed, indent=2))
             combo_log_fn(f"  Done. Reduction={result['reduction_pct']:.1f}%, "
                          f"eACH_uv={result['eACH_uv_steady_state']:.4g} /hr")
+            _update_combo_status_safe(project_dir, project_name, z, ach, status="done",
+                                       finished_at=now_iso(), uv_fingerprint=uv_fingerprint)
             if on_combo_done:
                 on_combo_done(z, ach, "done", trimmed)
         except StoppedByUser:
+            _update_combo_status_safe(project_dir, project_name, z, ach, status="stopped", finished_at=now_iso())
             raise
         except Exception as e:
             combo_log_fn(f"ERROR: {e}")
+            _update_combo_status_safe(project_dir, project_name, z, ach, status="error",
+                                       error_message=str(e), finished_at=now_iso())
             if on_combo_done:
                 on_combo_done(z, ach, "error", str(e))
 
@@ -1160,4 +1609,4 @@ def run_sweep(guv_path, settings_path, project_dir, room, settings, adv,
     finally:
         # Written even on StoppedByUser/a partial sweep - a summary of
         # whatever combinations did finish is more useful than none.
-        write_sweep_summary_csv(project_dir, project_name, combos)
+        write_sweep_summary_csv(project_dir, project_name)

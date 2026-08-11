@@ -43,17 +43,7 @@ def get_params():
         except ValueError:
             print("Invalid number")
 
-    # Volume
-    while True:
-        try:
-            volume = float(input("Room volume [m^3] (e.g., 30): "))
-            if volume > 0:
-                break
-            print("Volume must be positive")
-        except ValueError:
-            print("Invalid number")
-
-    return {"ach": ach, "volume": volume}
+    return {"ach": ach}
 
 def run_rtd_analysis(case_dir, params):
     """Extract and display RTD from age field."""
@@ -91,7 +81,7 @@ def run_rtd_analysis(case_dir, params):
 
     # RTD extraction
     rtd = rtd_from_age_field(age_values, n_bins=50)
-    integral = np.trapz(rtd['E_t'], rtd['bin_centers'])
+    integral = np.trapezoid(rtd['E_t'], rtd['bin_centers'])
 
     print("Residence Time Distribution (RTD):")
     print(f"  Bins:      {len(rtd['bin_centers'])}")
@@ -99,7 +89,7 @@ def run_rtd_analysis(case_dir, params):
     print(f"  Integral:  {integral:.4f} (should ~ 1.0)\n")
 
     # ASHRAE effectiveness
-    mixing = ashrae_air_change_effectiveness(age_values, params['ach'], params['volume'])
+    mixing = ashrae_air_change_effectiveness(age_values, params['ach'])
     print("ASHRAE Air-Change Effectiveness:")
     print(f"  Target ACH:      {params['ach']:.1f} 1/hr")
     print(f"  Effective ACH:   {mixing['effective_ach']:.2f} 1/hr")
@@ -116,9 +106,8 @@ def run_rtd_analysis(case_dir, params):
     print("RTD ANALYSIS COMPLETE")
     print("="*70 + "\n")
 
-    print("For full dose-distribution analysis with Z parameter:")
-    print("  Run: python tracer_demo.py <case> --ach {ach} --volume {volume} --Z 6")
-    print("  (Requires lamp geometry configuration)")
+    print("For full dose-distribution analysis (table + plots), run:")
+    print("  python tracer_dose_report.py <case>")
 
     return True
 

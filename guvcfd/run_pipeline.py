@@ -7,7 +7,7 @@ via manual WSL shell-outs, this ties into one command.
 """
 import json
 import re
-import shutil
+import time
 from pathlib import Path
 
 from guv_calcs import Project
@@ -23,6 +23,7 @@ from .initial_fields import (
 )
 from .mesh_gen import (
     write_mesh_dicts, write_map_fields_dict, opening_center, opening_half_extents, opening_grid_alignment,
+    opening_actual_area, write_decompose_par_dict, suggest_opening_size_fix, suggest_opening_center_fix,
 )
 from .monitoring import write_vol_average_dict
 from .visualization import center_frac_for_wall
@@ -38,6 +39,10 @@ from .splice import (
 )
 from .wsl_utils import (
     wsl_path as _wsl_path,
+    windows_path_to_wsl_mnt as _windows_path_to_wsl_mnt,
+    ensure_case_subdir as _ensure_case_subdir,
+    write_case_file as _write_case_file,
+    read_case_file as _read_case_file,
     run_wsl as _run_wsl,
     run_wsl_or_raise as _run_wsl_or_raise,
     run_wsl_streaming as _run_wsl_streaming,
@@ -66,8 +71,7 @@ class FlowConvergenceUndecided(Exception):
         self.total_iterations = total_iterations
 
 
-def _history_path(case_dir):
-    return f"{case_dir}/flow_convergence_history.json"
+_HISTORY_RELATIVE_PATH = "flow_convergence_history.json"
 
 
 def _load_history(case_dir):
@@ -79,20 +83,23 @@ def _load_history(case_dir):
     the process itself going away - leaves enough on disk to (a) diagnose
     what actually happened and (b) resume without losing the oscillation-
     acceptance check's accumulated evidence.
+
+    Read/written via _read_case_file/_write_case_file (WSL-native for a
+    real case_dir), not plain Windows-side open() - confirmed directly
+    2026-08-03: a genuine multi-hour flow convergence lost its entire
+    resumability this way (every _save_history() call "succeeded" with no
+    exception, but the file was never actually durable to WSL, so a crash
+    elsewhere left _load_history() seeing nothing at all - see
+    wsl_utils.write_wsl_text's docstring for why).
     """
-    path = _history_path(case_dir)
-    if not Path(path).exists():
-        return []
     try:
-        with open(path) as f:
-            return json.load(f)
-    except (json.JSONDecodeError, OSError):
+        return json.loads(_read_case_file(case_dir, _HISTORY_RELATIVE_PATH))
+    except (json.JSONDecodeError, OSError, RuntimeError):
         return []
 
 
 def _save_history(case_dir, history):
-    with open(_history_path(case_dir), "w") as f:
-        json.dump(history, f, indent=2)
+    _write_case_file(case_dir, _HISTORY_RELATIVE_PATH, json.dumps(history, indent=2))
 
 
 def _oscillation_diagnostic(history, window, growth_tol, rel_tol, n_iterations, check_field):
@@ -200,7 +207,8 @@ def _is_stable_oscillation(history, window, growth_tol):
 def converge_flow_field(case_dir, n_iterations=500, fan_entry=None, log_fn=print,
                          max_iterations=20000, check_field="p", rel_tol=0.01, should_stop=None,
                          method="simple", oscillation_window=6, oscillation_growth_tol=1.5,
-                         solver_log_fn=None, resume=False, should_pause=None, skip_potential_flow=False):
+                         solver_log_fn=None, resume=False, should_pause=None, skip_potential_flow=False,
+                         n_procs=None):
     """Run simpleFoam to actually converge the flow field on this mesh,
     starting from whatever is in 0/ (e.g. a mapFields warm start), then copy
     the result back into 0/ so it becomes pimpleFoam's starting point.
@@ -308,9 +316,31 @@ def converge_flow_field(case_dir, n_iterations=500, fan_entry=None, log_fn=print
     run used to hit). potentialFoam also ignores fvOptions entirely, so it
     can't see a sealed case's only real driving force (the fan) anyway -
     there's nothing useful for it to compute here, just risk.
+
+    n_procs: None (default) runs the solver serially, exactly as before.
+    An integer N decomposes the mesh into N subdomains (decomposeParDict,
+    scotch method - no geometric coefficients needed) once up front, then
+    every chunk: re-decomposes only the current 0/ field data (fast -
+    `decomposePar -fields`, not a full mesh redecomposition, since only
+    the fields change between chunks, not the mesh), runs
+    `mpirun -np N {solver} -parallel`, and reconstructs back into a single
+    serial time directory (`reconstructPar -latestTime`) before returning
+    control to the rest of this loop - every downstream step (volAverage
+    read, field copy-back to 0/, cleanup) then sees an ordinary serial
+    case directory, unchanged from the n_procs=None path. Independent of
+    `method` - "simple"+parallel and "lts"+parallel are both valid
+    combinations. Untested against a real solve as of the day this was
+    added - verify on a real case before trusting it for anything that
+    matters.
     """
     case_dir_wsl = _wsl_path(case_dir)
     solver = "pimpleFoam" if method == "lts" else "simpleFoam"
+    solver_cmd = f"mpirun -np {n_procs} {solver} -parallel" if n_procs else solver
+
+    if n_procs:
+        log_fn(f"Decomposing mesh into {n_procs} subdomains for parallel solving (scotch method)...")
+        write_decompose_par_dict(case_dir, n_procs)
+        _run_wsl_or_raise("decomposePar -force", case_dir_wsl, "decomposePar")
 
     log_fn(f"Flow-convergence budget: {max_iterations} iterations max, in chunks of {n_iterations}...")
 
@@ -378,9 +408,38 @@ def converge_flow_field(case_dir, n_iterations=500, fan_entry=None, log_fn=print
             log_fn(f"Running {solver} iterations {total_run + 1}-{chunk_end} "
                    f"(chunk size {n_iterations})...")
             set_control_dict_time(case_dir, end_time=n_iterations, write_interval=n_iterations, delta_t=1)
+            # Verify the write actually landed before launching the solver -
+            # confirmed directly (2026-08-04) that set_control_dict_time's
+            # own WSL-native write can still, in the REAL chunk-loop
+            # sequence (not reproducible in isolation), leave a
+            # subsequently-launched separate WSL process seeing a stale
+            # endTime - exact mechanism not pinned down despite real
+            # investigation, but this closes the gap regardless of cause,
+            # which matters more given how expensive this exact failure
+            # mode already was today (see the safety-net check just below,
+            # added earlier the same day for the same reason).
+            for attempt in range(5):
+                r = _run_wsl('grep -oE "endTime[[:space:]]+[0-9.]+" system/controlDict | '
+                             'grep -oE "[0-9.]+$"', case_dir_wsl)
+                if r.stdout.strip() == str(n_iterations):
+                    break
+                time.sleep(1)
+            else:
+                raise RuntimeError(
+                    f"set_control_dict_time wrote endTime={n_iterations} but it never became visible "
+                    f"after 5 retries (last read: {r.stdout.strip()!r}) - not launching {solver} against "
+                    f"a controlDict that may still have a stale endTime.")
+
+            if n_procs:
+                # Only the field data changes between chunks (mesh is fixed,
+                # decomposed once above) - `-fields` re-decomposes just 0/
+                # onto the existing processorN/ mesh split, far cheaper than
+                # a full redecomposition every chunk.
+                _run_wsl_or_raise("decomposePar -fields -time 0 -force", case_dir_wsl,
+                                   "decomposePar (fields)")
 
             r = _run_wsl_streaming(
-                f"{solver} 2>&1 | tee log.{solver}", case_dir_wsl,
+                f"{solver_cmd} 2>&1 | tee log.{solver}", case_dir_wsl,
                 on_line=solver_log_fn or log_fn, should_stop=should_stop, kill_pattern=solver,
                 should_pause=should_pause,
             )
@@ -390,6 +449,10 @@ def converge_flow_field(case_dir, n_iterations=500, fan_entry=None, log_fn=print
                 tail = "\n".join(r.stdout.splitlines()[-25:]) or "(no output captured)"
                 raise RuntimeError(f"{solver} failed (exit {r.returncode}):\n{tail}")
 
+            if n_procs:
+                log_fn("  Reconstructing parallel result into a single serial time directory...")
+                _run_wsl_or_raise("reconstructPar -latestTime", case_dir_wsl, "reconstructPar")
+
             r = _run_wsl_or_raise(
                 "ls -d [0-9]*/ 2>/dev/null | sed 's#/##' | sort -n | tail -1",
                 case_dir_wsl, "listing time directories",
@@ -397,6 +460,22 @@ def converge_flow_field(case_dir, n_iterations=500, fan_entry=None, log_fn=print
             latest = r.stdout.strip()
             if not latest or latest == "0":
                 raise RuntimeError(f"{solver} did not write any new time directory (found: {latest!r})")
+            # `latest` is a RELATIVE per-chunk value, not cumulative - every
+            # chunk restarts from "0/" (holding the previous chunk's
+            # results, relabeled) and runs to endTime=n_iterations again
+            # (set just above), by design, so `latest` should always equal
+            # n_iterations exactly. (Earlier version of this code derived
+            # total_run from `latest` directly, on the wrong assumption
+            # that endTime accumulated across chunks like chunk_end does -
+            # it doesn't; that broke real progress tracking, since `latest`
+            # legitimately stays at n_iterations forever.) Checking it here
+            # instead - not equal to n_iterations means the endTime write
+            # or the solve itself didn't do what was requested, which is
+            # exactly the failure this used to silently mask.
+            if latest != str(n_iterations):
+                raise RuntimeError(
+                    f"{solver} chunk expected to reach time {n_iterations} but reached {latest!r} instead - "
+                    f"endTime write may not have taken effect, or the solver stopped early.")
             total_run = chunk_end
 
             _run_wsl_or_raise("rm -rf postProcessing", case_dir_wsl, "clearing stale postProcessing")
@@ -599,9 +678,7 @@ def check_ach_delivery(case_dir, room_volume, ach, outlet_patches=("outlet",), t
     within_tolerance is True iff ratio is within [1-tol, 1+tol].
     """
     case_dir_wsl = _wsl_path(case_dir)
-    flow_rate_dict_path = f"{case_dir}/system/flowRateDict"
-    with open(flow_rate_dict_path, "w") as f:
-        f.write(_flow_rate_dict(outlet_patches))
+    _write_case_file(case_dir, "system/flowRateDict", _flow_rate_dict(outlet_patches))
 
     r = _run_wsl_or_raise("postProcess -dict system/flowRateDict -latestTime", case_dir_wsl,
                            "measuring delivered ACH (outlet flow rate)")
@@ -689,6 +766,86 @@ def check_settings_grid_alignment(settings, room, cell_size, source_size=None, t
     return mismatches
 
 
+def walk_opening_alignment_conflicts(settings, room, cell_size, tol=1e-6):
+    """Yields ONE grid-alignment conflict at a time, across Inlet/Outlet
+    (always) and 2nd inlet/2nd outlet (only when their own -enable flag is
+    set) - the contaminant source zone is NOT covered here, it stays on
+    check_settings_grid_alignment's existing bulk check (a single
+    symmetric cube has no width/height/position-pair/wall-center-bias
+    distinction for this per-opening flow to add value to).
+
+    Each yielded item is a dict:
+        {"opening": "Inlet"|"Outlet"|"2nd inlet"|"2nd outlet",
+         "kind": "size"|"center",
+         "field_id": <settings key this fix would update, e.g. "inlet-size-w">,
+         "axis_label": "width"|"height"|"position 1"|"position 2",
+         "current": <float, meters>, "suggested": <float, meters>}
+
+    Size conflicts for an opening are always yielded before its center
+    conflicts (see mesh_gen.suggest_opening_center_fix's own docstring for
+    why - a center fix is only meaningful once the size it's computed
+    against is an actual exact multiple of cell_size).
+
+    Drive with next()/send(agree: bool) - prime with next(), then
+    gen.send(True/False) per decision. agree=True makes `suggested` the
+    value in effect for anything computed AFTER it (e.g. a size fix
+    feeds into that same axis's own subsequent center check); agree=False
+    keeps `current` in effect. Declining a SIZE conflict on an axis
+    silently skips that axis's own CENTER conflict (mathematically, a
+    non-cell-multiple size can never have both edges land on the grid
+    regardless of center - see suggest_opening_center_fix's docstring).
+    Ends naturally via StopIteration (the generator protocol) once every
+    enabled opening's conflicts are exhausted.
+    """
+    def _walk_one_opening(name, prefix):
+        wall = settings[f"{prefix}-wall"]
+        center_frac = center_frac_for_wall(wall, settings[f"{prefix}-y-input"], settings[f"{prefix}-z-input"], room)
+        nominal_size = (settings[f"{prefix}-size-w"], settings[f"{prefix}-size-h"])
+        suggested_size = suggest_opening_size_fix(nominal_size, cell_size)
+
+        effective_size = list(nominal_size)
+        size_axis_ok = [True, True]
+        size_field_ids = (f"{prefix}-size-w", f"{prefix}-size-h")
+        size_axis_labels = ("width", "height")
+
+        for i in range(2):
+            if abs(suggested_size[i] - nominal_size[i]) <= tol:
+                continue
+            agree = yield {
+                "opening": name, "kind": "size", "field_id": size_field_ids[i],
+                "axis_label": size_axis_labels[i],
+                "current": nominal_size[i], "suggested": suggested_size[i],
+            }
+            if agree:
+                effective_size[i] = suggested_size[i]
+            else:
+                size_axis_ok[i] = False
+
+        (cur1, cur2), (sug1, sug2) = suggest_opening_center_fix(
+            wall, room.x, room.y, room.z, center_frac, tuple(effective_size), cell_size)
+        center_field_ids = (f"{prefix}-y-input", f"{prefix}-z-input")
+        center_axis_labels = ("position 1", "position 2")
+        currents, suggesteds = (cur1, cur2), (sug1, sug2)
+
+        for i in range(2):
+            if not size_axis_ok[i] or abs(suggesteds[i] - currents[i]) <= tol:
+                continue
+            yield {
+                "opening": name, "kind": "center", "field_id": center_field_ids[i],
+                "axis_label": center_axis_labels[i],
+                "current": currents[i], "suggested": suggesteds[i],
+            }
+
+    for name, prefix, enabled in [
+        ("Inlet", "inlet", True),
+        ("Outlet", "outlet", True),
+        ("2nd inlet", "inlet2", bool(settings.get("inlet2-enable"))),
+        ("2nd outlet", "outlet2", bool(settings.get("outlet2-enable"))),
+    ]:
+        if enabled:
+            yield from _walk_one_opening(name, prefix)
+
+
 def setup_case(guv_path, case_dir, template_case_dir=None, cell_size=0.1, Z=2.0, nbins=25,
                source_field="T", map_from_case=None, map_from_time=0, ach=3.0,
                inlet_wall="xMin", inlet_center=(0.5, 0.85), inlet_size=(0.3, 0.3),
@@ -698,14 +855,14 @@ def setup_case(guv_path, case_dir, template_case_dir=None, cell_size=0.1, Z=2.0,
                inlet2_diffuser_type="direct",
                outlet2_wall=None, outlet2_center=None, outlet2_size=None,
                converge_flow=True, simple_foam_iterations=500, flow_convergence_method="simple",
-               flow_rel_tol=0.01, flow_max_iterations=20000,
+               flow_rel_tol=0.01, flow_max_iterations=20000, n_procs=None,
                oscillation_window=6, oscillation_growth_tol=1.5, ach_delivery_tol=0.10,
                momentum_relaxation=None, scalar_relaxation=None,
                scalar_transport_ncorr=None, scalar_transport_tolerance=None,
-               pimple_end_time=120, pimple_write_interval=10, pimple_delta_t=0.5,
+               pimple_end_time=120, pimple_write_interval=10, pimple_delta_t=0.5, max_co=None,
                fan_speed=None, fan_center=None, fan_direction=(0, 0, -1),
                fan_disk_radius=0.6, fan_disk_thickness=0.2, fan_height=None,
-               sealed=False,
+               sealed=False, mechanical_ach_only=False,
                log_fn=print, should_stop=None, solver_log_fn=None, should_pause=None):
     """Set up an OpenFOAM case end-to-end from a .guv project. Returns a dict
     summarizing the run (room dims, lamp count, fluence/k ranges, zone count).
@@ -801,6 +958,14 @@ def setup_case(guv_path, case_dir, template_case_dir=None, cell_size=0.1, Z=2.0,
     ACH-delivery check is skipped (there's no ventilation to measure).
     Requires fan_speed - a sealed room with no fan has no driving force at
     all.
+
+    mechanical_ach_only: True to skip the fluence/inactivation-rate/cellZone/
+    fvOptions UV pipeline entirely (see _finish_case_setup) and write an
+    empty constant/fvOptions instead - for a pure ventilation-only study
+    (e.g. no UV lamps yet, or deliberately ignoring UV present in the
+    project) where there's nothing physical to bin. Independent of sealed
+    and of the project's actual lamp count - this is a user choice, not a
+    derived one.
     """
     if sealed and fan_speed is None:
         raise ValueError("A sealed room (ach<=0) needs a mixing fan (fan_speed) - "
@@ -810,23 +975,36 @@ def setup_case(guv_path, case_dir, template_case_dir=None, cell_size=0.1, Z=2.0,
     case_dir_wsl = _wsl_path(case_dir)
     summary = {}
 
-    Path(case_dir).mkdir(parents=True, exist_ok=True)
-    Path(f"{case_dir}/case.foam").touch()
+    # Everything a brand-new case directory needs (the directory tree itself,
+    # case.foam, and the static template config files) is created via ONE
+    # WSL-native command rather than Windows-side pathlib/shutil. Confirmed
+    # 2026-08-03 (see wsl_utils.windows_path_to_wsl_mnt's docstring): writes
+    # to a *newly created* directory/file made from the Windows side through
+    # \\wsl.localhost\... aren't reliably durable to the actual WSL
+    # filesystem - a real sweep lost an entire freshly-created case tree
+    # this way (blockMesh's `cd` into it failed with "No such file or
+    # directory" despite Python having reported the mkdir/copy as
+    # successful). Once a directory is genuinely established WSL-side,
+    # subsequent Windows<->WSL access into it is fine (that's the pattern
+    # the rest of this pipeline already relies on, e.g. write_mesh_dicts
+    # below writing into system/ right after this).
+    setup_cmd = (f'mkdir -p "{case_dir_wsl}/system" "{case_dir_wsl}/constant" '
+                 f'&& touch "{case_dir_wsl}/case.foam"')
+    if template_case_dir is not None:
+        template_wsl = _windows_path_to_wsl_mnt(str(template_case_dir))
+        for name in ("controlDict", "fvSchemes", "fvSolution", "volAverageDict"):
+            setup_cmd += (f' ; cp "{template_wsl}/system/{name}" '
+                          f'"{case_dir_wsl}/system/{name}" 2>/dev/null')
+        for name in ("transportProperties", "turbulenceProperties"):
+            setup_cmd += (f' ; cp "{template_wsl}/constant/{name}" '
+                          f'"{case_dir_wsl}/constant/{name}" 2>/dev/null')
+        setup_cmd += " ; true"
+    _run_wsl_or_raise(setup_cmd, "/", "create case directory")
     log_fn("Touched case.foam (ParaView marker file) - present from the start so it's "
            "there regardless of whether this run finishes, fails, or gets interrupted.")
 
     if template_case_dir is not None:
-        log_fn(f"Copying static config from {template_case_dir} ...")
-        Path(f"{case_dir}/system").mkdir(parents=True, exist_ok=True)
-        Path(f"{case_dir}/constant").mkdir(parents=True, exist_ok=True)
-        for name in ("controlDict", "fvSchemes", "fvSolution", "volAverageDict"):
-            src = Path(f"{template_case_dir}/system/{name}")
-            if src.exists():
-                shutil.copy(src, f"{case_dir}/system/{name}")
-        for name in ("transportProperties", "turbulenceProperties"):
-            src = Path(f"{template_case_dir}/constant/{name}")
-            if src.exists():
-                shutil.copy(src, f"{case_dir}/constant/{name}")
+        log_fn(f"Copied static config from {template_case_dir}")
         if momentum_relaxation is not None or scalar_relaxation is not None:
             set_relaxation_factors(case_dir, momentum_factor=momentum_relaxation,
                                     scalar_factor=scalar_relaxation)
@@ -897,10 +1075,12 @@ def setup_case(guv_path, case_dir, template_case_dir=None, cell_size=0.1, Z=2.0,
         inlet_velocity = (0.0, 0.0, 0.0)
         inlet2_velocity = (0.0, 0.0, 0.0) if inlet2_wall is not None else None
     else:
-        openings = [(inlet_wall, inlet_size[0] * inlet_size[1])]
+        openings = [opening_actual_area(inlet_wall, room.x, room.y, room.z, inlet_center, inlet_size,
+                                         cell_size=cell_size)]
         if inlet2_wall is not None:
-            openings.append((inlet2_wall, inlet2_size[0] * inlet2_size[1]))
-        total_area = sum(a for _, a in openings)
+            openings.append(opening_actual_area(inlet2_wall, room.x, room.y, room.z, inlet2_center, inlet2_size,
+                                                  cell_size=cell_size))
+        total_area = sum(openings)
         v_mag = compute_inlet_velocity(ach, room_volume, total_area)
 
         # Mesh already exists at this point (blockMesh/topoSet/createPatch
@@ -929,7 +1109,7 @@ def setup_case(guv_path, case_dir, template_case_dir=None, cell_size=0.1, Z=2.0,
                + (f", inlet2 ({inlet2_diffuser_type})" if inlet2_velocity else "")
                + f" (room volume={room_volume:.3g} m^3, total inlet area="
                f"{total_area:.3g} m^2)...")
-    Path(f"{case_dir}/0").mkdir(parents=True, exist_ok=True)
+    _ensure_case_subdir(case_dir, "0")
     write_initial_fields(case_dir, inlet_velocity=inlet_velocity, inlet2_velocity=inlet2_velocity,
                           has_outlet2=has_outlet2, sealed=sealed)
     summary["ach"] = ach
@@ -964,7 +1144,8 @@ def setup_case(guv_path, case_dir, template_case_dir=None, cell_size=0.1, Z=2.0,
             log_fn=log_fn, should_stop=should_stop, method=flow_convergence_method,
             rel_tol=flow_rel_tol, max_iterations=flow_max_iterations,
             oscillation_window=oscillation_window, oscillation_growth_tol=oscillation_growth_tol,
-            solver_log_fn=solver_log_fn, should_pause=should_pause, skip_potential_flow=sealed)
+            solver_log_fn=solver_log_fn, should_pause=should_pause, skip_potential_flow=sealed,
+            n_procs=n_procs)
         summary["flow_converged"] = flow_converged
         if should_stop is not None and should_stop():
             raise StoppedByUser("Stopped after flow convergence.")
@@ -982,57 +1163,83 @@ def setup_case(guv_path, case_dir, template_case_dir=None, cell_size=0.1, Z=2.0,
                 case_dir, room_volume, ach, outlet_patches=outlet_patches, tol=ach_delivery_tol, log_fn=log_fn)
 
     return _finish_case_setup(case_dir, room, Z, nbins, source_field, fan_entry,
-                               pimple_end_time, pimple_write_interval, pimple_delta_t, log_fn, summary)
+                               pimple_end_time, pimple_write_interval, pimple_delta_t, log_fn, summary,
+                               max_co=max_co, mechanical_ach_only=mechanical_ach_only)
 
 
 def _finish_case_setup(case_dir, room, Z, nbins, source_field, fan_entry,
-                        pimple_end_time, pimple_write_interval, pimple_delta_t, log_fn, summary):
+                        pimple_end_time, pimple_write_interval, pimple_delta_t, log_fn, summary,
+                        max_co=None, mechanical_ach_only=False):
     """Everything setup_case() does after flow convergence is resolved
     (converged, accepted, or explicitly overridden by the user) - factored
     out so resume_case_setup() can reach the exact same steps after
     resolving a previously-undecided flow convergence, without repeating
     (or having to keep in sync by hand) mesh generation, initial-field
     writing, or the flow-convergence call itself.
+
+    mechanical_ach_only: skip the fluence/inactivation-rate/cellZone/
+    fvOptions binning below entirely (there's nothing physical to bin - see
+    setup_case's own docstring) and write an empty constant/fvOptions
+    instead, same as ventilation_control.prepare_ventilation_only_control
+    does for its (normally secondary) UV-off control clone - here it's the
+    ONLY thing that runs, not a paired control.
     """
     case_dir_wsl = _wsl_path(case_dir)
-    ach = summary.get("ach")
 
-    log_fn("Computing fluence rate at cell centers...")
-    points = read_cell_centers(case_dir, "0")
-    values = compute_fluence_at_points(room, points)
-    log_fn(f"  {len(points)} cells, fluence rate range [{values.min():.4g}, {values.max():.4g}], "
-           f"mean {values.mean():.4g}")
-    summary["n_cells"] = len(points)
-    summary["fluence_range"] = (float(values.min()), float(values.max()))
-    summary["fluence_mean"] = float(values.mean())
-    patch_names = read_boundary_patch_names(case_dir)
-    write_scalar_field(case_dir, "fluenceRate", values, patch_names)
+    if mechanical_ach_only:
+        log_fn("Mechanical ACH only: skipping fluence/inactivation-rate/cellZone binning - "
+               "writing an empty constant/fvOptions (no UV source)...")
+        summary["fluence_range"] = None
+        summary["fluence_mean"] = None
+        summary["k_range"] = None
+        summary["eACH_uv_well_mixed_mean"] = 0.0
+        summary["eACH_uv_well_mixed_range"] = None
+        summary["n_zones"] = 0
+        write_fvoptions_file(case_dir, [])
+        set_function_object_enabled(case_dir, "scalarTransport1", True)
+        if fan_entry is not None:
+            log_fn("  Appending fan entry to fvOptions (stays active for the pimpleFoam phase too)...")
+            existing_fvoptions = _read_case_file(case_dir, "constant/fvOptions")
+            _write_case_file(case_dir, "constant/fvOptions", existing_fvoptions + fan_entry)
+    else:
+        ach = summary.get("ach")
 
-    log_fn(f"Computing inactivation rate (Z={Z})...")
-    k_values = compute_inactivation_rate(values, Z)
-    summary["k_range"] = (float(k_values.min()), float(k_values.max()))
-    write_scalar_field(case_dir, "kUV", k_values, patch_names)
+        log_fn("Computing fluence rate at cell centers...")
+        points = read_cell_centers(case_dir, "0")
+        values = compute_fluence_at_points(room, points)
+        log_fn(f"  {len(points)} cells, fluence rate range [{values.min():.4g}, {values.max():.4g}], "
+               f"mean {values.mean():.4g}")
+        summary["n_cells"] = len(points)
+        summary["fluence_range"] = (float(values.min()), float(values.max()))
+        summary["fluence_mean"] = float(values.mean())
+        patch_names = read_boundary_patch_names(case_dir)
+        write_scalar_field(case_dir, "fluenceRate", values, patch_names)
 
-    eACH_values = compute_well_mixed_eACH(k_values)
-    summary["eACH_uv_well_mixed_mean"] = float(eACH_values.mean())
-    summary["eACH_uv_well_mixed_range"] = (float(eACH_values.min()), float(eACH_values.max()))
-    log_fn(f"  eACH_UV well-mixed (volume-averaged) = {summary['eACH_uv_well_mixed_mean']:.4g} /hr "
-           f"(vs. ventilation ach={ach} /hr)")
+        log_fn(f"Computing inactivation rate (Z={Z})...")
+        k_values = compute_inactivation_rate(values, Z)
+        summary["k_range"] = (float(k_values.min()), float(k_values.max()))
+        write_scalar_field(case_dir, "kUV", k_values, patch_names)
 
-    log_fn(f"Binning into {nbins} cellZones...")
-    bin_idx, bin_repr = bin_decay_rates(k_values, nbins)
-    zone_names, _ = write_cellzones(case_dir, bin_idx, nbins)
-    write_fvoptions(case_dir, zone_names, bin_repr, field_name=source_field)
-    summary["n_zones"] = int(sum(1 for b in range(len(zone_names)) if (bin_idx == b).any() and b > 0))
+        eACH_values = compute_well_mixed_eACH(k_values)
+        summary["eACH_uv_well_mixed_mean"] = float(eACH_values.mean())
+        summary["eACH_uv_well_mixed_range"] = (float(eACH_values.min()), float(eACH_values.max()))
+        log_fn(f"  eACH_UV well-mixed (volume-averaged) = {summary['eACH_uv_well_mixed_mean']:.4g} /hr "
+               f"(vs. ventilation ach={ach} /hr)")
 
-    if fan_entry is not None:
-        log_fn("  Re-carving fan cellZone (write_cellzones() above overwrote constant/polyMesh/cellZones "
-               "from scratch, wiping it - topoSet's own merge behavior restores it deterministically, "
-               "same cylinder selection since the mesh hasn't changed)...")
-        _run_wsl_or_raise("topoSet -dict system/fanTopoSetDict", case_dir_wsl, "topoSet (restore fan zone)")
-        log_fn("  Appending fan entry to fvOptions (stays active for the pimpleFoam phase too)...")
-        with open(f"{case_dir}/constant/fvOptions", "a") as f:
-            f.write(fan_entry)
+        log_fn(f"Binning into {nbins} cellZones...")
+        bin_idx, bin_repr = bin_decay_rates(k_values, nbins)
+        zone_names, _ = write_cellzones(case_dir, bin_idx, nbins)
+        write_fvoptions(case_dir, zone_names, bin_repr, field_name=source_field)
+        summary["n_zones"] = int(sum(1 for b in range(len(zone_names)) if (bin_idx == b).any() and b > 0))
+
+        if fan_entry is not None:
+            log_fn("  Re-carving fan cellZone (write_cellzones() above overwrote constant/polyMesh/cellZones "
+                   "from scratch, wiping it - topoSet's own merge behavior restores it deterministically, "
+                   "same cylinder selection since the mesh hasn't changed)...")
+            _run_wsl_or_raise("topoSet -dict system/fanTopoSetDict", case_dir_wsl, "topoSet (restore fan zone)")
+            log_fn("  Appending fan entry to fvOptions (stays active for the pimpleFoam phase too)...")
+            existing_fvoptions = _read_case_file(case_dir, "constant/fvOptions")
+            _write_case_file(case_dir, "constant/fvOptions", existing_fvoptions + fan_entry)
 
     log_fn("Splicing fvOptions into controlDict...")
     _, n_open, n_close = splice_fv_options_into_control_dict(case_dir)
@@ -1043,7 +1250,7 @@ def _finish_case_setup(case_dir, room, Z, nbins, source_field, fan_entry,
     log_fn(f"Setting pimpleFoam transient run parameters: endTime={pimple_end_time}s, "
            f"writeInterval={pimple_write_interval}s, deltaT={pimple_delta_t}s...")
     set_control_dict_time(case_dir, end_time=pimple_end_time,
-                           write_interval=pimple_write_interval, delta_t=pimple_delta_t)
+                           write_interval=pimple_write_interval, delta_t=pimple_delta_t, max_co=max_co)
     summary["pimple_end_time"] = pimple_end_time
     summary["pimple_write_interval"] = pimple_write_interval
 
@@ -1060,8 +1267,8 @@ def resume_case_setup(case_dir, guv_path, decision, ach, Z, nbins=25, source_fie
                        simple_foam_iterations=500, flow_convergence_method="simple",
                        flow_rel_tol=0.01, oscillation_window=6, oscillation_growth_tol=1.5,
                        ach_delivery_tol=0.10,
-                       pimple_end_time=120, pimple_write_interval=10, pimple_delta_t=0.5,
-                       fan_speed=None, fan_direction=(0, 0, -1),
+                       pimple_end_time=120, pimple_write_interval=10, pimple_delta_t=0.5, max_co=None,
+                       fan_speed=None, fan_direction=(0, 0, -1), mechanical_ach_only=False,
                        log_fn=print, should_stop=None, solver_log_fn=None, should_pause=None):
     """Resume a case directory whose flow convergence previously raised
     FlowConvergenceUndecided - reuses the existing mesh, 0/ fields, and
@@ -1097,10 +1304,12 @@ def resume_case_setup(case_dir, guv_path, decision, ach, Z, nbins=25, source_fie
         summary["fan"] = {"speed": fan_speed, "direction": fan_direction}
 
     room_volume = room.x * room.y * room.z
-    openings = [(inlet_wall, inlet_size[0] * inlet_size[1])]
+    openings = [opening_actual_area(inlet_wall, room.x, room.y, room.z, inlet_center, inlet_size,
+                                     cell_size=cell_size)]
     if inlet2_wall is not None:
-        openings.append((inlet2_wall, inlet2_size[0] * inlet2_size[1]))
-    v_mag = compute_inlet_velocity(ach, room_volume, sum(a for _, a in openings))
+        openings.append(opening_actual_area(inlet2_wall, room.x, room.y, room.z, inlet2_center, inlet2_size,
+                                              cell_size=cell_size))
+    v_mag = compute_inlet_velocity(ach, room_volume, sum(openings))
     inlet_velocity = resolve_inlet_velocity(
         case_dir, "inlet", inlet_wall,
         opening_center(inlet_wall, room.x, room.y, room.z, inlet_center, inlet_size, cell_size=cell_size),
@@ -1157,4 +1366,5 @@ def resume_case_setup(case_dir, guv_path, decision, ach, Z, nbins=25, source_fie
         case_dir, room_volume, ach, outlet_patches=outlet_patches, tol=ach_delivery_tol, log_fn=log_fn)
 
     return _finish_case_setup(case_dir, room, Z, nbins, source_field, fan_entry,
-                               pimple_end_time, pimple_write_interval, pimple_delta_t, log_fn, summary)
+                               pimple_end_time, pimple_write_interval, pimple_delta_t, log_fn, summary,
+                               max_co=max_co, mechanical_ach_only=mechanical_ach_only)

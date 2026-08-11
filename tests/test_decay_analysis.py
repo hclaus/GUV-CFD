@@ -106,9 +106,9 @@ def test_compute_effective_eACH_propagates_ventilation_baseline_uncertainty():
 
 def test_write_results_summary_adds_corrected_fields_only_when_measured_given(tmp_path):
     case_dir = tmp_path / "case"
-    (case_dir / "postProcessing" / "volAverage1" / "0").mkdir(parents=True)
+    (case_dir / "postProcessing" / "volAverageLive1" / "0").mkdir(parents=True)
     t, T = _synthetic_decay(0.005)
-    dat_path = case_dir / "postProcessing" / "volAverage1" / "0" / "volFieldValue.dat"
+    dat_path = case_dir / "postProcessing" / "volAverageLive1" / "0" / "volFieldValue.dat"
     with open(dat_path, "w") as f:
         f.write("# Region\n# Cells\n# Volume\n# Time\tvolAverage(T)\n")
         for ti, Ti in zip(t, T):
@@ -151,9 +151,9 @@ def test_mechanical_mixing_efficiency_pct_none_when_either_input_missing():
 
 def test_write_results_summary_stores_mechanical_mixing_efficiency(tmp_path):
     case_dir = tmp_path / "case"
-    (case_dir / "postProcessing" / "volAverage1" / "0").mkdir(parents=True)
+    (case_dir / "postProcessing" / "volAverageLive1" / "0").mkdir(parents=True)
     t, T = _synthetic_decay(0.005)
-    dat_path = case_dir / "postProcessing" / "volAverage1" / "0" / "volFieldValue.dat"
+    dat_path = case_dir / "postProcessing" / "volAverageLive1" / "0" / "volFieldValue.dat"
     with open(dat_path, "w") as f:
         f.write("# Region\n# Cells\n# Volume\n# Time\tvolAverage(T)\n")
         for ti, Ti in zip(t, T):

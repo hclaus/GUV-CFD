@@ -9,6 +9,8 @@ CSV/interpolation.
 """
 import numpy as np
 
+from .wsl_utils import write_case_file as _write_case_file
+
 
 def bin_decay_rates(k_values, nbins):
     """Bin per-cell decay rates into nbins log-spaced groups (plus a zero bin).
@@ -75,8 +77,7 @@ def write_cellzones(case_dir, bin_idx, nbins):
     lines.append("")
 
     path = f"{case_dir}/constant/polyMesh/cellZones"
-    with open(path, "w") as f:
-        f.write("\n".join(lines))
+    _write_case_file(case_dir, "constant/polyMesh/cellZones", "\n".join(lines))
 
     return zone_names, path
 
@@ -121,6 +122,5 @@ def write_fvoptions(case_dir, zone_names, bin_repr, field_name="T"):
         lines.append("")
 
     path = f"{case_dir}/constant/fvOptions"
-    with open(path, "w") as f:
-        f.write("\n".join(lines))
+    _write_case_file(case_dir, "constant/fvOptions", "\n".join(lines))
     return path

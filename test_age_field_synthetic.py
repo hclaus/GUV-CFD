@@ -47,7 +47,7 @@ def test_rtd_extraction():
     print(f"  Peak E(t): {rtd['E_t'].max():.4e} s^-1")
 
     # Check normalization
-    integral = np.trapz(rtd['E_t'], rtd['bin_centers'])
+    integral = np.trapezoid(rtd['E_t'], rtd['bin_centers'])
     print(f"  Integral E(t)dt: {integral:.4f} (should ~ 1.0)")
 
     if abs(integral - 1.0) > 0.1:
@@ -64,17 +64,16 @@ def test_ashrae_effectiveness():
     print("TEST 2: ASHRAE Air-Change Effectiveness")
     print(f"{'='*70}\n")
 
-    # Well-mixed room scenario: all cells have same age = room_volume / flow_rate
-    room_volume = 30.0  # m^3
+    # Well-mixed room scenario: mean age = 3600 / target_ACH, independent of
+    # room volume (see ashrae_air_change_effectiveness's docstring).
     target_ach = 6.0    # 1/hr
-    mean_age_well_mixed = room_volume / (target_ach / 3600.0)  # seconds
+    mean_age_well_mixed = 3600.0 / target_ach  # seconds
 
     age_perfect = np.full(1000, mean_age_well_mixed)
-    mixing = ashrae_air_change_effectiveness(age_perfect, target_ach, room_volume)
+    mixing = ashrae_air_change_effectiveness(age_perfect, target_ach)
 
     print(f"Perfect mixing scenario:")
     print(f"  Target ACH: {target_ach} 1/hr")
-    print(f"  Volume:     {room_volume} m³")
     print(f"  Mean age:   {mixing['mean_age']:.1f} s")
     print(f"  Effective ACH: {mixing['effective_ach']:.2f} 1/hr")
     print(f"  Effectiveness (ε_a): {mixing['effectiveness']:.2%}")
@@ -86,7 +85,7 @@ def test_ashrae_effectiveness():
 
     # Poor mixing scenario: longer mean age = slower effective ACH
     age_poor = np.full(1000, mean_age_well_mixed * 2)  # 2x mean age
-    mixing_poor = ashrae_air_change_effectiveness(age_poor, target_ach, room_volume)
+    mixing_poor = ashrae_air_change_effectiveness(age_poor, target_ach)
 
     print(f"Poor mixing scenario (2× mean age):")
     print(f"  Effective ACH: {mixing_poor['effective_ach']:.2f} 1/hr")
@@ -133,7 +132,7 @@ def test_dose_distribution_and_inactivation():
     bin_centers, E_D = dose_distribution_function(bin_edges, bin_counts)
 
     # Check normalization
-    integral = np.trapz(E_D, bin_centers)
+    integral = np.trapezoid(E_D, bin_centers)
     print(f"Dose distribution E(D):")
     print(f"  Bins: {len(bin_centers)}")
     print(f"  ∫E(D)dD: {integral:.4f} (should ~ 1.0)")

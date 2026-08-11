@@ -1,0 +1,14 @@
+{
+  "name": "control_maxco_10",
+  "max_co": 10,
+  "outcome": "ok",
+  "wall_clock_s": 9781.464977264404,
+  "measured_ach": 2.599933211802516,
+  "measured_ach_ci95": [
+    2.5968199029143135,
+    2.603046520690718
+  ],
+  "lambda_per_s": 0.0007222036699451433,
+  "se_per_s": 4.131858984989735e-07,
+  "n_points": 21
+}

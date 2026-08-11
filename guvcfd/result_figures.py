@@ -7,6 +7,25 @@ import math
 import plotly.graph_objs as go
 
 
+def _missing_curve_data_figure(message):
+    """Placeholder for when the loaded result genuinely has no curve data
+    to plot - e.g. a sweep's own trimmed per-combo report.json
+    (scenario_runs._trim_report/_trim_decay_report deliberately strips
+    "live"/"decay_curve" from these, keeping only the scalar summary
+    numbers - by design, to keep a multi-combination sweep's disk usage
+    sane). That file is still perfectly valid for the summary metrics
+    table (a separate function, _steady_state_summary/_decay_summary in
+    app.py) - only the curve plot itself has nothing to show, so this
+    degrades gracefully instead of raising and taking the whole tab down
+    with it (confirmed live: loading one of these crashed the entire
+    Analysis tab with a bare KeyError, hiding even the summary numbers
+    that WERE available).
+    """
+    return go.Figure(layout=dict(
+        annotations=[dict(text=message, showarrow=False, font=dict(size=16, color="#888"))],
+    ))
+
+
 def _window_rect_and_line(fig, t, T_ss1, T_ss, window_span, color, shift=0.0):
     """Shade the trailing moving-average window (see decay_analysis.
     windowed_stats) on a phase's curve and mark its mean - same visual
@@ -37,13 +56,27 @@ def steady_state_figure(result):
     to the old sparse decay_curve for results.json predating live tracking.
     """
     p1, p2 = result["phase1"], result["phase2"]
+    if not (("live" in p1 or "decay_curve" in p1) and ("live" in p2 or "decay_curve" in p2)):
+        # A sweep's trimmed per-combo report.json (see
+        # scenario_runs._trim_report) - summary numbers only, no curve
+        # data at all in either phase, by design.
+        return _missing_curve_data_figure(
+            "No curve data in this file - it looks like a sweep's trimmed per-combination "
+            "report.json (summary numbers only). Load that combination's own results.json "
+            "(in its subfolder) instead to see the curve."
+        )
     T_ss1 = p1["T_ss"] or 1.0
-    curve1 = p1.get("live", p1["decay_curve"])
+    # NOT p1.get("live", p1["decay_curve"]) - dict.get's default argument is
+    # evaluated eagerly regardless of whether "live" is present, so that
+    # form always requires "decay_curve" to exist even when it's never
+    # actually used - crashes with KeyError on any result that has "live"
+    # but genuinely lacks "decay_curve".
+    curve1 = p1["live"] if "live" in p1 else p1["decay_curve"]
     t1 = curve1["t"]
     T1 = curve1["T"]
     t1_end = t1[-1] if t1 else 0.0
 
-    curve2 = p2.get("live", p2["decay_curve"])
+    curve2 = p2["live"] if "live" in p2 else p2["decay_curve"]
     t2 = curve2["t"]
     T2 = curve2["T"]
     t2_shifted = [t1_end + v for v in t2]
@@ -81,6 +114,15 @@ def decay_figure(result):
     since decay is exponential - a straight line here is a pure exponential,
     and curvature/kinks reveal where the real mixing deviates from one.
     """
+    if "decay_curve" not in result:
+        # A sweep's trimmed per-combo report.json (see
+        # scenario_runs._trim_decay_report) - summary numbers only, the
+        # top-level decay_curve is deliberately stripped.
+        return _missing_curve_data_figure(
+            "No curve data in this file - it looks like a sweep's trimmed per-combination "
+            "report.json (summary numbers only). Load that combination's own results.json "
+            "(in its subfolder) instead to see the curve."
+        )
     curve = result["decay_curve"]
     t, T = curve["t_seconds"], curve["volAverage_T"]
     T0 = T[0] if T else 1.0

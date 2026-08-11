@@ -43,6 +43,27 @@ rather than guessed.
 - OpenFOAM `fvOptions` User Guide.
   https://www.openfoam.com/documentation/guides/latest/doc/guide-fvoptions.html
 
+## Ventilation effectiveness / age-of-air (ASHRAE 129, Sandberg)
+
+See `AGE_OF_AIR_VS_UV_EFFECTIVENESS.md` for the full discussion - why this
+framework can't be directly combined with UV dose/effectiveness (a
+passive, first-moment RTD statistic vs. a spatially-reactive dose
+integral), and how this project's `age_analysis.py`/`lagrangian_tracking.py`
+already build toward the actual reactive generalization.
+
+- ANSI/ASHRAE 129-1997 (RA 2002) - Measuring Air-Change Effectiveness.
+  Defines local mean age of air, nominal time constant (`tau_n = V/Q`),
+  and Air Change Effectiveness (`E = tau_n / tau_p_bar`) via tracer-gas
+  procedures.
+  https://webstore.ansi.org/standards/ashrae/ansiashrae1291997ra2002
+
+- "A new method for air exchange efficiency assessment including natural
+  and mixed mode ventilation" (PMC). Source of the precise mean-age
+  integral formula and Sandberg's related-but-distinct "air exchange
+  efficiency" index (`epsilon_a = tau_n / (2*tau_bar)`, normalized so
+  perfect mixing = 50% and ideal displacement flow = 100%).
+  https://pmc.ncbi.nlm.nih.gov/articles/PMC8511897/
+
 ## Decay-mode vs. steady-state-mode rate constants (Z / k / eACH)
 
 - First MW, Rudnick SN, Banahan KF, Vincent RL, Brickner PW (2007),

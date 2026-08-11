@@ -23,13 +23,15 @@ from pathlib import Path
 from guv_calcs import Project
 
 from .. import scenario_runs
-from ..app_settings import load_advanced_settings
-from ..case_io import read_latest_time_field
+from ..app_settings import load_advanced_settings, merge_project_openfoam_settings, capture_openfoam_settings
+from ..case_io import read_latest_time_field, snapshot_openfoam_settings
 from ..decay_analysis import (
     mechanical_mixing_efficiency_pct, spatial_coefficient_of_variation, write_results_summary,
 )
 from ..fan import fan_fvoptions_entry
 from ..initial_fields import compute_inlet_velocities
+from ..mesh_gen import opening_actual_area
+from ..monitoring import splice_live_vol_average_if_needed
 from ..monitoring_points import compute_monitoring_results
 from ..run_pipeline import setup_case
 from ..splice import set_control_dict_time
@@ -239,10 +241,10 @@ def _setup_case_common(state, guv_path, case_dir, room, settings, adv):
         scalar_transport_tolerance=adv["scalar-transport-tolerance"],
         pimple_end_time=settings.get("pimple-end-time", 120),
         pimple_write_interval=settings.get("pimple-write-interval", 10),
-        pimple_delta_t=adv["pimple-delta-t"],
+        pimple_delta_t=adv["pimple-delta-t"], max_co=adv["max-co"],
         log_fn=state.log_fn, should_stop=state.should_stop, solver_log_fn=state.solver_log_fn,
         should_pause=state.should_pause,
-        sealed=settings["ach"] <= 0,
+        sealed=settings["ach"] <= 0, mechanical_ach_only=bool(settings.get("mech-ach-only")),
         **helpers.fan_kwargs(settings),
         **helpers.second_opening_kwargs(settings, "inlet2", room),
         **helpers.second_opening_kwargs(settings, "outlet2", room),
@@ -250,7 +252,8 @@ def _setup_case_common(state, guv_path, case_dir, room, settings, adv):
 
 
 def _run_decay(state, guv_path, case_dir, room, settings):
-    adv = load_advanced_settings()
+    adv = merge_project_openfoam_settings(settings, load_advanced_settings())
+    capture_openfoam_settings(settings, adv)
     _save_run_settings(case_dir, settings, guv_path)
     state.log_fn("=== Setting up mesh, flow field, and UV zones ===")
     summary = _setup_case_common(state, guv_path, case_dir, room, settings, adv)
@@ -258,6 +261,8 @@ def _run_decay(state, guv_path, case_dir, room, settings):
         raise StoppedByUser("Stopped after case setup.")
 
     sealed = settings["ach"] <= 0
+    mech_ach_only = bool(settings.get("mech-ach-only"))
+    skip_control = sealed or mech_ach_only
     case_dir_wsl = wsl_path(case_dir)
     control_dir = f"{case_dir}/no_UV"
     control_dir_wsl = wsl_path(control_dir)
@@ -266,65 +271,78 @@ def _run_decay(state, guv_path, case_dir, room, settings):
         settings["ach"], summary["eACH_uv_well_mixed_mean"], adv)
     write_interval = max(1, settings.get("pimple-write-interval", 10))
     set_control_dict_time(case_dir, end_time=combined_end_time,
-                           write_interval=write_interval, delta_t=adv["pimple-delta-t"])
+                           write_interval=write_interval, delta_t=adv["pimple-delta-t"], max_co=adv["max-co"])
+    splice_live_vol_average_if_needed(case_dir)
 
     if state.should_stop():
         raise StoppedByUser("Stopped before pimpleFoam.")
     if sealed:
         state.log_fn("Sealed room: skipping the UV-off control run - ventilation-only decay "
                       "rate is exactly 0 by construction (no opening for mass to leave through).")
+    elif mech_ach_only:
+        state.log_fn("Mechanical ACH only: skipping the UV-off control run - this run's own decay "
+                     "curve (empty UV source) already IS the ventilation-only measurement.")
     else:
         state.log_fn('=== Preparing UV-off control ("no_UV") ===')
         has_inlet2 = bool(settings.get("inlet2-enable"))
         prepare_ventilation_only_control(
-            case_dir, control_dir, settings["ach"], room.x, room.y, room.z,
-            settings["inlet-wall"], (settings["inlet-size-w"], settings["inlet-size-h"]),
-            control_end_time, write_interval, pimple_delta_t=adv["pimple-delta-t"],
-            inlet2_wall=settings["inlet2-wall"] if has_inlet2 else None,
-            inlet2_size=(settings["inlet2-size-w"], settings["inlet2-size-h"]) if has_inlet2 else None,
+            case_dir, control_dir, summary["inlet_velocity"],
+            control_end_time, write_interval, pimple_delta_t=adv["pimple-delta-t"], max_co=adv["max-co"],
+            inlet2_velocity=summary.get("inlet2_velocity") if has_inlet2 else None,
             has_outlet2=bool(settings.get("outlet2-enable")),
             sealed=False, log_fn=state.log_fn, should_stop=state.should_stop,
         )
 
     state.log_fn(f"Running pimpleFoam: UV-on ({combined_end_time}s)"
-                 + ("" if sealed else f" + UV-off control ({control_end_time}s)") + "...")
+                 + ("" if skip_control else f" + UV-off control ({control_end_time}s)") + "...")
     state.begin_phase(combined_end_time)
-    r_uv, r_control = _run_decay_pair(state, case_dir_wsl, None if sealed else control_dir_wsl)
+    r_uv, r_control = _run_decay_pair(
+        state, case_dir_wsl, None if skip_control else control_dir_wsl,
+        combined_end_time=combined_end_time, control_end_time=None if skip_control else control_end_time)
     if state.should_stop():
         raise StoppedByUser("Stopped during pimpleFoam.")
-    runs = [("UV-on", r_uv)] if sealed else [("UV-on", r_uv), ("UV-off control", r_control)]
+    runs = [("UV-on", r_uv)] if skip_control else [("UV-on", r_uv), ("UV-off control", r_control)]
     for label, r in runs:
         if r.returncode != 0 or "FOAM FATAL" in r.stdout or "Floating Point Exception" in r.stdout:
             tail = "\n".join(r.stdout.splitlines()[-25:]) or "(no output captured)"
             raise RuntimeError(f"{label} pimpleFoam failed (exit {r.returncode}):\n{tail}")
-
-    state.log_fn("Running postProcess volAverage...")
-    run_wsl_or_raise("postProcess -dict system/volAverageDict", case_dir_wsl, "postProcess volAverage")
 
     try:
         spatial_cov = spatial_coefficient_of_variation(read_latest_time_field(case_dir, "T"))
     except Exception:
         spatial_cov = None
 
-    if sealed:
-        control_results = {"total_ach_effective": 0.0}
+    if mech_ach_only:
+        state.log_fn("Writing results summary (mechanical ACH only - no separate control run to "
+                     "correct against; total_ach_effective is this run's own measured rate)...")
+        results = write_results_summary(
+            case_dir, f"{case_dir}/results.json", settings["ach"], 0.0,
+            extra={
+                "n_lamps": summary["n_lamps"], "fluence_mean": summary["fluence_mean"],
+                "flow_converged": summary.get("flow_converged"), "ach_delivery": summary.get("ach_delivery"),
+                "spatial_cov_final": spatial_cov,
+            },
+        )
     else:
-        state.log_fn("=== Post-processing UV-off control ===")
-        control_results = finish_ventilation_only_control(control_dir, settings["ach"], log_fn=state.log_fn)
+        if sealed:
+            control_results = {"total_ach_effective": 0.0}
+        else:
+            state.log_fn("=== Post-processing UV-off control ===")
+            control_results = finish_ventilation_only_control(control_dir, settings["ach"], log_fn=state.log_fn)
 
-    state.log_fn("Writing results summary...")
-    results = write_results_summary(
-        case_dir, f"{case_dir}/results.json", settings["ach"], summary["eACH_uv_well_mixed_mean"],
-        extra={
-            "n_lamps": summary["n_lamps"], "fluence_mean": summary["fluence_mean"],
-            "flow_converged": summary.get("flow_converged"), "ach_delivery": summary.get("ach_delivery"),
-            "spatial_cov_final": spatial_cov,
-        },
-        measured_ventilation_ach=control_results["total_ach_effective"],
-        measured_ventilation_ach_ci95=control_results.get("total_ach_effective_ci95"),
-        measured_ventilation_ach_se_per_s=control_results.get("fit_se_per_s"),
-        measured_ventilation_fit_dof=(control_results["fit_n"] - 2) if control_results.get("fit_n") else None,
-    )
+        state.log_fn("Writing results summary...")
+        results = write_results_summary(
+            case_dir, f"{case_dir}/results.json", settings["ach"], summary["eACH_uv_well_mixed_mean"],
+            extra={
+                "n_lamps": summary["n_lamps"], "fluence_mean": summary["fluence_mean"],
+                "flow_converged": summary.get("flow_converged"), "ach_delivery": summary.get("ach_delivery"),
+                "spatial_cov_final": spatial_cov,
+            },
+            measured_ventilation_ach=control_results["total_ach_effective"],
+            measured_ventilation_ach_ci95=control_results.get("total_ach_effective_ci95"),
+            measured_ventilation_ach_se_per_s=control_results.get("fit_se_per_s"),
+            measured_ventilation_fit_dof=(control_results["fit_n"] - 2) if control_results.get("fit_n") else None,
+        )
 
     points = helpers.gather_monitoring_points(settings)
     if points:
@@ -338,18 +356,18 @@ def _run_decay(state, guv_path, case_dir, room, settings):
                  f"(well-mixed={results['eACH_uv_well_mixed']:.4g} /hr)")
 
 
-def _run_decay_pair(state, case_dir_wsl, control_dir_wsl):
+def _run_decay_pair(state, case_dir_wsl, control_dir_wsl, combined_end_time=None, control_end_time=None):
     """Run UV-on (and, unless control_dir_wsl is None, the UV-off control)
     pimpleFoam solves concurrently - see guvcfd.app._run_decay_pair for the
     identical design this mirrors."""
     results = {}
     errors = {}
 
-    def run_one(name, cwd_wsl, on_line, log_prefix):
+    def run_one(name, cwd_wsl, on_line, log_prefix, total_time):
         try:
             callback = scenario_runs._throttled_solver_callback(
                 state.log_fn, log_prefix, on_line=on_line,
-                status_fn=state.live_status_fn, status_key=log_prefix)
+                status_fn=state.live_status_fn, status_key=log_prefix, total_time=total_time)
             results[name] = run_wsl_streaming(
                 "pimpleFoam 2>&1 | tee log.pimpleFoam", cwd_wsl,
                 on_line=callback, should_stop=state.should_stop, kill_pattern="pimpleFoam",
@@ -360,9 +378,11 @@ def _run_decay_pair(state, case_dir_wsl, control_dir_wsl):
         finally:
             state.live_status_fn(log_prefix, None)
 
-    threads = [threading.Thread(target=run_one, args=("uv", case_dir_wsl, state.solver_log_fn, "UV-on"))]
+    threads = [threading.Thread(target=run_one,
+                                 args=("uv", case_dir_wsl, state.solver_log_fn, "UV-on", combined_end_time))]
     if control_dir_wsl is not None:
-        threads.append(threading.Thread(target=run_one, args=("control", control_dir_wsl, None, "control")))
+        threads.append(threading.Thread(target=run_one,
+                                         args=("control", control_dir_wsl, None, "control", control_end_time)))
     for th in threads:
         th.start()
     for th in threads:
@@ -375,7 +395,8 @@ def _run_decay_pair(state, case_dir_wsl, control_dir_wsl):
 def _run_steady_state(state, guv_path, case_dir, room, settings):
     if settings["ach"] <= 0:
         raise ValueError("Sealed-room / ACH<=0 is only supported in Decay mode.")
-    adv = load_advanced_settings()
+    adv = merge_project_openfoam_settings(settings, load_advanced_settings())
+    capture_openfoam_settings(settings, adv)
     _save_run_settings(case_dir, settings, guv_path)
 
     state.log_fn("=== Setting up mesh, flow field, and UV zones ===")
@@ -389,11 +410,18 @@ def _run_steady_state(state, guv_path, case_dir, room, settings):
         fan_entry = fan_fvoptions_entry(settings["fan-speed"], direction=direction)
 
     room_volume = room.x * room.y * room.z
+    cell_size = adv["mesh-cell-size"]
     has_inlet2 = bool(settings.get("inlet2-enable"))
     has_outlet2 = bool(settings.get("outlet2-enable"))
-    openings = [(settings["inlet-wall"], settings["inlet-size-w"] * settings["inlet-size-h"])]
+    openings = [(settings["inlet-wall"],
+                 opening_actual_area(settings["inlet-wall"], room.x, room.y, room.z,
+                                      helpers.opening_center_frac(settings, "inlet", room),
+                                      (settings["inlet-size-w"], settings["inlet-size-h"]), cell_size))]
     if has_inlet2:
-        openings.append((settings["inlet2-wall"], settings["inlet2-size-w"] * settings["inlet2-size-h"]))
+        openings.append((settings["inlet2-wall"],
+                          opening_actual_area(settings["inlet2-wall"], room.x, room.y, room.z,
+                                               helpers.opening_center_frac(settings, "inlet2", room),
+                                               (settings["inlet2-size-w"], settings["inlet2-size-h"]), cell_size)))
     velocities = compute_inlet_velocities(settings["ach"], room_volume, openings)
     inlet_velocity = velocities[0]
     inlet2_velocity = velocities[1] if has_inlet2 else None
@@ -444,6 +472,10 @@ def _run_steady_state(state, guv_path, case_dir, room, settings):
     result["flow_converged"] = summary.get("flow_converged")
     result["ach_delivery"] = summary.get("ach_delivery")
     result["mechanical_mixing_efficiency_pct"] = mechanical_mixing_efficiency_pct(result)
+    try:
+        snapshot_openfoam_settings(case_dir)
+    except Exception:
+        pass  # archival only - never block a results.json write over it
     with open(f"{case_dir}/results.json", "w") as f:
         json.dump(result, f, indent=2)
     state.results = result

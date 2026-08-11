@@ -4,12 +4,13 @@ Demo script: extract RTD and dose distribution from an OpenFOAM case
 with the new age-of-air tracer field.
 
 Usage:
-    python tracer_demo.py <case_dir> [--ach ACH] [--volume VOLUME] [--Z Z]
+    python tracer_demo.py <case_dir> [--ach ACH] [--Z Z]
 
 Example:
-    python tracer_demo.py /path/to/case --ach 6 --volume 30 --Z 6
+    python tracer_demo.py /path/to/case --ach 6 --Z 6
 
-Note: Z is the sensitivity parameter [cm²/mJ]; k is computed as k = Z * E_avg * 1e-3.
+Note: Z is the dose-based sensitivity parameter [cm²/mJ], applied directly
+as exp(-Z*D) where D is dose [mJ/cm²] - see dose_distribution.py.
 """
 import argparse
 import json
@@ -23,14 +24,12 @@ from guvcfd.age_analysis import (
     ashrae_air_change_effectiveness
 )
 from guvcfd.dose_distribution import (
-    compute_dose_at_cells, build_dose_distribution,
-    dose_distribution_function, segregated_flow_inactivation
+    compute_dose_at_cells, build_dose_distribution, dose_distribution_function,
 )
-from guvcfd.fluence import compute_fluence_at_points
-from guvcfd.case_io import read_cell_centers, latest_time_dir
+from guvcfd.case_io import read_cell_centers, read_openfoam_scalar_field
 
 
-def demo_rtd_extraction(case_dir, target_ach=None, room_volume=None):
+def demo_rtd_extraction(case_dir, target_ach=None):
     """Extract and display RTD from age field."""
     print(f"\n{'='*60}")
     print("TRACER ANALYSIS: Age-of-Air Field → Residence Time Distribution")
@@ -56,12 +55,12 @@ def demo_rtd_extraction(case_dir, target_ach=None, room_volume=None):
     # RTD extraction
     rtd = rtd_from_age_field(age_values, n_bins=50)
     print(f"Residence Time Distribution (50 bins):")
-    print(f"  ∫ E(t) dt     ≈ {np.trapz(rtd['E_t'], rtd['bin_centers']):.4f}")
+    print(f"  ∫ E(t) dt     ≈ {np.trapezoid(rtd['E_t'], rtd['bin_centers']):.4f}")
     print(f"  Peak E(t):    {rtd['E_t'].max():.4e} s⁻¹\n")
 
-    # ASHRAE effectiveness (if ACH and volume given)
-    if target_ach is not None and room_volume is not None:
-        mixing = ashrae_air_change_effectiveness(age_values, target_ach, room_volume)
+    # ASHRAE effectiveness (if ACH given)
+    if target_ach is not None:
+        mixing = ashrae_air_change_effectiveness(age_values, target_ach)
         print(f"ASHRAE Air-Change Effectiveness (target {target_ach} ACH):")
         print(f"  Effective ACH: {mixing['effective_ach']:.2f} 1/hr")
         print(f"  Effectiveness: ε_a = {mixing['effectiveness']:.2%}")
@@ -80,31 +79,28 @@ def demo_dose_distribution(case_dir, age_values, Z=6.0):
     print(f"{'='*60}\n")
 
     try:
-        # Read cell geometry
-        time_dir = latest_time_dir(case_dir)
-        cell_centers = read_cell_centers(case_dir, time_dir)
+        # fluenceRate is already computed and written to disk during normal
+        # case setup (run_pipeline._finish_case_setup) - read it directly
+        # instead of recomputing via guv_calcs (which needs a loaded Room
+        # with lamp geometry, not just a case_dir path).
+        fluence_rate = np.asarray(read_openfoam_scalar_field(f"{case_dir}/0/fluenceRate"))
+        cell_centers = read_cell_centers(case_dir, "0")
     except Exception as e:
-        print(f"WARNING: Could not read cell centers: {e}")
-        print("  Skipping dose distribution (requires cell center data)")
+        print(f"WARNING: Could not read fluenceRate/cell centers: {e}")
+        print("  Skipping dose distribution (case must have been through normal case setup)")
         return None
 
-    try:
-        fluence_rate = compute_fluence_at_points(case_dir, cell_centers)
-    except Exception as e:
-        print(f"WARNING: Could not compute fluence: {e}")
-        print("  (Make sure lamp geometry is configured)")
-        return None
-
-    # Compute dose
+    # Compute dose (fluence [uW/cm²] x age [s] x 1e-3 = mJ/cm²)
     dose_values = compute_dose_at_cells(fluence_rate, age_values)
     print(f"Computed {len(dose_values)} cell doses from fluence × age")
 
-    # Compute k from Z and mean fluence
     mean_fluence_uW_cm2 = np.mean(fluence_rate)
-    k = Z * mean_fluence_uW_cm2 * 1e-3  # k [1/s] = Z [cm²/mJ] * E [uW/cm²] * 1e-3
     print(f"  Mean fluence rate:  {mean_fluence_uW_cm2:.2f} uW/cm²")
-    print(f"  Sensitivity Z:      {Z} cm²/mJ")
-    print(f"  Computed k:         {k:.4f} 1/s\n")
+    print(f"  Sensitivity Z:      {Z} cm²/mJ\n")
+    # Z [cm²/mJ] is applied directly as the dose-based inactivation constant
+    # (exp(-Z*D), D in mJ/cm²) - NOT re-derived into a time-rate constant,
+    # since dose already incorporates both fluence and residence time.
+    k = Z
 
     # Dose statistics
     dose_stats = {
@@ -118,20 +114,26 @@ def demo_dose_distribution(case_dir, age_values, Z=6.0):
     print(f"  Std dev:      {dose_stats['std']:.4f} mJ/cm²")
     print(f"  Min / Max:    {dose_stats['min']:.4f} / {dose_stats['max']:.4f} mJ/cm²\n")
 
-    # Dose distribution
+    # Dose distribution (for display only - see below for the inactivation
+    # prediction itself, which doesn't use these bins)
     bin_edges, bin_counts = build_dose_distribution(dose_values, n_bins=50)
     bin_centers, E_D = dose_distribution_function(bin_edges, bin_counts)
 
     print(f"Dose Distribution (50 bins):")
-    print(f"  ∫ E(D) dD     ≈ {np.trapz(E_D, bin_centers):.4f}\n")
+    print(f"  ∫ E(D) dD     ≈ {np.trapezoid(E_D, bin_centers):.4f}\n")
 
-    # Segregated-flow inactivation prediction
-    N_over_N0 = segregated_flow_inactivation(bin_centers, E_D, k)
+    # segregated_flow_inactivation's fixed-width histogram integral is too
+    # coarse for a right-skewed dose field (most cells near D~0, long tail) -
+    # it can collapse the low-dose region into one wide bin and OVER-predict
+    # kill, even violating Jensen's inequality (a heterogeneous dose field
+    # can only predict LESS kill than its own mean dose, never more, since
+    # exp(-Z*D) is convex). Average exp(-Z*D) directly over every cell's own
+    # dose instead - no binning error.
+    N_over_N0 = float(np.mean(np.exp(-k * dose_values)))
     log_reduction = -np.log10(max(N_over_N0, 1e-10))
 
     print(f"Segregated-Flow Model Inactivation Prediction:")
     print(f"  Pathogen Z:   {Z} cm²/mJ")
-    print(f"  Computed k:   {k:.4f} 1/s")
     print(f"  N/N₀:         {N_over_N0:.4e}")
     print(f"  Log reduction: {log_reduction:.2f} (i.e., 10^{-log_reduction:.1f} kill)")
     print(f"  Survival:     {100 * N_over_N0:.2%}\n")
@@ -172,8 +174,6 @@ def main():
     parser.add_argument("case_dir", help="Path to OpenFOAM case directory")
     parser.add_argument("--ach", type=float, default=None,
                         help="Nominal ventilation ACH [1/hr] (for effectiveness calculation)")
-    parser.add_argument("--volume", type=float, default=None,
-                        help="Room volume [m³] (for effectiveness calculation)")
     parser.add_argument("--Z", type=float, default=6.0,
                         help="Sensitivity parameter [cm²/mJ] (default: 6)")
     args = parser.parse_args()
@@ -184,7 +184,7 @@ def main():
         sys.exit(1)
 
     # RTD extraction
-    age_values = demo_rtd_extraction(case_path, args.ach, args.volume)
+    age_values = demo_rtd_extraction(case_path, args.ach)
     if age_values is None:
         sys.exit(1)
 

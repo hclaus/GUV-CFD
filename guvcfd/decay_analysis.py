@@ -13,21 +13,52 @@ import numpy as np
 from scipy import stats
 from scipy.optimize import curve_fit, OptimizeWarning
 
+from .case_io import snapshot_openfoam_settings as _snapshot_openfoam_settings
+from .wsl_utils import wsl_path as _wsl_path, read_wsl_text as _read_wsl_text, write_case_file as _write_case_file
+
 
 def read_vol_average_dat(path):
     """Parse postProcessing/volAverage1/<time>/volFieldValue.dat.
 
     Returns (t, values) arrays, skipping the '# ...' header lines.
+
+    Read via a WSL-native process when `path` is a real \\\\wsl.localhost\\...
+    path, not a plain Windows-side open() - this file is freshly rewritten
+    by a WSL-native `postProcess` call (via converge_flow_field's
+    `rm -rf postProcessing; postProcess -dict system/volAverageDict`)
+    immediately before every read, and that combination hits the same
+    cross-boundary visibility gap documented in wsl_utils.write_wsl_text -
+    confirmed directly: a real multi-hour flow convergence crashed here
+    with FileNotFoundError on chunk ~16, after 15 identical reads had
+    already succeeded (it's low-probability per attempt, not consistently
+    broken, which is why it took that long to surface). Falls back to a
+    plain read for non-WSL paths (e.g. test fixtures).
     """
+    path_for_wsl = _wsl_path(path)
+    if path_for_wsl != path:
+        content = _read_wsl_text(path_for_wsl)
+    else:
+        with open(path) as f:
+            content = f.read()
     t, values = [], []
-    with open(path) as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            parts = re.split(r"\s+", line)
-            t.append(float(parts[0]))
-            values.append(float(parts[1]))
+    for line in content.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = re.split(r"\s+", line)
+        if len(parts) < 2:
+            # A torn/incomplete trailing line - confirmed directly: even
+            # though postProcess has already returned by the time this
+            # reads its output, a fresh WSL-native `cat` from a separate
+            # process can still see a not-yet-fully-settled last line (the
+            # same filesystem-consistency category as the cross-boundary
+            # gap above, just WSL-internal this time). The caller only
+            # ever wants the latest COMPLETE row (converge_flow_field uses
+            # vals[-1]) - skipping one malformed trailing line costs
+            # nothing real, unlike raising and losing the whole chunk.
+            continue
+        t.append(float(parts[0]))
+        values.append(float(parts[1]))
     return np.array(t), np.array(values)
 
 
@@ -402,7 +433,7 @@ def mechanical_mixing_efficiency_pct(result):
 
 
 def write_results_summary(case_dir, out_path, ventilation_ach, well_mixed_eACH_mean,
-                           vol_average_dat="postProcessing/volAverage1/0/volFieldValue.dat",
+                           vol_average_dat="postProcessing/volAverageLive1/0/volFieldValue.dat",
                            extra=None, measured_ventilation_ach=None,
                            measured_ventilation_ach_ci95=None,
                            measured_ventilation_ach_se_per_s=None,
@@ -485,6 +516,16 @@ def write_results_summary(case_dir, out_path, ventilation_ach, well_mixed_eACH_m
 
     summary["mechanical_mixing_efficiency_pct"] = mechanical_mixing_efficiency_pct(summary)
 
-    with open(out_path, "w") as f:
-        json.dump(summary, f, indent=2)
+    try:
+        _snapshot_openfoam_settings(case_dir)
+    except Exception:
+        pass  # archival only - never block a results.json write over it
+
+    content = json.dumps(summary, indent=2)
+    prefix = f"{case_dir}/"
+    if out_path.startswith(prefix):
+        _write_case_file(case_dir, out_path[len(prefix):], content)
+    else:
+        with open(out_path, "w") as f:
+            f.write(content)
     return summary

@@ -14,6 +14,8 @@ import math
 import numpy as np
 
 from .case_io import read_patch_face_centers
+from .mesh_gen import opening_actual_area, opening_center, opening_half_extents
+from .wsl_utils import write_case_file as _write_case_file, read_case_file as _read_case_file
 
 _WALL_PATCHES = ("xMinWall", "xMaxWall", "floor", "ceiling", "frontWall", "backWall")
 
@@ -252,6 +254,60 @@ def resolve_inlet_velocity(case_dir, patch_name, wall, opening_center, v_mag, di
     raise ValueError(f"Unknown diffuser_type: {diffuser_type!r} (expected 'direct' or 'ceiling')")
 
 
+def resolve_case_inlet_velocities(case_dir, room, ach, cell_size, inlet_wall, inlet_center, inlet_size,
+                                   inlet_diffuser_type="direct", inlet2_wall=None, inlet2_center=None,
+                                   inlet2_size=None, inlet2_diffuser_type="direct", sealed=False):
+    """(inlet_velocity, inlet2_velocity) for an already-meshed case_dir -
+    the single source of truth for turning ACH + opening geometry into a
+    velocity, used by every caller that needs it: setup_case's own initial
+    write, resume_case_setup (after a flow-convergence pause), and
+    scenario_runs._build_flow_base's "already flow-converged, reuse it"
+    shortcut (which skips setup_case entirely, but still needs this same
+    velocity for prepare_ventilation_only_control's clone downstream - see
+    that function's own docstring for why it now takes velocity directly
+    instead of recomputing it a third way).
+
+    Deliberately factored out after two independent copies of this same
+    calculation existed at once (setup_case's own inline version and
+    resume_case_setup's near-identical copy) and had already started to
+    matter for correctness (see mesh_gen.opening_actual_area's own
+    docstring for the inlet-velocity-area bug this guards against) -
+    a single shared function can't silently drift out of sync with itself
+    the way copy-pasted inline logic already had.
+
+    Stateless and cheap (pure geometry + a local polyMesh face-center read
+    for "ceiling" diffusers, no WSL round-trip beyond that) - safe to call
+    repeatedly, including from a "reuse the existing case" shortcut that
+    never runs setup_case's own WSL-heavy steps at all.
+    """
+    if sealed:
+        return (0.0, 0.0, 0.0), ((0.0, 0.0, 0.0) if inlet2_wall is not None else None)
+
+    room_volume = room.x * room.y * room.z
+    openings = [opening_actual_area(inlet_wall, room.x, room.y, room.z, inlet_center, inlet_size,
+                                     cell_size=cell_size)]
+    if inlet2_wall is not None:
+        openings.append(opening_actual_area(inlet2_wall, room.x, room.y, room.z, inlet2_center, inlet2_size,
+                                              cell_size=cell_size))
+    v_mag = compute_inlet_velocity(ach, room_volume, sum(openings))
+
+    inlet_velocity = resolve_inlet_velocity(
+        case_dir, "inlet", inlet_wall,
+        opening_center(inlet_wall, room.x, room.y, room.z, inlet_center, inlet_size, cell_size=cell_size),
+        v_mag, diffuser_type=inlet_diffuser_type,
+        half_extents=opening_half_extents(inlet_wall, room.x, room.y, room.z, inlet_center, inlet_size,
+                                           cell_size=cell_size))
+    inlet2_velocity = None
+    if inlet2_wall is not None:
+        inlet2_velocity = resolve_inlet_velocity(
+            case_dir, "inlet2", inlet2_wall,
+            opening_center(inlet2_wall, room.x, room.y, room.z, inlet2_center, inlet2_size, cell_size=cell_size),
+            v_mag, diffuser_type=inlet2_diffuser_type,
+            half_extents=opening_half_extents(inlet2_wall, room.x, room.y, room.z, inlet2_center, inlet2_size,
+                                               cell_size=cell_size))
+    return inlet_velocity, inlet2_velocity
+
+
 _FIELD_SPECS = {
     "U": {
         "foam_class": "volVectorField",
@@ -436,9 +492,9 @@ def write_initial_fields(case_dir, time_dir="0", inlet_velocity=(0.278, 0, 0), T
     paths = {}
     for field_name in _FIELD_SPECS:
         path = f"{case_dir}/{time_dir}/{field_name}"
-        with open(path, "w") as f:
-            f.write(field_file_content(field_name, time_dir, inlet_velocity=inlet_velocity, T_initial=T_initial,
-                                        inlet2_velocity=inlet2_velocity, has_outlet2=has_outlet2, sealed=sealed))
+        content = field_file_content(field_name, time_dir, inlet_velocity=inlet_velocity, T_initial=T_initial,
+                                      inlet2_velocity=inlet2_velocity, has_outlet2=has_outlet2, sealed=sealed)
+        _write_case_file(case_dir, f"{time_dir}/{field_name}", content)
         paths[field_name] = path
     return paths
 
@@ -472,18 +528,17 @@ def restore_boundary_conditions(case_dir, time_dir="0", inlet_velocity=(0.278, 0
     paths = {}
     for field_name in _FIELD_SPECS:
         path = f"{case_dir}/{time_dir}/{field_name}"
+        relative_path = f"{time_dir}/{field_name}"
         if field_name in _FULL_RESET_FIELDS:
-            with open(path, "w") as f:
-                f.write(field_file_content(field_name, time_dir, inlet_velocity=inlet_velocity, T_initial=T_initial,
-                                            inlet2_velocity=inlet2_velocity, has_outlet2=has_outlet2, sealed=sealed))
+            content = field_file_content(field_name, time_dir, inlet_velocity=inlet_velocity, T_initial=T_initial,
+                                          inlet2_velocity=inlet2_velocity, has_outlet2=has_outlet2, sealed=sealed)
+            _write_case_file(case_dir, relative_path, content)
             paths[field_name] = path
             continue
-        with open(path) as f:
-            content = f.read()
+        content = _read_case_file(case_dir, relative_path)
         idx = content.index("boundaryField")
         new_content = content[:idx] + boundary_field_block(
             field_name, inlet_velocity, inlet2_velocity=inlet2_velocity, has_outlet2=has_outlet2, sealed=sealed)
-        with open(path, "w") as f:
-            f.write(new_content)
+        _write_case_file(case_dir, relative_path, new_content)
         paths[field_name] = path
     return paths

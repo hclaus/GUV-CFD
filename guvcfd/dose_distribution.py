@@ -23,17 +23,19 @@ from .age_analysis import build_rtd_histogram, rtd_from_histogram
 def compute_dose_at_cells(fluence_rate, age_values):
     """Compute UV dose received at each cell over its residence time.
 
-    dose = fluence_rate [mW/cm² = mJ/(cm²·s)] × age [s]
+    dose = fluence_rate [uW/cm²] × age [s] × 1e-3
          = mJ/cm² (milli-joules per square centimeter)
 
-    fluence_rate: (N,) array [mW/cm²]
+    fluence_rate: (N,) array [uW/cm²] - guv_calcs' native intensity unit
+    (see fluence.compute_fluence_at_points), NOT mW/cm² - the 1e-3 factor
+    converts uW*s (= uJ) to mJ.
     age_values: (N,) array [s]
 
     Returns (N,) array of doses [mJ/cm²]
     """
     fluence_rate = np.asarray(fluence_rate, dtype=float)
     age_values = np.asarray(age_values, dtype=float)
-    return fluence_rate * age_values  # mW/cm² × s = mJ/cm²
+    return fluence_rate * age_values * 1e-3  # uW/cm² x s x 1e-3 = mJ/cm²
 
 
 def build_dose_distribution(dose_values, n_bins=50):
@@ -105,6 +107,19 @@ def segregated_flow_inactivation(dose_centers, E_D, k):
 
     Returns:
     - N_over_N0: overall survival fraction (unitless, 0-1)
+
+    Caution: a fixed-width histogram (see build_dose_distribution) under-
+    resolves a right-skewed dose field (most cells near D~0, a long tail
+    to much higher doses - typical of a real room, since most of the
+    volume never sees direct fluence) - it can collapse the entire
+    low-dose region into one wide bin and OVER-predict kill, even
+    violating Jensen's inequality (exp(-k*D) is convex in D, so a
+    heterogeneous dose field can only predict LESS kill than plugging its
+    own mean dose into exp(-k*mean(D)), never more - if this function's
+    result is below that, the binning is too coarse for your case).
+    Prefer averaging exp(-k*D) directly over per-cell dose values (no
+    binning error) when you have them; use this function only for
+    already-binned/aggregated data.
     """
     dose_centers = np.asarray(dose_centers, dtype=float)
     E_D = np.asarray(E_D, dtype=float)
@@ -122,15 +137,21 @@ def segregated_flow_inactivation(dose_centers, E_D, k):
     return float(N_over_N0)
 
 
-def compute_dose_distribution_from_cfd(case_dir, cell_centers, k_or_Z, room_volume=None):
+def compute_dose_distribution_from_cfd(case_dir, room, cell_centers, k_or_Z, room_volume=None):
     """End-to-end dose distribution and inactivation prediction.
 
     Combines CFD fluence + age field to compute expected inactivation for
     a given pathogen.
 
     case_dir: path to OpenFOAM case directory
+    room: a loaded guv_calcs Room (with lamp geometry) - see
+    fluence.compute_fluence_at_points. If fluence has already been
+    computed and written to case_dir/0/fluenceRate (the normal case-setup
+    path, see run_pipeline._finish_case_setup), read that directly instead
+    of calling this function again from scratch.
     cell_centers: (N, 3) array of cell center coordinates [m]
-    k_or_Z: inactivation rate constant (k) [1/s]
+    k_or_Z: dose-based inactivation constant (Z) [cm²/mJ], applied directly
+    as exp(-Z*D) - NOT a time-rate constant (see segregated_flow_inactivation).
     room_volume: room volume [m³], optional, for eACH_uv computation
 
     Returns dict with:
@@ -139,17 +160,12 @@ def compute_dose_distribution_from_cfd(case_dir, cell_centers, k_or_Z, room_volu
     - dose_distribution: {bin_centers, E_D, bin_widths}
     - inactivation: N/N₀ survival fraction
     - inactivation_log10: log₁₀(N/N₀) (negative = log reduction, or -log CFU/mL)
-
-    Note: This function requires guv_calcs and may not work without lamp geometry.
-    For simpler use cases, compute_dose_at_cells + segregated_flow_inactivation
-    can be called directly with pre-computed fluence rates.
     """
-    from .case_io import read_latest_time_field
     from .fluence import compute_fluence_at_points
     from .age_analysis import read_age_field
 
     # Get fluence rate and age from CFD
-    fluence_rate = compute_fluence_at_points(case_dir, cell_centers)  # mW/cm²
+    fluence_rate = compute_fluence_at_points(room, cell_centers)  # uW/cm²
     age_values = read_age_field(case_dir)  # s
 
     # Compute dose at each cell
@@ -168,7 +184,6 @@ def compute_dose_distribution_from_cfd(case_dir, cell_centers, k_or_Z, room_volu
     bin_centers, E_D = dose_distribution_function(bin_edges, bin_counts)
     bin_widths = np.diff(bin_edges)
 
-    # Ensure k is a scalar rate constant (not Z sensitivity)
     if not isinstance(k_or_Z, (int, float)):
         raise TypeError("k_or_Z must be a scalar")
     k = float(k_or_Z)
@@ -197,7 +212,7 @@ def compute_dose_distribution_from_cfd(case_dir, cell_centers, k_or_Z, room_volu
         mean_age = float(np.mean(age_values))
         if mean_age > 0:
             mean_fluence = float(np.mean(fluence_rate))
-            mean_rate_per_s = mean_fluence * 1e-3 * k  # mW/cm² × k × 1e-3
+            mean_rate_per_s = mean_fluence * 1e-3 * k  # uW/cm² × k × 1e-3
             eACH_uv = mean_rate_per_s * 3600.0  # [1/hr]
             result["eACH_uv_from_dose_distribution"] = eACH_uv
 

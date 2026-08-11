@@ -239,13 +239,13 @@ def test_phase_solver_callback_redirects_time_lines_to_status_fn():
     assert solver_lines == ["Time = 42.5", "smoothSolver:  Solving for Ux, Initial residual = 0.01"]
 
 
-def test_phase_solver_callback_converts_time_to_iteration_when_delta_t_scaled():
-    # Regression: OpenFOAM's own "Time" is iteration*delta_t (see _run_phase's
-    # delta_t docstring) - at delta_t=3 a 1500-iteration budget's raw "Time"
-    # reaches 4500, which doesn't match the plain iteration-count language
-    # elsewhere in the UI. status_fn should see "Iteration N" (N divided back
-    # out), not the raw scaled Time - solver_log_fn still gets the raw line
-    # unconverted either way (matches log.simpleFoam exactly for debugging).
+def test_phase_solver_callback_always_shows_time_even_when_delta_t_scaled():
+    # Regression (2026-08-08): a previous version relabeled this "Iteration
+    # N" (dividing Time back out by delta_t) specifically when delta_t != 1,
+    # so the same status field showed "Time" for some combinations and
+    # "Iteration" for others with nothing in the UI explaining why -
+    # confirmed as a real point of confusion. Now always "Time", in
+    # seconds, for every combination alike, regardless of delta_t.
     solver_lines = []
     status_calls = []
     callback = ssp._phase_solver_callback(
@@ -253,7 +253,7 @@ def test_phase_solver_callback_converts_time_to_iteration_when_delta_t_scaled():
 
     callback("Time = 840")
 
-    assert status_calls == [("Z=6/ACH=6/Phase1", "Iteration 280")]
+    assert status_calls == [("Z=6/ACH=6/Phase1", "Time = 840")]
     assert solver_lines == ["Time = 840"]  # raw line unconverted
 
 
@@ -267,19 +267,18 @@ def test_phase_solver_callback_leaves_time_unconverted_at_delta_t_one():
 
 def test_phase_solver_callback_iteration_base_makes_progress_cumulative():
     # Regression: every chunk's own OpenFOAM "Time" restarts from 0 (see
-    # _run_phase's "every chunk starts fresh at time-label 0") - without
-    # iteration_base, "Iteration N" was chunk-LOCAL progress (resetting to
-    # a small number every ~400 iterations instead of climbing toward the
-    # full budget), inconsistent with the "801-1200 of 1500 iterations"
-    # cumulative framing the surrounding log already uses. Confirmed
-    # directly: at delta_t=3, the 3rd 400-iteration chunk's own "Time = 1161"
-    # (chunk-local) displayed as "Iteration 387" with no indication this
-    # was actually cumulative iteration 800+387=1187.
+    # _run_phase's "every chunk starts fresh at time-label 0") -
+    # iteration_base (a cumulative ITERATION count from prior chunks) is
+    # converted to a TIME offset (iteration_base * delta_t) and added to
+    # this chunk's own raw Time, so the displayed number is always the
+    # true cumulative elapsed time, not chunk-local progress that resets
+    # every ~400 iterations. At delta_t=3, iteration_base=800 (2400s of
+    # prior chunks) plus this chunk's own "Time = 1161" gives 3561.
     status_calls = []
     callback = ssp._phase_solver_callback(
         _log, None, lambda k, m: status_calls.append((k, m)), "key", delta_t=3, iteration_base=800)
     callback("Time = 1161")
-    assert status_calls == [("key", "Iteration 1187")]
+    assert status_calls == [("key", "Time = 3561")]
 
 
 def test_phase_solver_callback_iteration_base_applies_even_at_delta_t_one():
@@ -290,7 +289,24 @@ def test_phase_solver_callback_iteration_base_applies_even_at_delta_t_one():
     callback = ssp._phase_solver_callback(
         _log, None, lambda k, m: status_calls.append((k, m)), "key", delta_t=1, iteration_base=400)
     callback("Time = 120")
-    assert status_calls == [("key", "Iteration 520")]
+    assert status_calls == [("key", "Time = 520")]
+
+
+def test_phase_solver_callback_appends_total_time_suffix_when_given():
+    status_calls = []
+    callback = ssp._phase_solver_callback(
+        _log, None, lambda k, m: status_calls.append((k, m)), "key", delta_t=3, iteration_base=800,
+        total_time=4500)
+    callback("Time = 1161")
+    assert status_calls == [("key", "Time = 3561 of 4500 total seconds")]
+
+
+def test_phase_solver_callback_omits_total_time_suffix_when_not_given():
+    status_calls = []
+    callback = ssp._phase_solver_callback(
+        _log, None, lambda k, m: status_calls.append((k, m)), "key")
+    callback("Time = 100")
+    assert status_calls == [("key", "Time = 100")]
 
 
 def _log(msg):

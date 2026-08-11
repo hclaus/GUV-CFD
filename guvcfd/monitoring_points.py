@@ -12,7 +12,7 @@ control run, "Continue").
 import re
 
 from .decay_analysis import read_vol_average_dat, compute_effective_eACH, windowed_stats
-from .wsl_utils import wsl_path, run_wsl_or_raise
+from .wsl_utils import wsl_path, run_wsl_or_raise, write_case_file as _write_case_file
 
 _UNSAFE_ZONE_CHARS_RE = re.compile(r"[^A-Za-z0-9_]+")
 
@@ -84,8 +84,7 @@ def monitoring_topo_set_dict(points, cell_size):
 def write_monitoring_topo_set_dict(case_dir, points, cell_size,
                                     filename="monitoringTopoSetDict"):
     path = f"{case_dir}/system/{filename}"
-    with open(path, "w") as f:
-        f.write(monitoring_topo_set_dict(points, cell_size))
+    _write_case_file(case_dir, f"system/{filename}", monitoring_topo_set_dict(points, cell_size))
     return path
 
 
@@ -132,8 +131,7 @@ def monitoring_average_dict(points, field="T"):
 def write_monitoring_average_dict(case_dir, points, field="T",
                                    filename="monitoringAverageDict"):
     path = f"{case_dir}/system/{filename}"
-    with open(path, "w") as f:
-        f.write(monitoring_average_dict(points, field))
+    _write_case_file(case_dir, f"system/{filename}", monitoring_average_dict(points, field))
     return path
 
 

@@ -1,0 +1,48 @@
+{
+  "base_build_s": 202.16242909431458,
+  "control_end_time_s": 2763,
+  "results": [
+    {
+      "name": "control_maxco_5",
+      "max_co": 5,
+      "outcome": "ok",
+      "wall_clock_s": 15379.457840681076,
+      "measured_ach": 2.666828617798328,
+      "measured_ach_ci95": [
+        2.6634319791481365,
+        2.670225256448519
+      ],
+      "lambda_per_s": 0.0007407857271662022,
+      "se_per_s": 4.5078829083551305e-07,
+      "n_points": 21
+    },
+    {
+      "name": "control_maxco_10",
+      "max_co": 10,
+      "outcome": "ok",
+      "wall_clock_s": 9781.464977264404,
+      "measured_ach": 2.599933211802516,
+      "measured_ach_ci95": [
+        2.5968199029143135,
+        2.603046520690718
+      ],
+      "lambda_per_s": 0.0007222036699451433,
+      "se_per_s": 4.131858984989735e-07,
+      "n_points": 21
+    },
+    {
+      "name": "control_maxco_15",
+      "max_co": 15,
+      "outcome": "ok",
+      "wall_clock_s": 6960.689484119415,
+      "measured_ach": 2.532802864919822,
+      "measured_ach_ci95": [
+        2.5303558162025133,
+        2.5352499136371307
+      ],
+      "lambda_per_s": 0.0007035563513666173,
+      "se_per_s": 3.247625144948831e-07,
+      "n_points": 21
+    }
+  ]
+}

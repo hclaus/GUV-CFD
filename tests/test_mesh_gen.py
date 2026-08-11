@@ -2,6 +2,7 @@ import math
 
 from guvcfd.mesh_gen import (
     _opening_box, opening_center, opening_half_extents, topo_set_dict, create_patch_dict, write_mesh_dicts,
+    suggest_opening_size_fix, suggest_opening_center_fix, _WALL_SPECS,
 )
 
 _ROOM = (3.2, 4.8, 2.57)  # Lx, Ly, Lz
@@ -220,3 +221,127 @@ def test_opening_half_extents_no_snap_matches_nominal_size_exactly():
     hw, hh = opening_half_extents("frontWall", 4.0, 3.0, 2.7, (0.5, 0.5), (0.5, 0.2))
     assert math.isclose(hw, 0.25, abs_tol=1e-9)
     assert math.isclose(hh, 0.1, abs_tol=1e-9)
+
+
+# --- suggest_opening_size_fix / suggest_opening_center_fix (2026-08-07) ---
+
+def test_suggest_opening_size_fix_is_a_noop_when_already_exact_multiples():
+    w, h = suggest_opening_size_fix((0.4, 0.3), 0.1)
+    assert math.isclose(w, 0.4, abs_tol=1e-9)
+    assert math.isclose(h, 0.3, abs_tol=1e-9)
+
+
+def test_suggest_opening_size_fix_stays_a_noop_under_fp_noise():
+    # 0.1*3 is 0.30000000000000004 in binary float - must not spuriously
+    # bump to 0.4 just because of that representation noise.
+    noisy = 0.1 + 0.1 + 0.1
+    assert noisy != 0.3  # sanity: confirms this IS the noisy case
+    w, h = suggest_opening_size_fix((noisy, 0.4), 0.1)
+    assert math.isclose(w, 0.3, abs_tol=1e-9)
+    assert math.isclose(h, 0.4, abs_tol=1e-9)
+
+
+def test_suggest_opening_size_fix_rounds_up_only_the_off_axis():
+    w, h = suggest_opening_size_fix((0.37, 0.4), 0.1)
+    assert math.isclose(w, 0.4, abs_tol=1e-9)
+    assert math.isclose(h, 0.4, abs_tol=1e-9)
+
+
+def test_suggest_opening_size_fix_rounds_up_both_axes():
+    w, h = suggest_opening_size_fix((0.23, 0.35), 0.1)
+    assert math.isclose(w, 0.3, abs_tol=1e-9)
+    assert math.isclose(h, 0.4, abs_tol=1e-9)
+
+
+def test_suggest_opening_center_fix_even_width_aligns_to_grid_lines():
+    # 0.4m width / 0.1m cells = 4 (even) -> valid centers are exact grid
+    # lines. A center already on one needs no shift.
+    (cur_y, cur_z), (sug_y, sug_z) = suggest_opening_center_fix(
+        "xMin", 4.0, 5.0, 3.0, (2.5 / 5.0, 0.4 / 3.0), (0.4, 0.4), 0.1)
+    assert math.isclose(cur_y, 2.5, abs_tol=1e-9) and math.isclose(sug_y, 2.5, abs_tol=1e-9)
+    assert math.isclose(cur_z, 0.4, abs_tol=1e-9) and math.isclose(sug_z, 0.4, abs_tol=1e-9)
+
+
+def test_suggest_opening_center_fix_even_width_off_grid_shifts_to_nearest_line():
+    (cur_y, _), (sug_y, _) = suggest_opening_center_fix(
+        "xMin", 4.0, 5.0, 3.0, (2.53 / 5.0, 0.4 / 3.0), (0.4, 0.4), 0.1)
+    assert math.isclose(cur_y, 2.53, abs_tol=1e-9)
+    assert math.isclose(sug_y, 2.5, abs_tol=1e-9)  # nearest grid line, not 2.6
+
+
+def test_suggest_opening_center_fix_odd_width_needs_cell_center_offset_not_grid_line():
+    # 0.3m width / 0.1m cells = 3 (odd) -> valid centers sit at
+    # cell-CENTER offsets (..., 0.05, 0.15, 0.25, ...), NOT grid lines.
+    # A center sitting exactly ON a grid line (2.5) is the "naive wrong
+    # assumption" case - must still shift by half a cell.
+    (cur_y, _), (sug_y, _) = suggest_opening_center_fix(
+        "xMin", 4.0, 5.0, 3.0, (2.5 / 5.0, 0.4 / 3.0), (0.3, 0.4), 0.1)
+    assert math.isclose(cur_y, 2.5, abs_tol=1e-9)
+    assert math.isclose(sug_y, 2.45, abs_tol=1e-9) or math.isclose(sug_y, 2.55, abs_tol=1e-9)
+    assert abs(sug_y - cur_y) - 0.05 < 1e-9  # exactly half a cell, the max possible
+
+
+def test_suggest_opening_center_fix_never_shifts_more_than_half_a_cell():
+    import random
+    random.seed(0)
+    for _ in range(200):
+        w = round(random.uniform(0.2, 0.6), 1)  # already an exact multiple of cell_size
+        y = random.uniform(0.5, 4.5)
+        (cur_y, _), (sug_y, _) = suggest_opening_center_fix(
+            "xMin", 4.0, 5.0, 3.0, (y / 5.0, 0.4 / 3.0), (w, 0.4), 0.1)
+        assert abs(sug_y - cur_y) <= 0.05 + 1e-9, (w, y, cur_y, sug_y)
+
+
+def test_suggest_opening_center_fix_breaks_exact_tie_toward_wall_center():
+    # y=2.55 is exactly equidistant (0.05m) from both 2.5 and 2.6 for a
+    # 0.4m (even) width. Wall midpoint on the y axis is Ly/2 = 2.5 - so
+    # the tie must break toward 2.5, NOT toward 2.6 (which is what
+    # Python's round()/banker's-rounding-style "round half to even" could
+    # plausibly pick instead - this is the regression the tie-break logic
+    # exists to prevent, mirroring snap_outward's own documented edge-tie
+    # bug class).
+    (cur_y, _), (sug_y, _) = suggest_opening_center_fix(
+        "xMin", 4.0, 5.0, 3.0, (2.55 / 5.0, 0.4 / 3.0), (0.4, 0.4), 0.1)
+    assert math.isclose(cur_y, 2.55, abs_tol=1e-9)
+    assert math.isclose(sug_y, 2.5, abs_tol=1e-9)
+
+
+def test_suggest_opening_center_fix_returns_absolute_meters_not_center_frac():
+    (cur_y, cur_z), _ = suggest_opening_center_fix(
+        "xMin", 4.0, 5.0, 3.0, (0.5, 0.5), (0.4, 0.4), 0.1)
+    assert math.isclose(cur_y, 2.5, abs_tol=1e-9)   # 0.5 * Ly=5, NOT 0.5 itself
+    assert math.isclose(cur_z, 1.5, abs_tol=1e-9)   # 0.5 * Lz=3, NOT 0.5 itself
+
+
+def test_suggest_opening_center_fix_works_on_every_wall():
+    # Sweep all 6 _WALL_SPECS entries to confirm a1/a2 axis selection and
+    # dims indexing stay correct everywhere, not just the historically-
+    # tested xMin/xMax.
+    Lx, Ly, Lz = 4.0, 5.0, 3.0
+    dims = (Lx, Ly, Lz)
+    for wall, (_, _, (a1, a2)) in _WALL_SPECS.items():
+        c1, c2 = 0.53 / dims[a1], 0.5 / dims[a2]  # off-grid on axis1, on-grid on axis2
+        (cur1, cur2), (sug1, sug2) = suggest_opening_center_fix(wall, Lx, Ly, Lz, (c1, c2), (0.4, 0.4), 0.1)
+        assert math.isclose(cur1, 0.53, abs_tol=1e-9), wall
+        assert math.isclose(sug1, 0.5, abs_tol=1e-9), wall  # nearest grid line
+        assert math.isclose(cur2, 0.5, abs_tol=1e-9), wall
+        assert math.isclose(sug2, 0.5, abs_tol=1e-9), wall  # already aligned, no shift
+
+
+def test_size_then_center_fix_matches_the_planning_session_worked_examples():
+    # The 4 worked examples verified during planning, as an end-to-end
+    # regression pin - room 4x5x3m, cell_size 0.1m, wall xMin.
+    Lx, Ly, Lz = 4.0, 5.0, 3.0
+    cases = [
+        (0.23, 0.35, 1.37, 0.68, 0.3, 0.4, 1.35, 0.7),
+        (0.40, 0.20, 3.62, 2.14, 0.4, 0.2, 3.6, 2.1),
+        (0.31, 0.31, 2.05, 1.50, 0.4, 0.4, 2.1, 1.5),
+        (0.27, 0.40, 0.45, 2.77, 0.3, 0.4, 0.45, 2.8),
+    ]
+    for w, h, y, z, exp_w, exp_h, exp_y, exp_z in cases:
+        sw, sh = suggest_opening_size_fix((w, h), 0.1)
+        assert math.isclose(sw, exp_w, abs_tol=1e-9) and math.isclose(sh, exp_h, abs_tol=1e-9)
+        (_, _), (sug_y, sug_z) = suggest_opening_center_fix(
+            "xMin", Lx, Ly, Lz, (y / Ly, z / Lz), (sw, sh), 0.1)
+        assert math.isclose(sug_y, exp_y, abs_tol=1e-9)
+        assert math.isclose(sug_z, exp_z, abs_tol=1e-9)

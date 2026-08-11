@@ -1,0 +1,70 @@
+[
+  {
+    "name": "serial_simple",
+    "elapsed_s": 280.60678458213806,
+    "flow_convergence_s": 265.74784421920776,
+    "outcome": "ERROR (after flow convergence resolved - see note)",
+    "detail": "All decay rates are zero - check fluence data / Z factor",
+    "U_mag_stats": {
+      "mean": 0.0368124302960893,
+      "max": 0.29990813133226313,
+      "min": 0.00043693181276830827
+    },
+    "p_stats": {
+      "mean": 0.04569168450911228,
+      "max": 0.0608261,
+      "min": 0.025711
+    }
+  },
+  {
+    "name": "serial_lts",
+    "elapsed_s": 1423.414883852005,
+    "flow_convergence_s": 1410.9082298278809,
+    "outcome": "hit the 1500-iteration cap without a verdict",
+    "detail": "Flow field did not converge within 1500 iterations, and there's no clear verdict on whether it's a stable bounded oscillation either: Not enough chunk history yet to tell whether this is a stable, bounded oscillation (needs 12 chunks of evidence, only 3 available) - this is NOT the same as having checked and found it unstable. The trend so far is flat.",
+    "U_mag_stats": {
+      "mean": 0.03791737758995457,
+      "max": 0.3170143532613153,
+      "min": 0.0015973623886801642
+    },
+    "p_stats": {
+      "mean": 0.04883875387027239,
+      "max": 0.0675962,
+      "min": 0.0288065
+    }
+  },
+  {
+    "name": "parallel_simple",
+    "elapsed_s": 425.83172845840454,
+    "flow_convergence_s": 413.3835060596466,
+    "outcome": "hit the 1500-iteration cap without a verdict",
+    "detail": "Flow field did not converge within 1500 iterations, and there's no clear verdict on whether it's a stable bounded oscillation either: Not enough chunk history yet to tell whether this is a stable, bounded oscillation (needs 12 chunks of evidence, only 3 available) - this is NOT the same as having checked and found it unstable. The trend so far is flat.",
+    "U_mag_stats": {
+      "mean": 0.03853955708758949,
+      "max": 0.30215175894785057,
+      "min": 0.0005483318400932048
+    },
+    "p_stats": {
+      "mean": 0.04589543557221243,
+      "max": 0.0641968,
+      "min": 0.0243656
+    }
+  },
+  {
+    "name": "parallel_lts",
+    "elapsed_s": 1491.9690489768982,
+    "flow_convergence_s": 1479.035803079605,
+    "outcome": "hit the 1500-iteration cap without a verdict",
+    "detail": "Flow field did not converge within 1500 iterations, and there's no clear verdict on whether it's a stable bounded oscillation either: Not enough chunk history yet to tell whether this is a stable, bounded oscillation (needs 12 chunks of evidence, only 3 available) - this is NOT the same as having checked and found it unstable. The trend so far is flat.",
+    "U_mag_stats": {
+      "mean": 0.03791272759742229,
+      "max": 0.31702554083059303,
+      "min": 0.0011403707143157439
+    },
+    "p_stats": {
+      "mean": 0.0488393369292573,
+      "max": 0.0676071,
+      "min": 0.028794
+    }
+  }
+]

@@ -90,7 +90,28 @@ ADVANCED_SETTINGS_DEFAULTS = {
     "decay-ach-min-fraction": 90.0,   # % - decay-mode UV-off control run's target reduction
     "decay-each-min-fraction": 90.0,  # % - decay-mode UV-on run's baseline target reduction
     "decay-each-max-fraction": 99.9,  # % - decay-mode UV-on run's target when eACH is high (cheap to reach)
-    "keep-shared-scratch-dirs": False,  # troubleshooting opt-in - see scenario_runs.py's cleanup_ach_fn
+    # Default flipped True->True is intentional (2026-08-10): a later sweep
+    # launch on the same project_dir now validates reuse by flow_fingerprint
+    # (see project_status.find_reusable_ach_base) rather than blind file
+    # presence, so keeping these around by default is safe and is what
+    # makes "apply a different UV design"/"add more Z/ACH" fast across
+    # separate launches, not just within one - see the "Extend / modify
+    # simulations" modal's Clean up shared scratch directories action for
+    # the explicit disk-space release valve this trades for.
+    "keep-shared-scratch-dirs": True,
+    # pimpleFoam's adaptive-timestep Courant cap (splice.set_control_dict_time's
+    # own _MAX_CO=5 was the hardcoded value before this) - was a per-project-
+    # only setting with zero UI anywhere (see PROJECT_OPENFOAM_SETTINGS_KEYS
+    # below), only ever changeable by hand-editing a .guvcfd file directly.
+    # Promoted to a normal advanced default 2026-08-07, then raised to 10 the
+    # same day once a dedicated A/B decay-accuracy test (compare_maxco_decay_
+    # accuracy.py, see maxco_decay_accuracy_NOTES.md) confirmed 10 vs. the
+    # original 5 costs only ~2.5% on the measured decay rate for a real ~36%
+    # wall-clock speedup - well under this project's ~200% eACH materiality
+    # bar. 15 was also tested (~5% cost, ~55% speedup - diminishing returns,
+    # not adopted as the default). Lower this project-by-project if a
+    # specific case's own flow/mesh needs more numerical margin.
+    "max-co": 10,
 }
 
 
@@ -117,3 +138,71 @@ def save_advanced_settings(settings):
     with open(ADVANCED_SETTINGS_PATH, "w") as f:
         json.dump(to_save, f, indent=2)
     return to_save
+
+
+# Every OpenFOAM/meshing/solver setting that should be captured per-project
+# (into the .guvcfd file, at save time - see app.py's _capture_openfoam_settings/
+# qtapp's equivalent) rather than only living in the global advanced_settings.json -
+# this is what makes a specific run's exact settings reproducible regardless
+# of what the *global* advanced settings later change to, and lets a copied/
+# edited .guvcfd experiment with one setting while pinning everything else.
+# Excludes deltat-scaling-enabled/-effective-fraction/-target-fraction
+# (already migrated earlier - see steady_state_pipeline.merge_project_deltat_settings,
+# the precedent this generalizes) and app-behavior-only toggles with no
+# effect on simulation results (keep-all-timesteps, keep-shared-scratch-dirs).
+PROJECT_OPENFOAM_SETTINGS_KEYS = (
+    "flow-rel-tol", "flow-max-iterations", "plateau-rel-tol", "pimple-delta-t",
+    "mesh-cell-size", "uv-zone-bins",
+    "momentum-relaxation", "scalar-relaxation",
+    "scalar-transport-ncorr", "scalar-transport-tolerance",
+    "t-infinity-early-stop-enabled", "t-infinity-rel-tol",
+    "phase1-require-stable-extrapolation", "phase-chunk-size", "phase-write-interval",
+    "oscillation-window", "oscillation-growth-tol",
+    "ach-delivery-tol", "mass-balance-tol",
+    "phase1-t-initial", "phase1-extrapolation-streak",
+    "phase1-settling-safety-multiplier", "phase1-max-iterations-ceiling",
+    "decay-ach-min-fraction", "decay-each-min-fraction", "decay-each-max-fraction",
+    "max-co",
+)
+
+
+def _resolved_default(key, adv):
+    """key's value from adv if present, else ADVANCED_SETTINGS_DEFAULTS -
+    never raises. `adv` is a complete dict in production
+    (load_advanced_settings()'s own contract), but tests commonly
+    monkeypatch it with a partial dict for brevity - falling back to the
+    real module-level default keeps this function's own "never raises,
+    always resolves to something sensible" contract regardless of how
+    complete `adv` is, matching load_advanced_settings() itself.
+    """
+    return adv[key] if key in adv else ADVANCED_SETTINGS_DEFAULTS[key]
+
+
+def merge_project_openfoam_settings(settings, adv):
+    """Like steady_state_pipeline.merge_project_deltat_settings, but for
+    every other key in PROJECT_OPENFOAM_SETTINGS_KEYS. Call once right
+    after load_advanced_settings() - every existing adv["mesh-cell-size"]-
+    style call site downstream then picks up the per-project override
+    automatically, with no change needed at that call site. Falls back to
+    adv's global-default value for a project saved before this feature
+    existed.
+    """
+    merged = dict(adv)
+    for key in PROJECT_OPENFOAM_SETTINGS_KEYS:
+        merged[key] = settings.get(key, _resolved_default(key, adv))
+    return merged
+
+
+def capture_openfoam_settings(settings, adv):
+    """Fill in any PROJECT_OPENFOAM_SETTINGS_KEYS missing from `settings`
+    (a .guvcfd project dict about to be saved) with their CURRENT resolved
+    value from `adv` - mutates and returns `settings`. Called at save time, not at run time:
+    once a key is present, it's never overwritten by a later save (that
+    would defeat the point - a project's pinned settings must survive the
+    global advanced settings changing later), so this only ever backfills
+    a brand new project or one saved before this feature existed.
+    """
+    for key in PROJECT_OPENFOAM_SETTINGS_KEYS:
+        if key not in settings:
+            settings[key] = _resolved_default(key, adv)
+    return settings

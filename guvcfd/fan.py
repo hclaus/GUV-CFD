@@ -23,6 +23,7 @@ scalarSemiImplicitSource entries elsewhere) works, confirmed by the log's
 "Pressure gradient source: uncorrected Ubar = ..." line showing the body
 force genuinely driving the zone's velocity, not silently ignored.
 """
+from .wsl_utils import write_case_file as _write_case_file
 
 SPEED_RANGE = (0.05, 1.5)  # m/s - matches the GUI's own fan-speed slider max (app.py)
 
@@ -57,8 +58,7 @@ def fan_topo_set_dict(p1, p2, radius, zone_name="fanZone", cellset_name="fanZone
 def write_fan_topo_set_dict(case_dir, p1, p2, radius, zone_name="fanZone",
                              cellset_name="fanZoneCells", filename="fanTopoSetDict"):
     path = f"{case_dir}/system/{filename}"
-    with open(path, "w") as f:
-        f.write(fan_topo_set_dict(p1, p2, radius, zone_name, cellset_name))
+    _write_case_file(case_dir, f"system/{filename}", fan_topo_set_dict(p1, p2, radius, zone_name, cellset_name))
     return path
 
 

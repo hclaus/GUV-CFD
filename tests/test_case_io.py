@@ -1,7 +1,8 @@
 import pytest
 
 from guvcfd.case_io import (
-    clear_stale_run_output, read_patch_face_centers, latest_time_dir, read_latest_time_field,
+    clear_stale_run_output, read_patch_face_centers, read_patch_face_areas, read_openfoam_vector_field,
+    latest_time_dir, read_latest_time_field, snapshot_openfoam_settings,
 )
 
 _POINTS = """FoamFile
@@ -127,6 +128,43 @@ def test_face_count_mismatch_asserts(tmp_path):
         read_patch_face_centers(case_dir, "inlet")
 
 
+def test_reads_face_areas_of_unit_squares(tmp_path):
+    # _POINTS/_FACES describes two adjacent 1x1 unit squares in the z=0
+    # plane (see test_reads_face_centers_in_patch_order) - each face's
+    # area should come out to exactly 1.0.
+    case_dir = _write_polymesh(tmp_path)
+    areas = read_patch_face_areas(case_dir, "inlet")
+    assert areas.shape == (2,)
+    assert areas == pytest.approx([1.0, 1.0])
+
+
+def _write_vector_field_file(path, values):
+    body = "\n".join(f"({v[0]} {v[1]} {v[2]})" for v in values)
+    path.write_text(
+        "FoamFile\n{\n    class volVectorField;\n    object U;\n}\n\n"
+        f"internalField   nonuniform List<vector>\n{len(values)}\n(\n{body}\n)\n;\n"
+    )
+
+
+def test_reads_vector_field(tmp_path):
+    path = tmp_path / "U"
+    _write_vector_field_file(path, [(0.1, 0.2, 0.3), (-1.0, 0.0, 2.5)])
+    values = read_openfoam_vector_field(str(path))
+    assert values.shape == (2, 3)
+    assert values[0] == pytest.approx((0.1, 0.2, 0.3))
+    assert values[1] == pytest.approx((-1.0, 0.0, 2.5))
+
+
+def test_vector_field_length_mismatch_asserts(tmp_path):
+    path = tmp_path / "U"
+    path.write_text(
+        "FoamFile\n{\n    class volVectorField;\n    object U;\n}\n\n"
+        "internalField   nonuniform List<vector>\n3\n(\n(0 0 0)\n(1 1 1)\n)\n;\n"
+    )
+    with pytest.raises(AssertionError):
+        read_openfoam_vector_field(str(path))
+
+
 def _make_stale_case(tmp_path):
     case_dir = tmp_path / "case"
     for name in ("0", "100", "500", "2000"):
@@ -189,3 +227,30 @@ def test_read_latest_time_field_reads_from_the_highest_numbered_directory(tmp_pa
     _write_scalar_field_file(tmp_path / "50" / "T", [1.0, 2.0])
     _write_scalar_field_file(tmp_path / "100" / "T", [3.0, 4.0, 5.0])
     assert read_latest_time_field(str(tmp_path), "T") == [3.0, 4.0, 5.0]
+
+
+def test_snapshot_openfoam_settings_copies_present_files_into_dest_subdir(tmp_path):
+    (tmp_path / "system").mkdir()
+    (tmp_path / "constant").mkdir()
+    (tmp_path / "system" / "controlDict").write_text("maxCo 10;")
+    (tmp_path / "system" / "fvSolution").write_text("solvers {}")
+    # fvSchemes/turbulenceProperties/transportProperties deliberately absent -
+    # a missing source file must be skipped, not raise.
+
+    snapshot_openfoam_settings(str(tmp_path))
+
+    dest = tmp_path / "system" / "project_schemes"
+    assert (dest / "controlDict").read_text() == "maxCo 10;"
+    assert (dest / "fvSolution").read_text() == "solvers {}"
+    assert not (dest / "fvSchemes").exists()
+
+
+def test_snapshot_openfoam_settings_overwrites_on_repeat_call(tmp_path):
+    (tmp_path / "system").mkdir()
+    (tmp_path / "system" / "controlDict").write_text("maxCo 5;")
+
+    snapshot_openfoam_settings(str(tmp_path))
+    (tmp_path / "system" / "controlDict").write_text("maxCo 10;")
+    snapshot_openfoam_settings(str(tmp_path))
+
+    assert (tmp_path / "system" / "project_schemes" / "controlDict").read_text() == "maxCo 10;"

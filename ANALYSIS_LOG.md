@@ -560,3 +560,318 @@ says the two should match under good mixing, so the size of the gap is
 itself a measurement of how far this CFD room's mixing (or the two modes'
 fitting/methodology) departs from that ideal, which is exactly what this
 session's own y+/mesh-grading investigation (above) was probing directly.
+
+---
+
+## 2026-08-02 — Lagrangian particle tracking: evaluating the age-field snapshot dose method
+
+**Context**: an earlier this-session addition (`tracer_dose_report.py`) estimated
+single-pass UV dose per cell as `dose[x] = fluenceRate[x] * age[x]`, volume-averaged
+across the whole mesh, and used that to predict inactivation via Blatchley et al.'s
+segregated-flow model. Before trusting it, checked whether it actually represents
+what that model requires: dose integrated over each fluid parcel's full transit,
+inlet to outlet ("integration over the full time, to infinity" in RTD terms) — or
+something narrower.
+
+**Finding 1 — the age field is a one-time snapshot, not a trajectory record.**
+`age(x)` (solved via `scalarTransport2`, see `TRACER_IMPLEMENTATION.md`) is an
+*Eulerian* quantity: at steady state, it tells you how long the parcel *currently
+occupying point x* has been traveling since it entered — nothing about how much
+travel it still has left, or the total dose it will have accumulated by the time it
+actually reaches the outlet. Multiplying by the *local* fluence rate at that same
+point compounds the problem: it stands in for the fluence experienced along the
+parcel's entire path so far, not just its current location. And critically, the
+volume-weighted average taken across *all* cells is a snapshot of *where the room's
+air currently is*, not a sample of *what air experiences by the time it leaves* —
+reactor engineering has a name for exactly this distinction: the "internal age
+distribution" (volume-weighted, a snapshot of the whole vessel's contents at one
+instant) versus the *residence-time distribution* (RTD, weighted by who's actually
+exiting) are related but **not the same function**, except in a few idealized flow
+patterns. The age-field method computes the former and uses it as a proxy for the
+latter.
+
+**Method built to get the real thing**: `guvcfd/lagrangian_tracking.py` — particles
+seeded at the inlet (weighted by local mass flux, so a non-uniform diffuser is
+sampled correctly), each integrated with RK4 through the case's own solved velocity
+field, accumulating dose = the integral of fluenceRate along its *real* path, until
+it actually crosses the outlet (or times out). Validated against closed-form
+trajectories (uniform plug flow, a linear-fluence integral, solid-body rotation for
+curved paths) plus a full synthetic end-to-end test through real polyMesh/field-file
+I/O.
+
+**Finding 2 — first attempt had its own bias: pure mean-flow advection can't
+escape a stagnant recirculation zone, so trapped particles get silently excluded.**
+RANS only resolves the *mean* velocity field; a particle with near-zero local mean
+velocity (a recirculation pocket) has no way to leave under pure advection, no
+matter how long it's given. On the real case, ~30% of seeded particles never
+reached the outlet within a generous time cap (~6.7x the age field's own mean) and
+were dropped from the N/N0 average — a survivorship bias that overrepresents fast,
+short-circuiting paths and *understates* real dose (those particles never got
+credited with the extra time — and extra dose — they'd actually accumulate before
+eventually leaving).
+
+**Fix — turbulent dispersion as a stochastic random walk.** Added
+`sqrt(2*nut*dt)*N(0,1)` per axis on top of the deterministic RK4 advection
+(Euler-Maruyama), using the case's own solved `nut` field as diffusivity directly —
+not an independently chosen Schmidt number, but the *same* diffusivity convention
+the case's own `age`/`T` scalar transport equations already use (`alphaDt=1` in
+`system/controlDict`). Validated with a precise statistical test: mean-squared
+displacement of a pure-diffusion population matches the Einstein relation
+(MSD = 6·D·t) to within Monte Carlo tolerance. Confirmed on the real case: trapped
+fraction dropped from 30% (N=20) to 0.3% (1/300 particles).
+
+**Performance cost of the fix**: meaningful. Diffusion makes particle paths meander
+instead of exiting directly, so cost scales close to *linearly* in particle count
+(~10-16s/particle on this room-sized case) rather than the earlier sub-linear
+scaling (batching helped more when most particles exited quickly and dropped out of
+the active batch). 5000 particles would take on the order of a day; used N=300
+instead (~80 minutes), agreed with the user given the tradeoff.
+
+**Three-way comparison — three genuinely different physical scenarios, Z=6 cm²/mJ:**
+
+| Method | What it measures | N/N0 | log₁₀ reduction |
+|---|---|---|---|
+| 1. Euler decay curve (established, unchanged) | full CFD-simulated room decay, ventilation+UV combined | 1.81×10⁻³ | 2.74 |
+| 2. Age-field snapshot (now known flawed) | single-pass survival, volume-weighted snapshot | 0.112 | 0.95 |
+| 3. Lagrangian + diffusion (rigorous) | single-pass survival, true exit-weighted trajectory | 0.179 | 0.75 |
+
+The fix **flipped which method predicts more kill**: before adding diffusion,
+Lagrangian's survivorship bias made it predict *less* kill than the (already
+flawed) age-snapshot method; after the fix, it predicts *more* — because the
+previously-excluded slow parcels do eventually leave, but pick up substantially
+more dose getting there, pulling the population's overall survival down. Mean
+residence time (exited particles only) nearly doubled, from 177s (biased) to 580s
+(fixed) — now *exceeding* the age-field method's own volume-weighted mean age
+(341s), which makes sense once the slow parcels are counted. The clearest evidence
+this is a real improvement, not just a different number: plotting both methods'
+normalized RTDs against the ideal-CSTR curve, the diffusion-fixed Lagrangian result
+tracks the ideal exponential decay closely; the pre-fix version looked nothing like
+it.
+
+**Directly answering "over what time is the Euler comparison done, and is it
+apples-to-apples?"**: **not apples-to-apples, and not "just ACH."** Method 1's
+number is the room's *full combined* (ventilation + UV) decay, read directly off
+the actual simulated decay curve at **t = 500 seconds** — this case's own UV-on run
+duration (chosen by the pipeline's adaptive run-duration logic to hit a target
+eACH/ACH confidence window, not an arbitrary stopping point). To isolate what
+ventilation *alone* would have achieved over that same 500s, using the CFD-measured
+ventilation rate (4.61/hr from the UV-off control run — not the nominal 6.0/hr
+setpoint):
+
+| | N/N0 at t=500s | log₁₀ reduction |
+|---|---|---|
+| Ventilation only (measured 4.61 ACH, no UV) | 0.527 | 0.28 |
+| Combined (ventilation + UV, the actual run) | 1.81×10⁻³ | 2.74 |
+
+So essentially all of the observed reduction in the real decay run is attributable
+to UV, not ventilation — confirming Method 1 was never an "ACH-only" number to
+begin with.
+
+**Correction (same day, after user pushback)**: the paragraph originally here
+claimed Methods 2/3's single-pass framing "can't be forced onto Method 1's
+elapsed-time axis" without an extra modeling assumption - that was wrong, or at
+least incomplete. There IS a direct, assumption-light bridge for the
+**ventilation-only** question specifically: the washout fraction. Strip UV out
+entirely, and "what fraction of room air is still present at time t" is exactly
+`1 - F(t)`, where F is the *cumulative* residence-time distribution - i.e. the
+fraction of Lagrangian-tracked particles that have *already exited* by time t.
+This needs no CSTR/well-mixed assumption at all; it falls straight out of RTD
+theory and uses data already in hand (the particle tracker's own `t_exit` array).
+
+Computed directly (N=500 particles, diffusion on, capped at exactly t=500s -
+cheaper than the full-exit runs above since no straggler needs to be followed
+past the comparison time itself; 294/500 had exited by then):
+
+| Method | Remaining at t=500s | Reduction % |
+|---|---|---|
+| **Lagrangian washout** (rigorous, `1-F(500)`) | 41.2% | 58.8% |
+| Euler, **nominal** ACH = 6.0/hr | 43.5% | 56.5% |
+| Euler, **CFD-measured** ACH = 4.61/hr | 52.7% | 47.3% |
+
+So: **pure ACH (Euler) and Lagrangian do give close - not identical - answers, but
+only if "pure ACH" means the *nominal* setpoint.** Lagrangian vs. nominal-ACH
+Euler differ by only ~5% relative - the simple well-mixed exponential model is a
+decent approximation of this room's real ventilation-only removal. Lagrangian vs.
+measured-ACH Euler differ by ~22% relative - using the CFD-measured (lower) rate
+in the simple model *understates* how fast ventilation actually clears the room
+according to the rigorous, non-well-mixed particle tracking. That's a mildly
+counterintuitive result (naively, the "more accurate" measured rate feeding a
+simple model might have been expected to track the rigorous method better, not
+worse) - flagged here as an observation, not something this evaluation dug into
+the cause of.
+
+This washout comparison is only valid for the ventilation-only question - it does
+NOT extend to a UV-dose comparison between Method 1 and Methods 2/3, since UV
+dose depends on the *full trajectory* each parcel takes (see Finding 1), not just
+whether it has exited yet. **For the dose question, Method 2 vs. Method 3 remains
+the one genuinely apples-to-apples comparison** - both single-pass, same
+scenario, same Z - and that's where the real, actionable dose finding still lives
+(the flip described above).
+
+**Second correction (same day, user caught this too) - the two methods don't
+even start from the same initial distribution.** Confirmed directly in
+`initial_fields.py`: a decay run's T field is written as `internalField uniform
+{T_initial}` - a single scalar applied to **every cell simultaneously**, i.e. the
+whole room is instantaneously and uniformly "contaminated" at t=0 (T=1
+everywhere, with T=0 fixed at the inlet as the boundary condition fresh air
+enters through). This is a real, standard experimental protocol (the "decay
+method" in the GUV literature - release a uniform tracer, watch it fall) - not a
+bug - but it means Method 1's t=500s comparison point describes contaminant that
+started **everywhere in the room**, decaying via combined dilution+UV, while
+Method 3's Lagrangian particles all start **at the inlet** (t=0 there by
+definition) and are tracked forward from a single entry surface. The washout
+comparison above (`1-F(t)` vs. exp(-ACH·t/3600)) sidesteps this specific mismatch
+because it only asks about *air entering via the inlet* on both sides - Method 1
+plays no part in it, it's a Lagrangian-vs-simple-model comparison, not
+Method-1-vs-Method-3. But it means the earlier framing of Method 1 as "the
+established, trusted number" this whole session compared everything else against
+needs a footnote: it answers "if the room were instantaneously and uniformly
+contaminated, how fast does it clear" - a genuinely different physical question
+from "what happens to air/pathogen entering through the inlet," which is what
+Methods 2 and 3 both ask. Neither framing is more "correct" than the other - they
+correspond to different real scenarios (a point-source release event that's had
+time to mix throughout the room vs. continuous inflow of contaminated air) - but
+conflating them, even informally, is a mistake this log itself was at risk of
+making.
+
+**Proposed follow-up (not yet built)**: an inlet-concentrated pulse IC - instead
+of `T=uniform 1` everywhere, write a spatially-varying initial T field
+concentrated near the inlet (e.g. T=1 within some radius of the inlet opening,
+T=0 elsewhere, or a smoother Gaussian falloff) and rerun the decay solve from
+there, reusing the case's already-converged flow field (same reuse pattern as
+the UV-off control clone). This would give a THIRD room-average decay curve
+whose starting point at least shares Method 3's "contaminant originates at the
+inlet" framing, making it a meaningfully closer (if still not identical - it's
+still a one-time pulse decaying, not Method 3's continuous inflow) point of
+comparison than the uniform-IC curve. Requires: (1) a non-uniform `internalField`
+writer for T (today's `write_initial_fields`/`field_file_content` only support a
+single uniform scalar - see `_field_spec`), computing a per-cell value from
+distance-to-inlet using the mesh's own cell centers, and (2) an actual new
+pimpleFoam transient solve (real wall-clock cost, comparable to the original
+decay run - not a free post-processing step like the washout calculation above).
+**Built and run (same day, follow-up)** - `pulse_at_inlet_experiment.py`: clones
+the case's already-converged UV-off control run (`no_UV/` - same mesh, same
+converged flow field, no UV source), overwrites `0/T` with a sphere of T=1
+centered at the inlet's own face-center-of-mass (radius as a CLI arg) instead of
+`uniform 1`, reruns pimpleFoam to t=500s, reads the resulting room-average
+remaining fraction. (Also discovered along the way: `monitoring.
+write_vol_average_dict`'s default `patches=("outlet",)` already sets up an
+OUTLET-patch area-average function object - `postProcessing/outletAverage/0/
+surfaceFieldValue.dat` was sitting on disk, fully computed, for every run this
+whole session, unused by any reading code. A genuine outlet-breakthrough-curve
+comparison - closer to what the user's "measure at the outlet" question was
+really asking for - is now cheap to build from data that already exists;
+flagged as the natural next refinement, not done in this pass.)
+
+| Pulse radius | Room volume affected | Reduction % at t=500s |
+|---|---|---|
+| 0.5m | 0.5% (216/39936 cells) | 99.6% |
+| 1.5m | 10.8% (4306/39936 cells) | 92.5% |
+| infinite (= the existing uniform-IC baseline) | 100% | 46.8% |
+| **Lagrangian washout (rigorous, N=500)** | - | **58.8%** |
+
+The trend is monotonic and physically sensible on its own terms - a smaller,
+more tightly-concentrated pulse sits more squarely in the direct, strong
+near-inlet jet and gets flushed out of the ROOM AVERAGE almost immediately
+(a small-volume effect: with 99.5% of the room starting at T=0, very little
+actual transport is needed to swing a volume-weighted average that far).
+Reduction % falls monotonically toward the uniform-IC limit (46.8%) as pulse
+radius grows.
+
+**But even at 10.8% of room volume, the pulse run (92.5%) is nowhere near
+Lagrangian's washout (58.8%)** - not a rounding-level gap, a large one.
+Lagrangian's number sits mathematically *between* the 1.5m-pulse and
+fully-uniform results, meaning some larger pulse radius (rough sense: needing
+to reach something like 30-50% of the room's volume, at which point "a pulse
+near the inlet" starts to blur into "most of the room") might numerically
+match it - not yet tried.
+
+**This is a real, unresolved discrepancy, not just a sizing artifact to tune
+away.** Even granting that the pulse-IC framing only ever approximately matches
+Method 3's continuous-inflow, particles-start-at-a-point setup (see the
+buildable-next-step note above - a one-time pulse decaying is still not the
+same as continuous inflow), the fact that *no* pulse size tried so far - across
+a 20x range in affected volume - lands anywhere close to the Lagrangian number
+is evidence that the Euler (mean-flow + turbulent-diffusivity) field and the
+Lagrangian tracker are not simply two equivalent views of the same transport in
+this case. Candidate explanations, none confirmed:
+- Room-average is the wrong metric to compare against a near-inlet release in
+  the first place - the now-available but still-unread outlet-breakthrough
+  data (see above) may tell a materially different story than the room-average
+  numbers used here, since a pulse can clear the room average fast without
+  most of it having actually reached the outlet yet (recirculation/dead-zone
+  fluid can sit in the room a long time without diluting the *average* much
+  once it's a small fraction of a large room).
+  - Something about the Lagrangian tracker's own dispersion strength, seeding,
+  or exit-detection could be systematically biased (see the still-open `nu`
+  omission and survivorship-adjacent caveats noted above/earlier this session)
+  - the diffusivity-consistency check above narrows this a little (confirms
+  the *coefficient* matches by design) but doesn't rule out other
+  implementation gaps.
+- The pulse-vs-continuous-inflow framing mismatch (Finding 1 revisited) may
+  simply be a bigger effect in this specific flow than assumed - worth
+  checking against a genuinely bigger pulse (30-50% of room volume) before
+  concluding the two methods disagree at the physics level rather than the
+  comparison-design level.
+
+Not resolved in this session - flagged as the most important open question
+this whole evaluation surfaced, ahead of any of the numeric findings above it.
+
+**Sample-size sensitivity check (user question - "run N=250, which direction does
+it move")**: a second independent Lagrangian washout run, N=250 (different seed,
+99 vs. the N=500 run's 7): 155/250 exited by t=500s, remaining fraction 0.380
+(62.0% reduction) vs. the N=500 run's 0.412 (58.8% reduction). Difference: 0.032,
+or **1.45 standard errors** (binomial SE ~= sqrt(p(1-p)/n), 0.022 at N=500, 0.031
+at N=250) - unremarkable, ordinary sampling noise for these sample sizes, not a
+directional drift. The Lagrangian washout estimate itself looks statistically
+stable around ~38-41% remaining - it is NOT the source of the large gap against
+the Euler pulse experiments described above; that gap needs a different
+explanation (see the candidate list above - most likely the room-average-vs-
+outlet-breakthrough metric question, still open).
+
+**Turbulence-diffusivity consistency check (user question)**: does the Lagrangian
+tracker's random walk actually match what the CFD's own decay run (Method 1) uses
+for turbulent mixing of T? Yes, by design - confirmed directly in
+`system/controlDict`: `alphaD=1, alphaDt=1` for the T scalarTransport equation,
+meaning its total diffusivity is `D = alphaD*nu + alphaDt*nut = nu + nut`
+(molecular + turbulent). `integrate_particles`' random walk was deliberately
+scaled by `nut` (not an independently-chosen Schmidt number) specifically to
+match this. One small, previously-unstated gap: the tracker used `nut` ALONE,
+omitting the molecular term `nu`. Checked directly: `constant/transportProperties`
+gives `nu = 1.5e-5 m^2/s` (air) against a measured mean `nut ~= 4e-4 m^2/s` in
+this case - molecular is ~3.75% of turbulent, so turbulent transport dominates by
+~25x and the omission is small, but it means the tracker's diffusivity is
+marginally (~3-4%) lower than the CFD's own T equation everywhere, and
+relatively more understated in any near-wall/low-nut cells where the two values
+are closer together. Not fixed in this session (would just mean passing `nu +
+nut` instead of `nut` into the random-walk term - a one-line change to
+`load_flow_field`'s nut handling) - flagged for completeness, not expected to
+change any conclusion given the ~25x margin.
+
+**Takeaway (revised - the pulse-experiment gap is the headline finding, not a
+footnote)**: the age-field snapshot method (`tracer_dose_report.py`'s current
+approach) measures a real but different quantity than the paper's model calls
+for, and shouldn't be trusted as a stand-in for true single-pass dose survival -
+treat its output as a rough, differently-biased estimate, not a validated
+result. The Lagrangian tracker with turbulent dispersion
+(`guvcfd/lagrangian_tracking.py`) is the more rigorous method now available for
+both the dose question and, via the washout fraction, the pure-ventilation
+question - its own estimate is statistically stable across sample sizes (see
+above). Method 1 (the established decay-curve fit) remains untouched and still
+the trusted number for "how fast does this room's contamination actually decay
+over time" under combined ventilation+UV.
+
+But the pulse-at-inlet experiment built specifically to cross-check the
+Lagrangian tracker against the CFD's own Euler field found a large,
+unresolved discrepancy - a pulse covering 10.8% of the room's volume near the
+inlet still clears the room average almost 3x faster (92.5% reduction) than
+the Lagrangian washout predicts (58.8%), and no pulse size tried so far lands
+close. **This is not just "the age-field method is flawed, use Lagrangian
+instead" anymore - it's an open question about whether the Lagrangian
+tracker's own results can be trusted at face value**, at least not without
+either the outlet-breakthrough comparison (data already sitting on disk,
+unread - see above) or a genuinely room-scale pulse test to rule out a
+comparison-design artifact first. Until that's resolved, none of this
+session's Lagrangian-derived numbers (dose N/N0, washout fractions) should be
+treated as settled - they're the best rigorous estimate built so far, not a
+validated one.

@@ -397,7 +397,8 @@ def _copy_latest_to_zero(case_dir_wsl, latest, include_T, log_fn):
 _TIME_LINE_RE = re.compile(r"^Time\s*=\s*[\d.]+\s*$")
 
 
-def _phase_solver_callback(log_fn, solver_log_fn, status_fn, status_key, delta_t=1, iteration_base=0):
+def _phase_solver_callback(log_fn, solver_log_fn, status_fn, status_key, delta_t=1, iteration_base=0,
+                            total_time=None):
     """Wraps a phase's simpleFoam on_line callback.
 
     With no status_fn (single-run mode - progress there comes from
@@ -414,22 +415,29 @@ def _phase_solver_callback(log_fn, solver_log_fn, status_fn, status_key, delta_t
     still receives every raw line either way.
 
     delta_t: OpenFOAM's own "Time" is iteration*delta_t (see _run_phase's
-    own delta_t docstring) - reported to status_fn as "Iteration N" (N
-    divided back out) instead of the raw "Time = N", so this matches the
-    plain iteration-count language Simulation settings/phase1-iterations
-    uses rather than showing a number scaled by a factor the UI never
-    otherwise surfaces. Confirmed directly as a real point of confusion:
-    at delta_t=3, a 1500-iteration budget showed as "Time = 4500" with no
-    indication of the scaling.
+    own delta_t docstring). Previously this reported "Iteration N" (Time
+    divided back out) instead, to match phase1-iterations' plain
+    iteration-count language - but that meant this same status field
+    showed "Time" for some combinations and "Iteration" for others
+    depending on whether delta_t happened to be scaled for that specific
+    ACH, with nothing in the UI explaining why (confirmed directly as a
+    real point of confusion, 2026-08-08). Now always shows "Time", always
+    in seconds, for every combination alike - consistency over cleverness.
 
     iteration_base: each chunk's own OpenFOAM "Time" restarts from 0 (see
     _run_phase's "every chunk starts fresh at time-label 0" - the same
     reason the live per-iteration series gets offset by total_run before
-    being accumulated) - without this, "Iteration N" would be chunk-LOCAL
-    progress (e.g. resetting to a small number every ~400 iterations),
-    not the cumulative total the "iterations of budget" framing everywhere
-    else implies. Pass the chunk's own starting total_run here so the
-    displayed number is always the true cumulative iteration.
+    being accumulated) - converted to a TIME offset (iteration_base *
+    delta_t) and added to the chunk's own raw Time, so the displayed
+    number is always the true cumulative elapsed time across every chunk,
+    not chunk-local progress that resets every ~400 iterations.
+
+    total_time: this phase's own overall target end time [s]
+    (n_iterations * delta_t - the same value _run_phase's own end_time
+    would be if it ran in one single chunk) - appended as "Time = N of
+    total_time total seconds" so the display always shows elapsed vs.
+    total, in the same units, regardless of delta_t. None (rare) just
+    omits the suffix.
 
     solver_log_fn/log_fn still get the raw, unconverted line either way -
     only status_fn's display is adjusted.
@@ -440,10 +448,12 @@ def _phase_solver_callback(log_fn, solver_log_fn, status_fn, status_key, delta_t
     def callback(line):
         stripped = line.strip()
         if _TIME_LINE_RE.match(stripped):
-            if delta_t != 1 or iteration_base:
-                raw_time = float(stripped.split("=", 1)[1])
-                stripped = f"Iteration {iteration_base + round(raw_time / delta_t)}"
-            status_fn(status_key, stripped)
+            raw_time = float(stripped.split("=", 1)[1])
+            cumulative_time = iteration_base * delta_t + raw_time
+            display = f"Time = {cumulative_time:.4g}"
+            if total_time is not None:
+                display += f" of {total_time} total seconds"
+            status_fn(status_key, display)
         if solver_log_fn:
             solver_log_fn(line)
     return callback
@@ -614,7 +624,8 @@ def _run_phase(case_dir, case_dir_wsl, n_iterations, write_interval, window_frac
         r = run_wsl_streaming(
             "simpleFoam 2>&1 | tee log.simpleFoam", case_dir_wsl,
             on_line=_phase_solver_callback(log_fn, solver_log_fn, status_fn, status_key,
-                                           delta_t=delta_t, iteration_base=total_run),
+                                           delta_t=delta_t, iteration_base=total_run,
+                                           total_time=n_iterations * delta_t),
             should_stop=should_stop, kill_pattern="simpleFoam", should_pause=should_pause,
         )
         if should_stop is not None and should_stop():

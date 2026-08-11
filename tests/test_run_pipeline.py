@@ -100,11 +100,46 @@ def test_setup_case_sealed_without_fan_raises_before_any_wsl_call(monkeypatch):
         assert "fan" in str(e).lower()
 
 
+def test_finish_case_setup_mechanical_ach_only_skips_fluence_pipeline(monkeypatch):
+    # mechanical_ach_only has nothing physical to bin (no fluence at all,
+    # by user choice, independent of the project's actual lamp count) -
+    # must never touch the fluence/inactivation-rate/cellZone/fvOptions
+    # binning path, only write an empty fvOptions instead.
+    def fail(*a, **k):
+        raise AssertionError("must not touch the UV/fluence pipeline for mechanical_ach_only")
+
+    for name in ("read_cell_centers", "compute_fluence_at_points", "read_boundary_patch_names",
+                 "write_scalar_field", "compute_inactivation_rate", "compute_well_mixed_eACH",
+                 "bin_decay_rates", "write_cellzones", "write_fvoptions"):
+        monkeypatch.setattr(run_pipeline, name, fail)
+
+    written = {}
+    monkeypatch.setattr(run_pipeline, "write_fvoptions_file",
+                         lambda case_dir, entries: written.setdefault("fvoptions", entries))
+    monkeypatch.setattr(run_pipeline, "set_function_object_enabled", lambda *a, **k: None)
+    monkeypatch.setattr(run_pipeline, "splice_fv_options_into_control_dict",
+                         lambda case_dir: (f"{case_dir}/system/controlDict", 2, 2))
+    monkeypatch.setattr(run_pipeline, "set_control_dict_time", lambda *a, **k: None)
+
+    summary = {"ach": 3.0}
+    result = run_pipeline._finish_case_setup(
+        "unused_dir", room=None, Z=6.0, nbins=25, source_field="T", fan_entry=None,
+        pimple_end_time=120, pimple_write_interval=10, pimple_delta_t=0.5, log_fn=lambda *a: None,
+        summary=summary, mechanical_ach_only=True,
+    )
+    assert written["fvoptions"] == []
+    assert result["eACH_uv_well_mixed_mean"] == 0.0
+    assert result["n_zones"] == 0
+    assert result["fluence_mean"] is None
+
+
 def test_converge_flow_field_skip_potential_flow_never_runs_potentialfoam(monkeypatch, tmp_path):
     commands = []
 
     def fake_run_wsl(cmd, cwd_wsl):
         commands.append(cmd)
+        if "endTime" in cmd:
+            return SimpleNamespace(stdout="500", stderr="", returncode=0)
         return SimpleNamespace(stdout="", stderr="", returncode=0)
 
     def fake_run_wsl_or_raise(cmd, cwd_wsl, step_name):
@@ -261,6 +296,137 @@ def test_check_settings_grid_alignment_skips_disabled_second_openings():
     assert "2nd inlet" not in names and "2nd outlet" not in names
 
 
+# --- walk_opening_alignment_conflicts (2026-08-07) ---
+
+def _walk_all(settings, room, cell_size, agree_fn=lambda c: True):
+    """Drive the generator to completion, returning the full list of
+    conflicts it yielded, deciding each one via agree_fn(conflict)."""
+    gen = run_pipeline.walk_opening_alignment_conflicts(settings, room, cell_size)
+    seen = []
+    conflict = next(gen, None)
+    while conflict is not None:
+        seen.append(conflict)
+        try:
+            conflict = gen.send(agree_fn(conflict))
+        except StopIteration:
+            conflict = None
+    return seen
+
+
+def test_walk_opening_alignment_conflicts_empty_when_already_aligned():
+    room = SimpleNamespace(x=4.0, y=4.0, z=4.0)
+    settings = {
+        "inlet-wall": "xMin", "inlet-y-input": 2.0, "inlet-z-input": 2.0,
+        "inlet-size-w": 0.4, "inlet-size-h": 0.4,
+        "outlet-wall": "xMax", "outlet-y-input": 2.0, "outlet-z-input": 2.0,
+        "outlet-size-w": 0.4, "outlet-size-h": 0.4,
+    }
+    assert _walk_all(settings, room, 0.1) == []
+
+
+def test_walk_opening_alignment_conflicts_size_before_center_for_one_opening():
+    room = SimpleNamespace(x=4.0, y=5.0, z=3.0)
+    settings = {
+        "inlet-wall": "xMin", "inlet-y-input": 1.37, "inlet-z-input": 0.68,
+        "inlet-size-w": 0.23, "inlet-size-h": 0.35,
+        "outlet-wall": "xMax", "outlet-y-input": 2.5, "outlet-z-input": 1.5,
+        "outlet-size-w": 0.4, "outlet-size-h": 0.4,
+    }
+    conflicts = _walk_all(settings, room, 0.1)
+    kinds = [(c["opening"], c["kind"], c["axis_label"]) for c in conflicts]
+    assert kinds == [
+        ("Inlet", "size", "width"), ("Inlet", "size", "height"),
+        ("Inlet", "center", "position 1"), ("Inlet", "center", "position 2"),
+    ]
+    # Outlet is already exactly aligned - contributes nothing.
+
+
+def test_walk_opening_alignment_conflicts_center_uses_the_agreed_size_not_nominal():
+    room = SimpleNamespace(x=4.0, y=5.0, z=3.0)
+    settings = {
+        "inlet-wall": "xMin", "inlet-y-input": 1.37, "inlet-z-input": 0.68,
+        "inlet-size-w": 0.23, "inlet-size-h": 0.35,
+        "outlet-wall": "xMax", "outlet-y-input": 2.5, "outlet-z-input": 1.5,
+        "outlet-size-w": 0.4, "outlet-size-h": 0.4,  # already aligned - contributes nothing
+    }
+    conflicts = _walk_all(settings, room, 0.1)
+    center1 = next(c for c in conflicts if c["kind"] == "center" and c["axis_label"] == "position 1")
+    # Matches the worked-example value computed against the AGREED 0.3m
+    # width, not the original 0.23m nominal.
+    assert abs(center1["suggested"] - 1.35) < 1e-9
+
+
+def test_walk_opening_alignment_conflicts_declined_size_skips_its_own_center_check():
+    room = SimpleNamespace(x=4.0, y=5.0, z=3.0)
+    settings = {
+        "inlet-wall": "xMin", "inlet-y-input": 1.37, "inlet-z-input": 0.68,
+        "inlet-size-w": 0.23, "inlet-size-h": 0.35,
+        "outlet-wall": "xMax", "outlet-y-input": 2.5, "outlet-z-input": 1.5,
+        "outlet-size-w": 0.4, "outlet-size-h": 0.4,  # already aligned - contributes nothing
+    }
+
+    def decline_width_only(c):
+        return not (c["kind"] == "size" and c["axis_label"] == "width")
+
+    conflicts = _walk_all(settings, room, 0.1, agree_fn=decline_width_only)
+    kinds = [(c["kind"], c["axis_label"]) for c in conflicts]
+    assert ("size", "width") in kinds
+    assert ("size", "height") in kinds
+    assert ("center", "position 1") not in kinds  # width's size was declined -> skipped
+    assert ("center", "position 2") in kinds       # height's size was agreed -> still checked
+
+
+def test_walk_opening_alignment_conflicts_keeps_conflicts_correctly_attributed_per_opening():
+    # Regression guard for the inlet/outlet mixup risk this session hit -
+    # Inlet and Outlet have differently-shaped mismatches here, so a
+    # cross-attribution bug would show up as a value from the wrong
+    # opening's own fields.
+    room = SimpleNamespace(x=4.0, y=5.0, z=3.0)
+    settings = {
+        "inlet-wall": "xMin", "inlet-y-input": 2.5, "inlet-z-input": 0.4,
+        "inlet-size-w": 0.4, "inlet-size-h": 0.4,  # inlet: already aligned
+        "outlet-wall": "xMax", "outlet-y-input": 2.35, "outlet-z-input": 2.7,
+        "outlet-size-w": 0.4, "outlet-size-h": 0.2,  # outlet: needs a center shift
+    }
+    conflicts = _walk_all(settings, room, 0.1)
+    assert len(conflicts) > 0  # sanity: this position genuinely needs a fix, not a vacuous pass
+    assert all(c["opening"] == "Outlet" for c in conflicts)
+    for c in conflicts:
+        assert c["field_id"].startswith("outlet-")
+
+
+def test_walk_opening_alignment_conflicts_disabled_second_openings_never_appear():
+    room = SimpleNamespace(x=3.2, y=4.8, z=2.57)
+    settings = dict(_patient_ward_settings())
+    settings.update({
+        "inlet2-enable": False, "inlet2-wall": "ceiling", "inlet2-y-input": 2.0, "inlet2-z-input": 1.5,
+        "inlet2-size-w": 0.33, "inlet2-size-h": 0.33,
+        "outlet2-enable": False, "outlet2-wall": "floor", "outlet2-y-input": 2.0, "outlet2-z-input": 1.5,
+        "outlet2-size-w": 0.33, "outlet2-size-h": 0.33,
+    })
+    conflicts = _walk_all(settings, room, 0.1)
+    assert all(c["opening"] not in ("2nd inlet", "2nd outlet") for c in conflicts)
+
+
+def test_walk_opening_alignment_conflicts_enabled_second_openings_are_included():
+    room = SimpleNamespace(x=3.2, y=4.8, z=2.57)
+    settings = dict(_patient_ward_settings())
+    settings.update({
+        "inlet2-enable": True, "inlet2-wall": "ceiling", "inlet2-y-input": 2.0, "inlet2-z-input": 1.5,
+        "inlet2-size-w": 0.33, "inlet2-size-h": 0.33,
+        "outlet2-enable": False,
+    })
+    conflicts = _walk_all(settings, room, 0.1)
+    assert any(c["opening"] == "2nd inlet" for c in conflicts)
+
+
+def test_walk_opening_alignment_conflicts_never_yields_the_source_zone():
+    room = SimpleNamespace(x=3.2, y=4.8, z=2.57)
+    settings = _patient_ward_settings()  # inject-x/y/z-input present, but no source_size arg exists on this function
+    conflicts = _walk_all(settings, room, 0.1)
+    assert all("source" not in c["opening"].lower() for c in conflicts)
+
+
 # --- Persisted chunk history + FlowConvergenceUndecided diagnostics ---
 
 def test_history_round_trips_through_disk(tmp_path):
@@ -326,12 +492,18 @@ def test_converge_flow_field_raises_flow_convergence_undecided_not_runtime_error
     call_count = {"n": 0}
 
     def fake_run_wsl(cmd, cwd_wsl):
+        if "endTime" in cmd:
+            return SimpleNamespace(stdout="500", stderr="", returncode=0)
         return SimpleNamespace(stdout="", stderr="", returncode=0)
 
     def fake_run_wsl_or_raise(cmd, cwd_wsl, step_name):
         if "ls -d" in cmd:
             call_count["n"] += 1
-            return SimpleNamespace(stdout=str(call_count["n"] * 500), returncode=0)
+            # Every chunk restarts from "0/" and targets endTime=n_iterations
+            # again (by design - see converge_flow_field's own comment on
+            # this), so the time directory reached is always n_iterations
+            # (500 here), not a running cumulative total.
+            return SimpleNamespace(stdout="500", returncode=0)
         if "ls " in cmd and "grep" in cmd:
             return SimpleNamespace(stdout="U p k omega nut phi", returncode=0)
         return SimpleNamespace(stdout="", returncode=0)

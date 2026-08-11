@@ -5,16 +5,107 @@ from pathlib import Path
 
 import numpy as np
 
+from .wsl_utils import (
+    write_case_file as _write_case_file,
+    wsl_path as _wsl_path,
+    read_wsl_text as _read_wsl_text,
+    run_wsl_or_raise as _run_wsl_or_raise,
+)
+
+# Every file that carries an OpenFOAM-level solver/physics constant not
+# otherwise captured in any settings JSON (nOuterCorrectors, maxDeltaT,
+# GAMG tolerances, discretization schemes, turbulence model choice,
+# transport properties, ...) - see snapshot_openfoam_settings.
+_SNAPSHOT_FILES = (
+    "system/controlDict", "system/fvSolution", "system/fvSchemes",
+    "constant/turbulenceProperties", "constant/transportProperties",
+)
+
+
+def snapshot_openfoam_settings(case_dir, dest_subdir="system/project_schemes", files=_SNAPSHOT_FILES):
+    """Copy the actual solver dict files into <case_dir>/<dest_subdir>/ -
+    a verbatim record of exactly what solver constants this run used,
+    independent of whether a given value is exposed as a named setting
+    anywhere. Motivated directly by 2026-08-07's live maxCo edits
+    (5 -> 7 -> 10 mid-run), made by hand-editing controlDict outside the
+    app entirely - no settings-JSON field, however complete, would have
+    captured that on its own; a verbatim copy of the file that actually
+    governed the solve does, unconditionally, and automatically covers
+    every OTHER constant (nOuterCorrectors, maxDeltaT, GAMG tolerances,
+    discretization schemes, turbulence model, ...) that was never worth
+    promoting to its own named setting either.
+
+    dest_subdir lives INSIDE system/ (not a sibling of it) deliberately -
+    OpenFOAM only ever looks up specific named dictionaries by IOobject,
+    never enumerates system/'s own contents, so an extra subdirectory
+    there is completely inert to every OpenFOAM application reading this
+    case.
+
+    Safe to call more than once for the same case_dir (e.g. re-snapshotting
+    after a mid-run hand-edit) - each call just overwrites the destination
+    with the source files' current content, so the latest call always
+    wins. Missing source files (e.g. a template variant without
+    turbulenceProperties) are skipped, not fatal.
+
+    Uses a WSL-native copy when case_dir is a real \\\\wsl.localhost\\...
+    path (matching this module's own _read_text), rather than always
+    shelling out to wsl.exe - a plain local case_dir (e.g. a test fixture
+    under a pytest tmp_path) is copied with plain shutil instead, so tests
+    never pay for a doomed-to-fail wsl.exe spawn.
+    """
+    case_dir_wsl = _wsl_path(case_dir)
+    if case_dir_wsl != case_dir:
+        copies = " ".join(f'[ -f "{f}" ] && cp "{f}" "{dest_subdir}/{Path(f).name}"; true' for f in files)
+        cmd = f'mkdir -p "{dest_subdir}" && {copies}'
+        _run_wsl_or_raise(cmd, case_dir_wsl, "snapshotting OpenFOAM settings")
+    else:
+        dest = Path(case_dir) / dest_subdir
+        dest.mkdir(parents=True, exist_ok=True)
+        for f in files:
+            src = Path(case_dir) / f
+            if src.is_file():
+                shutil.copy2(src, dest / src.name)
+
+
+def _read_text(path):
+    """Read `path`, via a WSL-native process when it's a real
+    \\\\wsl.localhost\\... path rather than a plain Windows-side open() -
+    these field files are freshly written by a WSL-native command
+    (writeCellCentres, the solver itself) shortly before being read here,
+    which hits the same cross-boundary visibility gap documented in
+    wsl_utils.write_case_file. Falls back to a plain read for non-WSL
+    paths (e.g. test fixtures).
+    """
+    path_for_wsl = _wsl_path(path)
+    if path_for_wsl != path:
+        return _read_wsl_text(path_for_wsl)
+    with open(path) as f:
+        return f.read()
+
 
 def read_openfoam_scalar_field(path):
     """Read an OpenFOAM scalar field file (e.g. Cx, Cy, Cz), return a list of floats."""
-    with open(path) as f:
-        content = f.read()
+    content = _read_text(path)
     m = re.search(r'internalField\s+nonuniform\s+List<scalar>\s*\n(\d+)\s*\n\(\n(.*?)\n\)', content, re.DOTALL)
     if not m:
         raise RuntimeError(f"Could not find internalField nonuniform List<scalar> block in {path}")
     n = int(m.group(1))
     values = [float(v) for v in m.group(2).split('\n') if v.strip()]
+    assert len(values) == n, f"{path}: parsed {len(values)} values but header says {n}"
+    return values
+
+
+def read_openfoam_vector_field(path):
+    """Read an OpenFOAM vector field file's internalField (e.g. U), return
+    an (N, 3) array. See read_openfoam_scalar_field for the scalar analog.
+    """
+    content = _read_text(path)
+    m = re.search(r'internalField\s+nonuniform\s+List<vector>\s*\n(\d+)\s*\n\(\n(.*?)\n\)', content, re.DOTALL)
+    if not m:
+        raise RuntimeError(f"Could not find internalField nonuniform List<vector> block in {path}")
+    n = int(m.group(1))
+    rows = re.findall(r'\(([^()]*)\)', m.group(2))
+    values = np.array([[float(v) for v in row.split()] for row in rows], dtype=float)
     assert len(values) == n, f"{path}: parsed {len(values)} values but header says {n}"
     return values
 
@@ -98,8 +189,7 @@ def clear_stale_run_output(case_dir):
 
 def read_boundary_patch_names(case_dir):
     """Read patch names from constant/polyMesh/boundary (canonical patch list)."""
-    with open(f"{case_dir}/constant/polyMesh/boundary") as f:
-        content = f.read()
+    content = _read_text(f"{case_dir}/constant/polyMesh/boundary")
     # Patch entries are top-level blocks: "    name\n    {\n ... type ...\n    }"
     return re.findall(r'^\s{4}(\w+)\s*\n\s{4}\{\s*\n\s*type', content, re.MULTILINE)
 
@@ -118,8 +208,7 @@ def _read_foam_count_and_list_body(content):
 
 
 def _read_polymesh_points(case_dir):
-    with open(f"{case_dir}/constant/polyMesh/points") as f:
-        content = f.read()
+    content = _read_text(f"{case_dir}/constant/polyMesh/points")
     n, body = _read_foam_count_and_list_body(content)
     coords = re.findall(r'\(([^()]*)\)', body)
     points = [tuple(float(v) for v in c.split()) for c in coords]
@@ -128,8 +217,7 @@ def _read_polymesh_points(case_dir):
 
 
 def _read_polymesh_faces(case_dir):
-    with open(f"{case_dir}/constant/polyMesh/faces") as f:
-        content = f.read()
+    content = _read_text(f"{case_dir}/constant/polyMesh/faces")
     n, body = _read_foam_count_and_list_body(content)
     entries = re.findall(r'\d+\(([^()]*)\)', body)
     faces = [[int(i) for i in idxs.split()] for idxs in entries]
@@ -138,8 +226,7 @@ def _read_polymesh_faces(case_dir):
 
 
 def _read_polymesh_patch_range(case_dir, patch_name):
-    with open(f"{case_dir}/constant/polyMesh/boundary") as f:
-        content = f.read()
+    content = _read_text(f"{case_dir}/constant/polyMesh/boundary")
     m = re.search(rf'\n\s*{re.escape(patch_name)}\s*\n\s*\{{(.*?)\n\s*\}}', content, re.DOTALL)
     if not m:
         raise RuntimeError(f"Could not find patch '{patch_name}' in {case_dir}/constant/polyMesh/boundary")
@@ -169,6 +256,32 @@ def read_patch_face_centers(case_dir, patch_name):
         f"patch '{patch_name}': expected {n_faces} faces at startFace {start_face}, got {len(patch_faces)}")
     centers = np.array([np.mean([points[i] for i in face], axis=0) for face in patch_faces])
     return centers
+
+
+def read_patch_face_areas(case_dir, patch_name):
+    """Face areas [m^2] of a named boundary patch, in the same patch-face
+    order as read_patch_face_centers - needed to flux-weight particle
+    seeding (see lagrangian_tracking.seed_inlet_particles): a face's
+    contribution to volumetric flow is area * normal velocity, not just
+    velocity alone, so faces must be weighted by their own area too.
+
+    Computed by triangulating each face as a fan from its own centroid
+    (works for the roughly-planar quads/n-gons this mesh produces,
+    convex or not) and summing triangle areas via the cross-product
+    magnitude - the standard robust polygon-area-in-3D method.
+    """
+    points = _read_polymesh_points(case_dir)
+    faces = _read_polymesh_faces(case_dir)
+    start_face, n_faces = _read_polymesh_patch_range(case_dir, patch_name)
+    patch_faces = faces[start_face:start_face + n_faces]
+    areas = np.empty(n_faces)
+    for i, face in enumerate(patch_faces):
+        verts = np.array([points[idx] for idx in face])
+        centroid = verts.mean(axis=0)
+        tri_areas = 0.5 * np.linalg.norm(
+            np.cross(verts - centroid, np.roll(verts, -1, axis=0) - centroid), axis=1)
+        areas[i] = tri_areas.sum()
+    return areas
 
 
 def write_scalar_field(case_dir, field_name, values, patch_names, time_dir="0", dimensions="[0 0 0 0 0 0 0]"):
@@ -211,6 +324,5 @@ def write_scalar_field(case_dir, field_name, values, patch_names, time_dir="0", 
     lines.append("")
 
     out_path = f"{case_dir}/{time_dir}/{field_name}"
-    with open(out_path, "w") as f:
-        f.write("\n".join(lines))
+    _write_case_file(case_dir, f"{time_dir}/{field_name}", "\n".join(lines))
     return out_path

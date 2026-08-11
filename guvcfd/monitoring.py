@@ -12,6 +12,11 @@ functions{} block (see splice.splice_into_functions_block()) so they run
 every solver iteration, independent of writeInterval - see the
 live-volAverage validation experiment.
 """
+from .splice import splice_into_functions_block as _splice_into_functions_block
+from .wsl_utils import (
+    write_case_file as _write_case_file,
+    read_case_file as _read_case_file,
+)
 
 
 def vol_average_dict(field="T", patches=("outlet",)):
@@ -61,8 +66,7 @@ def vol_average_dict(field="T", patches=("outlet",)):
 
 def write_vol_average_dict(case_dir, field="T", patches=("outlet",)):
     path = f"{case_dir}/system/volAverageDict"
-    with open(path, "w") as f:
-        f.write(vol_average_dict(field, patches))
+    _write_case_file(case_dir, "system/volAverageDict", vol_average_dict(field, patches))
     return path
 
 
@@ -129,3 +133,27 @@ def live_vol_average_functions(field="T", patches=(), monitoring_zones=(), inden
             "}",
         ]
     return "\n".join(indent + line if line else "" for line in lines)
+
+
+def splice_live_vol_average_if_needed(case_dir, field="T", patches=(), monitoring_zones=()):
+    """Idempotently splice live_vol_average_functions() into case_dir's
+    controlDict - decay mode's equivalent of steady_state_pipeline._run_phase's
+    own inline idempotency check, pulled out into one shared helper so
+    every decay-mode caller (the main UV-on run, and the UV-off control run
+    - see ventilation_control.prepare_ventilation_only_control) gets the
+    same "every timestep, not just full-field writes" tracking steady-state
+    already had, without duplicating the check 5 times over.
+
+    Safe to call even when controlDict already has the live block - e.g. a
+    UV-off control run clones its case_dir from a case that may already
+    have spliced this in, and splicing a second, identically-named copy
+    would produce a brace-breaking duplicate rather than a no-op. Skips
+    instead of raising in that case.
+    """
+    content = _read_case_file(case_dir, "system/controlDict")
+    if "volAverageLive1" in content:
+        return
+    block = live_vol_average_functions(field=field, patches=patches, monitoring_zones=monitoring_zones)
+    _, n_open, n_close = _splice_into_functions_block(case_dir, block)
+    if n_open != n_close:
+        raise RuntimeError(f"Brace mismatch after live-volAverage splice: open={n_open} close={n_close}")

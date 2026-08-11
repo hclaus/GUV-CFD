@@ -2,6 +2,7 @@ from PySide6.QtGui import QAction, QKeySequence
 from PySide6.QtWidgets import QDialog, QMainWindow, QMessageBox, QTabWidget, QTextBrowser, QVBoxLayout
 
 from .. import help_content
+from ..version import APP_VERSION
 from .analysis_tab import AnalysisTab
 from .project_setup_tab import ProjectSetupTab
 from .run_tab import RunTab
@@ -18,12 +19,12 @@ _HELP_TOPICS = [
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("GUV-CFD")
+        self.setWindowTitle(f"GUV-CFD v{APP_VERSION}")
         self.resize(1400, 900)
 
         self.project_setup_tab = ProjectSetupTab()
         self.run_tab = RunTab(self.project_setup_tab)
-        self.analysis_tab = AnalysisTab()
+        self.analysis_tab = AnalysisTab(self.project_setup_tab)
 
         tabs = QTabWidget()
         tabs.addTab(self.project_setup_tab, "Project Setup")

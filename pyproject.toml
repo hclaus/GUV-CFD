@@ -13,6 +13,7 @@ dependencies = [
     "pyvista>=0.48.4",
     "pyvistaqt>=0.12.0",
     "matplotlib>=3.11.0",
+    "paramiko>=3.4.0",
 ]
 
 [dependency-groups]
@@ -22,3 +23,18 @@ dev = [
 
 [tool.uv]
 package = true
+
+[tool.pytest.ini_options]
+# Restrict default collection to tests/ - without this, a bare `pytest`/
+# `uv run pytest` (no path argument) scans the whole repo root too, which
+# picks up one-off research/debugging scripts that happen to match
+# test_*.py (test_potentialfoam_usefulness.py, test_tracer_on_patientward.py)
+# but aren't pytest tests at all - their module-level code launches REAL
+# OpenFOAM runs against real project paths just from being imported for
+# collection. Confirmed directly: this is what actually caused this
+# session's multiple 1.5+ hour "pytest is just slow" mysteries - not WSL
+# contention from anything else, pytest itself was running a real
+# multi-hour pimpleFoam solve during collection every time. Run those
+# scripts explicitly (`uv run python test_tracer_on_patientward.py`) when
+# actually wanted, never via bare pytest.
+testpaths = ["tests"]

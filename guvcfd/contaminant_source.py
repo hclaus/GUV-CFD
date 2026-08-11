@@ -17,7 +17,7 @@ import re
 
 from .decay_analysis import fit_asymptotic_value
 from .mesh_gen import snap_outward
-from .wsl_utils import wsl_path, run_wsl_or_raise, run_wsl
+from .wsl_utils import wsl_path, run_wsl_or_raise, run_wsl, write_case_file as _write_case_file
 
 
 def _source_box(center, size, cell_size=None):
@@ -95,8 +95,8 @@ def write_source_topo_set_dict(case_dir, center, size, zone_name="sourceZone",
                                 cellset_name="sourceZoneCells", filename="sourceTopoSetDict",
                                 cell_size=None):
     path = f"{case_dir}/system/{filename}"
-    with open(path, "w") as f:
-        f.write(source_topo_set_dict(center, size, zone_name, cellset_name, cell_size=cell_size))
+    _write_case_file(case_dir, f"system/{filename}",
+                      source_topo_set_dict(center, size, zone_name, cellset_name, cell_size=cell_size))
     return path
 
 
@@ -158,8 +158,7 @@ def write_fvoptions_file(case_dir, entries):
     ]
     lines.extend(entries)
     path = f"{case_dir}/constant/fvOptions"
-    with open(path, "w") as f:
-        f.write("\n".join(lines))
+    _write_case_file(case_dir, "constant/fvOptions", "\n".join(lines))
     return path
 
 
@@ -353,8 +352,7 @@ def check_mass_balance(case_dir, patches, injection_rate_G, tol=0.10, log_fn=pri
     """
     case_dir_wsl = wsl_path(case_dir)
     dict_path = f"{case_dir}/system/massBalanceDict"
-    with open(dict_path, "w") as f:
-        f.write(_mass_balance_dict(patches))
+    _write_case_file(case_dir, "system/massBalanceDict", _mass_balance_dict(patches))
 
     r = run_wsl_or_raise("postProcess -dict system/massBalanceDict -latestTime", case_dir_wsl,
                           "measuring mass balance (outlet removal vs injection)")
