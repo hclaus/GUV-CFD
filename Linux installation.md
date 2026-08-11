@@ -230,6 +230,40 @@ ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes \
 Confirmed working 2026-08-06 - connected with zero prompts, printed
 `CONNECTED as hclaus from HolgersLT`.
 
+### Step 4 - raise sshd's MaxSessions cap (needed for real concurrent sweeps)
+
+Why: `wsl_utils.py` uses ONE shared SSH `Transport` app-wide; a real sweep
+opens up to 9 concurrent channels on it at once (persistent SFTP per
+thread, plus short exec channels for `mkdir`/`ls`/`cp -r`/`rm -rf`, etc.
+- see `scenario_runs._MAX_CONCURRENT_SOLVES`). OpenSSH's own default
+`MaxSessions 10` (the cap on channels open *at once* per connection) is
+close enough to that to fail intermittently under real load - confirmed
+directly: a 6-9 thread stress test
+(`tests/test_ssh_transport_concurrency.py`) failed 83-85/100 attempts at
+the default, and 0/100 after this fix (see
+`project_ssh_stress_test_pending_2026-08-09` memory for the full
+before/after numbers).
+
+From inside WSL (`wsl`, one `sudo` command - will prompt for your Linux
+account password):
+
+```bash
+sudo sed -i 's/^#MaxSessions 10/MaxSessions 40/' /etc/ssh/sshd_config
+sudo systemctl restart ssh
+```
+
+Verify it took effect:
+
+```bash
+grep MaxSessions /etc/ssh/sshd_config
+```
+
+should print `MaxSessions 40`. The app's own client-side channel
+semaphore (`_ssh_channel_semaphore` in `wsl_utils.py`) is set to 30,
+comfortably under this 40 - if you raise `MaxSessions` further, there's
+no need to also raise the semaphore unless you also raise
+`_MAX_CONCURRENT_SOLVES` well past 9.
+
 ## Code side (tracked in the plan file)
 
 `guvcfd/wsl_utils.py` has a paramiko-based connection manager and SSH/SFTP
@@ -284,6 +318,11 @@ so there's no need to.)
 - If SSH connection is refused entirely, check Windows Firewall isn't
   blocking the WSL virtual network adapter (uncommon, but possible after
   a Windows Update).
+- If SSH mode fails intermittently only under real concurrent-sweep load
+  (`Secsh channel N open FAILED: open failed: Connect failed`, or
+  SFTP reads/writes failing sporadically), check Part 2 Step 4's
+  `MaxSessions` setting hasn't reverted to OpenSSH's default of 10 - this
+  is the single most likely cause, not a paramiko/thread-safety bug.
 - If `blockMesh -help` (Part 1e) says "command not found" even after
   sourcing the bashrc, double check `openfoam2412-default` actually
   installed (`dpkg -l | grep openfoam2412` should list several packages)

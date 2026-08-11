@@ -8,6 +8,7 @@ for a flow-convergence-undecided / Phase-1-extrapolation-undecided pause -
 a run that hits one surfaces it as an error (log + status), not an
 interactive decision panel. Rerun, or use the web app to resume it.
 """
+import time
 from pathlib import Path
 
 from PySide6.QtCore import QTimer, Signal
@@ -23,6 +24,45 @@ from . import helpers, run_state, sweep_state
 
 _TABLE_HEADERS = ["Z", "ACH", "Status", "Reduction %", "Measured ACH eff. %", "Measured UV eff. %",
                    "Mechanical mixing eff. %", "Est. ACH /hr", "Est. eACH /hr"]
+
+# 25% bigger than this app's ~9pt/~28px native default, bold, with a
+# raised/beveled ("3D") gradient look - the flat native buttons were hard
+# to see against the surrounding form (2026-08-11 user report).
+_BUTTON_STYLE = """
+QPushButton {
+    font-weight: bold;
+    font-size: 12pt;
+    padding: 8px 20px;
+    min-height: 35px;
+    border: 2px outset #8a8a8a;
+    border-radius: 5px;
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #f0f0f0, stop:1 #c4c4c4);
+    color: #1a1a1a;
+}
+QPushButton:hover {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #fafafa, stop:1 #d2d2d2);
+}
+QPushButton:pressed {
+    border-style: inset;
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #b0b0b0, stop:1 #d0d0d0);
+}
+QPushButton:disabled {
+    color: #8a8a8a;
+    border: 2px outset #b5b5b5;
+    background: #d8d8d8;
+}
+"""
+
+
+def _format_mmss(seconds):
+    """Matches guvcfd.app's own _format_mmss exactly - H:MM:SS once past
+    an hour, else M:SS."""
+    seconds = max(0, int(seconds))
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}:{m:02d}:{s:02d}"
+    return f"{m}:{s:02d}"
 
 
 class RunTab(QWidget):
@@ -65,21 +105,27 @@ class RunTab(QWidget):
         btn_row = QHBoxLayout()
         sim_settings_btn = QPushButton("Simulation Settings...")
         sim_settings_btn.setToolTip("Simulation type, and solver run-duration settings for this project.")
+        sim_settings_btn.setStyleSheet(_BUTTON_STYLE)
         sim_settings_btn.clicked.connect(lambda: self.project_setup_tab.simulation_settings_dialog.exec())
         btn_row.addWidget(sim_settings_btn)
         self.run_btn = QPushButton("Start simulations")
+        self.run_btn.setStyleSheet(_BUTTON_STYLE)
         self.run_btn.clicked.connect(self.start_run)
         btn_row.addWidget(self.run_btn)
         self.stop_btn = QPushButton("Stop")
+        self.stop_btn.setStyleSheet(_BUTTON_STYLE)
         self.stop_btn.setEnabled(False)
         self.stop_btn.clicked.connect(self.stop_run)
         btn_row.addWidget(self.stop_btn)
         extend_btn = QPushButton("Extend / modify simulations...")
+        extend_btn.setStyleSheet(_BUTTON_STYLE)
         extend_btn.clicked.connect(self.open_extend_dialog)
         btn_row.addWidget(extend_btn)
         btn_row.addStretch(1)
         layout.addLayout(btn_row)
 
+        self.runtime_label = QLabel("")
+        layout.addWidget(self.runtime_label)
         self.status_label = QLabel("Idle.")
         layout.addWidget(self.status_label)
         self.progress_label = QLabel("")
@@ -307,6 +353,16 @@ class RunTab(QWidget):
             "stopped": "Stopped.",
         }.get(state.status, state.status)
         self.status_label.setText(status_text)
+
+        # Computed fresh from state.start_time every tick rather than a
+        # one-shot value, so it keeps ticking live while running - and,
+        # since start_time itself never changes, naturally freezes at the
+        # true total the instant nothing further updates it once status
+        # leaves "running" (matches guvcfd.app's own _with_total_run_time).
+        if state.start_time:
+            self.runtime_label.setText(f"Total run time: {_format_mmss(time.time() - state.start_time)}")
+        else:
+            self.runtime_label.setText("")
 
         if state.status != "running":
             self.timer.stop()
