@@ -374,7 +374,7 @@ Total elements catalogued: 38.
 | # | Element | Dash | Qt | Verdict | Sync note |
 |---|---|---|---|---|---|
 | 35 | Sweep support in-GUI | Fully in-GUI via `scenario_runs.run_sweep`/`run_decay_sweep`; a 1-combination "sweep" special-cased through the single-run path to retain decision/resume support | Also fully in-GUI, calling the identical `scenario_runs` functions; 1-combination case also special-cased through `run_state.launch_run` | MATCH (architecturally) | Contrary to the initial hypothesis, sweep/batch controls are NOT missing from Qt or handled by a separate script. The only real difference is items #31/#33 — Qt's 1-combo case gets no decision-panel/resume support either way (Qt has none at all, sweep or single).
-| 36 | Concurrency limit | `_MAX_CONCURRENT_Z` from `scenario_runs.py` | Same constant, imported directly | MATCH | Shared source of truth.
+| 36 | Concurrency limit | `_MAX_CONCURRENT_SOLVES` from `scenario_runs.py` (2026-08-11: replaced the old `_MAX_CONCURRENT_ACH`/`_MAX_CONCURRENT_Z` split with one shared 9-worker pool) | Same constant, imported directly | MATCH | Shared source of truth.
 | 37 | Sweep summary table population | Iterates combos in `sweep_combinations()` order | Same order, same underlying function | MATCH | —
 | 38 | Stale-results clearing on new sweep launch | Explicitly clears results stores to prevent the Analysis tab showing a stale result | N/A — Qt's Analysis tab is a separate widget with its own load step, not auto-populated during a run | N/A (different architecture) | No action needed.
 

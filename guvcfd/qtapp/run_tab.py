@@ -18,7 +18,7 @@ from PySide6.QtWidgets import (
 
 from ..app_settings import load_advanced_settings, merge_project_openfoam_settings
 from ..report import combo_summary_metrics
-from ..scenario_runs import _MAX_CONCURRENT_Z, sweep_combinations
+from ..scenario_runs import _MAX_CONCURRENT_SOLVES, sweep_combinations
 from . import helpers, run_state, sweep_state
 
 _TABLE_HEADERS = ["Z", "ACH", "Status", "Reduction %", "Measured ACH eff. %", "Measured UV eff. %",
@@ -100,13 +100,13 @@ class RunTab(QWidget):
         self.live_status_label = QPlainTextEdit()
         self.live_status_label.setReadOnly(True)
         self.live_status_label.setStyleSheet("background: rgba(127,127,127,0.08); font-family: monospace;")
-        # Fixed to fit _MAX_CONCURRENT_Z lines (the most concurrent
-        # combinations a sweep ever runs at once - see scenario_runs.
-        # _run_sweep_concurrent) rather than the old flat 70px, which cut
-        # off a line or two as soon as more than ~4 combinations were
-        # running concurrently. Still scrolls internally beyond that.
+        # Fixed to fit _MAX_CONCURRENT_SOLVES lines (the most concurrent
+        # solves a sweep ever runs at once, across every stage - see
+        # scenario_runs.py's own docstring) rather than the old flat 70px,
+        # which cut off a line or two as soon as more than ~4 combinations
+        # were running concurrently. Still scrolls internally beyond that.
         line_height = self.live_status_label.fontMetrics().lineSpacing()
-        self.live_status_label.setFixedHeight(line_height * _MAX_CONCURRENT_Z + 12)
+        self.live_status_label.setFixedHeight(line_height * _MAX_CONCURRENT_SOLVES + 12)
         layout.addWidget(self.live_status_label)
 
         layout.addWidget(_section_label("Log"))

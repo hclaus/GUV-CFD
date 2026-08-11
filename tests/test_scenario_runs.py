@@ -159,7 +159,7 @@ def test_run_sweep_creates_expected_subfolders_and_reports(tmp_path, monkeypatch
     monkeypatch.setattr(sr, "compute_uv_fingerprint", lambda *a, **k: "fake-uv-fp")
 
     def fake_run_scenario(case_dir, room, settings, z, ach, adv, z_summary, log_fn, should_stop, solver_log_fn,
-                           status_fn=None, control_results=None, base_summary=None, should_pause=None):
+                           status_fn=None, control_results_future=None, base_summary=None, should_pause=None):
         return {"reduction_pct": 90.0, "eACH_uv_steady_state": 50.0, "phase1": {"T_ss": 1.0, "live": {"t": [1]}},
                 "phase2": {"T_ss": 0.1, "live": {"t": [1]}}}
     monkeypatch.setattr(sr, "_run_scenario", fake_run_scenario)
@@ -260,7 +260,7 @@ def test_run_sweep_captures_build_flow_base_return_value_as_base_summary(tmp_pat
     captured = {}
 
     def fake_run_scenario(case_dir, room, settings, z, ach, adv, z_summary, log_fn, should_stop, solver_log_fn,
-                           status_fn=None, control_results=None, base_summary=None, should_pause=None):
+                           status_fn=None, control_results_future=None, base_summary=None, should_pause=None):
         captured["base_summary"] = base_summary
         return {"reduction_pct": 90.0, "eACH_uv_steady_state": 50.0, "phase1": {"T_ss": 1.0, "live": {"t": [1]}},
                 "phase2": {"T_ss": 0.1, "live": {"t": [1]}}}
@@ -349,7 +349,7 @@ def test_run_sweep_keeps_shared_dirs_when_setting_enabled(tmp_path, monkeypatch)
                          {"fluence_mean": 1.0, "eACH_uv_well_mixed_mean": 0.0})
 
     def fake_run_scenario(case_dir, room, settings, z, ach, adv, z_summary, log_fn, should_stop, solver_log_fn,
-                           status_fn=None, control_results=None, base_summary=None, should_pause=None):
+                           status_fn=None, control_results_future=None, base_summary=None, should_pause=None):
         return {"reduction_pct": 90.0, "eACH_uv_steady_state": 50.0, "phase1": {"T_ss": 1.0, "live": {"t": [1]}},
                 "phase2": {"T_ss": 0.1, "live": {"t": [1]}}}
     monkeypatch.setattr(sr, "_run_scenario", fake_run_scenario)
@@ -837,7 +837,7 @@ def test_run_sweep_skips_a_combo_that_already_has_results_json(tmp_path, monkeyp
     run_scenario_calls = []
 
     def fake_run_scenario(case_dir, room, settings, z, ach, adv, z_summary, log_fn, should_stop, solver_log_fn,
-                           status_fn=None, control_results=None, base_summary=None, should_pause=None):
+                           status_fn=None, control_results_future=None, base_summary=None, should_pause=None):
         run_scenario_calls.append(z)
         return {"reduction_pct": 90.0, "eACH_uv_steady_state": 50.0, "phase1": {"T_ss": 1.0, "live": {"t": [1]}},
                 "phase2": {"T_ss": 0.1, "live": {"t": [1]}}}
@@ -940,9 +940,12 @@ def test_run_scenario_threads_control_results_into_measured_ventilation_ach(monk
     sr._run_scenario("case_dir", room, settings, z=6.0, ach=3.0, adv=adv,
                       z_summary={"eACH_uv_well_mixed_mean": 0.0, "fluence_mean": 1.0}, log_fn=lambda m: None,
                       should_stop=None, solver_log_fn=None,
-                      control_results={"total_ach_effective": 2.46})
+                      control_results_future=sr._completed_future({"total_ach_effective": 2.46}))
 
-    assert calls[-1]["measured_ventilation_ach"] == 2.46
+    # The future itself is handed through, not resolved by _run_scenario -
+    # see run_steady_state_scenario's own control_results_future docstring
+    # for why (must resolve only after its own simpleFoam call, not before).
+    assert calls[-1]["control_results_future"].result()["total_ach_effective"] == 2.46
 
 
 def test_run_scenario_deltat_scaling_uses_configured_iterations_not_settling_inflation(monkeypatch):
@@ -1040,7 +1043,7 @@ def test_run_scenario_measured_ventilation_ach_none_without_control_results(monk
                       z_summary={"eACH_uv_well_mixed_mean": 0.0, "fluence_mean": 1.0}, log_fn=lambda m: None,
                       should_stop=None, solver_log_fn=None)
 
-    assert calls[-1]["measured_ventilation_ach"] is None
+    assert calls[-1]["control_results_future"] is None
 
 
 def test_run_shared_phase1_clones_base_dir_and_runs_phase1_only(tmp_path, monkeypatch):
@@ -1322,7 +1325,7 @@ def test_run_decay_scenario_rebuilds_fvoptions_from_this_combos_own_kuv(tmp_path
     sr._run_decay_scenario(case_dir, room, settings, z=6.0, ach=3.0, adv=adv,
                             z_summary={"eACH_uv_well_mixed_mean": 20.0}, log_fn=lambda m: None,
                             should_stop=None, solver_log_fn=lambda m: None,
-                            control_results=control_results)
+                            control_results_future=sr._completed_future(control_results))
 
     entries_z6 = written[case_dir]
     assert len(entries_z6) > 0
@@ -1334,7 +1337,7 @@ def test_run_decay_scenario_rebuilds_fvoptions_from_this_combos_own_kuv(tmp_path
     sr._run_decay_scenario(case_dir, room, settings, z=1.0, ach=3.0, adv=adv,
                             z_summary={"eACH_uv_well_mixed_mean": 3.3}, log_fn=lambda m: None,
                             should_stop=None, solver_log_fn=lambda m: None,
-                            control_results=control_results)
+                            control_results_future=sr._completed_future(control_results))
     entries_z1 = written[case_dir]
     assert entries_z1 != entries_z6
 
@@ -1375,7 +1378,7 @@ def test_run_decay_scenario_status_fn_gets_time_lines_and_clears_on_finish(tmp_p
     sr._run_decay_scenario(case_dir, room, settings, z=6.0, ach=3.0, adv=adv,
                             z_summary={"eACH_uv_well_mixed_mean": 20.0}, log_fn=lambda m: None,
                             should_stop=None, solver_log_fn=None,
-                            control_results=control_results, status_fn=lambda k, m: status_calls.append((k, m)))
+                            control_results_future=sr._completed_future(control_results), status_fn=lambda k, m: status_calls.append((k, m)))
 
     key = "Z=6.0/ACH=3.0/UV-on"
     # No log_prefix wrapping here - status_key already carries the combo
@@ -1452,7 +1455,7 @@ def test_run_decay_scenario_uses_configured_write_interval_not_duration_over_100
     sr._run_decay_scenario(case_dir, room, settings, z=6.0, ach=3.0, adv=adv,
                             z_summary={"eACH_uv_well_mixed_mean": 20.0}, log_fn=lambda m: None,
                             should_stop=None, solver_log_fn=lambda m: None,
-                            control_results=control_results)
+                            control_results_future=sr._completed_future(control_results))
 
     assert control_time_calls == [("main", 3)]
 
@@ -1483,86 +1486,56 @@ def test_run_shared_control_uses_configured_write_interval(tmp_path, monkeypatch
     assert prepare_calls == [("control", 3)]
 
 
-# --- _run_sweep_concurrent (see wsl_utils._kill_wsl_in_dir for the matching
-# kill-scoping fix that makes this safe): bounded ACH/Z concurrency shared
-# by run_sweep/run_decay_sweep ---
+# --- _completed_future / _run_ach_pool (2026-08-11 concurrency redesign -
+# see _MAX_CONCURRENT_SOLVES's own docstring for the full design: ONE
+# shared, globally-capped solver pool instead of the old separate ACH/Z
+# pools, with priority between stages falling out of submission order) ---
 
-def test_run_sweep_concurrent_bounds_ach_and_z_concurrency(monkeypatch):
-    monkeypatch.setattr(sr, "_MAX_CONCURRENT_ACH", 2)
-    monkeypatch.setattr(sr, "_MAX_CONCURRENT_Z", 2)
+def test_completed_future_resolves_immediately_to_the_given_value():
+    future = sr._completed_future({"total_ach_effective": 0.0})
+    assert future.done()
+    assert future.result() == {"total_ach_effective": 0.0}
 
+
+def test_run_ach_pool_runs_every_ach_and_is_unbounded(monkeypatch):
     lock = threading.Lock()
-    state = {"ach_live": 0, "ach_peak": 0, "z_live": 0, "z_peak": 0}
+    state = {"live": 0, "peak": 0}
+    seen = []
 
-    def build_ach_fn(ach):
+    def ach_worker(ach):
         with lock:
-            state["ach_live"] += 1
-            state["ach_peak"] = max(state["ach_peak"], state["ach_live"])
+            state["live"] += 1
+            state["peak"] = max(state["peak"], state["live"])
         time.sleep(0.05)
         with lock:
-            state["ach_live"] -= 1
-        return {"ach": ach}
+            state["live"] -= 1
+            seen.append(ach)
 
-    def run_z_fn(ctx, z, ach):
-        with lock:
-            state["z_live"] += 1
-            state["z_peak"] = max(state["z_peak"], state["z_live"])
-        time.sleep(0.05)
-        with lock:
-            state["z_live"] -= 1
+    achs = [1, 2, 3, 4, 5]
+    sr._run_ach_pool(achs, ach_worker, should_stop=None)
 
-    cleaned_up = []
-    def cleanup_ach_fn(ctx):
-        cleaned_up.append(ctx["ach"])
-
-    achs = [1, 2, 3, 4]
-    combos = [(z, ach) for ach in achs for z in (10, 20, 30)]  # 3 Z's per ACH, more than either pool size
-
-    sr._run_sweep_concurrent(achs, combos, should_stop=None,
-                              build_ach_fn=build_ach_fn, run_z_fn=run_z_fn, cleanup_ach_fn=cleanup_ach_fn)
-
-    assert state["ach_peak"] <= 2
-    assert state["z_peak"] <= 2
-    assert sorted(cleaned_up) == achs  # every ACH group's cleanup ran exactly once
+    assert sorted(seen) == achs
+    # Deliberately unbounded here (see _MAX_CONCURRENT_SOLVES's own
+    # docstring - the real cap lives on the shared solver pool each
+    # ach_worker submits its actual work to, not on this orchestrator
+    # layer) - all 5 should have been able to run concurrently.
+    assert state["peak"] == 5
 
 
-def test_run_sweep_concurrent_isolates_per_z_errors(monkeypatch):
-    monkeypatch.setattr(sr, "_MAX_CONCURRENT_ACH", 3)
-    monkeypatch.setattr(sr, "_MAX_CONCURRENT_Z", 3)
-
-    done = []
-    lock = threading.Lock()
-
-    def run_z_fn(ctx, z, ach):
-        if z == 2:
-            # A real run_z_fn (see run_sweep/run_decay_sweep) catches its
-            # own Exception and reports "error" instead of propagating -
-            # this fake mirrors that contract.
-            with lock:
-                done.append((z, ach, "error"))
-            return
-        with lock:
-            done.append((z, ach, "done"))
-
-    combos = [(2, 3), (6, 3)]
-    sr._run_sweep_concurrent([3], combos, should_stop=None,
-                              build_ach_fn=lambda ach: {"ach": ach},
-                              run_z_fn=run_z_fn, cleanup_ach_fn=lambda ctx: None)
-
-    assert set(done) == {(2, 3, "error"), (6, 3, "done")}
-
-
-def test_run_sweep_concurrent_propagates_stopped_by_user():
-    def build_ach_fn(ach):
-        return {"ach": ach}
-
-    def run_z_fn(ctx, z, ach):
+def test_run_ach_pool_propagates_stopped_by_user():
+    def ach_worker(ach):
         raise StoppedByUser("stop requested mid-combination")
 
     with pytest.raises(StoppedByUser):
-        sr._run_sweep_concurrent([3], [(2, 3)], should_stop=None,
-                                  build_ach_fn=build_ach_fn, run_z_fn=run_z_fn,
-                                  cleanup_ach_fn=lambda ctx: None)
+        sr._run_ach_pool([3], ach_worker, should_stop=None)
+
+
+def test_run_ach_pool_propagates_a_generic_exception():
+    def ach_worker(ach):
+        raise RuntimeError("boom")
+
+    with pytest.raises(RuntimeError, match="boom"):
+        sr._run_ach_pool([3], ach_worker, should_stop=None)
 
 
 def test_write_sweep_summary_csv_collects_every_done_combo_from_status(tmp_path):
@@ -1751,3 +1724,152 @@ def test_continue_decay_raises_on_pimplefoam_failure(tmp_path, monkeypatch):
     with pytest.raises(RuntimeError, match="pimpleFoam failed"):
         sr.continue_decay(case_dir, end_time=600, write_interval=10, log_fn=lambda m: None,
                            should_stop=lambda: False)
+
+
+# --- run_sweep/run_decay_sweep's own scheduling behavior (2026-08-11 - see
+# _MAX_CONCURRENT_SOLVES's docstring): Phase 1 and control are genuine
+# siblings for steady-state (both only need the converged flow base, not
+# each other), and decay's control + every Z's own decay solve are siblings
+# too (decay has no Phase 1 at all) - these guard that the rewrite actually
+# runs them concurrently rather than accidentally serializing one behind
+# the other, and that the shared solver pool's cap is real. ---
+
+def _steady_state_settings():
+    return {"sim-type": "steady_state", "fan-enable": False, "monitoring-enable": False,
+            "inlet-wall": "xMin", "inlet-size-w": 0.3, "inlet-size-h": 0.3,
+            "phase1-iterations": 100, "phase2-iterations": 100, "target-t-ss": 1.0,
+            "inject-x-input": 2, "inject-y-input": 2.5, "inject-z-input": 1.3, "z-value": 6,
+            "source-zone-size": 0.3}
+
+
+def test_run_sweep_runs_phase1_and_control_concurrently(tmp_path, monkeypatch):
+    project_dir = tmp_path / "proj"
+    project_dir.mkdir()
+    monkeypatch.setattr(sr, "_build_flow_base", lambda *a, **k: None)
+    monkeypatch.setattr(sr, "_copy_base_case", lambda base, target, log_fn: __import__("os").makedirs(target, exist_ok=True))
+    monkeypatch.setattr(sr, "_apply_z", lambda case_dir, z, nbins, fan_kwargs, log_fn:
+                         {"fluence_mean": 1.0, "eACH_uv_well_mixed_mean": 0.0})
+    monkeypatch.setattr(sr, "compute_uv_fingerprint", lambda *a, **k: "fake-uv-fp")
+    monkeypatch.setattr(sr, "write_source_topo_set_dict", lambda *a, **k: None)
+    monkeypatch.setattr(sr, "run_wsl_or_raise", lambda *a, **k: None)
+    monkeypatch.setattr(sr, "_run_scenario", lambda *a, **k: {
+        "reduction_pct": 90.0, "eACH_uv_steady_state": 50.0, "phase1": {"T_ss": 1.0, "live": {"t": [1]}},
+        "phase2": {"T_ss": 0.1, "live": {"t": [1]}}})
+
+    lock = threading.Lock()
+    intervals = {}
+
+    def make_recorder(name):
+        def recorder(*a, **k):
+            start = time.time()
+            time.sleep(0.15)
+            with lock:
+                intervals[name] = (start, time.time())
+            return {"total_ach_effective": 3.0} if name == "control" else None
+        return recorder
+
+    monkeypatch.setattr(sr, "_run_shared_phase1", make_recorder("phase1"))
+    monkeypatch.setattr(sr, "_run_shared_control", make_recorder("control"))
+
+    room = type("Room", (), {"x": 4.0, "y": 5.0, "z": 2.7})()
+    sr.run_sweep(
+        guv_path="proj.guv", settings_path="proj.guvcfd", project_dir=str(project_dir),
+        room=room, settings=_steady_state_settings(), adv={"uv-zone-bins": 25, "mesh-cell-size": 0.1},
+        z_values=[6], ach_values=[3], log_fn=lambda m: None,
+    )
+
+    p1_start, p1_end = intervals["phase1"]
+    c_start, c_end = intervals["control"]
+    # Genuinely concurrent, not sequential: each one's window overlaps the
+    # other's, rather than one starting only after the other has finished.
+    assert p1_start < c_end and c_start < p1_end
+
+
+def test_run_decay_sweep_runs_control_and_z_decay_concurrently(tmp_path, monkeypatch):
+    project_dir = tmp_path / "proj"
+    project_dir.mkdir()
+    monkeypatch.setattr(sr, "_build_flow_base", lambda *a, **k: None)
+    monkeypatch.setattr(sr, "_copy_base_case", lambda base, target, log_fn: __import__("os").makedirs(target, exist_ok=True))
+    monkeypatch.setattr(sr, "_apply_z", lambda case_dir, z, nbins, fan_kwargs, log_fn:
+                         {"fluence_mean": 1.0, "eACH_uv_well_mixed_mean": 0.0})
+    monkeypatch.setattr(sr, "run_wsl_or_raise", lambda *a, **k: None)
+    monkeypatch.setattr(sr, "compute_uv_fingerprint", lambda *a, **k: "fake-uv-fp")
+
+    lock = threading.Lock()
+    intervals = {}
+
+    def fake_control(*a, **k):
+        start = time.time()
+        time.sleep(0.15)
+        with lock:
+            intervals["control"] = (start, time.time())
+        return {"total_ach_effective": 3.0}
+
+    def fake_decay_scenario(*a, **k):
+        start = time.time()
+        time.sleep(0.15)
+        with lock:
+            intervals["decay_z6"] = (start, time.time())
+        return {"reduction_pct": 1.0, "eACH_uv_effective": 1.0, "eACH_uv_well_mixed": 1.0,
+                "phase1": {}, "phase2": {}}
+
+    monkeypatch.setattr(sr, "_run_shared_control", fake_control)
+    monkeypatch.setattr(sr, "_run_decay_scenario", fake_decay_scenario)
+
+    room = type("Room", (), {"x": 4.0, "y": 5.0, "z": 2.7})()
+    settings = dict(_decay_reuse_settings(), z_value=6)
+    settings["pimple-write-interval"] = 3
+    adv = {"uv-zone-bins": 5, "pimple-delta-t": 0.5, "max-co": 5,
+           "decay-ach-min-fraction": 90.0, "decay-each-min-fraction": 90.0, "decay-each-max-fraction": 99.9}
+
+    sr.run_decay_sweep(
+        guv_path="p.guv", settings_path="p.guvcfd", project_dir=str(project_dir),
+        room=room, settings=settings, adv=adv,
+        z_values=[6], ach_values=[3], log_fn=lambda m: None,
+    )
+
+    c_start, c_end = intervals["control"]
+    z_start, z_end = intervals["decay_z6"]
+    assert c_start < z_end and z_start < c_end  # siblings, not sequential
+
+
+def test_run_sweep_never_exceeds_max_concurrent_solves(tmp_path, monkeypatch):
+    project_dir = tmp_path / "proj"
+    project_dir.mkdir()
+    monkeypatch.setattr(sr, "_MAX_CONCURRENT_SOLVES", 3)
+    monkeypatch.setattr(sr, "_copy_base_case", lambda base, target, log_fn: __import__("os").makedirs(target, exist_ok=True))
+    monkeypatch.setattr(sr, "_apply_z", lambda case_dir, z, nbins, fan_kwargs, log_fn:
+                         {"fluence_mean": 1.0, "eACH_uv_well_mixed_mean": 0.0})
+    monkeypatch.setattr(sr, "compute_uv_fingerprint", lambda *a, **k: "fake-uv-fp")
+    monkeypatch.setattr(sr, "write_source_topo_set_dict", lambda *a, **k: None)
+    monkeypatch.setattr(sr, "run_wsl_or_raise", lambda *a, **k: None)
+
+    lock = threading.Lock()
+    state = {"live": 0, "peak": 0}
+
+    def track(fn=None):
+        def wrapped(*a, **k):
+            with lock:
+                state["live"] += 1
+                state["peak"] = max(state["peak"], state["live"])
+            time.sleep(0.03)
+            with lock:
+                state["live"] -= 1
+            return fn(*a, **k) if fn else None
+        return wrapped
+
+    monkeypatch.setattr(sr, "_build_flow_base", track())
+    monkeypatch.setattr(sr, "_run_shared_phase1", track())
+    monkeypatch.setattr(sr, "_run_shared_control", track(lambda *a, **k: {"total_ach_effective": 3.0}))
+    monkeypatch.setattr(sr, "_run_scenario", track(lambda *a, **k: {
+        "reduction_pct": 90.0, "eACH_uv_steady_state": 50.0, "phase1": {"T_ss": 1.0, "live": {"t": [1]}},
+        "phase2": {"T_ss": 0.1, "live": {"t": [1]}}}))
+
+    room = type("Room", (), {"x": 4.0, "y": 5.0, "z": 2.7})()
+    sr.run_sweep(
+        guv_path="proj.guv", settings_path="proj.guvcfd", project_dir=str(project_dir),
+        room=room, settings=_steady_state_settings(), adv={"uv-zone-bins": 25, "mesh-cell-size": 0.1},
+        z_values=[2, 6], ach_values=[1.5, 3, 6], log_fn=lambda m: None,
+    )
+
+    assert state["peak"] <= 3

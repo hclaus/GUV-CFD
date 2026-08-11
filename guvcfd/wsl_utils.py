@@ -50,7 +50,7 @@ _ssh_client_lock = threading.Lock()
 # semaphore is a separate, additional fix for a separate problem).
 # MaxSessions was raised to 40 server-side that same day (see "Linux
 # installation.md") specifically to cover real sweeps' up to 9 concurrent
-# threads (_MAX_CONCURRENT_ACH x _MAX_CONCURRENT_Z), each potentially
+# threads (scenario_runs._MAX_CONCURRENT_SOLVES), each potentially
 # wanting a persistent SFTP channel plus occasional exec channels
 # (including run_wsl_streaming's, up to 2 per decay group - UV-on +
 # UV-off control). 30 stays comfortably under the server's 40, leaving
@@ -305,7 +305,7 @@ def _get_sftp_client():
     get-or-create step - actual sftp.open(...).read()/.write() calls
     happened outside any lock, on the same shared object, from up to 9
     concurrent threads in real production use
-    (_MAX_CONCURRENT_ACH x _MAX_CONCURRENT_Z in scenario_runs.py).
+    (scenario_runs._MAX_CONCURRENT_SOLVES).
     Paramiko's Transport genuinely supports many concurrent *channels*,
     but a single SFTPClient's own internal state (request-id counter,
     pending-reply tracking) isn't documented as safe for concurrent
@@ -649,8 +649,8 @@ def _run_wsl_streaming_subprocess(cmd, cwd_wsl, on_line=None, should_stop=None, 
     again (kill -CONT) or should_stop() fires. This is a genuine pause -
     zero iterations lost, no chunk boundary needed, and critically no
     exception is ever raised, unlike a Stop - a caller further up (see
-    scenario_runs._run_sweep_concurrent) cleans up shared per-ACH state
-    in a finally block keyed off StoppedByUser propagating, and pausing
+    scenario_runs.run_sweep/run_decay_sweep's own ach_worker) cleans up
+    shared per-ACH state in a finally block keyed off StoppedByUser propagating, and pausing
     must never trigger that.
 
     stall_timeout: give up (kill the process, same as a Stop) if NO new

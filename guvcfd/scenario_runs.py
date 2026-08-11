@@ -32,7 +32,7 @@ import io
 import json
 import math
 import re
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed, wait as futures_wait
 from pathlib import Path
 
 import numpy as np
@@ -71,20 +71,33 @@ from .wsl_utils import (
 
 _TEMPLATE_CASE_DIR = str(Path(__file__).resolve().parent / "templates" / "case_template")
 
-# Two-level concurrency budget for run_sweep/run_decay_sweep (see
-# _run_sweep_concurrent): up to this many ACH groups build their flow field
-# at once, and - across whichever ACH groups are active - up to this many
-# Z values' own solves run at once, drawn from ONE shared pool rather than
-# one pool per ACH (so total concurrent OpenFOAM processes stays bounded by
-# MAX_ACH + MAX_Z regardless of how many ACH/Z values are actually swept).
-# _MAX_CONCURRENT_Z is the one that matters day-to-day - once an ACH
-# group's one-time flow convergence finishes, its slot in the ACH pool
-# goes idle and everything left running draws from the Z pool alone (a
-# sweep with 1-2 ACH values spends most of its time this way) - confirmed
-# on a real sweep: only 3 cores stayed busy during the per-Z decay-solving
-# phase even though up to 6 (MAX_ACH + MAX_Z) was the assumed target.
-_MAX_CONCURRENT_ACH = 3
-_MAX_CONCURRENT_Z = 6
+# Single, shared cap on how many OpenFOAM processes run at once, regardless
+# of which stage (flow convergence, Phase 1, control, Phase 2/decay) they
+# belong to (2026-08-11) - replaces the old two-pool _MAX_CONCURRENT_ACH/
+# _MAX_CONCURRENT_Z split (up to 3 ACH-level builds + up to 6 Z-level
+# solves, bounded separately), which left real spare capacity idle: while
+# up to 3 ACH groups were still converging their flow field, the ENTIRE
+# Z-pool sat unused even on a machine with cores to spare, since Phase 1/
+# control work for an ACH that had just finished converging had nowhere
+# to run except that same ACH-pool slot, one stage at a time.
+#
+# run_sweep/run_decay_sweep now submit every stage (per-ACH flow, Phase 1/
+# control, per-Z Phase 2/decay) to ONE shared pool of this size, and get
+# priority between stages for free from submission order rather than a
+# custom priority queue: every ACH's flow-convergence task is submitted
+# before ANY of that ACH's downstream tasks even exist (they're only
+# created once their own prerequisite's future resolves), so a
+# still-queued flow task for one ACH is always picked up before a
+# same-moment-ready Phase 1/control/Phase 2/decay task for another -
+# see each function's own ach_worker for the exact per-ACH ordering
+# (Phase 1 and control are genuine siblings - both only need the
+# converged flow base, not each other - so they're submitted together;
+# decay mode has no Phase 1 at all, so control and every Z's own decay
+# solve are submitted together instead, immediately once flow finishes).
+#
+# Sized at 9 (not the host's full core count) by explicit choice - leaves
+# headroom for the rest of the machine rather than claiming every core.
+_MAX_CONCURRENT_SOLVES = 9
 
 _UNSAFE_FOLDER_CHARS_RE = re.compile(r"[^A-Za-z0-9._-]+")
 # Matches pimpleFoam's per-timestep "Time = N" banner, not the residual/
@@ -488,7 +501,7 @@ def _apply_z(case_dir, Z, nbins, fan_kwargs, log_fn):
 
 
 def _run_scenario(case_dir, room, settings, z, ach, adv, z_summary, log_fn, should_stop, solver_log_fn,
-                   status_fn=None, control_results=None, base_summary=None, should_pause=None):
+                   status_fn=None, control_results_future=None, base_summary=None, should_pause=None):
     """run_steady_state_scenario() with this combination's z/ach - same
     call app._run_steady_state makes for a single run.
 
@@ -496,12 +509,26 @@ def _run_scenario(case_dir, room, settings, z, ach, adv, z_summary, log_fn, shou
     display in place instead of the scrolling log - see
     steady_state_pipeline.run_steady_state_scenario's own docstring.
 
-    control_results: the shared, once-per-ACH UV-off control's own result
-    dict (see _run_shared_control) - its measured ventilation rate feeds
-    run_steady_state_scenario's measured_ventilation_ach, which is more
-    reliable than deriving one from Phase 1's own point-source buildup
-    (see compute_corrected_eACH_uv_from_control's docstring). None falls
-    back to the old Phase-1-derived method.
+    control_results_future: a Future (see _completed_future for the
+    "value already in hand" case) resolving to the shared, once-per-ACH
+    UV-off control's own result dict (see _run_shared_control) - its
+    measured ventilation rate feeds run_steady_state_scenario's
+    measured_ventilation_ach, which is more reliable than deriving one
+    from Phase 1's own point-source buildup (see
+    compute_corrected_eACH_uv_from_control's docstring). None falls back
+    to the old Phase-1-derived method.
+
+    Resolved inside run_steady_state_scenario's own call below, not
+    eagerly here - control runs concurrently with Phase 1/Phase 2 now
+    (2026-08-11), consumed purely for a post-hoc corrected-report
+    subtraction (steady_state_pipeline.py's own measured_ventilation_ach
+    handling, well after its simpleFoam solve already ran), never as a
+    solver input - resolving any earlier would block Phase 2's own
+    simpleFoam call from starting until control had already finished,
+    silently serializing the two for no reason (the exact bug this
+    docstring update fixes - confirmed directly via a test asserting
+    Phase 2's own solve and control's actually overlap in wall-clock
+    time, not just Phase 1's).
 
     base_summary: the shared flow base's own setup_case() summary (see
     _build_flow_base) - carries flow_converged/ach_delivery/n_lamps
@@ -587,7 +614,7 @@ def _run_scenario(case_dir, room, settings, z, ach, adv, z_summary, log_fn, shou
         patches_to_monitor=patches_to_monitor,
         log_fn=log_fn, should_stop=should_stop, solver_log_fn=solver_log_fn, should_pause=should_pause,
         status_fn=status_fn,
-        measured_ventilation_ach=(control_results or {}).get("total_ach_effective"),
+        control_results_future=control_results_future,
         phase1_delta_t=phase1_delta_t, phase2_delta_t=phase2_delta_t,
     )
     result["fluence_mean"] = z_summary["fluence_mean"]
@@ -751,8 +778,8 @@ def _decay_run_durations(ach, eACH_well_mixed_est, adv):
 def _prefixed_log_fn(log_fn, prefix):
     """Wraps log_fn so every line it emits is tagged with which ACH group
     or Z/ACH combination it came from - necessary once multiple ACH
-    groups/Z values can be solving concurrently (see _run_sweep_concurrent)
-    and their log lines interleave; under the old strictly-sequential
+    groups/Z values can be solving concurrently (see _MAX_CONCURRENT_SOLVES's
+    own docstring) and their log lines interleave; under the old strictly-sequential
     sweep this context was implicit (only one combination's lines were
     ever being produced at a time).
     """
@@ -870,12 +897,24 @@ def _run_shared_control(base_dir, control_dir, ach, room, settings, adv, log_fn,
 
 
 def _run_decay_scenario(case_dir, room, settings, z, ach, adv, z_summary, log_fn, should_stop, solver_log_fn,
-                         control_results, base_summary=None, status_fn=None, should_pause=None):
+                         control_results_future, base_summary=None, status_fn=None, should_pause=None):
     """Decay-mode equivalent of _run_scenario() - runs this combination's
     own UV-on decay (adaptive duration) and writes the same corrected
     results.json shape a single decay run would, using control_results
     (the shared, once-per-ACH UV-off control - see _run_shared_control)
     instead of running its own redundant copy.
+
+    Takes a Future (see _completed_future for the "value already in hand"
+    case), not a resolved dict, and only calls .result() on it right
+    before write_results_summary actually needs it - AFTER this combo's
+    own pimpleFoam solve below has already run. Control genuinely runs
+    concurrently with this combo's own decay solve (2026-08-11 - control
+    is consumed purely for a post-hoc subtraction, never as a solver
+    input), so resolving any earlier would silently serialize the two
+    pimpleFoam runs behind each other for no reason - confirmed directly:
+    an earlier version resolved the future before this function was even
+    called, which meant this combo's own solve never actually started
+    until control's had already finished.
 
     Unlike steady-state's _run_scenario, this doesn't need
     run_steady_state_scenario itself - but it DOES need to rebuild the UV
@@ -944,6 +983,12 @@ def _run_decay_scenario(case_dir, room, settings, z, ach, adv, z_summary, log_fn
         log_fn(f"  Could not compute spatial CoV: {e}")
         spatial_cov = None
 
+    # Resolved here, at the point of actual use - only needed for this
+    # post-hoc subtraction, never as an input to the pimpleFoam solve
+    # above, so this is the latest point (not the earliest) this combo's
+    # own thread ever blocks waiting for control - see this function's
+    # own docstring for why that ordering matters.
+    control_results = control_results_future.result()
     log_fn("  Writing results summary...")
     result = write_results_summary(
         case_dir, f"{case_dir}/results.json", ach, eACH_well_mixed_est,
@@ -1084,44 +1129,34 @@ def write_sweep_summary_csv(project_dir, project_name):
     return csv_path
 
 
-def _run_sweep_concurrent(achs, combos, should_stop, build_ach_fn, run_z_fn, cleanup_ach_fn):
-    """Bounded two-level concurrency shared by run_sweep/run_decay_sweep:
-    up to _MAX_CONCURRENT_ACH ACH groups build their flow state at once;
-    every Z across every active ACH group draws from ONE shared pool of
-    _MAX_CONCURRENT_Z workers (not one pool per ACH), so total concurrent
-    OpenFOAM solves is bounded by MAX_ACH + MAX_Z regardless of how many
-    ACH/Z values are actually swept.
+def _completed_future(value):
+    """A Future already resolved to `value` - lets a caller that sometimes
+    has a real background task (e.g. a control run) and sometimes has a
+    value already in hand (e.g. a sealed room's fixed 0.0 decay rate, or
+    an ACH's reused control_results) hand BOTH cases to run_z_fn as the
+    exact same "control_results_future" shape, with no special-casing at
+    the point of use (control_results_future.result())."""
+    future = Future()
+    future.set_result(value)
+    return future
 
-    build_ach_fn(ach) -> ctx, called once per ACH on the ACH pool.
-    run_z_fn(ctx, z, ach), called once per Z on the shared Z pool - must
-        itself catch and report per-combo errors (StoppedByUser excepted)
-        so one Z's failure doesn't cancel its siblings, same as the old
-        sequential loops' inline try/except did.
-    cleanup_ach_fn(ctx), called once per ACH after every Z under it
-        (whether it succeeded, failed, or was skipped) has finished -
-        always called if build_ach_fn returned, even on error/stop.
+
+def _run_ach_pool(achs, ach_worker, should_stop):
+    """Run ach_worker(ach) for every ach on its own thread (unbounded - see
+    _MAX_CONCURRENT_SOLVES's own docstring for why the REAL concurrency cap
+    lives on the shared solver pool each ach_worker submits its actual
+    OpenFOAM-invoking work to, not here: these per-ACH orchestrator threads
+    mostly just call .submit()/.result() and sit blocked waiting, they
+    don't themselves consume a core). Re-raises the first exception hit by
+    any ach_worker (StoppedByUser or otherwise) once every already-running
+    worker has settled - matches a plain ThreadPoolExecutor context
+    manager's own shutdown(wait=True) semantics, just without capping
+    how many run at once.
     """
-    z_pool = ThreadPoolExecutor(max_workers=_MAX_CONCURRENT_Z)
-
-    def ach_worker(ach):
-        if should_stop is not None and should_stop():
-            raise StoppedByUser("Stopped before starting the next ACH group.")
-        ctx = build_ach_fn(ach)
-        zs = [z for z, a in combos if a == ach]
-        z_futures = [z_pool.submit(run_z_fn, ctx, z, ach) for z in zs]
-        try:
-            for f in z_futures:
-                f.result()  # re-raises StoppedByUser; per-combo errors are already caught inside run_z_fn
-        finally:
-            cleanup_ach_fn(ctx)
-
-    try:
-        with ThreadPoolExecutor(max_workers=_MAX_CONCURRENT_ACH) as ach_pool:
-            ach_futures = [ach_pool.submit(ach_worker, ach) for ach in achs]
-            for f in as_completed(ach_futures):
-                f.result()
-    finally:
-        z_pool.shutdown(wait=True)
+    with ThreadPoolExecutor(max_workers=max(1, len(achs))) as ach_pool:
+        ach_futures = [ach_pool.submit(ach_worker, ach) for ach in achs]
+        for f in as_completed(ach_futures):
+            f.result()
 
 
 def _skip_if_combo_already_done(case_dir, subdir, combo_log_fn, trim_fn, on_combo_done, z, ach):
@@ -1350,10 +1385,23 @@ def run_decay_sweep(guv_path, settings_path, project_dir, room, settings, adv,
     """Decay-mode equivalent of run_sweep() - same Z x ACH cross-product,
     same shared-flow-field-per-ACH reuse (_build_flow_base/_copy_base_case/
     _apply_z are identical either way - only the per-combination solve
-    itself differs). Up to _MAX_CONCURRENT_ACH ACH groups (each building
-    its own flow field + shared UV-off control) run at once, and every
-    Z's own UV-on decay draws from one shared pool of _MAX_CONCURRENT_Z
-    workers across all of them - see _run_sweep_concurrent.
+    itself differs).
+
+    Every stage (per-ACH flow convergence, control, per-Z decay) is
+    submitted to ONE shared pool of _MAX_CONCURRENT_SOLVES workers - see
+    that constant's own docstring for exactly how priority between stages
+    falls out of submission order, and this function's own ach_worker
+    (inside) for the per-ACH sequencing. Unlike run_sweep's Phase 1/Phase 2
+    (a real dependency - Phase 2 clones Phase 1's own converged
+    checkpoint), decay mode has no Phase 1 at all: control and every Z's
+    own UV-on decay solve are BOTH only ever dependent on the converged
+    flow base, never on each other, so they're submitted together the
+    moment flow finishes - control_results is only ever consumed for
+    post-hoc corrected reporting (a subtraction, not a solver input),
+    never as a prerequisite for actually running a Z's own decay solve
+    (the one exception - mechanical_ach_only, which reuses control's own
+    results.json file verbatim instead of running anything of its own -
+    still just waits on control's own future, not a structural rebuild).
 
     status_fn(key, line_or_None), if given, receives each concurrent
     combo's latest "Time = N" line to display in place (overwritten, not
@@ -1365,10 +1413,11 @@ def run_decay_sweep(guv_path, settings_path, project_dir, room, settings, adv,
     combos = sweep_combinations(z_values, ach_values)
     achs = sorted({ach for _, ach in combos})
     project_name = _sanitize(Path(project_dir).name)
+    pool = ThreadPoolExecutor(max_workers=_MAX_CONCURRENT_SOLVES)
 
     mechanical_ach_only = bool(settings.get("mech-ach-only"))
 
-    def build_ach_fn(ach):
+    def _prepare_flow(ach):
         sealed = ach <= 0
         if sealed and not settings.get("fan-enable"):
             raise ValueError(
@@ -1383,10 +1432,10 @@ def run_decay_sweep(guv_path, settings_path, project_dir, room, settings, adv,
         control_dir = f"{project_dir}/_control_ACH{_ach_label(ach)}"
         flow_fingerprint = compute_flow_fingerprint(settings, room)
 
-        # Sealed rooms never share a control run (see the sealed branch
-        # below) and their flow base is Z/UV-independent already for a
-        # different reason - reuse detection here is only meaningful for
-        # the ordinary, ventilated case.
+        # Sealed rooms never share a control run (see ach_worker's own
+        # sealed branch) and their flow base is Z/UV-independent already
+        # for a different reason - reuse detection here is only
+        # meaningful for the ordinary, ventilated case.
         reusable = None if sealed else find_reusable_ach_base(project_dir, project_name, ach, flow_fingerprint)
         if reusable is None:
             _discard_stale_ach_scratch_if_mismatched(project_dir, project_name, ach, flow_fingerprint,
@@ -1399,37 +1448,30 @@ def run_decay_sweep(guv_path, settings_path, project_dir, room, settings, adv,
         base_summary = _build_flow_base(guv_path, base_dir, room, settings, ach, adv,
                                          ach_log_fn, should_stop, solver_log_fn, should_pause=should_pause,
                                          sealed=sealed, mechanical_ach_only=mechanical_ach_only)
-        if sealed:
-            # No possible path for contaminant MASS to leave a sealed room
-            # (a fan redistributes air but can't remove contaminant from a
-            # closed room) - the true ventilation-only decay rate is
-            # exactly 0 by construction, not just approximately - see
-            # app._finish_decay's identical reasoning. Running a whole 2nd
-            # pimpleFoam solve to confirm that would double this ACH
-            # group's compute cost for no new information.
-            ach_log_fn("Skipping the UV-off control run - sealed room, ventilation-only decay "
-                       "rate is exactly 0 by construction.")
-            control_results = {"total_ach_effective": 0.0}
-        elif reusable is not None:
+        return {"ach": ach, "base_dir": base_dir, "control_dir": control_dir, "sealed": sealed,
+                "base_summary": base_summary, "flow_fingerprint": flow_fingerprint, "reusable": reusable,
+                "fan_kw": _fan_kwargs(settings)}
+
+    def _prepare_control(flow_ctx):
+        ach = flow_ctx["ach"]
+        ach_log_fn = _prefixed_log_fn(log_fn, f"ACH={ach}")
+        if flow_ctx["reusable"] is not None:
             ach_log_fn("Reusing this ACH's already-run UV-off control decay (unchanged flow "
                        "settings since an earlier sweep) - skipping a repeat pimpleFoam run.")
-            control_results = reusable["control_results"]
+            control_results = flow_ctx["reusable"]["control_results"]
         else:
-            # UV-off control is Z-independent (see _run_shared_control) - run
-            # it once per ACH here, not once per Z in run_z_fn below.
-            control_results = _run_shared_control(base_dir, control_dir, ach, room, settings, adv,
-                                                   ach_log_fn, should_stop, solver_log_fn, base_summary,
-                                                   status_fn=status_fn,
-                                                   should_pause=should_pause, sealed=sealed)
-        if not sealed:
-            _update_ach_base_status_safe(project_dir, project_name, ach, flow_fingerprint, base_dir,
-                                          control_dir, control_results, guv_path=guv_path,
-                                          settings_path=settings_path, sim_type="decay")
-        return {
-            "ach": ach, "base_dir": base_dir, "control_dir": control_dir,
-            "base_summary": base_summary, "control_results": control_results,
-            "fan_kw": _fan_kwargs(settings),
-        }
+            # UV-off control is Z-independent (see _run_shared_control) -
+            # run it once per ACH here, not once per Z in run_z_fn below -
+            # and (2026-08-11) concurrently with every Z's own decay solve
+            # for this ACH, not before them: neither depends on the other.
+            control_results = _run_shared_control(flow_ctx["base_dir"], flow_ctx["control_dir"], ach, room,
+                                                   settings, adv, ach_log_fn, should_stop, solver_log_fn,
+                                                   flow_ctx["base_summary"], status_fn=status_fn,
+                                                   should_pause=should_pause, sealed=False)
+        _update_ach_base_status_safe(project_dir, project_name, ach, flow_ctx["flow_fingerprint"],
+                                      flow_ctx["base_dir"], flow_ctx["control_dir"], control_results,
+                                      guv_path=guv_path, settings_path=settings_path, sim_type="decay")
+        return control_results
 
     def run_z_fn(ctx, z, ach):
         if should_stop is not None and should_stop():
@@ -1450,12 +1492,17 @@ def run_decay_sweep(guv_path, settings_path, project_dir, room, settings, adv,
             if mechanical_ach_only:
                 # No UV at all - Z is physically irrelevant (nothing in the
                 # case depends on it), and the shared per-ACH control run
-                # (ctx["control_results"]) already IS the measurement this
-                # combination wants: re-running _apply_z/_run_decay_scenario
-                # here would just be pimpleFoam solving the exact same
-                # empty-fvOptions physics a second (or third...) time.
+                # already IS the measurement this combination wants:
+                # re-running _apply_z/_run_decay_scenario here would just be
+                # pimpleFoam solving the exact same empty-fvOptions physics
+                # a second (or third...) time. Unlike the normal branch
+                # below, this DOES need control_results resolved right away
+                # (not just at report time) - it reads control's own
+                # results.json file directly, which only exists once
+                # control's future has actually settled.
                 combo_log_fn("  Mechanical ACH only - reusing this ACH's shared control result "
                              "(no UV, so Z has no effect)...")
+                ctx["control_results_future"].result()
                 control_dir_content = _read_case_file(ctx["control_dir"], "results.json")
                 write_case_file(case_dir, "results.json", control_dir_content)
                 result = json.loads(control_dir_content)
@@ -1463,9 +1510,17 @@ def run_decay_sweep(guv_path, settings_path, project_dir, room, settings, adv,
             else:
                 z_summary = _apply_z(case_dir, z, adv["uv-zone-bins"], ctx["fan_kw"], combo_log_fn)
                 uv_fingerprint = compute_uv_fingerprint(case_dir)
+                # The future itself is handed through, not .result() here -
+                # control runs concurrently with this Z's own decay solve
+                # now (2026-08-11); resolving eagerly at this point would
+                # block this Z's own pimpleFoam call from ever starting
+                # until control's had already finished, silently
+                # serializing the two. _run_decay_scenario resolves it
+                # itself, at the one point it's actually needed (see its
+                # own docstring) - after, not before, this combo's solve.
                 result = _run_decay_scenario(case_dir, room, settings, z, ach, adv,
                                               z_summary, combo_log_fn, should_stop, solver_log_fn,
-                                              ctx["control_results"], base_summary=ctx["base_summary"],
+                                              ctx["control_results_future"], base_summary=ctx["base_summary"],
                                               status_fn=status_fn, should_pause=should_pause)
             capture_openfoam_settings(settings, adv)
             _save_run_settings(case_dir, settings, guv_path, settings_path, z, ach)
@@ -1502,9 +1557,52 @@ def run_decay_sweep(guv_path, settings_path, project_dir, room, settings, adv,
             f'rm -rf "{wsl_path(ctx["base_dir"])}" "{wsl_path(ctx["control_dir"])}"', wsl_path(project_dir),
             "cleaning up shared base case and control run")
 
+    def ach_worker(ach):
+        if should_stop is not None and should_stop():
+            raise StoppedByUser("Stopped before starting the next ACH group.")
+        flow_ctx = pool.submit(_prepare_flow, ach).result()
+        if flow_ctx["sealed"]:
+            # No possible path for contaminant MASS to leave a sealed room
+            # (a fan redistributes air but can't remove contaminant from a
+            # closed room) - the true ventilation-only decay rate is
+            # exactly 0 by construction, not just approximately - see
+            # app._finish_decay's identical reasoning. Running a whole 2nd
+            # pimpleFoam solve to confirm that would double this ACH
+            # group's compute cost for no new information, so this is a
+            # value already in hand, not a real background task - see
+            # _completed_future's own docstring for why run_z_fn still
+            # gets the exact same "control_results_future" shape either way.
+            _prefixed_log_fn(log_fn, f"ACH={ach}")(
+                "Skipping the UV-off control run - sealed room, ventilation-only decay "
+                "rate is exactly 0 by construction.")
+            control_future = _completed_future({"total_ach_effective": 0.0})
+        else:
+            control_future = pool.submit(_prepare_control, flow_ctx)
+        zs = [z for z, a in combos if a == ach]
+        z_ctx = dict(flow_ctx, control_results_future=control_future)
+        z_futures = [pool.submit(run_z_fn, z_ctx, z, ach) for z in zs]
+        try:
+            for f in z_futures:
+                f.result()  # re-raises StoppedByUser; per-combo errors are already caught inside run_z_fn
+        finally:
+            # Always wait for control to physically finish before cleanup
+            # runs, even when unwinding from a Z failure above - cleanup
+            # deletes control_dir, and doing that while control is still
+            # actively writing to it would be a real race (rm -rf against
+            # an in-progress OpenFOAM case), not just a theoretical one.
+            # futures.wait() never raises, unlike .result() - control's own
+            # exception (if any) is deliberately re-raised separately
+            # below, so a genuine control failure still surfaces as this
+            # ACH group's overall failure, same as it always has, without
+            # masking whatever already failed above.
+            futures_wait([control_future])
+            cleanup_ach_fn(flow_ctx)
+        control_future.result()
+
     try:
-        _run_sweep_concurrent(achs, combos, should_stop, build_ach_fn, run_z_fn, cleanup_ach_fn)
+        _run_ach_pool(achs, ach_worker, should_stop)
     finally:
+        pool.shutdown(wait=True)
         write_sweep_summary_csv(project_dir, project_name)
 
 
@@ -1567,10 +1665,16 @@ def run_sweep(guv_path, settings_path, project_dir, room, settings, adv,
     run_steady_state_scenario() call beyond what those functions already
     do internally.
 
-    Up to _MAX_CONCURRENT_ACH ACH groups (each building its own flow
-    field) run at once, and every Z's own steady-state scenario draws from
-    one shared pool of _MAX_CONCURRENT_Z workers across all of them - see
-    _run_sweep_concurrent.
+    Every stage (per-ACH flow convergence, Phase 1, control, per-Z Phase 2)
+    is submitted to ONE shared pool of _MAX_CONCURRENT_SOLVES workers -
+    see that constant's own docstring for exactly how priority between
+    stages falls out of submission order, and this function's own
+    ach_worker (inside) for the per-ACH sequencing: flow first; then
+    Phase 1 and control together (genuine siblings - Phase 2 needs Phase
+    1's converged checkpoint specifically, so that wait is a real
+    dependency, not just a priority preference; control needs only the
+    converged flow base, so it runs alongside Phase 1 rather than after
+    it); then, once Phase 1 resolves, every Z sharing this ACH.
 
     status_fn(key, line_or_None), if given, receives each concurrent
     combo's latest "Time = N" line to display in place instead of the
@@ -1584,8 +1688,9 @@ def run_sweep(guv_path, settings_path, project_dir, room, settings, adv,
     combos = sweep_combinations(z_values, ach_values)
     achs = sorted({ach for _, ach in combos})
     project_name = _sanitize(Path(project_dir).name)
+    pool = ThreadPoolExecutor(max_workers=_MAX_CONCURRENT_SOLVES)
 
-    def build_ach_fn(ach):
+    def _prepare_flow(ach):
         ach_log_fn = _prefixed_log_fn(log_fn, f"ACH={ach}")
         base_dir = f"{project_dir}/_base_ACH{_fmt(ach)}"
         phase1_dir = f"{project_dir}/_phase1_ACH{_fmt(ach)}"
@@ -1602,33 +1707,46 @@ def run_sweep(guv_path, settings_path, project_dir, room, settings, adv,
         ach_log_fn("=== converging flow field (once per ACH) ===")
         base_summary = _build_flow_base(guv_path, base_dir, room, settings, ach, adv, ach_log_fn, should_stop,
                                          solver_log_fn, should_pause=should_pause)
+        return {"ach": ach, "base_dir": base_dir, "phase1_dir": phase1_dir, "control_dir": control_dir,
+                "base_summary": base_summary, "flow_fingerprint": flow_fingerprint, "reusable": reusable,
+                "fan_kw": _fan_kwargs(settings)}
+
+    def _prepare_phase1(flow_ctx):
+        ach = flow_ctx["ach"]
+        ach_log_fn = _prefixed_log_fn(log_fn, f"ACH={ach}")
         # Phase 1 ("source only, no UV") is Z-independent (see
         # _run_shared_phase1) - run it once per ACH here, not once per Z
         # in run_z_fn below. Its own reuse check (checkpoint/pending on
-        # disk) isn't fingerprint-aware either, but the stale-discard
-        # above already removed phase1_dir if it belonged to a mismatched
-        # fingerprint, so whatever's left here (if anything) is safe.
-        _run_shared_phase1(base_dir, phase1_dir, ach, room, settings, adv, ach_log_fn, should_stop, solver_log_fn,
-                            status_fn=status_fn, should_pause=should_pause)
-        if reusable is not None:
+        # disk) isn't fingerprint-aware either, but _prepare_flow's own
+        # stale-discard already removed phase1_dir if it belonged to a
+        # mismatched fingerprint, so whatever's left here (if anything)
+        # is safe.
+        _run_shared_phase1(flow_ctx["base_dir"], flow_ctx["phase1_dir"], ach, room, settings, adv, ach_log_fn,
+                            should_stop, solver_log_fn, status_fn=status_fn, should_pause=should_pause)
+
+    def _prepare_control(flow_ctx):
+        ach = flow_ctx["ach"]
+        ach_log_fn = _prefixed_log_fn(log_fn, f"ACH={ach}")
+        if flow_ctx["reusable"] is not None:
             ach_log_fn("Reusing this ACH's already-run UV-off control decay (unchanged flow "
                        "settings since an earlier sweep) - skipping a repeat pimpleFoam run.")
-            control_results = reusable["control_results"]
+            control_results = flow_ctx["reusable"]["control_results"]
         else:
             # A dedicated UV-off control run (same one decay mode already uses)
             # measures the actual ventilation rate directly, without Phase 1's
             # point-source mixing-transport lag - see
             # compute_corrected_eACH_uv_from_control's docstring for why that
-            # matters. Shared per ACH, same as the flow base and Phase 1.
-            control_results = _run_shared_control(base_dir, control_dir, ach, room, settings, adv,
-                                                   ach_log_fn, should_stop, solver_log_fn, base_summary,
-                                                   status_fn=status_fn,
+            # matters. Shared per ACH, same as the flow base and Phase 1 - and
+            # (2026-08-11) runs CONCURRENTLY with Phase 1, not after it, since
+            # it only needs the converged flow base, not Phase 1's own result.
+            control_results = _run_shared_control(flow_ctx["base_dir"], flow_ctx["control_dir"], ach, room,
+                                                   settings, adv, ach_log_fn, should_stop, solver_log_fn,
+                                                   flow_ctx["base_summary"], status_fn=status_fn,
                                                    should_pause=should_pause)
-        _update_ach_base_status_safe(project_dir, project_name, ach, flow_fingerprint, base_dir, control_dir,
-                                      control_results, guv_path=guv_path, settings_path=settings_path,
-                                      sim_type="steady_state")
-        return {"ach": ach, "base_dir": base_dir, "phase1_dir": phase1_dir, "control_dir": control_dir,
-                "base_summary": base_summary, "control_results": control_results, "fan_kw": _fan_kwargs(settings)}
+        _update_ach_base_status_safe(project_dir, project_name, ach, flow_ctx["flow_fingerprint"],
+                                      flow_ctx["base_dir"], flow_ctx["control_dir"], control_results,
+                                      guv_path=guv_path, settings_path=settings_path, sim_type="steady_state")
+        return control_results
 
     def run_z_fn(ctx, z, ach):
         if should_stop is not None and should_stop():
@@ -1658,9 +1776,17 @@ def run_sweep(guv_path, settings_path, project_dir, room, settings, adv,
                 settings["source-zone-size"], cell_size=adv["mesh-cell-size"])
             run_wsl_or_raise("topoSet -dict system/sourceTopoSetDict", wsl_path(case_dir),
                               "topoSet (restoring source zone wiped by _apply_z)")
+            # The future itself is handed through, not .result() here -
+            # control runs concurrently with Phase 1/Phase 2 now
+            # (2026-08-11); resolving eagerly at this point would block
+            # Phase 2's own simpleFoam call from ever starting until
+            # control had already finished, silently serializing the two.
+            # _run_scenario/run_steady_state_scenario resolve it themselves,
+            # at the one point it's actually needed (see their own
+            # docstrings) - after, not before, this combo's own solve.
             result = _run_scenario(case_dir, room, settings, z, ach, adv,
                                     z_summary, combo_log_fn, should_stop, solver_log_fn,
-                                    status_fn=status_fn, control_results=ctx["control_results"],
+                                    status_fn=status_fn, control_results_future=ctx["control_results_future"],
                                     base_summary=ctx["base_summary"], should_pause=should_pause)
             try:
                 snapshot_openfoam_settings(case_dir)
@@ -1702,9 +1828,43 @@ def run_sweep(guv_path, settings_path, project_dir, room, settings, adv,
             f'rm -rf "{wsl_path(ctx["base_dir"])}" "{wsl_path(ctx["phase1_dir"])}" "{wsl_path(ctx["control_dir"])}"',
             wsl_path(project_dir), "cleaning up shared base case, Phase 1 run, and control run")
 
+    def ach_worker(ach):
+        if should_stop is not None and should_stop():
+            raise StoppedByUser("Stopped before starting the next ACH group.")
+        flow_ctx = pool.submit(_prepare_flow, ach).result()
+        # Phase 1 and control are genuine siblings (both only need the
+        # converged flow base) - submitted together, Phase 1 textually
+        # first so it wins a tie if only one pool slot is free at this
+        # exact instant, matching the stated priority without needing a
+        # real priority queue.
+        phase1_future = pool.submit(_prepare_phase1, flow_ctx)
+        control_future = pool.submit(_prepare_control, flow_ctx)
+        try:
+            phase1_future.result()  # Phase 2 clones phase1_dir - a real dependency, not just a preference
+            zs = [z for z, a in combos if a == ach]
+            z_ctx = dict(flow_ctx, control_results_future=control_future)
+            z_futures = [pool.submit(run_z_fn, z_ctx, z, ach) for z in zs]
+            for f in z_futures:
+                f.result()  # re-raises StoppedByUser; per-combo errors are already caught inside run_z_fn
+        finally:
+            # Always wait for control to physically finish before cleanup
+            # runs, even when unwinding from a Phase 1/Z failure above -
+            # cleanup deletes control_dir, and doing that while control is
+            # still actively writing to it would be a real race (rm -rf
+            # against an in-progress OpenFOAM case), not just a
+            # theoretical one. futures.wait() never raises, unlike
+            # .result() - control's own exception (if any) is deliberately
+            # re-raised separately below, so a genuine control failure
+            # still surfaces as this ACH group's overall failure, same as
+            # it always has, without masking whatever already failed above.
+            futures_wait([control_future])
+            cleanup_ach_fn(flow_ctx)
+        control_future.result()
+
     try:
-        _run_sweep_concurrent(achs, combos, should_stop, build_ach_fn, run_z_fn, cleanup_ach_fn)
+        _run_ach_pool(achs, ach_worker, should_stop)
     finally:
+        pool.shutdown(wait=True)
         # Written even on StoppedByUser/a partial sweep - a summary of
         # whatever combinations did finish is more useful than none.
         write_sweep_summary_csv(project_dir, project_name)

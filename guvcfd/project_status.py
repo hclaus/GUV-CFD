@@ -143,8 +143,8 @@ def update_combo_status(project_dir, project_name, z, ach, guv_path=None, settin
     (and the combo's own entry within it) if either is missing.
 
     Guarded by a process-wide lock: sweep combinations run concurrently
-    (see scenario_runs._run_sweep_concurrent, up to _MAX_CONCURRENT_Z at
-    once) and each calls this independently on the SAME project-level
+    (see scenario_runs._MAX_CONCURRENT_SOLVES's own docstring, up to that
+    many in flight at once across every stage) and each calls this independently on the SAME project-level
     file - without a lock, two threads' read-modify-write cycles could
     race (both read before either writes, so the second write silently
     discards the first thread's update). A single global lock is

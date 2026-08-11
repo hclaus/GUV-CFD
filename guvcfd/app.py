@@ -4368,8 +4368,8 @@ def _confirm_extend_cleanup(submit_n_clicks):
 
 def _extend_pipeline_thread(case_dirs, end_time, write_interval):
     """Sequentially extend each decay case_dir to end_time - not folded
-    into _run_sweep_concurrent, since this is a small, explicit, user-
-    picked list rather than a Z x ACH cross-product (see the plan's own
+    into run_sweep/run_decay_sweep's own shared solver pool, since this is
+    a small, explicit, user-picked list rather than a Z x ACH cross-product (see the plan's own
     "Extend specific run(s)" design). Reuses _scenario_state/_scenario_log
     so progress shows on the same Run Simulations tab the ordinary sweep
     path already renders to.

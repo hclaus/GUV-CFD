@@ -408,8 +408,8 @@ def _phase_solver_callback(log_fn, solver_log_fn, status_fn, status_key, delta_t
     (solver_log_fn or log_fn getting every raw line).
 
     With status_fn (a concurrent sweep combination - see
-    scenario_runs._run_sweep_concurrent), "Time = N" banners go to
-    status_fn instead - overwritten in place, not appended - so several
+    scenario_runs._MAX_CONCURRENT_SOLVES's own docstring), "Time = N"
+    banners go to status_fn instead - overwritten in place, not appended - so several
     combinations solving at once don't flood the scrolling log the same
     way decay mode's _throttled_solver_callback already avoids. solver_log_fn
     still receives every raw line either way.
@@ -985,7 +985,8 @@ def run_steady_state_scenario(case_dir, room_x, room_y, room_z, ach, Z, nbins=25
                                fan_entry=None, monitoring_points=None,
                                patches_to_monitor=("outlet",), log_fn=print, should_stop=None,
                                solver_log_fn=None, status_fn=None, phase1_only=False, should_pause=None,
-                               measured_ventilation_ach=None, phase1_delta_t=1, phase2_delta_t=1):
+                               measured_ventilation_ach=None, control_results_future=None,
+                               phase1_delta_t=1, phase2_delta_t=1):
     """Run both phases of a continuous-source steady-state scenario against
     an already-converged case (mesh + flow + fluenceRate/kUV must already
     exist - see run_pipeline.setup_case()). Returns a summary dict.
@@ -1106,9 +1107,9 @@ def run_steady_state_scenario(case_dir, room_x, room_y, room_z, ach, Z, nbins=25
     correct even if this default changes for future runs.
 
     status_fn(key, line_or_None), if given (a concurrent sweep combination
-    - see scenario_runs._run_sweep_concurrent), receives each phase's
-    latest "Time = N" line to display in place instead of the scrolling
-    log - see _phase_solver_callback.
+    - see scenario_runs._MAX_CONCURRENT_SOLVES's own docstring), receives
+    each phase's latest "Time = N" line to display in place instead of
+    the scrolling log - see _phase_solver_callback.
 
     should_pause: forwarded straight through to each _run_phase call's
     run_wsl_streaming - suspends the active simpleFoam process in place
@@ -1122,6 +1123,21 @@ def run_steady_state_scenario(case_dir, room_x, room_y, room_z, ach, Z, nbins=25
     measured rate) instead of deriving the ventilation rate from Phase 1's
     own T_ss1 (compute_corrected_eACH_uv) - see the former's docstring for
     why that matters whenever the source zone is small/localized.
+
+    control_results_future: a Future resolving to that same control run's
+    full result dict (see scenario_runs._completed_future for the "value
+    already in hand" case) - takes precedence over measured_ventilation_ach
+    when given, resolved only right here (well after both phases' own
+    simpleFoam calls above have already run), not by the caller up front.
+    Control genuinely runs concurrently with Phase 1/Phase 2 now
+    (2026-08-11); resolving any earlier - e.g. passing an already-resolved
+    measured_ventilation_ach computed from .result() before this function
+    is even called - would block Phase 2's own simpleFoam call from
+    starting until control had already finished, silently serializing the
+    two for no reason (a real bug caught in the sweep scheduling rewrite
+    that motivated this parameter). Used by scenario_runs._run_scenario;
+    the single-run path (app.py) still passes a plain
+    measured_ventilation_ach, since it never has a Future to give.
 
     phase1_only: stop right after Phase 1 finishes (and its checkpoint is
     written) instead of continuing into Phase 2 - used by
@@ -1506,6 +1522,9 @@ def run_steady_state_scenario(case_dir, room_x, room_y, room_z, ach, Z, nbins=25
     summary["reduction_pct"] = reduction_pct
     summary["eACH_uv_steady_state"] = eACH_uv
     log_fn(f"Reduction: {reduction_pct:.1f}%, eACH_uv (steady-state method) = {eACH_uv:.4g} /hr")
+
+    if control_results_future is not None:
+        measured_ventilation_ach = control_results_future.result().get("total_ach_effective")
 
     if measured_ventilation_ach is not None:
         # Preferred: a real UV-off control run measured the ventilation
