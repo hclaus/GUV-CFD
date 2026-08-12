@@ -123,6 +123,53 @@ def test_update_combo_status_top_level_fields_never_overwritten_once_set(tmp_pat
     assert status["guv_path"] == "original.guv"
 
 
+# --- compute_guv_design_suffix (2026-08-12 incident: a different .guv
+# applied to Z/ACH values a project already used used to land on those
+# SAME combos and get silently skipped as "already done") ---
+
+def test_compute_guv_design_suffix_empty_for_the_original_design():
+    assert ps.compute_guv_design_suffix("room.guv", "room.guv") == ""
+
+
+def test_compute_guv_design_suffix_empty_for_a_brand_new_project():
+    # No original recorded yet - nothing to be "different" from.
+    assert ps.compute_guv_design_suffix("room.guv", None) == ""
+
+
+def test_compute_guv_design_suffix_empty_when_guv_path_not_given():
+    assert ps.compute_guv_design_suffix(None, "room.guv") == ""
+
+
+def test_compute_guv_design_suffix_nonempty_for_a_different_design():
+    assert ps.compute_guv_design_suffix("lampB.guv", "lampA.guv") == "_lampB"
+
+
+def test_compute_guv_design_suffix_sanitizes_unsafe_filename_characters():
+    assert ps.compute_guv_design_suffix("C:/designs/lamp B v2 (final).guv", "lampA.guv") == "_lamp_B_v2_final"
+
+
+def test_update_combo_status_uses_guv_suffix_in_the_combo_key(tmp_path):
+    ps.update_combo_status(str(tmp_path), "myproj", z=6.0, ach=3.0, guv_path="lampA.guv", status="done")
+    ps.update_combo_status(str(tmp_path), "myproj", z=6.0, ach=3.0, guv_path="lampB.guv",
+                            guv_suffix="_lampB", status="done")
+
+    status = ps.load_project_status(str(tmp_path), "myproj")
+    assert set(status["combos"]) == {"Z6_ACH3", "Z6_ACH3_lampB"}
+    # The original design's own combo is completely untouched by the
+    # second call - different key, no shared mutable state.
+    assert status["combos"]["Z6_ACH3"]["guv_path"] == "lampA.guv"
+    assert status["combos"]["Z6_ACH3_lampB"]["guv_path"] == "lampB.guv"
+
+
+def test_update_combo_status_records_guv_path_and_subdir_per_combo(tmp_path):
+    ps.update_combo_status(str(tmp_path), "myproj", z=6.0, ach=3.0, guv_path="lampA.guv",
+                            subdir="Z6_ACH3", status="done")
+    status = ps.load_project_status(str(tmp_path), "myproj")
+    combo = status["combos"]["Z6_ACH3"]
+    assert combo["guv_path"] == "lampA.guv"
+    assert combo["subdir"] == "Z6_ACH3"
+
+
 def test_update_combo_status_is_safe_under_concurrent_writers(tmp_path):
     # Regression guard: several combos updating the SAME project status
     # file concurrently (matches _run_sweep_concurrent's real usage

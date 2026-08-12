@@ -2927,11 +2927,14 @@ def _ach_label_for_dirs(ach):
 
 def _extend_status_table(status, project_dir=None):
     """dbc.Table (or an explanatory message) for a loaded project_status
-    dict's combos - Z, ACH, status, a simple checkmark for whether each
-    fingerprint is on record (a human doesn't need to see the raw hash -
-    see project_status.py's own combo schema), and whether this combo's
-    ACH group still has a Control run / Phase 1 (steady-state) working
-    copy sitting on disk. Started/finished timestamps are deliberately
+    dict's combos - Z, ACH, status, which .guv design produced it (see
+    compute_guv_design_suffix - two designs can share the same Z/ACH, so
+    without this column they'd look identical), a simple checkmark for
+    whether each fingerprint is on record (a human doesn't need to see
+    the raw hash - see project_status.py's own combo schema), and whether
+    this combo's ACH group still has a Control run / Phase 1
+    (steady-state) working copy sitting on disk. Started/finished
+    timestamps are deliberately
     NOT shown - they're only ever set by a live run, so a status file
     rebuilt from disk (see rebuild_project_status_from_disk, the common
     case for a project predating this feature) never has them, making
@@ -2966,8 +2969,10 @@ def _extend_status_table(status, project_dir=None):
             label = _ach_label_for_dirs(ach)
             control_ok = Path(f"{project_dir}/_control_ACH{label}").exists()
             phase1_ok = Path(f"{project_dir}/_phase1_ACH{label}").exists()
+        design = Path(c["guv_path"]).stem if c.get("guv_path") else ""
         rows.append(html.Tr([
             html.Td(f"{c.get('z')}"), html.Td(f"{c.get('ach')}"), html.Td(c.get("status", "")),
+            html.Td(design),
             html.Td("✓" if c.get("flow_fingerprint") else ""),
             html.Td("✓" if c.get("uv_fingerprint") else ""),
             html.Td("✓" if control_ok else ""),
@@ -2975,7 +2980,7 @@ def _extend_status_table(status, project_dir=None):
         ]))
     return dbc.Table(
         [html.Thead(html.Tr([html.Th(h) for h in
-                              ("Z", "ACH", "Status", "Flow", "UV", "Control (ACH)", "Phase 1")]))]
+                              ("Z", "ACH", "Status", "Design", "Flow", "UV", "Control (ACH)", "Phase 1")]))]
         + [html.Tbody(rows)],
         bordered=True, size="sm", className="mb-0",
     )
@@ -4479,7 +4484,13 @@ def _run_extend_action(n_clicks, uv_guv_path, uv_z_text, extend_combo_keys, exte
             if not combo:
                 continue
             z, ach = combo["z"], combo["ach"]
-            case_dirs.append((f"{project_dir}/{scenario_runs._subdir_name(z, ach)}", z, ach))
+            # combo["subdir"], if recorded, is this combo's OWN actual
+            # folder name - use it verbatim rather than recomputing from
+            # (z, ach) alone, which would silently drop this combo's own
+            # guv_suffix (see scenario_runs._subdir_name's docstring) and
+            # point at the wrong - possibly a different design's - folder.
+            subdir = combo.get("subdir") or scenario_runs._subdir_name(z, ach)
+            case_dirs.append((f"{project_dir}/{subdir}", z, ach))
         thread = threading.Thread(target=_extend_pipeline_thread,
                                    args=(case_dirs, extend_end_time, write_interval), daemon=True)
         thread.start()

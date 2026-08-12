@@ -26,6 +26,7 @@ sweeps" GUI/flow work, deliberately a separate follow-up).
 """
 import hashlib
 import json
+import re
 import threading
 import time
 from pathlib import Path
@@ -123,8 +124,8 @@ def save_project_status(project_dir, project_name, status):
     write_case_file(project_dir, _status_relative_path(project_name), json.dumps(status, indent=2))
 
 
-def _combo_key(z, ach):
-    return f"Z{z:g}_ACH{ach:g}"
+def _combo_key(z, ach, guv_suffix=""):
+    return f"Z{z:g}_ACH{ach:g}{guv_suffix}"
 
 
 def _ach_label(ach):
@@ -137,8 +138,46 @@ def _ach_label(ach):
     return "sealed" if ach <= 0 else f"{ach:g}"
 
 
+def _sanitize_guv_stem(guv_path):
+    """Filesystem-safe stem of a .guv file's own name - matches
+    scenario_runs._sanitize's effect (not imported from there - same
+    circular-import reason _ach_label above gives), used only to build
+    compute_guv_design_suffix's own suffix.
+    """
+    stem = re.sub(r"[^A-Za-z0-9_-]+", "_", Path(guv_path).stem).strip("_")
+    return stem or "design"
+
+
+def compute_guv_design_suffix(guv_path, original_guv_path):
+    """"" if guv_path IS this project's original design (the first
+    guv_path ever recorded for it - see load_project_status's own
+    guv_path.setdefault, which never changes once set) or there's no
+    original recorded yet (a brand-new project); otherwise
+    "_<guv-filename-stem>".
+
+    Why this exists (2026-08-12 incident): combo keys/subfolder names are
+    Z/ACH-only, with no discriminator for which .guv file produced them.
+    Applying a genuinely different lamp design to a room that already has
+    combos at the same Z/ACH values used to land on those SAME combos -
+    _skip_if_combo_already_done then skipped every one of them as
+    "already done" (confirmed live: a full sweep at an already-used ACH
+    silently no-op'd end to end, reusing the ORIGINAL design's stale
+    results under the new design's name, no new folder created and no
+    error raised). Suffixing every combo that belongs to a non-original
+    design makes that structurally impossible - see scenario_runs.py's
+    own run_sweep/run_decay_sweep for where this is computed once per
+    call and threaded into folder naming (_subdir_name) and this suffix's
+    own use in _combo_key above. The project's FIRST design keeps its
+    exact existing (unsuffixed) folder/key names always - old data is
+    never renamed or altered by this.
+    """
+    if not guv_path or not original_guv_path or guv_path == original_guv_path:
+        return ""
+    return "_" + _sanitize_guv_stem(guv_path)
+
+
 def update_combo_status(project_dir, project_name, z, ach, guv_path=None, settings_path=None, sim_type=None,
-                         **fields):
+                         guv_suffix="", subdir=None, **fields):
     """Read-modify-write a single combo's entry - creates the status file
     (and the combo's own entry within it) if either is missing.
 
@@ -150,12 +189,34 @@ def update_combo_status(project_dir, project_name, z, ach, guv_path=None, settin
     discards the first thread's update). A single global lock is
     sufficient for the current concurrency model (one sweep active per
     app instance at a time) - revisit if that ever changes.
+
+    guv_suffix: threaded straight into the combo's own KEY (see
+    _combo_key/compute_guv_design_suffix) - the caller (scenario_runs.py's
+    run_sweep/run_decay_sweep) computes this ONCE per call and passes the
+    exact same value used to build this combo's actual subdir/case_dir,
+    so the JSON key and the folder on disk always agree; "" (the default)
+    reproduces this function's exact pre-2026-08-12 behavior for any other
+    caller.
+
+    subdir: the combo's actual folder name (see scenario_runs._subdir_name)
+    - stored verbatim so a later reader (e.g. _find_done_combo_case_dir_for_ach,
+    the Extend/modify dialogs' "extend" action) can reconstruct case_dir
+    from this record directly instead of recomputing _subdir_name(z, ach)
+    itself, which would silently drop this combo's own guv_suffix and
+    point at the WRONG (possibly a different design's) folder. None (the
+    default) leaves it out entirely - every such reader already falls
+    back to the old recompute-from-(z, ach) behavior when absent, so
+    combos written before this field existed keep working unchanged.
     """
     with _status_lock:
         status = load_project_status(project_dir, project_name, guv_path, settings_path, sim_type)
-        combo = status["combos"].setdefault(_combo_key(z, ach), {})
+        combo = status["combos"].setdefault(_combo_key(z, ach, guv_suffix), {})
         combo["z"] = z
         combo["ach"] = ach
+        if guv_path is not None:
+            combo["guv_path"] = guv_path
+        if subdir is not None:
+            combo["subdir"] = subdir
         combo.update(fields)
         save_project_status(project_dir, project_name, status)
         return status

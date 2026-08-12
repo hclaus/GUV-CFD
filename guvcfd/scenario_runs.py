@@ -52,8 +52,8 @@ from .mesh_gen import opening_actual_area
 from .monitoring import splice_live_vol_average_if_needed
 from .monitoring_points import compute_monitoring_results, point_reduction_basis
 from .project_status import (
-    compute_flow_fingerprint, compute_uv_fingerprint, find_reusable_ach_base, get_ach_base_record,
-    load_project_status, now_iso, update_ach_base_status, update_combo_status,
+    compute_flow_fingerprint, compute_guv_design_suffix, compute_uv_fingerprint, find_reusable_ach_base,
+    get_ach_base_record, load_project_status, now_iso, update_ach_base_status, update_combo_status,
 )
 from .report import combo_summary_metrics
 from .run_pipeline import check_ach_delivery, setup_case
@@ -126,8 +126,16 @@ def _ach_label(ach):
     return "sealed" if ach <= 0 else _fmt(ach)
 
 
-def _subdir_name(z, ach):
-    return _sanitize(f"Z{_fmt(z)}_ACH{_ach_label(ach)}")
+def _subdir_name(z, ach, guv_suffix=""):
+    """guv_suffix (see project_status.compute_guv_design_suffix) is ""
+    for a project's original design (today's exact naming, unchanged) and
+    "_<guv-filename-stem>" for any later, genuinely different design - see
+    that function's own docstring for the incident this closes: without
+    it, a different .guv applied to Z/ACH values a project already used
+    would land on those SAME combos and get silently skipped as
+    "already done" instead of computing anything new.
+    """
+    return _sanitize(f"Z{_fmt(z)}_ACH{_ach_label(ach)}{guv_suffix}")
 
 
 def sweep_combinations(z_values, ach_values):
@@ -297,7 +305,16 @@ def _find_done_combo_case_dir_for_ach(project_dir, project_name, ach, flow_finge
     for combo in status.get("combos", {}).values():
         if (combo.get("ach") == ach and combo.get("status") == "done"
                 and combo.get("flow_fingerprint") == flow_fingerprint and "z" in combo):
-            return f"{project_dir}/{_subdir_name(combo['z'], combo['ach'])}"
+            # combo["subdir"], if recorded, is this combo's OWN actual
+            # folder name - use it verbatim rather than recomputing from
+            # (z, ach) alone, which would silently drop this combo's own
+            # guv_suffix (see _subdir_name's own docstring) and point at
+            # the wrong - possibly a different design's - folder. Falls
+            # back to the old recompute for combos written before this
+            # field existed (never suffixed themselves, so it's correct
+            # for them too).
+            subdir = combo.get("subdir") or _subdir_name(combo["z"], combo["ach"])
+            return f"{project_dir}/{subdir}"
     return None
 
 
@@ -1064,7 +1081,7 @@ def _trim_decay_report(result):
     return trimmed
 
 
-_SWEEP_SUMMARY_FIELDS = ["Z", "ACH", "total_reduction_pct", "ach_efficiency_pct", "uv_efficiency_pct",
+_SWEEP_SUMMARY_FIELDS = ["Z", "ACH", "Design", "total_reduction_pct", "ach_efficiency_pct", "uv_efficiency_pct",
                          "mechanical_mixing_efficiency_pct", "est_ach_per_hr", "est_each_per_hr"]
 
 
@@ -1122,16 +1139,30 @@ def write_sweep_summary_csv(project_dir, project_name):
         status = load_project_status(project_dir, project_name)
     except Exception:
         status = {"combos": {}}
+    # Iterates the combo RECORDS themselves (keyed by _combo_key, which
+    # includes each combo's own guv_suffix - see compute_guv_design_suffix)
+    # rather than a deduplicated {(z, ach), ...} set - two different .guv
+    # designs can both have a "done" combo at the same Z/ACH, and
+    # deduplicating by (z, ach) alone used to silently collapse them into
+    # one row (whichever design's own report.json _subdir_name(z, ach)
+    # happened to reconstruct without a suffix - i.e. always the
+    # ORIGINAL design's), dropping every other design's row entirely.
     combos = sorted(
-        {(c["z"], c["ach"]) for c in status.get("combos", {}).values()
-         if c.get("status") == "done" and "z" in c and "ach" in c},
-        key=lambda zc: (zc[1], zc[0]),
+        ((key, c) for key, c in status.get("combos", {}).items()
+         if c.get("status") == "done" and "z" in c and "ach" in c),
+        key=lambda kv: (kv[1]["ach"], kv[1]["z"], kv[0]),
     )
 
     rows = []
     monitoring_columns = set()
-    for z, ach in combos:
-        report_relative = f"{project_name}_{_subdir_name(z, ach)}_report.json"
+    for key, combo in combos:
+        z, ach = combo["z"], combo["ach"]
+        # combo["subdir"], if recorded, is this combo's OWN actual folder
+        # name - see _find_done_combo_case_dir_for_ach's identical
+        # fallback for why recomputing _subdir_name(z, ach) alone isn't
+        # safe once a combo may belong to a non-original design.
+        subdir = combo.get("subdir") or _subdir_name(z, ach)
+        report_relative = f"{project_name}_{subdir}_report.json"
         try:
             detail = json.loads(_read_case_file(project_dir, report_relative))
         except (json.JSONDecodeError, OSError, RuntimeError):
@@ -1142,7 +1173,9 @@ def write_sweep_summary_csv(project_dir, project_name):
             # existence check on it isn't reliable - see wsl_utils's own
             # cross-boundary-visibility docstrings.
             continue
-        row = {"Z": z, "ACH": ach, **combo_summary_metrics(detail), **_monitoring_summary_columns(detail)}
+        design = Path(combo["guv_path"]).stem if combo.get("guv_path") else ""
+        row = {"Z": z, "ACH": ach, "Design": design,
+               **combo_summary_metrics(detail), **_monitoring_summary_columns(detail)}
         monitoring_columns.update(row.keys() - set(_SWEEP_SUMMARY_FIELDS))
         rows.append(row)
 
@@ -1443,6 +1476,14 @@ def run_decay_sweep(guv_path, settings_path, project_dir, room, settings, adv,
     project_name = _sanitize(Path(project_dir).name)
     pool = ThreadPoolExecutor(max_workers=_MAX_CONCURRENT_SOLVES)
 
+    # "" for this project's original design (today's exact naming,
+    # unchanged) - see compute_guv_design_suffix's own docstring for the
+    # incident this closes: a genuinely different .guv applied to Z/ACH
+    # values this project already used, without this, would silently
+    # land on and get skipped as those SAME already-done combos.
+    original_guv_path = load_project_status(project_dir, project_name).get("guv_path")
+    guv_suffix = compute_guv_design_suffix(guv_path, original_guv_path)
+
     mechanical_ach_only = bool(settings.get("mech-ach-only"))
 
     def _prepare_flow(ach):
@@ -1506,7 +1547,7 @@ def run_decay_sweep(guv_path, settings_path, project_dir, room, settings, adv,
             raise StoppedByUser("Stopped before the next combination.")
 
         combo_log_fn = _prefixed_log_fn(log_fn, f"Z={z}/ACH={ach}")
-        subdir = _subdir_name(z, ach)
+        subdir = _subdir_name(z, ach, guv_suffix)
         case_dir = f"{project_dir}/{subdir}"
         combo_log_fn(f"--- -> {subdir} ---")
         if _skip_if_combo_already_done(case_dir, subdir, combo_log_fn, _trim_decay_report, on_combo_done, z, ach):
@@ -1514,7 +1555,8 @@ def run_decay_sweep(guv_path, settings_path, project_dir, room, settings, adv,
         flow_fingerprint = compute_flow_fingerprint(settings, room)
         _update_combo_status_safe(project_dir, project_name, z, ach, guv_path=guv_path,
                                    settings_path=settings_path, sim_type="decay", status="running",
-                                   started_at=now_iso(), flow_fingerprint=flow_fingerprint)
+                                   started_at=now_iso(), flow_fingerprint=flow_fingerprint,
+                                   guv_suffix=guv_suffix, subdir=subdir)
         try:
             _copy_base_case(ctx["base_dir"], case_dir, combo_log_fn)
             if mechanical_ach_only:
@@ -1560,16 +1602,19 @@ def run_decay_sweep(guv_path, settings_path, project_dir, room, settings, adv,
             combo_log_fn(f"  Done. eACH_uv effective={result['eACH_uv_effective']:.4g} /hr "
                          f"(well-mixed={result['eACH_uv_well_mixed']:.4g} /hr)")
             _update_combo_status_safe(project_dir, project_name, z, ach, status="done",
-                                       finished_at=now_iso(), uv_fingerprint=uv_fingerprint)
+                                       finished_at=now_iso(), uv_fingerprint=uv_fingerprint,
+                                       guv_suffix=guv_suffix, subdir=subdir)
             if on_combo_done:
                 on_combo_done(z, ach, "done", trimmed)
         except StoppedByUser:
-            _update_combo_status_safe(project_dir, project_name, z, ach, status="stopped", finished_at=now_iso())
+            _update_combo_status_safe(project_dir, project_name, z, ach, status="stopped", finished_at=now_iso(),
+                                       guv_suffix=guv_suffix, subdir=subdir)
             raise
         except Exception as e:
             combo_log_fn(f"ERROR: {e}")
             _update_combo_status_safe(project_dir, project_name, z, ach, status="error",
-                                       error_message=str(e), finished_at=now_iso())
+                                       error_message=str(e), finished_at=now_iso(),
+                                       guv_suffix=guv_suffix, subdir=subdir)
             if on_combo_done:
                 on_combo_done(z, ach, "error", str(e))
 
@@ -1718,6 +1763,14 @@ def run_sweep(guv_path, settings_path, project_dir, room, settings, adv,
     project_name = _sanitize(Path(project_dir).name)
     pool = ThreadPoolExecutor(max_workers=_MAX_CONCURRENT_SOLVES)
 
+    # "" for this project's original design (today's exact naming,
+    # unchanged) - see compute_guv_design_suffix's own docstring for the
+    # incident this closes: a genuinely different .guv applied to Z/ACH
+    # values this project already used, without this, would silently
+    # land on and get skipped as those SAME already-done combos.
+    original_guv_path = load_project_status(project_dir, project_name).get("guv_path")
+    guv_suffix = compute_guv_design_suffix(guv_path, original_guv_path)
+
     def _prepare_flow(ach):
         ach_log_fn = _prefixed_log_fn(log_fn, f"ACH={ach}")
         base_dir = f"{project_dir}/_base_ACH{_fmt(ach)}"
@@ -1781,7 +1834,7 @@ def run_sweep(guv_path, settings_path, project_dir, room, settings, adv,
             raise StoppedByUser("Stopped before the next combination.")
 
         combo_log_fn = _prefixed_log_fn(log_fn, f"Z={z}/ACH={ach}")
-        subdir = _subdir_name(z, ach)
+        subdir = _subdir_name(z, ach, guv_suffix)
         case_dir = f"{project_dir}/{subdir}"
         combo_log_fn(f"--- -> {subdir} ---")
         if _skip_if_combo_already_done(case_dir, subdir, combo_log_fn, _trim_report, on_combo_done, z, ach):
@@ -1789,7 +1842,8 @@ def run_sweep(guv_path, settings_path, project_dir, room, settings, adv,
         flow_fingerprint = compute_flow_fingerprint(settings, room)
         _update_combo_status_safe(project_dir, project_name, z, ach, guv_path=guv_path,
                                    settings_path=settings_path, sim_type="steady_state", status="running",
-                                   started_at=now_iso(), flow_fingerprint=flow_fingerprint)
+                                   started_at=now_iso(), flow_fingerprint=flow_fingerprint,
+                                   guv_suffix=guv_suffix, subdir=subdir)
         try:
             _copy_base_case(ctx["phase1_dir"], case_dir, combo_log_fn)
             z_summary = _apply_z(case_dir, z, adv["uv-zone-bins"], ctx["fan_kw"], combo_log_fn)
@@ -1831,16 +1885,19 @@ def run_sweep(guv_path, settings_path, project_dir, room, settings, adv,
             combo_log_fn(f"  Done. Reduction={result['reduction_pct']:.1f}%, "
                          f"eACH_uv={result['eACH_uv_steady_state']:.4g} /hr")
             _update_combo_status_safe(project_dir, project_name, z, ach, status="done",
-                                       finished_at=now_iso(), uv_fingerprint=uv_fingerprint)
+                                       finished_at=now_iso(), uv_fingerprint=uv_fingerprint,
+                                       guv_suffix=guv_suffix, subdir=subdir)
             if on_combo_done:
                 on_combo_done(z, ach, "done", trimmed)
         except StoppedByUser:
-            _update_combo_status_safe(project_dir, project_name, z, ach, status="stopped", finished_at=now_iso())
+            _update_combo_status_safe(project_dir, project_name, z, ach, status="stopped", finished_at=now_iso(),
+                                       guv_suffix=guv_suffix, subdir=subdir)
             raise
         except Exception as e:
             combo_log_fn(f"ERROR: {e}")
             _update_combo_status_safe(project_dir, project_name, z, ach, status="error",
-                                       error_message=str(e), finished_at=now_iso())
+                                       error_message=str(e), finished_at=now_iso(),
+                                       guv_suffix=guv_suffix, subdir=subdir)
             if on_combo_done:
                 on_combo_done(z, ach, "error", str(e))
 

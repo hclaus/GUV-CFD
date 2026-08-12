@@ -158,7 +158,20 @@ def test_extend_status_table_omits_started_finished_columns():
     status = {"combos": {"Z6_ACH3": {"z": 6.0, "ach": 3.0, "status": "done"}}}
     table = guvcfd_app._extend_status_table(status)
     headers = [th.children for th in table.children[0].children.children]
-    assert headers == ["Z", "ACH", "Status", "Flow", "UV", "Control (ACH)", "Phase 1"]
+    assert headers == ["Z", "ACH", "Status", "Design", "Flow", "UV", "Control (ACH)", "Phase 1"]
+
+
+def test_extend_status_table_shows_which_guv_design_produced_each_combo():
+    # Two designs at the SAME Z/ACH would look identical without this
+    # column - see compute_guv_design_suffix's own docstring.
+    status = {"combos": {
+        "Z6_ACH3": {"z": 6.0, "ach": 3.0, "status": "done", "guv_path": "C:/rooms/lampA.guv"},
+        "Z6_ACH3_lampB": {"z": 6.0, "ach": 3.0, "status": "done", "guv_path": "C:/rooms/lampB.guv"},
+    }}
+    table = guvcfd_app._extend_status_table(status)
+    rows = table.children[1].children
+    designs = {row.children[3].children for row in rows}
+    assert designs == {"lampA", "lampB"}
 
 
 def test_extend_status_table_shows_control_and_phase1_checkmarks_when_dirs_exist(tmp_path):
@@ -169,24 +182,24 @@ def test_extend_status_table_shows_control_and_phase1_checkmarks_when_dirs_exist
     table = guvcfd_app._extend_status_table(status, str(tmp_path))
 
     row = table.children[1].children[0]
-    assert row.children[5].children == "✓"  # Control (ACH)
-    assert row.children[6].children == "✓"  # Phase 1
+    assert row.children[6].children == "✓"  # Control (ACH)
+    assert row.children[7].children == "✓"  # Phase 1
 
 
 def test_extend_status_table_blank_control_and_phase1_when_dirs_missing(tmp_path):
     status = {"combos": {"Z6_ACH3": {"z": 6.0, "ach": 3.0, "status": "done"}}}
     table = guvcfd_app._extend_status_table(status, str(tmp_path))
     row = table.children[1].children[0]
-    assert row.children[5].children == ""
     assert row.children[6].children == ""
+    assert row.children[7].children == ""
 
 
 def test_extend_status_table_blank_control_and_phase1_when_no_project_dir():
     status = {"combos": {"Z6_ACH3": {"z": 6.0, "ach": 3.0, "status": "done"}}}
     table = guvcfd_app._extend_status_table(status)  # project_dir=None
     row = table.children[1].children[0]
-    assert row.children[5].children == ""
     assert row.children[6].children == ""
+    assert row.children[7].children == ""
 
 
 # --- action selection ---

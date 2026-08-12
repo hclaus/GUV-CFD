@@ -442,6 +442,18 @@ def test_find_done_combo_case_dir_for_ach_finds_matching_done_combo(tmp_path):
     assert donor == f"{tmp_path}/Z1_ACH3"
 
 
+def test_find_done_combo_case_dir_for_ach_uses_recorded_subdir_not_a_recompute(tmp_path):
+    # A combo belonging to a non-original design has a guv-suffixed
+    # subdir that recomputing _subdir_name(z, ach) alone would miss (see
+    # compute_guv_design_suffix's own docstring) - the recorded "subdir"
+    # field must be used verbatim, not reconstructed.
+    from guvcfd.project_status import update_combo_status
+    update_combo_status(str(tmp_path), "myproj", z=1.0, ach=3.0, status="done", flow_fingerprint="fp1",
+                         guv_path="lampB.guv", guv_suffix="_lampB", subdir="Z1_ACH3_lampB")
+    donor = sr._find_done_combo_case_dir_for_ach(str(tmp_path), "myproj", 3.0, "fp1")
+    assert donor == f"{tmp_path}/Z1_ACH3_lampB"
+
+
 def test_find_done_combo_case_dir_for_ach_none_when_fingerprint_mismatches(tmp_path):
     from guvcfd.project_status import update_combo_status
     update_combo_status(str(tmp_path), "myproj", z=1.0, ach=3.0, status="done", flow_fingerprint="fp1")
@@ -601,6 +613,76 @@ def test_run_decay_sweep_second_launch_reuses_matching_flow_and_control(tmp_path
     assert control_calls == [3]  # only the FIRST launch's control run - second reused it
     assert (project_dir / "myproject_Z6_ACH3_report.json").exists()
     assert (project_dir / "myproject_Z2_ACH3_report.json").exists()
+
+
+def test_run_decay_sweep_different_guv_at_same_z_ach_gets_its_own_folder(tmp_path, monkeypatch):
+    # Regression guard for the 2026-08-12 incident: applying a genuinely
+    # different .guv file to Z/ACH values a project already used - the
+    # SAME (z, ach) as an existing "done" combo - used to land on that
+    # SAME combo and get silently skipped as "already done" (no new
+    # folder, no new report, no error - just the original design's stale
+    # numbers reused under the new design's name). The second design must
+    # get its own folder/report, and the first design's own files must be
+    # completely untouched (byte-identical) by the second launch.
+    project_dir = tmp_path / "myproject"
+    project_dir.mkdir()
+
+    def fake_build_flow_base(guv_path, base_dir, room, settings, ach, adv, log_fn, *a, **k):
+        __import__("os").makedirs(base_dir, exist_ok=True)
+        return {"flow_converged": True, "inlet_velocity": 1.0, "inlet2_velocity": None}
+
+    def fake_run_shared_control(base_dir, control_dir, ach, *a, **k):
+        __import__("os").makedirs(control_dir, exist_ok=True)
+        return {"total_ach_effective": 3.0}
+
+    monkeypatch.setattr(sr, "_build_flow_base", fake_build_flow_base)
+    monkeypatch.setattr(sr, "_run_shared_control", fake_run_shared_control)
+    monkeypatch.setattr(sr, "_copy_base_case",
+                         lambda base, target, log_fn: __import__("os").makedirs(target, exist_ok=True))
+    monkeypatch.setattr(sr, "_apply_z", lambda case_dir, z, nbins, fan_kwargs, log_fn:
+                         {"fluence_mean": 1.0, "eACH_uv_well_mixed_mean": 0.0})
+    monkeypatch.setattr(sr, "compute_uv_fingerprint", lambda *a, **k: "fake-uv-fp")
+    decay_calls = []
+    monkeypatch.setattr(sr, "_run_decay_scenario", lambda *a, **k: decay_calls.append(1) or {
+        "reduction_pct": 1.0, "eACH_uv_effective": 1.0, "eACH_uv_well_mixed": 1.0, "phase1": {}, "phase2": {}})
+    monkeypatch.setattr(sr, "run_wsl_or_raise", lambda cmd, *a, **k: None)
+
+    room = type("Room", (), {"x": 4.0, "y": 5.0, "z": 2.7})()
+    settings = _decay_reuse_settings()
+    adv = {"uv-zone-bins": 25, "mesh-cell-size": 0.1, "keep-shared-scratch-dirs": True}
+
+    results_seen = []
+    sr.run_decay_sweep(
+        guv_path="lampA.guv", settings_path="proj.guvcfd", project_dir=str(project_dir),
+        room=room, settings=settings, adv=adv,
+        z_values=[6], ach_values=[3], log_fn=lambda m: None,
+        on_combo_done=lambda z, ach, status, detail: results_seen.append((z, ach, status)),
+    )
+    original_report = (project_dir / "myproject_Z6_ACH3_report.json").read_text()
+
+    sr.run_decay_sweep(
+        guv_path="lampB.guv", settings_path="proj.guvcfd", project_dir=str(project_dir),
+        room=room, settings=settings, adv=adv,
+        z_values=[6], ach_values=[3], log_fn=lambda m: None,
+        on_combo_done=lambda z, ach, status, detail: results_seen.append((z, ach, status)),
+    )
+
+    # The whole point: the second design's combo actually ran (not
+    # skipped as "already done") - 2 real solves, not 1.
+    assert len(decay_calls) == 2
+    assert results_seen == [(6, 3, "done"), (6, 3, "done")]
+
+    # A genuinely NEW folder/report for the second design...
+    assert (project_dir / "Z6_ACH3_lampB").exists()
+    assert (project_dir / "myproject_Z6_ACH3_lampB_report.json").exists()
+    # ...and the ORIGINAL design's own folder/report are untouched.
+    assert (project_dir / "myproject_Z6_ACH3_report.json").read_text() == original_report
+
+    status = load_project_status(str(project_dir), "myproject")
+    assert set(status["combos"]) == {"Z6_ACH3", "Z6_ACH3_lampB"}
+    assert status["combos"]["Z6_ACH3"]["guv_path"] == "lampA.guv"
+    assert status["combos"]["Z6_ACH3_lampB"]["guv_path"] == "lampB.guv"
+    assert status["guv_path"] == "lampA.guv"  # the project's original design, never overwritten
 
 
 def test_run_decay_sweep_rebuilds_when_flow_settings_change_between_launches(tmp_path, monkeypatch):
@@ -1588,6 +1670,36 @@ def test_write_sweep_summary_csv_collects_every_done_combo_from_status(tmp_path)
     assert rows[0]["ACH"] == "3.0"
     assert float(rows[0]["total_reduction_pct"]) == pytest.approx(85.8)
     assert float(rows[0]["est_each_per_hr"]) == pytest.approx(18.2)
+
+
+def test_write_sweep_summary_csv_includes_a_row_per_design_at_the_same_z_ach(tmp_path):
+    import csv as csv_module
+    project_dir = str(tmp_path)
+    project_name = "myproj"
+    from guvcfd.project_status import update_combo_status
+    # Two different designs, both "done" at the SAME (z, ach) - see
+    # compute_guv_design_suffix's own docstring for the incident this
+    # guards against: deduplicating by (z, ach) alone used to collapse
+    # these into a single row, always the ORIGINAL design's.
+    update_combo_status(project_dir, project_name, z=6.0, ach=3.0, guv_path="lampA.guv",
+                         subdir="Z6_ACH3", status="done")
+    update_combo_status(project_dir, project_name, z=6.0, ach=3.0, guv_path="lampB.guv",
+                         guv_suffix="_lampB", subdir="Z6_ACH3_lampB", status="done")
+
+    with open(f"{project_dir}/{project_name}_Z6_ACH3_report.json", "w") as f:
+        json.dump({"reduction_pct_corrected": 80.0, "eACH_uv_steady_state_corrected": 10.0}, f)
+    with open(f"{project_dir}/{project_name}_Z6_ACH3_lampB_report.json", "w") as f:
+        json.dump({"reduction_pct_corrected": 95.0, "eACH_uv_steady_state_corrected": 25.0}, f)
+
+    csv_path = sr.write_sweep_summary_csv(project_dir, project_name)
+    with open(csv_path, newline="") as f:
+        rows = list(csv_module.DictReader(f))
+
+    assert len(rows) == 2
+    by_design = {r["Design"]: r for r in rows}
+    assert set(by_design) == {"lampA", "lampB"}
+    assert float(by_design["lampA"]["total_reduction_pct"]) == pytest.approx(80.0)
+    assert float(by_design["lampB"]["total_reduction_pct"]) == pytest.approx(95.0)
 
 
 def test_write_sweep_summary_csv_handles_no_reports_at_all(tmp_path):

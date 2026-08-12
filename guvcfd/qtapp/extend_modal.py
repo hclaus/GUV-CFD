@@ -31,7 +31,7 @@ from ..project_status import clear_ach_bases, load_project_status
 from ..wsl_utils import run_wsl_or_raise, wsl_path
 from . import helpers
 
-_STATUS_TABLE_HEADERS = ["Z", "ACH", "Status", "Flow", "UV", "Control (ACH)", "Phase 1"]
+_STATUS_TABLE_HEADERS = ["Z", "ACH", "Status", "Design", "Flow", "UV", "Control (ACH)", "Phase 1"]
 
 
 def _ach_label_for_dirs(ach):
@@ -305,8 +305,9 @@ class ExtendModifyDialog(QDialog):
                 label = _ach_label_for_dirs(ach)
                 control_ok = Path(f"{self._project_dir}/_control_ACH{label}").exists()
                 phase1_ok = Path(f"{self._project_dir}/_phase1_ACH{label}").exists()
+            design = Path(c["guv_path"]).stem if c.get("guv_path") else ""
             values = [
-                f"{c.get('z')}", f"{c.get('ach')}", c.get("status", ""),
+                f"{c.get('z')}", f"{c.get('ach')}", c.get("status", ""), design,
                 "✓" if c.get("flow_fingerprint") else "", "✓" if c.get("uv_fingerprint") else "",
                 "✓" if control_ok else "", "✓" if phase1_ok else "",
             ]
@@ -445,7 +446,14 @@ class ExtendModifyDialog(QDialog):
                 if not combo:
                     continue
                 z, ach = combo["z"], combo["ach"]
-                case_dirs.append((f"{self._project_dir}/{scenario_runs._subdir_name(z, ach)}", z, ach))
+                # combo["subdir"], if recorded, is this combo's OWN actual
+                # folder name - use it verbatim rather than recomputing
+                # from (z, ach) alone, which would silently drop this
+                # combo's own guv_suffix (see scenario_runs._subdir_name's
+                # docstring) and point at the wrong - possibly a different
+                # design's - folder.
+                subdir = combo.get("subdir") or scenario_runs._subdir_name(z, ach)
+                case_dirs.append((f"{self._project_dir}/{subdir}", z, ach))
             self.run_tab.launch_extend_from_extend(case_dirs, end_time, write_interval)
             self.accept()
         else:
