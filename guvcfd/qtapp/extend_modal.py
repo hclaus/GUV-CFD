@@ -20,9 +20,9 @@ from pathlib import Path
 from guv_calcs import Project
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
-    QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QGroupBox, QHBoxLayout, QLabel,
+    QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QGroupBox, QHBoxLayout, QLabel,
     QLineEdit, QListWidget, QListWidgetItem, QMessageBox, QPushButton, QSpinBox, QTableWidget, QTableWidgetItem,
-    QVBoxLayout,
+    QVBoxLayout, QWidget,
 )
 
 from .. import scenario_runs
@@ -31,7 +31,7 @@ from ..project_status import clear_ach_bases, load_project_status
 from ..wsl_utils import run_wsl_or_raise, wsl_path
 from . import helpers
 
-_STATUS_TABLE_HEADERS = ["Z", "ACH", "Status", "Design", "Flow", "UV", "Control (ACH)", "Phase 1"]
+_STATUS_TABLE_HEADERS = ["Z", "ACH", "Status", "Design", "Mode", "Flow", "UV", "Control (ACH)", "Phase 1"]
 
 
 def _ach_label_for_dirs(ach):
@@ -188,6 +188,28 @@ class ExtendModifyDialog(QDialog):
         uv_note.setWordWrap(True)
         uv_note.setStyleSheet("color: gray;")
         uv_layout.addRow(uv_note)
+        # Only shown for a steady-state project - switching TO decay mode
+        # is supported (the shared flow base and UV-off control run are
+        # identical either way, and decay mode has no Phase 1 concept at
+        # all, so only each Z's own UV-on decay solve is new work); the
+        # reverse (decay -> steady-state) isn't offered - see _refresh's
+        # own visibility logic. A dedicated container widget (rather than
+        # rows added directly to uv_layout) so the whole thing - label,
+        # combo, and note - can be shown/hidden as one unit.
+        self.uv_mode_widget = QWidget()
+        uv_mode_layout = QFormLayout(self.uv_mode_widget)
+        uv_mode_layout.setContentsMargins(0, 0, 0, 0)
+        self.uv_mode_combo = QComboBox()
+        self.uv_mode_combo.addItem("Steady state (same as this project)", userData="steady_state")
+        self.uv_mode_combo.addItem("Decay mode", userData="decay")
+        uv_mode_layout.addRow("Simulation mode", self.uv_mode_combo)
+        uv_mode_note = QLabel("Switching to Decay mode reuses this ACH's already-converged flow field "
+                               "and UV-off control run - only each Z's own UV-on decay solve is new work.")
+        uv_mode_note.setWordWrap(True)
+        uv_mode_note.setStyleSheet("color: gray;")
+        uv_mode_layout.addRow(uv_mode_note)
+        self.uv_mode_widget.setVisible(False)
+        uv_layout.addRow(self.uv_mode_widget)
         self.uv_group.setVisible(False)
         layout.addWidget(self.uv_group)
 
@@ -283,6 +305,10 @@ class ExtendModifyDialog(QDialog):
         self.uv_z_edit.setText(", ".join(f"{v:g}" for v in z_values))
         if guv_path:
             self.uv_guv_edit.setText(guv_path)
+        # Only offered for a steady-state project - see the mode
+        # dropdown's own note for why the reverse direction isn't.
+        self.uv_mode_widget.setVisible((settings or {}).get("sim-type") == "steady_state")
+        self.uv_mode_combo.setCurrentIndex(0)  # reset to "Steady state" every fresh load
         self._populate_combo_list(combos)
 
     def _render_status_table(self):
@@ -306,8 +332,9 @@ class ExtendModifyDialog(QDialog):
                 control_ok = Path(f"{self._project_dir}/_control_ACH{label}").exists()
                 phase1_ok = Path(f"{self._project_dir}/_phase1_ACH{label}").exists()
             design = Path(c["guv_path"]).stem if c.get("guv_path") else ""
+            mode = c.get("sim_type") or ""
             values = [
-                f"{c.get('z')}", f"{c.get('ach')}", c.get("status", ""), design,
+                f"{c.get('z')}", f"{c.get('ach')}", c.get("status", ""), design, mode,
                 "✓" if c.get("flow_fingerprint") else "", "✓" if c.get("uv_fingerprint") else "",
                 "✓" if control_ok else "", "✓" if phase1_ok else "",
             ]
@@ -410,9 +437,18 @@ class ExtendModifyDialog(QDialog):
             z_values = (uv_z_values or sorted({c["z"] for c in combos.values() if "z" in c})
                         or [self._settings.get("z-value")])
             ach_values = sorted({c["ach"] for c in combos.values() if "ach" in c}) or [self._settings.get("ach")]
+            # The mode dropdown is only shown (and only meaningful) for a
+            # steady-state project (see uv_mode_widget's own note -
+            # switching FROM decay isn't offered) - if this project isn't
+            # steady-state, ignore it entirely rather than trust its
+            # hidden default value, which would otherwise silently flip
+            # an already-decay project back to steady-state.
+            current_sim_type = self._settings.get("sim-type")
+            sim_type = (self.uv_mode_combo.currentData() if current_sim_type == "steady_state"
+                        else current_sim_type)
             self.run_tab.launch_sweep_from_extend(
                 guv_path, self._settings_path, self._project_dir, self._room,
-                dict(self._settings, **{"z-value": z_values[0]}), adv, z_values, ach_values)
+                dict(self._settings, **{"z-value": z_values[0], "sim-type": sim_type}), adv, z_values, ach_values)
             self.accept()
         elif self._action == "sweep":
             try:
@@ -449,7 +485,7 @@ class ExtendModifyDialog(QDialog):
                 # combo["subdir"], if recorded, is this combo's OWN actual
                 # folder name - use it verbatim rather than recomputing
                 # from (z, ach) alone, which would silently drop this
-                # combo's own guv_suffix (see scenario_runs._subdir_name's
+                # combo's own combo_suffix (see scenario_runs._subdir_name's
                 # docstring) and point at the wrong - possibly a different
                 # design's - folder.
                 subdir = combo.get("subdir") or scenario_runs._subdir_name(z, ach)

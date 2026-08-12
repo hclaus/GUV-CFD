@@ -50,8 +50,8 @@ def test_refresh_extend_view_prefills_sweep_fields_and_dropdown(tmp_path, monkey
     monkeypatch.setattr(guvcfd_app.Project, "load",
                          staticmethod(lambda path: SimpleNamespace(rooms={"r": fake_room})))
 
-    body, msg, sweep_z, sweep_ach, uv_z, uv_guv, options, rebuild_style = guvcfd_app._refresh_extend_view(
-        str(tmp_path))
+    body, msg, sweep_z, sweep_ach, uv_z, uv_guv, options, rebuild_style, mode_style = (
+        guvcfd_app._refresh_extend_view(str(tmp_path)))
     assert msg == ""
     assert sweep_z == "2, 6"
     assert sweep_ach == "3, 6"
@@ -62,13 +62,29 @@ def test_refresh_extend_view_prefills_sweep_fields_and_dropdown(tmp_path, monkey
     assert uv_guv == "proj.guv"
     assert len(options) == 3
     assert rebuild_style == {"display": "none"}  # combos exist - nothing to rebuild
+    # This project's sim-type is "decay" - the mode-switch dropdown is
+    # only offered for a steady-state project (see its own layout note).
+    assert mode_style == {"display": "none"}
     assert guvcfd_app._pending_extend_modal["project_dir"] == str(tmp_path)
     assert guvcfd_app._pending_extend_modal["room"] is fake_room
 
 
+def test_refresh_extend_view_shows_mode_dropdown_for_a_steady_state_project(tmp_path, monkeypatch):
+    settings_path = tmp_path / "proj.guvcfd"
+    settings_path.write_text('{"sim-type": "steady_state"}')
+    update_combo_status(str(tmp_path), tmp_path.name, z=6.0, ach=3.0, guv_path="proj.guv",
+                         settings_path=str(settings_path), sim_type="steady_state", status="done")
+    fake_room = SimpleNamespace(x=4.0, y=5.0, z=2.7)
+    monkeypatch.setattr(guvcfd_app.Project, "load",
+                         staticmethod(lambda path: SimpleNamespace(rooms={"r": fake_room})))
+
+    *_, mode_style = guvcfd_app._refresh_extend_view(str(tmp_path))
+    assert mode_style == {"display": "block"}
+
+
 def test_refresh_extend_view_offers_rebuild_when_no_status_file_exists(tmp_path):
-    body, msg, sweep_z, sweep_ach, uv_z, uv_guv, options, rebuild_style = guvcfd_app._refresh_extend_view(
-        str(tmp_path))
+    body, msg, sweep_z, sweep_ach, uv_z, uv_guv, options, rebuild_style, mode_style = (
+        guvcfd_app._refresh_extend_view(str(tmp_path)))
     assert rebuild_style == {"display": "block"}
 
 
@@ -127,13 +143,14 @@ def test_create_extend_status_from_disk_rebuilds_and_reloads(tmp_path, monkeypat
     monkeypatch.setattr(guvcfd_app.Project, "load",
                          staticmethod(lambda path: SimpleNamespace(rooms={"r": fake_room})))
 
-    body, msg, sweep_z, sweep_ach, uv_z, uv_guv, options, rebuild_style = guvcfd_app._create_extend_status_from_disk(
-        1, str(tmp_path))
+    body, msg, sweep_z, sweep_ach, uv_z, uv_guv, options, rebuild_style, mode_style = (
+        guvcfd_app._create_extend_status_from_disk(1, str(tmp_path)))
 
     assert "Rebuilt a status file from 1 existing run folder(s)." in msg
     assert sweep_z == "6" and sweep_ach == "3"
     assert uv_z == "6"
     assert rebuild_style == {"display": "none"}  # now has combos - nothing left to rebuild
+    assert mode_style == {"display": "none"}  # rebuilt project's own sim-type is "decay"
 
 
 # --- _extend_status_table ---
@@ -158,7 +175,7 @@ def test_extend_status_table_omits_started_finished_columns():
     status = {"combos": {"Z6_ACH3": {"z": 6.0, "ach": 3.0, "status": "done"}}}
     table = guvcfd_app._extend_status_table(status)
     headers = [th.children for th in table.children[0].children.children]
-    assert headers == ["Z", "ACH", "Status", "Design", "Flow", "UV", "Control (ACH)", "Phase 1"]
+    assert headers == ["Z", "ACH", "Status", "Design", "Mode", "Flow", "UV", "Control (ACH)", "Phase 1"]
 
 
 def test_extend_status_table_shows_which_guv_design_produced_each_combo():
@@ -174,6 +191,20 @@ def test_extend_status_table_shows_which_guv_design_produced_each_combo():
     assert designs == {"lampA", "lampB"}
 
 
+def test_extend_status_table_shows_which_sim_mode_each_combo_ran_under():
+    # A steady-state project's combo re-evaluated in decay mode would
+    # look identical to the original without this column - see
+    # compute_sim_type_suffix's own docstring.
+    status = {"combos": {
+        "Z6_ACH3": {"z": 6.0, "ach": 3.0, "status": "done", "sim_type": "steady_state"},
+        "Z6_ACH3_decay": {"z": 6.0, "ach": 3.0, "status": "done", "sim_type": "decay"},
+    }}
+    table = guvcfd_app._extend_status_table(status)
+    rows = table.children[1].children
+    modes = {row.children[4].children for row in rows}
+    assert modes == {"steady_state", "decay"}
+
+
 def test_extend_status_table_shows_control_and_phase1_checkmarks_when_dirs_exist(tmp_path):
     (tmp_path / "_control_ACH3").mkdir()
     (tmp_path / "_phase1_ACH3").mkdir()
@@ -182,24 +213,24 @@ def test_extend_status_table_shows_control_and_phase1_checkmarks_when_dirs_exist
     table = guvcfd_app._extend_status_table(status, str(tmp_path))
 
     row = table.children[1].children[0]
-    assert row.children[6].children == "✓"  # Control (ACH)
-    assert row.children[7].children == "✓"  # Phase 1
+    assert row.children[7].children == "✓"  # Control (ACH)
+    assert row.children[8].children == "✓"  # Phase 1
 
 
 def test_extend_status_table_blank_control_and_phase1_when_dirs_missing(tmp_path):
     status = {"combos": {"Z6_ACH3": {"z": 6.0, "ach": 3.0, "status": "done"}}}
     table = guvcfd_app._extend_status_table(status, str(tmp_path))
     row = table.children[1].children[0]
-    assert row.children[6].children == ""
     assert row.children[7].children == ""
+    assert row.children[8].children == ""
 
 
 def test_extend_status_table_blank_control_and_phase1_when_no_project_dir():
     status = {"combos": {"Z6_ACH3": {"z": 6.0, "ach": 3.0, "status": "done"}}}
     table = guvcfd_app._extend_status_table(status)  # project_dir=None
     row = table.children[1].children[0]
-    assert row.children[6].children == ""
     assert row.children[7].children == ""
+    assert row.children[8].children == ""
 
 
 # --- action selection ---
@@ -242,7 +273,7 @@ def test_cancel_extend_modal_clears_pending_state():
 def test_run_extend_action_requires_a_project_loaded():
     _reset_run_states()
     is_open, msg, tab, poll_disabled, run_disabled, stop_disabled = guvcfd_app._run_extend_action(
-        1, None, None, None, None, None, None)
+        1, None, None, None, None, None, None, None)
     assert msg == "Load a valid project folder first."
 
 
@@ -253,7 +284,7 @@ def test_run_extend_action_requires_an_action_chosen(tmp_path):
         status={"combos": {}}, action=None,
     )
     is_open, msg, tab, poll_disabled, run_disabled, stop_disabled = guvcfd_app._run_extend_action(
-        1, None, None, None, None, None, None)
+        1, None, None, None, None, None, None, None)
     assert "Choose one of the 3 actions" in msg
 
 
@@ -276,7 +307,7 @@ def test_run_extend_action_uv_launches_sweep_with_new_guv_and_z(tmp_path, monkey
     monkeypatch.setattr(guvcfd_app, "_launch_scenario_sweep", fake_launch)
 
     is_open, msg, tab, poll_disabled, run_disabled, stop_disabled = guvcfd_app._run_extend_action(
-        1, "new.guv", "8", None, None, None, None)
+        1, "new.guv", "8", None, None, None, None, None)
 
     assert is_open is False and tab == "scenario-runs"
     assert poll_disabled is False and run_disabled is True and stop_disabled is False
@@ -302,7 +333,7 @@ def test_run_extend_action_uv_launches_sweep_with_multiple_z_values(tmp_path, mo
                          lambda guv_path, settings_path, project_dir, room, settings, adv, z_values, ach_values:
                          captured.update(z_values=z_values))
 
-    guvcfd_app._run_extend_action(1, "new.guv", "2, 6, 6.5", None, None, None, None)
+    guvcfd_app._run_extend_action(1, "new.guv", "2, 6, 6.5", None, None, None, None, None)
     assert captured["z_values"] == [2.0, 6.0, 6.5]
 
 
@@ -327,7 +358,7 @@ def test_run_extend_action_uv_blank_z_defaults_to_projects_original_z_values(tmp
                          lambda guv_path, settings_path, project_dir, room, settings, adv, z_values, ach_values:
                          captured.update(z_values=z_values))
 
-    guvcfd_app._run_extend_action(1, "new.guv", "", None, None, None, None)
+    guvcfd_app._run_extend_action(1, "new.guv", "", None, None, None, None, None)
     assert captured["z_values"] == [2.0, 6.0]
 
 
@@ -338,7 +369,7 @@ def test_run_extend_action_uv_requires_guv_path(tmp_path):
         status={"combos": {}}, action="uv",
     )
     is_open, msg, tab, poll_disabled, run_disabled, stop_disabled = guvcfd_app._run_extend_action(
-        1, None, None, None, None, None, None)
+        1, None, None, None, None, None, None, None)
     assert "Pick a .guv file first" in msg
 
 
@@ -349,7 +380,7 @@ def test_run_extend_action_uv_rejects_unparseable_z_list(tmp_path):
         status={"combos": {}}, action="uv",
     )
     is_open, msg, tab, poll_disabled, run_disabled, stop_disabled = guvcfd_app._run_extend_action(
-        1, "new.guv", "not-a-number", None, None, None, None)
+        1, "new.guv", "not-a-number", None, None, None, None, None)
     assert "Can't parse Z value list" in msg
 
 
@@ -371,7 +402,7 @@ def test_run_extend_action_sweep_launches_with_parsed_z_ach(tmp_path, monkeypatc
     monkeypatch.setattr(guvcfd_app, "_launch_scenario_sweep", fake_launch)
 
     is_open, msg, tab, poll_disabled, run_disabled, stop_disabled = guvcfd_app._run_extend_action(
-        1, None, None, None, None, "2, 6", "3, 6")
+        1, None, None, None, None, None, "2, 6", "3, 6")
 
     assert poll_disabled is False and run_disabled is True and stop_disabled is False
     assert captured["z_values"] == [2.0, 6.0]
@@ -385,7 +416,7 @@ def test_run_extend_action_sweep_requires_at_least_one_z_and_ach(tmp_path):
         status={"combos": {}}, action="sweep",
     )
     is_open, msg, tab, poll_disabled, run_disabled, stop_disabled = guvcfd_app._run_extend_action(
-        1, None, None, None, None, "", "")
+        1, None, None, None, None, None, "", "")
     assert "at least one Z value" in msg
 
 
@@ -396,7 +427,7 @@ def test_run_extend_action_extend_rejects_steady_state_projects(tmp_path):
         status={"combos": {"Z6_ACH3": {"z": 6.0, "ach": 3.0}}}, action="extend",
     )
     is_open, msg, tab, poll_disabled, run_disabled, stop_disabled = guvcfd_app._run_extend_action(
-        1, None, None, ["Z6_ACH3"], 900, None, None)
+        1, None, None, None, ["Z6_ACH3"], 900, None, None)
     assert "only supported for decay" in msg
 
 
@@ -421,7 +452,7 @@ def test_run_extend_action_extend_starts_a_thread_with_the_selected_combos(tmp_p
     monkeypatch.setattr(guvcfd_app.threading, "Thread", FakeThread)
 
     is_open, msg, tab, poll_disabled, run_disabled, stop_disabled = guvcfd_app._run_extend_action(
-        1, None, None, ["Z6_ACH3"], 900, None, None)
+        1, None, None, None, ["Z6_ACH3"], 900, None, None)
 
     assert is_open is False and tab == "scenario-runs"
     assert poll_disabled is False and run_disabled is True and stop_disabled is False
@@ -437,10 +468,10 @@ def test_run_extend_action_extend_requires_a_selection_and_duration(tmp_path):
         project_dir=str(tmp_path), settings={"sim-type": "decay"}, room=SimpleNamespace(x=1, y=1, z=1),
         status={"combos": {}}, action="extend",
     )
-    result = guvcfd_app._run_extend_action(1, None, None, None, None, None, None)
+    result = guvcfd_app._run_extend_action(1, None, None, None, None, None, None, None)
     assert "Pick at least one combination" in result[1]
 
-    result = guvcfd_app._run_extend_action(1, None, None, ["Z6_ACH3"], None, None, None)
+    result = guvcfd_app._run_extend_action(1, None, None, None, ["Z6_ACH3"], None, None, None)
     assert "Enter a new end time" in result[1]
 
 

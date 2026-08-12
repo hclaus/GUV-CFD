@@ -437,8 +437,9 @@ def _decay_reuse_settings():
 
 def test_find_done_combo_case_dir_for_ach_finds_matching_done_combo(tmp_path):
     from guvcfd.project_status import update_combo_status
-    update_combo_status(str(tmp_path), "myproj", z=1.0, ach=3.0, status="done", flow_fingerprint="fp1")
-    donor = sr._find_done_combo_case_dir_for_ach(str(tmp_path), "myproj", 3.0, "fp1")
+    update_combo_status(str(tmp_path), "myproj", z=1.0, ach=3.0, status="done", flow_fingerprint="fp1",
+                         sim_type="steady_state")
+    donor = sr._find_done_combo_case_dir_for_ach(str(tmp_path), "myproj", 3.0, "fp1", "steady_state", "steady_state")
     assert donor == f"{tmp_path}/Z1_ACH3"
 
 
@@ -449,27 +450,74 @@ def test_find_done_combo_case_dir_for_ach_uses_recorded_subdir_not_a_recompute(t
     # field must be used verbatim, not reconstructed.
     from guvcfd.project_status import update_combo_status
     update_combo_status(str(tmp_path), "myproj", z=1.0, ach=3.0, status="done", flow_fingerprint="fp1",
-                         guv_path="lampB.guv", guv_suffix="_lampB", subdir="Z1_ACH3_lampB")
-    donor = sr._find_done_combo_case_dir_for_ach(str(tmp_path), "myproj", 3.0, "fp1")
+                         guv_path="lampB.guv", combo_suffix="_lampB", subdir="Z1_ACH3_lampB",
+                         sim_type="steady_state")
+    donor = sr._find_done_combo_case_dir_for_ach(str(tmp_path), "myproj", 3.0, "fp1", "steady_state", "steady_state")
     assert donor == f"{tmp_path}/Z1_ACH3_lampB"
 
 
 def test_find_done_combo_case_dir_for_ach_none_when_fingerprint_mismatches(tmp_path):
     from guvcfd.project_status import update_combo_status
-    update_combo_status(str(tmp_path), "myproj", z=1.0, ach=3.0, status="done", flow_fingerprint="fp1")
-    assert sr._find_done_combo_case_dir_for_ach(str(tmp_path), "myproj", 3.0, "fp2") is None
+    update_combo_status(str(tmp_path), "myproj", z=1.0, ach=3.0, status="done", flow_fingerprint="fp1",
+                         sim_type="steady_state")
+    assert sr._find_done_combo_case_dir_for_ach(
+        str(tmp_path), "myproj", 3.0, "fp2", "steady_state", "steady_state") is None
 
 
 def test_find_done_combo_case_dir_for_ach_none_when_status_not_done(tmp_path):
     from guvcfd.project_status import update_combo_status
-    update_combo_status(str(tmp_path), "myproj", z=1.0, ach=3.0, status="running", flow_fingerprint="fp1")
-    assert sr._find_done_combo_case_dir_for_ach(str(tmp_path), "myproj", 3.0, "fp1") is None
+    update_combo_status(str(tmp_path), "myproj", z=1.0, ach=3.0, status="running", flow_fingerprint="fp1",
+                         sim_type="steady_state")
+    assert sr._find_done_combo_case_dir_for_ach(
+        str(tmp_path), "myproj", 3.0, "fp1", "steady_state", "steady_state") is None
 
 
 def test_find_done_combo_case_dir_for_ach_none_when_wrong_ach(tmp_path):
     from guvcfd.project_status import update_combo_status
-    update_combo_status(str(tmp_path), "myproj", z=1.0, ach=6.0, status="done", flow_fingerprint="fp1")
-    assert sr._find_done_combo_case_dir_for_ach(str(tmp_path), "myproj", 3.0, "fp1") is None
+    update_combo_status(str(tmp_path), "myproj", z=1.0, ach=6.0, status="done", flow_fingerprint="fp1",
+                         sim_type="steady_state")
+    assert sr._find_done_combo_case_dir_for_ach(
+        str(tmp_path), "myproj", 3.0, "fp1", "steady_state", "steady_state") is None
+
+
+# --- _find_done_combo_case_dir_for_ach's sim_type-matching safety gate
+# (2026-08-12): a steady-state combo's case_dir is a copy of Phase 1's own
+# case, which can carry a non-zero warm-started T field that stripping
+# doesn't remove - unsafe to seed a Decay-mode base from. ---
+
+def test_find_done_combo_case_dir_for_ach_rejects_a_cross_mode_donor(tmp_path):
+    from guvcfd.project_status import update_combo_status
+    update_combo_status(str(tmp_path), "myproj", z=1.0, ach=3.0, status="done", flow_fingerprint="fp1",
+                         sim_type="steady_state")
+    # Looking for a DECAY-mode donor - the only recorded combo is
+    # steady-state, so it must not be offered as a donor.
+    assert sr._find_done_combo_case_dir_for_ach(
+        str(tmp_path), "myproj", 3.0, "fp1", "decay", "steady_state") is None
+
+
+def test_find_done_combo_case_dir_for_ach_accepts_a_same_mode_donor(tmp_path):
+    from guvcfd.project_status import update_combo_status
+    update_combo_status(str(tmp_path), "myproj", z=1.0, ach=3.0, status="done", flow_fingerprint="fp1",
+                         sim_type="decay")
+    donor = sr._find_done_combo_case_dir_for_ach(str(tmp_path), "myproj", 3.0, "fp1", "decay", "steady_state")
+    assert donor == f"{tmp_path}/Z1_ACH3"
+
+
+def test_find_done_combo_case_dir_for_ach_falls_back_to_original_sim_type_for_old_combos(tmp_path):
+    # A combo written before per-combo sim_type tracking existed has no
+    # "sim_type" of its own - original_sim_type (the project's own
+    # first-ever recorded mode) is the correct assumption for it, since
+    # mode-switching didn't exist yet when it was written.
+    from guvcfd.project_status import update_combo_status
+    update_combo_status(str(tmp_path), "myproj", z=1.0, ach=3.0, status="done", flow_fingerprint="fp1")
+    donor = sr._find_done_combo_case_dir_for_ach(
+        str(tmp_path), "myproj", 3.0, "fp1", "steady_state", "steady_state")
+    assert donor == f"{tmp_path}/Z1_ACH3"
+    # But NOT if the current sweep is a genuine mode switch - an old,
+    # sim_type-less combo can't be trusted as a decay donor just because
+    # the project's original mode happened to be something else.
+    assert sr._find_done_combo_case_dir_for_ach(
+        str(tmp_path), "myproj", 3.0, "fp1", "decay", "steady_state") is None
 
 
 def test_seed_ach_base_from_existing_combo_copies_and_strips(monkeypatch):
@@ -494,7 +542,8 @@ def test_seed_ach_base_if_no_scratch_survives_noop_when_fluencerate_present(tmp_
     called = []
     monkeypatch.setattr(sr, "_find_done_combo_case_dir_for_ach", lambda *a, **k: called.append(1))
 
-    sr._seed_ach_base_if_no_scratch_survives(str(tmp_path), "myproj", 3.0, "fp1", str(base_dir), lambda m: None)
+    sr._seed_ach_base_if_no_scratch_survives(str(tmp_path), "myproj", 3.0, "fp1", str(base_dir), lambda m: None,
+                                              "steady_state", "steady_state")
     assert called == []  # never even looked for a donor - nothing to do
 
 
@@ -504,7 +553,8 @@ def test_seed_ach_base_if_no_scratch_survives_noop_when_no_donor(tmp_path, monke
     seeded = []
     monkeypatch.setattr(sr, "_seed_ach_base_from_existing_combo", lambda *a, **k: seeded.append(1))
 
-    sr._seed_ach_base_if_no_scratch_survives(str(tmp_path), "myproj", 3.0, "fp1", str(base_dir), lambda m: None)
+    sr._seed_ach_base_if_no_scratch_survives(str(tmp_path), "myproj", 3.0, "fp1", str(base_dir), lambda m: None,
+                                              "steady_state", "steady_state")
     assert seeded == []
 
 
@@ -515,7 +565,8 @@ def test_seed_ach_base_if_no_scratch_survives_seeds_when_donor_found(tmp_path, m
     monkeypatch.setattr(sr, "_seed_ach_base_from_existing_combo",
                          lambda source, base, log_fn: seeded.append((source, base)))
 
-    sr._seed_ach_base_if_no_scratch_survives(str(tmp_path), "myproj", 3.0, "fp1", str(base_dir), lambda m: None)
+    sr._seed_ach_base_if_no_scratch_survives(str(tmp_path), "myproj", 3.0, "fp1", str(base_dir), lambda m: None,
+                                              "steady_state", "steady_state")
     assert seeded == [(f"{tmp_path}/Z1_ACH3", str(base_dir))]
 
 
@@ -683,6 +734,114 @@ def test_run_decay_sweep_different_guv_at_same_z_ach_gets_its_own_folder(tmp_pat
     assert status["combos"]["Z6_ACH3"]["guv_path"] == "lampA.guv"
     assert status["combos"]["Z6_ACH3_lampB"]["guv_path"] == "lampB.guv"
     assert status["guv_path"] == "lampA.guv"  # the project's original design, never overwritten
+
+
+def test_switching_a_steady_state_project_to_decay_mode_gets_its_own_folder_and_reuses_flow(tmp_path, monkeypatch):
+    # Regression guard for the 2026-08-12 mode-switch feature: re-
+    # evaluating an already-swept Z/ACH under Decay mode instead of
+    # Steady-state must NOT land on and get skipped as that same combo -
+    # it needs its own folder, and (per the whole point of the feature)
+    # should reuse the already-converged flow field/UV-off control run,
+    # only running each Z's own new UV-on decay solve.
+    project_dir = tmp_path / "myproject"
+    project_dir.mkdir()
+
+    build_calls = []
+
+    def fake_build_flow_base(guv_path, base_dir, room, settings, ach, adv, log_fn, *a, **k):
+        build_calls.append(ach)
+        __import__("os").makedirs(f"{base_dir}/0", exist_ok=True)
+        return {"flow_converged": True, "inlet_velocity": 1.0, "inlet2_velocity": None}
+
+    control_calls = []
+
+    def fake_run_shared_control(base_dir, control_dir, ach, *a, **k):
+        control_calls.append(ach)
+        __import__("os").makedirs(control_dir, exist_ok=True)
+        return {"total_ach_effective": 3.0}
+
+    monkeypatch.setattr(sr, "_build_flow_base", fake_build_flow_base)
+    monkeypatch.setattr(sr, "_run_shared_phase1", lambda *a, **k: None)
+    monkeypatch.setattr(sr, "_run_shared_control", fake_run_shared_control)
+    monkeypatch.setattr(sr, "write_source_topo_set_dict", lambda *a, **k: None)
+    monkeypatch.setattr(sr, "_copy_base_case",
+                         lambda base, target, log_fn: __import__("os").makedirs(target, exist_ok=True))
+    monkeypatch.setattr(sr, "_apply_z", lambda case_dir, z, nbins, fan_kwargs, log_fn:
+                         {"fluence_mean": 1.0, "eACH_uv_well_mixed_mean": 0.0})
+    monkeypatch.setattr(sr, "compute_uv_fingerprint", lambda *a, **k: "fake-uv-fp")
+    monkeypatch.setattr(sr, "run_wsl_or_raise", lambda cmd, *a, **k: None)
+    monkeypatch.setattr(sr, "_run_scenario", lambda *a, **k: {
+        "reduction_pct": 90.0, "eACH_uv_steady_state": 50.0, "phase1": {"T_ss": 1.0, "live": {"t": [1]}},
+        "phase2": {"T_ss": 0.1, "live": {"t": [1]}}})
+    decay_calls = []
+    monkeypatch.setattr(sr, "_run_decay_scenario", lambda *a, **k: decay_calls.append(1) or {
+        "reduction_pct": 1.0, "eACH_uv_effective": 1.0, "eACH_uv_well_mixed": 1.0, "phase1": {}, "phase2": {}})
+
+    room = type("Room", (), {"x": 4.0, "y": 5.0, "z": 2.7})()
+    # Every FLOW_FINGERPRINT_FIELDS key populated explicitly (see
+    # _decay_reuse_settings's own docstring) - otherwise run_z_fn's own
+    # capture_openfoam_settings() call would silently backfill missing
+    # fields with real defaults partway through the FIRST (steady-state)
+    # sweep, mutating this same dict object such that the SECOND (decay)
+    # sweep's own flow_fingerprint no longer matches what got recorded -
+    # a spurious mismatch that has nothing to do with the actual feature
+    # under test here.
+    steady_settings = dict(_decay_reuse_settings(), **{
+        "sim-type": "steady_state", "monitoring-enable": False,
+        "phase1-iterations": 100, "phase2-iterations": 100, "target-t-ss": 1.0,
+        "inject-x-input": 2, "inject-y-input": 2.5, "inject-z-input": 1.3, "z-value": 6,
+        "source-zone-size": 0.3,
+    })
+    adv = {"uv-zone-bins": 25, "mesh-cell-size": 0.1, "keep-shared-scratch-dirs": True,
+           "pimple-delta-t": 0.5, "max-co": 5,
+           "decay-ach-min-fraction": 90.0, "decay-each-min-fraction": 90.0, "decay-each-max-fraction": 99.9}
+
+    sr.run_sweep(
+        guv_path="room.guv", settings_path="proj.guvcfd", project_dir=str(project_dir),
+        room=room, settings=steady_settings, adv=adv,
+        z_values=[6], ach_values=[3], log_fn=lambda m: None,
+    )
+    original_report = (project_dir / "myproject_Z6_ACH3_report.json").read_text()
+
+    decay_settings = dict(_decay_reuse_settings(), **{
+        "monitoring-enable": False, "pimple-write-interval": 3, "z-value": 6,
+    })
+    results_seen = []
+    sr.run_decay_sweep(
+        guv_path="room.guv", settings_path="proj.guvcfd", project_dir=str(project_dir),
+        room=room, settings=decay_settings, adv=adv,
+        z_values=[6], ach_values=[3], log_fn=lambda m: None,
+        on_combo_done=lambda z, ach, status, detail: results_seen.append((z, ach, status)),
+    )
+
+    # The decay combo actually ran (not skipped as "already done")...
+    assert len(decay_calls) == 1
+    assert results_seen == [(6, 3, "done")]
+    # ...into its own, genuinely new folder/report...
+    assert (project_dir / "Z6_ACH3_decay").exists()
+    assert (project_dir / "myproject_Z6_ACH3_decay_report.json").exists()
+    # ...while the original steady-state combo's own files are untouched.
+    assert (project_dir / "myproject_Z6_ACH3_report.json").read_text() == original_report
+
+    # The whole point of the feature: control was measured ONCE (by the
+    # steady-state sweep) and REUSED by the decay sweep, not re-run -
+    # _prepare_control skips _run_shared_control entirely once
+    # find_reusable_ach_base matches, which this genuinely mode-agnostic
+    # reuse path (ach_bases record + a surviving scratch dir) does
+    # regardless of sim_type - only the seed-from-existing-combo fallback
+    # (irrelevant here, since the real scratch dir survives) is
+    # restricted to same-mode donors (see _find_done_combo_case_dir_for_ach's
+    # own docstring). _build_flow_base itself is still called once per
+    # sweep launch either way (real reuse-vs-fresh-build is decided
+    # INSIDE it - out of scope for this mock, which stands in for both).
+    assert build_calls == [3, 3]
+    assert control_calls == [3]
+
+    status = load_project_status(str(project_dir), "myproject")
+    assert set(status["combos"]) == {"Z6_ACH3", "Z6_ACH3_decay"}
+    assert status["combos"]["Z6_ACH3"]["sim_type"] == "steady_state"
+    assert status["combos"]["Z6_ACH3_decay"]["sim_type"] == "decay"
+    assert status["sim_type"] == "steady_state"  # the project's original, never overwritten
 
 
 def test_run_decay_sweep_rebuilds_when_flow_settings_change_between_launches(tmp_path, monkeypatch):
@@ -1682,9 +1841,9 @@ def test_write_sweep_summary_csv_includes_a_row_per_design_at_the_same_z_ach(tmp
     # guards against: deduplicating by (z, ach) alone used to collapse
     # these into a single row, always the ORIGINAL design's.
     update_combo_status(project_dir, project_name, z=6.0, ach=3.0, guv_path="lampA.guv",
-                         subdir="Z6_ACH3", status="done")
+                         sim_type="steady_state", subdir="Z6_ACH3", status="done")
     update_combo_status(project_dir, project_name, z=6.0, ach=3.0, guv_path="lampB.guv",
-                         guv_suffix="_lampB", subdir="Z6_ACH3_lampB", status="done")
+                         sim_type="steady_state", combo_suffix="_lampB", subdir="Z6_ACH3_lampB", status="done")
 
     with open(f"{project_dir}/{project_name}_Z6_ACH3_report.json", "w") as f:
         json.dump({"reduction_pct_corrected": 80.0, "eACH_uv_steady_state_corrected": 10.0}, f)
@@ -1700,6 +1859,35 @@ def test_write_sweep_summary_csv_includes_a_row_per_design_at_the_same_z_ach(tmp
     assert set(by_design) == {"lampA", "lampB"}
     assert float(by_design["lampA"]["total_reduction_pct"]) == pytest.approx(80.0)
     assert float(by_design["lampB"]["total_reduction_pct"]) == pytest.approx(95.0)
+    assert by_design["lampA"]["Mode"] == "steady_state" and by_design["lampB"]["Mode"] == "steady_state"
+
+
+def test_write_sweep_summary_csv_includes_a_row_per_mode_at_the_same_z_ach(tmp_path):
+    import csv as csv_module
+    project_dir = str(tmp_path)
+    project_name = "myproj"
+    from guvcfd.project_status import update_combo_status
+    # A steady-state project's Z/ACH re-evaluated in Decay mode - see
+    # compute_sim_type_suffix's own docstring for the incident this
+    # guards against, same class of bug as the guv-design case above.
+    update_combo_status(project_dir, project_name, z=6.0, ach=3.0, guv_path="room.guv",
+                         sim_type="steady_state", subdir="Z6_ACH3", status="done")
+    update_combo_status(project_dir, project_name, z=6.0, ach=3.0, guv_path="room.guv",
+                         sim_type="decay", combo_suffix="_decay", subdir="Z6_ACH3_decay", status="done")
+
+    with open(f"{project_dir}/{project_name}_Z6_ACH3_report.json", "w") as f:
+        json.dump({"reduction_pct_corrected": 80.0, "eACH_uv_steady_state_corrected": 10.0}, f)
+    with open(f"{project_dir}/{project_name}_Z6_ACH3_decay_report.json", "w") as f:
+        json.dump({"eACH_uv_effective": 12.0}, f)
+
+    csv_path = sr.write_sweep_summary_csv(project_dir, project_name)
+    with open(csv_path, newline="") as f:
+        rows = list(csv_module.DictReader(f))
+
+    assert len(rows) == 2
+    by_mode = {r["Mode"]: r for r in rows}
+    assert set(by_mode) == {"steady_state", "decay"}
+    assert by_mode["steady_state"]["Design"] == "room" and by_mode["decay"]["Design"] == "room"
 
 
 def test_write_sweep_summary_csv_handles_no_reports_at_all(tmp_path):

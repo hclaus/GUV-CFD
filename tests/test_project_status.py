@@ -148,10 +148,10 @@ def test_compute_guv_design_suffix_sanitizes_unsafe_filename_characters():
     assert ps.compute_guv_design_suffix("C:/designs/lamp B v2 (final).guv", "lampA.guv") == "_lamp_B_v2_final"
 
 
-def test_update_combo_status_uses_guv_suffix_in_the_combo_key(tmp_path):
+def test_update_combo_status_uses_combo_suffix_in_the_combo_key(tmp_path):
     ps.update_combo_status(str(tmp_path), "myproj", z=6.0, ach=3.0, guv_path="lampA.guv", status="done")
     ps.update_combo_status(str(tmp_path), "myproj", z=6.0, ach=3.0, guv_path="lampB.guv",
-                            guv_suffix="_lampB", status="done")
+                            combo_suffix="_lampB", status="done")
 
     status = ps.load_project_status(str(tmp_path), "myproj")
     assert set(status["combos"]) == {"Z6_ACH3", "Z6_ACH3_lampB"}
@@ -159,6 +159,40 @@ def test_update_combo_status_uses_guv_suffix_in_the_combo_key(tmp_path):
     # second call - different key, no shared mutable state.
     assert status["combos"]["Z6_ACH3"]["guv_path"] == "lampA.guv"
     assert status["combos"]["Z6_ACH3_lampB"]["guv_path"] == "lampB.guv"
+
+
+# --- compute_sim_type_suffix (2026-08-12: a project switching TO decay
+# mode from steady-state at Z/ACH values it already used, same class of
+# issue as compute_guv_design_suffix's own incident) ---
+
+def test_compute_sim_type_suffix_empty_for_the_original_mode():
+    assert ps.compute_sim_type_suffix("steady_state", "steady_state") == ""
+
+
+def test_compute_sim_type_suffix_empty_for_a_brand_new_project():
+    assert ps.compute_sim_type_suffix("decay", None) == ""
+
+
+def test_compute_sim_type_suffix_empty_when_sim_type_not_given():
+    assert ps.compute_sim_type_suffix(None, "steady_state") == ""
+
+
+def test_compute_sim_type_suffix_nonempty_for_a_switched_mode():
+    assert ps.compute_sim_type_suffix("decay", "steady_state") == "_decay"
+
+
+def test_update_combo_status_records_sim_type_per_combo_distinct_from_top_level(tmp_path):
+    # A project can now genuinely mix modes across its own combos - each
+    # combo's OWN sim_type (not just the top-level, first-write-wins
+    # status["sim_type"]) must be recorded.
+    ps.update_combo_status(str(tmp_path), "myproj", z=6.0, ach=3.0, sim_type="steady_state", status="done")
+    ps.update_combo_status(str(tmp_path), "myproj", z=6.0, ach=3.0, sim_type="decay",
+                            combo_suffix="_decay", status="done")
+
+    status = ps.load_project_status(str(tmp_path), "myproj")
+    assert status["sim_type"] == "steady_state"  # the project's original, never overwritten
+    assert status["combos"]["Z6_ACH3"]["sim_type"] == "steady_state"
+    assert status["combos"]["Z6_ACH3_decay"]["sim_type"] == "decay"
 
 
 def test_update_combo_status_records_guv_path_and_subdir_per_combo(tmp_path):

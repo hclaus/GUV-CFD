@@ -124,8 +124,8 @@ def save_project_status(project_dir, project_name, status):
     write_case_file(project_dir, _status_relative_path(project_name), json.dumps(status, indent=2))
 
 
-def _combo_key(z, ach, guv_suffix=""):
-    return f"Z{z:g}_ACH{ach:g}{guv_suffix}"
+def _combo_key(z, ach, combo_suffix=""):
+    return f"Z{z:g}_ACH{ach:g}{combo_suffix}"
 
 
 def _ach_label(ach):
@@ -176,8 +176,36 @@ def compute_guv_design_suffix(guv_path, original_guv_path):
     return "_" + _sanitize_guv_stem(guv_path)
 
 
+def compute_sim_type_suffix(sim_type, original_sim_type):
+    """"" if sim_type IS this project's original recorded sim-type (the
+    first one ever recorded - see load_project_status's own
+    sim_type.setdefault, which never changes once set) or there's no
+    original recorded yet; otherwise "_<sim_type>" (e.g. "_decay").
+
+    Same rationale/mechanism as compute_guv_design_suffix (2026-08-12),
+    extended (2026-08-12) to a second, independent axis a combo can vary
+    on: a steady-state project's own already-swept Z/ACH values re-run in
+    Decay mode (control is the SAME shared UV-off run either way, and
+    Decay mode has no Phase 1 concept at all - only that Z's own UV-on
+    decay solve is new work) would otherwise land on and get skipped as
+    those SAME already-done combos, exactly like the guv-design case.
+    Concatenates with compute_guv_design_suffix's own result when both
+    differ (see scenario_runs.py's run_sweep/run_decay_sweep for where
+    both are computed and combined into one combo_suffix) - e.g.
+    "_lampB_decay" if a sweep changes both the design AND the mode at
+    once. One-directional in practice: only steady_state -> decay is
+    offered in either app's UI (see the Extend/modify dialogs' "Apply
+    different UV design" section), since decay -> steady_state isn't a
+    requested use case, but this function itself has no such restriction
+    baked in.
+    """
+    if not sim_type or not original_sim_type or sim_type == original_sim_type:
+        return ""
+    return f"_{sim_type}"
+
+
 def update_combo_status(project_dir, project_name, z, ach, guv_path=None, settings_path=None, sim_type=None,
-                         guv_suffix="", subdir=None, **fields):
+                         combo_suffix="", subdir=None, **fields):
     """Read-modify-write a single combo's entry - creates the status file
     (and the combo's own entry within it) if either is missing.
 
@@ -190,19 +218,20 @@ def update_combo_status(project_dir, project_name, z, ach, guv_path=None, settin
     sufficient for the current concurrency model (one sweep active per
     app instance at a time) - revisit if that ever changes.
 
-    guv_suffix: threaded straight into the combo's own KEY (see
-    _combo_key/compute_guv_design_suffix) - the caller (scenario_runs.py's
-    run_sweep/run_decay_sweep) computes this ONCE per call and passes the
-    exact same value used to build this combo's actual subdir/case_dir,
-    so the JSON key and the folder on disk always agree; "" (the default)
-    reproduces this function's exact pre-2026-08-12 behavior for any other
-    caller.
+    combo_suffix: threaded straight into the combo's own KEY (see
+    _combo_key/compute_guv_design_suffix/compute_sim_type_suffix) - the
+    caller (scenario_runs.py's run_sweep/run_decay_sweep) computes this
+    ONCE per call (concatenating both suffixes if both apply) and passes
+    the exact same value used to build this combo's actual subdir/
+    case_dir, so the JSON key and the folder on disk always agree; ""
+    (the default) reproduces this function's exact pre-2026-08-12
+    behavior for any other caller.
 
     subdir: the combo's actual folder name (see scenario_runs._subdir_name)
     - stored verbatim so a later reader (e.g. _find_done_combo_case_dir_for_ach,
     the Extend/modify dialogs' "extend" action) can reconstruct case_dir
     from this record directly instead of recomputing _subdir_name(z, ach)
-    itself, which would silently drop this combo's own guv_suffix and
+    itself, which would silently drop this combo's own combo_suffix and
     point at the WRONG (possibly a different design's) folder. None (the
     default) leaves it out entirely - every such reader already falls
     back to the old recompute-from-(z, ach) behavior when absent, so
@@ -210,11 +239,18 @@ def update_combo_status(project_dir, project_name, z, ach, guv_path=None, settin
     """
     with _status_lock:
         status = load_project_status(project_dir, project_name, guv_path, settings_path, sim_type)
-        combo = status["combos"].setdefault(_combo_key(z, ach, guv_suffix), {})
+        combo = status["combos"].setdefault(_combo_key(z, ach, combo_suffix), {})
         combo["z"] = z
         combo["ach"] = ach
         if guv_path is not None:
             combo["guv_path"] = guv_path
+        # This combo's OWN sim_type, distinct from the top-level, first-
+        # write-wins status["sim_type"] - a project can now genuinely mix
+        # modes across its own combos (see compute_sim_type_suffix), so
+        # each combo needs to record which one it actually is, not just
+        # inherit the project's original one.
+        if sim_type is not None:
+            combo["sim_type"] = sim_type
         if subdir is not None:
             combo["subdir"] = subdir
         combo.update(fields)

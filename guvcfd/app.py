@@ -2927,14 +2927,15 @@ def _ach_label_for_dirs(ach):
 
 def _extend_status_table(status, project_dir=None):
     """dbc.Table (or an explanatory message) for a loaded project_status
-    dict's combos - Z, ACH, status, which .guv design produced it (see
-    compute_guv_design_suffix - two designs can share the same Z/ACH, so
-    without this column they'd look identical), a simple checkmark for
-    whether each fingerprint is on record (a human doesn't need to see
-    the raw hash - see project_status.py's own combo schema), and whether
-    this combo's ACH group still has a Control run / Phase 1
-    (steady-state) working copy sitting on disk. Started/finished
-    timestamps are deliberately
+    dict's combos - Z, ACH, status, which .guv design produced it and
+    which simulation mode it ran under (see compute_guv_design_suffix/
+    compute_sim_type_suffix - two combos can share the same Z/ACH but
+    differ in design and/or mode, so without these columns they'd look
+    identical), a simple checkmark for whether each fingerprint is on
+    record (a human doesn't need to see the raw hash - see
+    project_status.py's own combo schema), and whether this combo's ACH
+    group still has a Control run / Phase 1 (steady-state) working copy
+    sitting on disk. Started/finished timestamps are deliberately
     NOT shown - they're only ever set by a live run, so a status file
     rebuilt from disk (see rebuild_project_status_from_disk, the common
     case for a project predating this feature) never has them, making
@@ -2970,9 +2971,10 @@ def _extend_status_table(status, project_dir=None):
             control_ok = Path(f"{project_dir}/_control_ACH{label}").exists()
             phase1_ok = Path(f"{project_dir}/_phase1_ACH{label}").exists()
         design = Path(c["guv_path"]).stem if c.get("guv_path") else ""
+        mode = c.get("sim_type", "")
         rows.append(html.Tr([
             html.Td(f"{c.get('z')}"), html.Td(f"{c.get('ach')}"), html.Td(c.get("status", "")),
-            html.Td(design),
+            html.Td(design), html.Td(mode),
             html.Td("✓" if c.get("flow_fingerprint") else ""),
             html.Td("✓" if c.get("uv_fingerprint") else ""),
             html.Td("✓" if control_ok else ""),
@@ -2980,7 +2982,7 @@ def _extend_status_table(status, project_dir=None):
         ]))
     return dbc.Table(
         [html.Thead(html.Tr([html.Th(h) for h in
-                              ("Z", "ACH", "Status", "Design", "Flow", "UV", "Control (ACH)", "Phase 1")]))]
+                              ("Z", "ACH", "Status", "Design", "Mode", "Flow", "UV", "Control (ACH)", "Phase 1")]))]
         + [html.Tbody(rows)],
         bordered=True, size="sm", className="mb-0",
     )
@@ -3052,6 +3054,21 @@ extend_modal = dbc.Modal(
                        "design - any whose flow settings haven't changed reuse the existing flow "
                        "field/control run instead of re-solving them.",
                        className="small text-muted mt-2 mb-0"),
+                # Only shown for a steady-state project - switching TO decay
+                # mode is supported (the shared flow base and UV-off
+                # control run are identical either way, and decay mode has
+                # no Phase 1 concept at all, so only each Z's own UV-on
+                # decay solve is new work); the reverse (decay -> steady-
+                # state) isn't offered.
+                html.Div([
+                    _labeled("Simulation mode", dcc.Dropdown(
+                        id="extend-uv-sim-type", clearable=False, value="steady_state",
+                        options=[{"label": "Steady state (same as this project)", "value": "steady_state"},
+                                 {"label": "Decay mode", "value": "decay"}])),
+                    html.P("Switching to Decay mode reuses this ACH's already-converged flow field and "
+                           "UV-off control run - only each Z's own UV-on decay solve is new work.",
+                           className="small text-muted mt-1 mb-0"),
+                ], id="extend-uv-mode-row", style={"display": "none"}),
             ], id="extend-uv-section", style={"display": "none"}),
 
             # --- "Extend specific run(s)" sub-form ---
@@ -4143,11 +4160,16 @@ def _refresh_extend_view(project_dir):
     # combo subfolders would fix).
     no_status_at_all = not combos and not (status or {}).get("guv_path")
     rebuild_style = {"display": "block"} if (project_dir and no_status_at_all) else {"display": "none"}
+    # Only offered for a steady-state project - see the dropdown's own
+    # note in the layout for why the reverse direction isn't.
+    mode_row_style = ({"display": "block"} if (settings or {}).get("sim-type") == "steady_state"
+                       else {"display": "none"})
     # Prefilled with this project's own Z values (not left blank) so the
     # user sees exactly which ones are about to be re-evaluated under a
     # new .guv design, rather than having to remember/guess what leaving
     # it empty defaults to.
-    return body, (error or ""), sweep_z, sweep_ach, sweep_z, (guv_path or ""), dropdown_options, rebuild_style
+    return (body, (error or ""), sweep_z, sweep_ach, sweep_z, (guv_path or ""), dropdown_options, rebuild_style,
+            mode_row_style)
 
 
 @app.callback(
@@ -4161,14 +4183,16 @@ def _refresh_extend_view(project_dir):
     Output("extend-uv-guv-path", "value", allow_duplicate=True),
     Output("extend-combo-dropdown", "options", allow_duplicate=True),
     Output("extend-rebuild-status-wrapper", "style", allow_duplicate=True),
+    Output("extend-uv-mode-row", "style", allow_duplicate=True),
     Input("extend-modal-open-btn", "n_clicks"),
     State("case-dir", "value"),
     prevent_initial_call=True,
 )
 def _open_extend_modal(n_clicks, current_case_dir):
     project_dir = current_case_dir or ""
-    body, msg, sweep_z, sweep_ach, uv_z, uv_guv, options, rebuild_style = _refresh_extend_view(project_dir)
-    return True, project_dir, body, msg, sweep_z, sweep_ach, uv_z, uv_guv, options, rebuild_style
+    body, msg, sweep_z, sweep_ach, uv_z, uv_guv, options, rebuild_style, mode_style = _refresh_extend_view(
+        project_dir)
+    return True, project_dir, body, msg, sweep_z, sweep_ach, uv_z, uv_guv, options, rebuild_style, mode_style
 
 
 @app.callback(
@@ -4180,6 +4204,7 @@ def _open_extend_modal(n_clicks, current_case_dir):
     Output("extend-uv-guv-path", "value", allow_duplicate=True),
     Output("extend-combo-dropdown", "options", allow_duplicate=True),
     Output("extend-rebuild-status-wrapper", "style", allow_duplicate=True),
+    Output("extend-uv-mode-row", "style", allow_duplicate=True),
     Input("extend-load-btn", "n_clicks"),
     State("extend-project-dir-input", "value"),
     prevent_initial_call=True,
@@ -4187,7 +4212,7 @@ def _open_extend_modal(n_clicks, current_case_dir):
 def _load_extend_project(n_clicks, project_dir):
     if not project_dir:
         return (dash.no_update, "Enter a project folder first.", dash.no_update, dash.no_update,
-                dash.no_update, dash.no_update, dash.no_update, dash.no_update)
+                dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update)
     return _refresh_extend_view(project_dir)
 
 
@@ -4200,6 +4225,7 @@ def _load_extend_project(n_clicks, project_dir):
     Output("extend-uv-guv-path", "value", allow_duplicate=True),
     Output("extend-combo-dropdown", "options", allow_duplicate=True),
     Output("extend-rebuild-status-wrapper", "style", allow_duplicate=True),
+    Output("extend-uv-mode-row", "style", allow_duplicate=True),
     Input("extend-rebuild-status-btn", "n_clicks"),
     State("extend-project-dir-input", "value"),
     prevent_initial_call=True,
@@ -4214,23 +4240,24 @@ def _create_extend_status_from_disk(n_clicks, project_dir):
     """
     _NA = dash.no_update
     if not project_dir:
-        return _NA, "Enter a project folder first.", _NA, _NA, _NA, _NA, _NA, _NA
+        return _NA, "Enter a project folder first.", _NA, _NA, _NA, _NA, _NA, _NA, _NA
     guv_path = scenario_runs.find_first_guv_path_on_disk(project_dir)
     if not guv_path:
         return (_NA, "No existing run folders (with their own run_settings.json) were found in "
-                "this location to rebuild a status file from.", _NA, _NA, _NA, _NA, _NA, _NA)
+                "this location to rebuild a status file from.", _NA, _NA, _NA, _NA, _NA, _NA, _NA)
     try:
         project = Project.load(guv_path)
         room = next(iter(project.rooms.values()))
     except Exception as e:
-        return _NA, f"Found run folders, but failed to load {guv_path}: {e}", _NA, _NA, _NA, _NA, _NA, _NA
+        return _NA, f"Found run folders, but failed to load {guv_path}: {e}", _NA, _NA, _NA, _NA, _NA, _NA, _NA
 
     project_name = Path(project_dir).name
     n_found = scenario_runs.rebuild_project_status_from_disk(project_dir, project_name, room)
-    body, msg, sweep_z, sweep_ach, uv_z, uv_guv, options, rebuild_style = _refresh_extend_view(project_dir)
+    body, msg, sweep_z, sweep_ach, uv_z, uv_guv, options, rebuild_style, mode_style = _refresh_extend_view(
+        project_dir)
     prefix = f"Rebuilt a status file from {n_found} existing run folder(s)."
     return (body, (f"{prefix} {msg}" if msg else prefix), sweep_z, sweep_ach, uv_z, uv_guv, options,
-            rebuild_style)
+            rebuild_style, mode_style)
 
 
 @app.callback(
@@ -4426,13 +4453,14 @@ def _extend_pipeline_thread(case_dirs, end_time, write_interval):
     Input("extend-run-btn", "n_clicks"),
     State("extend-uv-guv-path", "value"),
     State("extend-uv-z-values", "value"),
+    State("extend-uv-sim-type", "value"),
     State("extend-combo-dropdown", "value"),
     State("extend-duration-input", "value"),
     State("extend-sweep-z-values", "value"),
     State("extend-sweep-ach-values", "value"),
     prevent_initial_call=True,
 )
-def _run_extend_action(n_clicks, uv_guv_path, uv_z_text, extend_combo_keys, extend_end_time,
+def _run_extend_action(n_clicks, uv_guv_path, uv_z_text, uv_sim_type, extend_combo_keys, extend_end_time,
                         sweep_z_text, sweep_ach_text):
     _NA = dash.no_update
     pending = _pending_extend_modal
@@ -4458,8 +4486,17 @@ def _run_extend_action(n_clicks, uv_guv_path, uv_z_text, extend_combo_keys, exte
         # to retype a list they already swept once.
         z_values = uv_z_values or sorted({c["z"] for c in combos.values() if "z" in c}) or [settings.get("z-value")]
         ach_values = sorted({c["ach"] for c in combos.values() if "ach" in c}) or [settings.get("ach")]
+        # The mode dropdown is only shown (and only meaningful) for a
+        # steady-state project (see the layout's own note - switching
+        # FROM decay isn't offered) - if this project isn't steady-state,
+        # ignore uv_sim_type entirely rather than trust the hidden
+        # dropdown's own default value, which would otherwise silently
+        # flip an already-decay project back to steady-state.
+        current_sim_type = settings.get("sim-type")
+        sim_type = uv_sim_type if (current_sim_type == "steady_state" and uv_sim_type) else current_sim_type
         _launch_scenario_sweep(uv_guv_path, pending["settings_path"], project_dir, room,
-                                dict(settings, **{"z-value": z_values[0]}), adv, z_values, ach_values)
+                                dict(settings, **{"z-value": z_values[0], "sim-type": sim_type}),
+                                adv, z_values, ach_values)
     elif action == "sweep":
         try:
             z_values = _parse_number_list(sweep_z_text)
@@ -4487,7 +4524,7 @@ def _run_extend_action(n_clicks, uv_guv_path, uv_z_text, extend_combo_keys, exte
             # combo["subdir"], if recorded, is this combo's OWN actual
             # folder name - use it verbatim rather than recomputing from
             # (z, ach) alone, which would silently drop this combo's own
-            # guv_suffix (see scenario_runs._subdir_name's docstring) and
+            # combo_suffix (see scenario_runs._subdir_name's docstring) and
             # point at the wrong - possibly a different design's - folder.
             subdir = combo.get("subdir") or scenario_runs._subdir_name(z, ach)
             case_dirs.append((f"{project_dir}/{subdir}", z, ach))
