@@ -1831,6 +1831,55 @@ def test_write_sweep_summary_csv_collects_every_done_combo_from_status(tmp_path)
     assert float(rows[0]["est_each_per_hr"]) == pytest.approx(18.2)
 
 
+def test_write_sweep_summary_csv_includes_phase1_spatial_cov_and_phase2_t_ss_cv(tmp_path):
+    # 2026-08-13: convergence-quality diagnostics - phase1's own SPATIAL
+    # mixing uniformity (a snapshot at its final iteration) and phase2's
+    # own TEMPORAL stability (how much the room-average T still
+    # fluctuates over its trailing convergence window) - two different
+    # questions, not the same number reused (see
+    # _convergence_quality_columns's own docstring).
+    import csv as csv_module
+    project_dir = str(tmp_path)
+    project_name = "myproj"
+    from guvcfd.project_status import update_combo_status
+    update_combo_status(project_dir, project_name, z=6.0, ach=3.0, status="done")
+    report = {
+        "reduction_pct_corrected": 80.0, "eACH_uv_steady_state_corrected": 10.0,
+        "phase1": {"spatial_cov": 0.045}, "phase2": {"T_ss_cv": 0.012},
+    }
+    with open(f"{project_dir}/{project_name}_Z6_ACH3_report.json", "w") as f:
+        json.dump(report, f)
+
+    csv_path = sr.write_sweep_summary_csv(project_dir, project_name)
+    with open(csv_path, newline="") as f:
+        rows = list(csv_module.DictReader(f))
+
+    assert len(rows) == 1
+    assert float(rows[0]["phase1_spatial_cov_pct"]) == pytest.approx(4.5)
+    assert float(rows[0]["phase2_T_ss_cv_pct"]) == pytest.approx(1.2)
+
+
+def test_write_sweep_summary_csv_blank_convergence_quality_for_decay_rows(tmp_path):
+    # Decay-mode reports have no phase1/phase2 structure at all - these
+    # columns must come back blank, not raise or default to 0.
+    import csv as csv_module
+    project_dir = str(tmp_path)
+    project_name = "myproj"
+    from guvcfd.project_status import update_combo_status
+    update_combo_status(project_dir, project_name, z=6.0, ach=3.0, sim_type="decay", status="done")
+    report = {"eACH_uv_effective": 12.0, "eACH_uv_well_mixed": 15.0}
+    with open(f"{project_dir}/{project_name}_Z6_ACH3_report.json", "w") as f:
+        json.dump(report, f)
+
+    csv_path = sr.write_sweep_summary_csv(project_dir, project_name)
+    with open(csv_path, newline="") as f:
+        rows = list(csv_module.DictReader(f))
+
+    assert len(rows) == 1
+    assert rows[0]["phase1_spatial_cov_pct"] == ""
+    assert rows[0]["phase2_T_ss_cv_pct"] == ""
+
+
 def test_write_sweep_summary_csv_includes_a_row_per_design_at_the_same_z_ach(tmp_path):
     import csv as csv_module
     project_dir = str(tmp_path)
