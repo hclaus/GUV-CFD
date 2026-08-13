@@ -4481,6 +4481,20 @@ def _run_extend_action(n_clicks, uv_guv_path, uv_z_text, uv_sim_type, extend_com
             uv_z_values = _parse_number_list(uv_z_text)
         except ValueError as e:
             return _NA, f"Can't parse Z value list: {e}", _NA, _NA, _NA, _NA
+        # Load THIS design's own room fresh - `room` (from pending) is
+        # whatever was loaded for the ORIGINAL project (see
+        # _refresh_extend_view), and the whole point of this action is a
+        # DIFFERENT lamp design/room object. Confirmed as a real bug
+        # (2026-08-12): passing the original room through unchanged meant
+        # every "apply different design" launch silently recomputed
+        # fluenceRate from the SAME (original) lamp positions regardless
+        # of which .guv was actually picked - two genuinely different
+        # designs produced identical results because the physics never
+        # actually changed, only the file path label did.
+        try:
+            uv_room = next(iter(Project.load(uv_guv_path).rooms.values()))
+        except Exception as e:
+            return _NA, f"Failed to load {uv_guv_path}: {e}", _NA, _NA, _NA, _NA
         # Blank field - use every Z value already recorded for this project
         # (see the note in the modal itself) rather than requiring the user
         # to retype a list they already swept once.
@@ -4494,7 +4508,7 @@ def _run_extend_action(n_clicks, uv_guv_path, uv_z_text, uv_sim_type, extend_com
         # flip an already-decay project back to steady-state.
         current_sim_type = settings.get("sim-type")
         sim_type = uv_sim_type if (current_sim_type == "steady_state" and uv_sim_type) else current_sim_type
-        _launch_scenario_sweep(uv_guv_path, pending["settings_path"], project_dir, room,
+        _launch_scenario_sweep(uv_guv_path, pending["settings_path"], project_dir, uv_room,
                                 dict(settings, **{"z-value": z_values[0], "sim-type": sim_type}),
                                 adv, z_values, ach_values)
     elif action == "sweep":

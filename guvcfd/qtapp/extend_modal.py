@@ -426,6 +426,21 @@ class ExtendModifyDialog(QDialog):
             if not guv_path:
                 self.msg_label.setText("Pick a .guv file first.")
                 return
+            # Load THIS design's own room fresh - self._room is whatever
+            # was loaded for the ORIGINAL project (see _refresh), and the
+            # whole point of this action is a DIFFERENT lamp design/room
+            # object. Confirmed as a real bug (2026-08-12): passing
+            # self._room through unchanged meant every "apply different
+            # design" launch silently recomputed fluenceRate from the
+            # SAME (original) lamp positions regardless of which .guv was
+            # actually picked - two genuinely different designs produced
+            # identical results because the physics never actually
+            # changed, only the file path label did.
+            try:
+                new_room = next(iter(Project.load(guv_path).rooms.values()))
+            except Exception as e:
+                self.msg_label.setText(f"Failed to load {guv_path}: {e}")
+                return
             try:
                 uv_z_values = helpers.parse_number_list(self.uv_z_edit.text())
             except ValueError as e:
@@ -447,7 +462,7 @@ class ExtendModifyDialog(QDialog):
             sim_type = (self.uv_mode_combo.currentData() if current_sim_type == "steady_state"
                         else current_sim_type)
             self.run_tab.launch_sweep_from_extend(
-                guv_path, self._settings_path, self._project_dir, self._room,
+                guv_path, self._settings_path, self._project_dir, new_room,
                 dict(self._settings, **{"z-value": z_values[0], "sim-type": sim_type}), adv, z_values, ach_values)
             self.accept()
         elif self._action == "sweep":

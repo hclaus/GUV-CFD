@@ -298,11 +298,14 @@ def test_run_extend_action_uv_launches_sweep_with_new_guv_and_z(tmp_path, monkey
     )
     monkeypatch.setattr(guvcfd_app, "load_advanced_settings", lambda: {})
     monkeypatch.setattr(guvcfd_app, "merge_project_openfoam_settings", lambda settings, adv: {"mesh-cell-size": 0.1})
+    fake_new_room = SimpleNamespace(x=9.0, y=9.0, z=9.0)
+    monkeypatch.setattr(guvcfd_app.Project, "load",
+                         staticmethod(lambda path: SimpleNamespace(rooms={"r": fake_new_room})))
 
     captured = {}
 
     def fake_launch(guv_path, settings_path, project_dir, room, settings, adv, z_values, ach_values):
-        captured.update(guv_path=guv_path, z_values=z_values, ach_values=ach_values)
+        captured.update(guv_path=guv_path, room=room, z_values=z_values, ach_values=ach_values)
 
     monkeypatch.setattr(guvcfd_app, "_launch_scenario_sweep", fake_launch)
 
@@ -314,6 +317,12 @@ def test_run_extend_action_uv_launches_sweep_with_new_guv_and_z(tmp_path, monkey
     assert captured["guv_path"] == "new.guv"
     assert captured["z_values"] == [8.0]
     assert captured["ach_values"] == [3.0, 6.0]
+    # Regression guard (2026-08-12): the room passed to the launch must be
+    # freshly loaded from the NEW .guv file, not the original project's
+    # own room (pending["room"], a SimpleNamespace(x=1,y=1,z=1) here) -
+    # two genuinely different designs used to silently compute against
+    # the SAME (original) lamp positions, producing identical results.
+    assert captured["room"] is fake_new_room
     assert guvcfd_app._pending_extend_modal["project_dir"] is None  # cleared after dispatch
 
 
@@ -327,6 +336,8 @@ def test_run_extend_action_uv_launches_sweep_with_multiple_z_values(tmp_path, mo
     )
     monkeypatch.setattr(guvcfd_app, "load_advanced_settings", lambda: {})
     monkeypatch.setattr(guvcfd_app, "merge_project_openfoam_settings", lambda settings, adv: {"mesh-cell-size": 0.1})
+    monkeypatch.setattr(guvcfd_app.Project, "load",
+                         staticmethod(lambda path: SimpleNamespace(rooms={"r": SimpleNamespace(x=1, y=1, z=1)})))
 
     captured = {}
     monkeypatch.setattr(guvcfd_app, "_launch_scenario_sweep",
@@ -352,6 +363,8 @@ def test_run_extend_action_uv_blank_z_defaults_to_projects_original_z_values(tmp
     )
     monkeypatch.setattr(guvcfd_app, "load_advanced_settings", lambda: {})
     monkeypatch.setattr(guvcfd_app, "merge_project_openfoam_settings", lambda settings, adv: {"mesh-cell-size": 0.1})
+    monkeypatch.setattr(guvcfd_app.Project, "load",
+                         staticmethod(lambda path: SimpleNamespace(rooms={"r": SimpleNamespace(x=1, y=1, z=1)})))
 
     captured = {}
     monkeypatch.setattr(guvcfd_app, "_launch_scenario_sweep",
@@ -371,6 +384,19 @@ def test_run_extend_action_uv_requires_guv_path(tmp_path):
     is_open, msg, tab, poll_disabled, run_disabled, stop_disabled = guvcfd_app._run_extend_action(
         1, None, None, None, None, None, None, None)
     assert "Pick a .guv file first" in msg
+
+
+def test_run_extend_action_uv_reports_a_failure_to_load_the_new_guv_file(tmp_path, monkeypatch):
+    _reset_run_states()
+    guvcfd_app._pending_extend_modal.update(
+        project_dir=str(tmp_path), settings={"sim-type": "decay"}, room=SimpleNamespace(x=1, y=1, z=1),
+        status={"combos": {}}, action="uv",
+    )
+    monkeypatch.setattr(guvcfd_app.Project, "load",
+                         staticmethod(lambda path: (_ for _ in ()).throw(RuntimeError("bad file"))))
+    is_open, msg, tab, poll_disabled, run_disabled, stop_disabled = guvcfd_app._run_extend_action(
+        1, "broken.guv", "6", None, None, None, None, None)
+    assert "Failed to load broken.guv" in msg
 
 
 def test_run_extend_action_uv_rejects_unparseable_z_list(tmp_path):
