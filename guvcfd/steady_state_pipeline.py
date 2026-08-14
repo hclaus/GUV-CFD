@@ -37,7 +37,10 @@ from .splice import (
     set_control_dict_time, set_function_write_interval, ensure_simple_fvsolution,
     disable_simple_residual_control,
 )
-from .wsl_utils import wsl_path, run_wsl_or_raise, run_wsl_streaming, StoppedByUser
+from .wsl_utils import (
+    wsl_path, run_wsl_or_raise, run_wsl_streaming, StoppedByUser,
+    read_case_file as _read_case_file, write_case_file as _write_case_file,
+)
 
 
 class Phase1ExtrapolationUndecided(Exception):
@@ -906,16 +909,18 @@ def _write_phase1_checkpoint(case_dir, phase1_summary, phase1_monitoring, G, Su,
         "phase1_summary": phase1_summary, "phase1_monitoring": phase1_monitoring,
         "G": G, "Su": Su, "source_volume": source_volume, "n_source_cells": n_source_cells,
     }
-    with open(_phase1_checkpoint_path(case_dir), "w") as f:
-        json.dump(data, f, indent=2)
+    # WSL-native write, not plain Windows-side open() - see
+    # run_pipeline._load_history's identical fix/docstring for the
+    # confirmed incident this same gap already caused once (a "successful"
+    # write that silently wasn't durable to WSL, so a later read saw
+    # nothing at all).
+    _write_case_file(case_dir, "phase1_checkpoint.json", json.dumps(data, indent=2))
 
 
 def _read_phase1_checkpoint(case_dir):
-    path = _phase1_checkpoint_path(case_dir)
     try:
-        with open(path) as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
+        return json.loads(_read_case_file(case_dir, "phase1_checkpoint.json"))
+    except (json.JSONDecodeError, OSError, RuntimeError):
         return None
 
 
@@ -937,16 +942,13 @@ def _write_phase1_pending(case_dir, G, Su, source_volume, n_source_cells):
     whole scenario is abandoned.
     """
     data = {"G": G, "Su": Su, "source_volume": source_volume, "n_source_cells": n_source_cells}
-    with open(_phase1_pending_path(case_dir), "w") as f:
-        json.dump(data, f, indent=2)
+    _write_case_file(case_dir, "phase1_pending.json", json.dumps(data, indent=2))
 
 
 def _read_phase1_pending(case_dir):
-    path = _phase1_pending_path(case_dir)
     try:
-        with open(path) as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
+        return json.loads(_read_case_file(case_dir, "phase1_pending.json"))
+    except (json.JSONDecodeError, OSError, RuntimeError):
         return None
 
 

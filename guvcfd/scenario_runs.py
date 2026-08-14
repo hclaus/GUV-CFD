@@ -752,6 +752,25 @@ def _run_shared_phase1(base_dir, phase1_dir, ach, room, settings, adv, log_fn, s
     if _read_phase1_checkpoint(phase1_dir) is not None:
         log_fn(f"=== ACH={ach}: found an already-converged Phase 1 checkpoint at "
                f"{Path(phase1_dir).name}/ from an earlier attempt - reusing it, nothing to redo ===")
+        # fluenceRate is recomputed here too, not just trusted from
+        # whatever .guv file originally built/seeded phase1_dir - see
+        # _build_flow_base's own identical fix and docstring for the
+        # incident this closes. That fix alone wasn't enough for
+        # steady-state: every Z/ACH combo is cloned from phase1_dir (see
+        # run_z_fn's own _copy_base_case call below), NOT from base_dir
+        # directly, so a stale fluenceRate sitting here silently survived
+        # regardless of how correctly base_dir's own copy got refreshed -
+        # confirmed live: base_dir's fluenceRate was genuinely fresh after
+        # a rebuild, n_lamps in the final report was even correct (it
+        # comes from base_dir's own setup_case() summary), yet every
+        # actual combo's own results were still byte-identical to the
+        # ORIGINAL design's, because the one field that actually drives
+        # the UV simulation was never touched.
+        log_fn("  Recomputing fluence rate from this run's own .guv file (never trusted from an "
+               "earlier design, even when Phase 1 itself is reused)...")
+        fluence_points = read_cell_centers(phase1_dir, "0")
+        fluence_values = compute_fluence_at_points(room, fluence_points)
+        write_scalar_field(phase1_dir, "fluenceRate", fluence_values, read_boundary_patch_names(phase1_dir))
         return
     phase1_resume_decision = None
     if _read_phase1_pending(phase1_dir) is not None:
@@ -759,6 +778,17 @@ def _run_shared_phase1(base_dir, phase1_dir, ach, room, settings, adv, log_fn, s
                f"earlier attempt (interrupted before a checkpoint was written) - resuming it instead of "
                f"starting over ===")
         phase1_resume_decision = "accept"
+        # Same fix as the checkpoint-reuse branch above, for the same
+        # reason - Phase 1's own solve never uses fluenceRate/kUV at all
+        # (no UV sink term, "source only, no UV"), so resuming it doesn't
+        # touch this field either; it's just carried forward into every
+        # Z's own combo later, so it must reflect THIS run's .guv file
+        # regardless of Phase 1's own convergence state.
+        log_fn("  Recomputing fluence rate from this run's own .guv file (never trusted from an "
+               "earlier design, even when resuming Phase 1's own in-progress convergence)...")
+        fluence_points = read_cell_centers(phase1_dir, "0")
+        fluence_values = compute_fluence_at_points(room, fluence_points)
+        write_scalar_field(phase1_dir, "fluenceRate", fluence_values, read_boundary_patch_names(phase1_dir))
     else:
         _copy_base_case(base_dir, phase1_dir, log_fn)
 

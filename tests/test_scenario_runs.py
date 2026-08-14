@@ -1,6 +1,7 @@
 import json
 import threading
 import time
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -1433,6 +1434,10 @@ def test_run_shared_phase1_skips_entirely_when_checkpoint_already_exists(tmp_pat
     monkeypatch.setattr(sr, "_copy_base_case", lambda base, target, log_fn: copy_calls.append((base, target)))
     scenario_calls = []
     monkeypatch.setattr(sr, "run_steady_state_scenario", lambda *a, **k: scenario_calls.append((a, k)))
+    monkeypatch.setattr(sr, "read_cell_centers", lambda case_dir, time_dir: [])
+    monkeypatch.setattr(sr, "compute_fluence_at_points", lambda room, points: [])
+    monkeypatch.setattr(sr, "write_scalar_field", lambda *a, **k: None)
+    monkeypatch.setattr(sr, "read_boundary_patch_names", lambda case_dir: [])
 
     room = type("Room", (), {"x": 4.0, "y": 5.0, "z": 2.7})()
     sr._run_shared_phase1("base_dir", str(phase1_dir), ach=6.0, room=room, settings={}, adv={},
@@ -1460,6 +1465,10 @@ def test_run_shared_phase1_resumes_undecided_pending_instead_of_restarting(tmp_p
     def fake_run_steady_state_scenario(case_dir, room_x, room_y, room_z, ach, Z, **kwargs):
         scenario_calls.append({"case_dir": case_dir, **kwargs})
     monkeypatch.setattr(sr, "run_steady_state_scenario", fake_run_steady_state_scenario)
+    monkeypatch.setattr(sr, "read_cell_centers", lambda case_dir, time_dir: [])
+    monkeypatch.setattr(sr, "compute_fluence_at_points", lambda room, points: [])
+    monkeypatch.setattr(sr, "write_scalar_field", lambda *a, **k: None)
+    monkeypatch.setattr(sr, "read_boundary_patch_names", lambda case_dir: [])
 
     room = type("Room", (), {"x": 4.0, "y": 5.0, "z": 2.7})()
     settings = {"fan-enable": False, "inlet2-enable": False, "outlet2-enable": False,
@@ -1479,6 +1488,151 @@ def test_run_shared_phase1_resumes_undecided_pending_instead_of_restarting(tmp_p
     assert copy_calls == []
     assert len(scenario_calls) == 1
     assert scenario_calls[0]["phase1_resume_decision"] == "accept"
+
+
+# --- _run_shared_phase1's own fluenceRate recompute on reuse (2026-08-13
+# incident: every Z/ACH combo for steady-state is cloned from phase1_dir,
+# not base_dir directly - _build_flow_base's own recompute fix never
+# reached the file that actually matters once Phase 1 itself is reused) ---
+
+def test_run_shared_phase1_recomputes_fluence_when_checkpoint_reused(tmp_path, monkeypatch):
+    phase1_dir = tmp_path / "_phase1_ACH6"
+    phase1_dir.mkdir()
+    sspl._write_phase1_checkpoint(str(phase1_dir), {"iterations": 1500}, {}, G=1.0, Su=1.0,
+                                   source_volume=0.064, n_source_cells=64)
+    monkeypatch.setattr(sr, "_copy_base_case", lambda *a, **k: None)
+    monkeypatch.setattr(sr, "run_steady_state_scenario", lambda *a, **k: None)
+    monkeypatch.setattr(sr, "read_cell_centers", lambda case_dir, time_dir: ["p1", "p2"])
+    fluence_calls = []
+    fake_fluence = [1.1, 2.2]
+    monkeypatch.setattr(sr, "compute_fluence_at_points",
+                         lambda room, points: fluence_calls.append((room, points)) or fake_fluence)
+    write_calls = []
+    monkeypatch.setattr(sr, "write_scalar_field",
+                         lambda case_dir, name, values, patch_names: write_calls.append((case_dir, name, values)))
+    monkeypatch.setattr(sr, "read_boundary_patch_names", lambda case_dir: ["inlet", "outlet"])
+
+    room = type("Room", (), {"x": 4.0, "y": 5.0, "z": 2.7})()
+    sr._run_shared_phase1("base_dir", str(phase1_dir), ach=6.0, room=room, settings={}, adv={},
+                           log_fn=lambda m: None, should_stop=None, solver_log_fn=None)
+
+    assert len(fluence_calls) == 1 and fluence_calls[0][0] is room
+    assert write_calls == [(str(phase1_dir), "fluenceRate", fake_fluence)]
+
+
+def test_run_shared_phase1_recomputes_fluence_when_resuming_pending(tmp_path, monkeypatch):
+    phase1_dir = tmp_path / "_phase1_ACH6"
+    phase1_dir.mkdir()
+    sspl._write_phase1_pending(str(phase1_dir), G=1.0, Su=1.0, source_volume=0.064, n_source_cells=64)
+    monkeypatch.setattr(sr, "_copy_base_case", lambda *a, **k: None)
+    monkeypatch.setattr(sr, "run_steady_state_scenario", lambda *a, **k: None)
+    monkeypatch.setattr(sr, "read_cell_centers", lambda case_dir, time_dir: ["p1"])
+    fluence_calls = []
+    fake_fluence = [3.3]
+    monkeypatch.setattr(sr, "compute_fluence_at_points",
+                         lambda room, points: fluence_calls.append((room, points)) or fake_fluence)
+    write_calls = []
+    monkeypatch.setattr(sr, "write_scalar_field",
+                         lambda case_dir, name, values, patch_names: write_calls.append((case_dir, name, values)))
+    monkeypatch.setattr(sr, "read_boundary_patch_names", lambda case_dir: [])
+
+    room = type("Room", (), {"x": 4.0, "y": 5.0, "z": 2.7})()
+    settings = {"fan-enable": False, "inlet2-enable": False, "outlet2-enable": False,
+                "inlet-wall": "xMin", "inlet-y-input": 1.5, "inlet-z-input": 1.3,
+                "inlet-size-w": 0.3, "inlet-size-h": 0.3,
+                "phase1-iterations": 1500, "target-t-ss": 1.0, "z-value": 6,
+                "inject-x-input": 2, "inject-y-input": 2.5, "inject-z-input": 1.3,
+                "t-ss-window-frac": None, "monitoring-enable": False, "source-zone-size": 0.3}
+    adv = {"mesh-cell-size": 0.1, "plateau-rel-tol": 1.0,
+           "t-infinity-early-stop-enabled": False, "phase1-require-stable-extrapolation": False,
+           "keep-all-timesteps": False, "phase-chunk-size": 400, "phase-write-interval": 200,
+           "deltat-scaling-enabled": False, "deltat-effective-fraction": 0.7, "deltat-target-fraction": 0.995}
+
+    sr._run_shared_phase1(str(phase1_dir), str(phase1_dir), ach=6.0, room=room, settings=settings, adv=adv,
+                           log_fn=lambda m: None, should_stop=None, solver_log_fn=None)
+
+    assert len(fluence_calls) == 1 and fluence_calls[0][0] is room
+    assert write_calls == [(str(phase1_dir), "fluenceRate", fake_fluence)]
+
+
+def test_run_sweep_different_guv_at_same_z_ach_produces_genuinely_different_results(tmp_path, monkeypatch):
+    # End-to-end regression for the 2026-08-13 incident: a steady-state
+    # sweep whose ACH group already has a REUSED flow base (_build_flow_base)
+    # AND a REUSED Phase 1 checkpoint (_run_shared_phase1) - both genuinely
+    # mode/guv-independent reuse paths - must still produce a DIFFERENT
+    # combo result for a different .guv design, because both reuse paths
+    # recompute their own copy of fluenceRate. A prior version of this fix
+    # only covered _build_flow_base's own copy, which every combo's own
+    # case_dir is NOT actually cloned from (phase1_dir is) - confirmed
+    # live: n_lamps in the final report was correct, but the actual
+    # UV-dependent numbers were byte-identical to the original design.
+    project_dir = tmp_path / "myproject"
+    project_dir.mkdir()
+
+    # _build_flow_base is mocked as "already reused" (fluenceRate already
+    # present) - its own recompute isn't what's under test here.
+    def fake_build_flow_base(guv_path, base_dir, room, settings, ach, adv, log_fn, *a, **k):
+        Path(f"{base_dir}/0").mkdir(parents=True, exist_ok=True)
+        Path(f"{base_dir}/0/fluenceRate").write_text("stale")
+        return {"flow_converged": True, "inlet_velocity": 1.0, "inlet2_velocity": None, "n_lamps": 4}
+
+    monkeypatch.setattr(sr, "_build_flow_base", fake_build_flow_base)
+    monkeypatch.setattr(sr, "_run_shared_control", lambda *a, **k: {"total_ach_effective": 3.0})
+    monkeypatch.setattr(sr, "write_source_topo_set_dict", lambda *a, **k: None)
+    monkeypatch.setattr(sr, "_copy_base_case",
+                         lambda base, target, log_fn: __import__("os").makedirs(target, exist_ok=True))
+    monkeypatch.setattr(sr, "_apply_z", lambda case_dir, z, nbins, fan_kwargs, log_fn:
+                         {"fluence_mean": 1.0, "eACH_uv_well_mixed_mean": 0.0})
+    monkeypatch.setattr(sr, "compute_uv_fingerprint", lambda *a, **k: "fake-uv-fp")
+    monkeypatch.setattr(sr, "run_wsl_or_raise", lambda cmd, *a, **k: None)
+
+    # _run_shared_phase1 is the REAL function - already has an existing
+    # checkpoint (simulating an earlier design's Phase 1), so it takes the
+    # reuse branch and must recompute fluenceRate itself.
+    phase1_dir = project_dir / "_phase1_ACH3"
+    phase1_dir.mkdir()
+    sspl._write_phase1_checkpoint(str(phase1_dir), {"iterations": 1500}, {}, G=1.0, Su=1.0,
+                                   source_volume=0.064, n_source_cells=64)
+    monkeypatch.setattr(sr, "read_cell_centers", lambda case_dir, time_dir: ["p1", "p2"])
+    monkeypatch.setattr(sr, "read_boundary_patch_names", lambda case_dir: ["inlet", "outlet"])
+    written_fluence = {}
+
+    def fake_write_scalar_field(case_dir, name, values, patch_names):
+        if name == "fluenceRate":
+            written_fluence[case_dir] = values
+
+    monkeypatch.setattr(sr, "write_scalar_field", fake_write_scalar_field)
+
+    room_a = type("RoomA", (), {"x": 4.0, "y": 5.0, "z": 2.7})()
+    room_b = type("RoomB", (), {"x": 4.0, "y": 5.0, "z": 2.7})()
+
+    def fake_compute_fluence(room, points):
+        # Genuinely different output per room, like two different lamp
+        # layouts would produce.
+        return [10.0] if room is room_a else [99.0]
+
+    monkeypatch.setattr(sr, "compute_fluence_at_points", fake_compute_fluence)
+    monkeypatch.setattr(sr, "_run_scenario", lambda *a, **k: {
+        "reduction_pct": 90.0, "eACH_uv_steady_state": 50.0, "phase1": {"T_ss": 1.0, "live": {"t": [1]}},
+        "phase2": {"T_ss": 0.1, "live": {"t": [1]}}})
+
+    settings = {"sim-type": "steady_state", "fan-enable": False, "monitoring-enable": False,
+                "inlet-wall": "xMin", "inlet-size-w": 0.3, "inlet-size-h": 0.3,
+                "phase1-iterations": 100, "phase2-iterations": 100, "target-t-ss": 1.0,
+                "inject-x-input": 2, "inject-y-input": 2.5, "inject-z-input": 1.3, "z-value": 6,
+                "source-zone-size": 0.3}
+    adv = {"uv-zone-bins": 25, "mesh-cell-size": 0.1}
+
+    sr.run_sweep(
+        guv_path="lampB.guv", settings_path="proj.guvcfd", project_dir=str(project_dir),
+        room=room_b, settings=settings, adv=adv,
+        z_values=[6], ach_values=[3], log_fn=lambda m: None,
+    )
+
+    # The recompute happened against phase1_dir (what every combo actually
+    # clones from), using THIS run's own room (room_b) - not left at
+    # whatever "stale" placeholder _build_flow_base's own reuse wrote.
+    assert written_fluence.get(f"{project_dir}/_phase1_ACH3") == [99.0]
 
 
 def test_run_sweep_recarves_source_zone_after_apply_z_wipes_it(tmp_path, monkeypatch):
