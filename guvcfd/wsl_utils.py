@@ -5,6 +5,7 @@ source scenario).
 import atexit
 import os
 import queue
+import random
 import subprocess
 import threading
 import time
@@ -199,6 +200,23 @@ def _get_ssh_client():
 # before this budget's later attempts pay for a full reconnect.
 _WSL_RETRY_ATTEMPTS = 4
 _WSL_RETRY_DELAY_S = 1.5
+
+
+def _wsl_retry_sleep():
+    """Sleep before a WSL-launch retry, with jitter added on top of the
+    fixed base delay - confirmed as a real incident: several combos
+    dispatched by the concurrent scheduler at nearly the same instant
+    (e.g. every Z sharing an ACH, right after that ACH's shared Phase 1
+    resolves) can have their quick per-combo setup commands (touch,
+    topoSet, ...) all fail to launch together, and every one of them was
+    retrying on the exact same fixed delay - giving them no chance to
+    desynchronize before colliding again on the same contention. Jitter
+    only, not exponential backoff - these launches aren't competing for a
+    resource that's genuinely scarce and needs shedding load, just
+    coincidentally bunched; the goal is to break up the pile-up, not slow
+    everything down.
+    """
+    time.sleep(_WSL_RETRY_DELAY_S + random.uniform(0, _WSL_RETRY_DELAY_S))
 
 # SFTP open/read/write ride a channel with no timeout by default - if the
 # connection goes silently dead (no RST/FIN, just stops delivering data)
@@ -407,7 +425,7 @@ def _write_wsl_text_ssh(wsl_target_path, content):
             if attempt >= 1:
                 _discard_dead_ssh_client()
             if attempt < _WSL_RETRY_ATTEMPTS:
-                time.sleep(_WSL_RETRY_DELAY_S)
+                _wsl_retry_sleep()
     raise RuntimeError(f"writing {wsl_target_path} via SFTP failed after retries: {last_exc}")
 
 
@@ -462,7 +480,7 @@ def _read_wsl_text_ssh(wsl_source_path):
             if attempt >= 1:
                 _discard_dead_ssh_client()
             if attempt < _WSL_RETRY_ATTEMPTS:
-                time.sleep(_WSL_RETRY_DELAY_S)
+                _wsl_retry_sleep()
     raise RuntimeError(f"reading {wsl_source_path} via SFTP failed after retries: {last_exc}")
 
 
@@ -530,7 +548,7 @@ def _run_wsl_subprocess(cmd, cwd_wsl):
         if not _looks_like_wsl_launch_failure(r.returncode, r.stdout, r.stderr):
             return r
         if attempt < _WSL_RETRY_ATTEMPTS:
-            time.sleep(_WSL_RETRY_DELAY_S)
+            _wsl_retry_sleep()
     return r
 
 
@@ -571,7 +589,7 @@ def _run_wsl_ssh(cmd, cwd_wsl):
             last_exc = e
             _discard_dead_ssh_client()
             if attempt < _WSL_RETRY_ATTEMPTS:
-                time.sleep(_WSL_RETRY_DELAY_S)
+                _wsl_retry_sleep()
     raise RuntimeError(f"SSH connection to WSL failed after {_WSL_RETRY_ATTEMPTS + 1} attempts: {last_exc}")
 
 
@@ -746,7 +764,7 @@ def _run_wsl_streaming_subprocess(cmd, cwd_wsl, on_line=None, should_stop=None, 
         if attempt < _WSL_RETRY_ATTEMPTS:
             if on_line:
                 on_line(f"[wsl launch produced no output - retrying ({attempt + 1}/{_WSL_RETRY_ATTEMPTS})...]")
-            time.sleep(_WSL_RETRY_DELAY_S)
+            _wsl_retry_sleep()
 
     return subprocess.CompletedProcess(proc.args, proc.returncode, "\n".join(lines), "")
 
@@ -794,7 +812,7 @@ def _run_wsl_streaming_ssh(cmd, cwd_wsl, on_line=None, should_stop=None, kill_pa
             if attempt < _WSL_RETRY_ATTEMPTS:
                 if on_line:
                     on_line(f"[SSH connection to WSL failed - retrying ({attempt + 1}/{_WSL_RETRY_ATTEMPTS})...]")
-                time.sleep(_WSL_RETRY_DELAY_S)
+                _wsl_retry_sleep()
                 continue
             raise RuntimeError(f"Could not start streaming command over SSH: {e}") from e
 
@@ -895,7 +913,7 @@ def _run_wsl_streaming_ssh(cmd, cwd_wsl, on_line=None, should_stop=None, kill_pa
         if attempt < _WSL_RETRY_ATTEMPTS:
             if on_line:
                 on_line(f"[connection produced no output - retrying ({attempt + 1}/{_WSL_RETRY_ATTEMPTS})...]")
-            time.sleep(_WSL_RETRY_DELAY_S)
+            _wsl_retry_sleep()
 
     return subprocess.CompletedProcess(full_cmd, returncode, "\n".join(lines), "")
 

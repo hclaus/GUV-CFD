@@ -144,8 +144,8 @@ def test_converge_flow_field_skip_potential_flow_never_runs_potentialfoam(monkey
 
     def fake_run_wsl_or_raise(cmd, cwd_wsl, step_name):
         commands.append(cmd)
-        if "ls -d" in cmd:
-            return SimpleNamespace(stdout="500", returncode=0)
+        if "[ -d" in cmd:
+            return SimpleNamespace(stdout="yes", returncode=0)
         if "ls " in cmd and "grep" in cmd:
             return SimpleNamespace(stdout="U p k omega nut phi", returncode=0)
         return SimpleNamespace(stdout="", returncode=0)
@@ -173,6 +173,104 @@ def test_converge_flow_field_skip_potential_flow_never_runs_potentialfoam(monkey
         pass
 
     assert not any("potentialFoam" in c for c in commands)
+
+
+def test_converge_flow_field_clears_stale_time_dirs_on_cold_start(monkeypatch, tmp_path):
+    # Regression test for a real incident: re-running flow convergence
+    # (cold start, not resume) on a case_dir that had already been through
+    # a full Phase 1/Phase 2 left a stale, numerically-LARGER time
+    # directory (steady_state_pipeline's own chunk loop deliberately keeps
+    # its intermediate directories, unlike this loop's own end-of-chunk
+    # cleanup) sitting there from that earlier, unrelated run. A cold start
+    # must proactively clear it before the chunk loop's first check, not
+    # just rely on the check itself being exact (belt and suspenders).
+    commands = []
+
+    def fake_run_wsl(cmd, cwd_wsl):
+        commands.append(cmd)
+        return SimpleNamespace(stdout="500" if "endTime" in cmd else "", stderr="", returncode=0)
+
+    def fake_run_wsl_or_raise(cmd, cwd_wsl, step_name):
+        commands.append(cmd)
+        if "[ -d" in cmd:
+            return SimpleNamespace(stdout="yes", returncode=0)
+        if "ls " in cmd and "grep" in cmd:
+            return SimpleNamespace(stdout="U p k omega nut phi", returncode=0)
+        return SimpleNamespace(stdout="", returncode=0)
+
+    monkeypatch.setattr(run_pipeline, "_run_wsl", fake_run_wsl)
+    monkeypatch.setattr(run_pipeline, "_run_wsl_or_raise", fake_run_wsl_or_raise)
+    monkeypatch.setattr(run_pipeline, "_run_wsl_streaming",
+                         lambda *a, **k: SimpleNamespace(stdout="", returncode=0))
+    monkeypatch.setattr(run_pipeline, "read_vol_average_dat", lambda path: ([0], [0.0]))
+    monkeypatch.setattr(run_pipeline, "set_function_object_enabled", lambda *a, **k: None)
+    monkeypatch.setattr(run_pipeline, "ensure_simple_fvsolution", lambda *a, **k: None)
+    monkeypatch.setattr(run_pipeline, "write_fvoptions_file", lambda *a, **k: None)
+    monkeypatch.setattr(run_pipeline, "set_control_dict_time", lambda *a, **k: None)
+    monkeypatch.setattr(run_pipeline, "write_vol_average_dict", lambda *a, **k: None)
+
+    try:
+        converge_flow_field(str(tmp_path), n_iterations=500, max_iterations=500,
+                             skip_potential_flow=True, log_fn=lambda *a: None)
+    except FlowConvergenceUndecided:
+        pass  # irrelevant here - only the cleanup/check commands matter
+
+    # With max_iterations == n_iterations, exactly one chunk runs, so this
+    # cleanup command (also issued once per chunk at its own end, an
+    # existing, unrelated behavior) should appear TWICE here: once as this
+    # cold start's own proactive clear before the loop even starts, once as
+    # that one chunk's own end-of-loop cleanup - see the sibling resume
+    # test, where only the latter fires.
+    cleanup_cmds = [c for c in commands if "0/" in c and "rm -rf" in c and "for d in" in c]
+    assert len(cleanup_cmds) == 2, (
+        f"expected a cold-start clear plus the one chunk's own end-of-loop clear, got {cleanup_cmds!r}")
+    # Never trusts "whichever directory is numerically largest" - the exact
+    # bug that let a stale "5000/" masquerade as this chunk's own output.
+    assert not any("sort -n" in c for c in commands)
+
+
+def test_converge_flow_field_resume_does_not_clear_time_dirs(monkeypatch, tmp_path):
+    # A resume's whole point is to keep prior chunks' own time directories
+    # (that's what makes the resume meaningful) - must never issue the
+    # cold-start cleanup.
+    commands = []
+
+    def fake_run_wsl(cmd, cwd_wsl):
+        commands.append(cmd)
+        return SimpleNamespace(stdout="500" if "endTime" in cmd else "", stderr="", returncode=0)
+
+    def fake_run_wsl_or_raise(cmd, cwd_wsl, step_name):
+        commands.append(cmd)
+        if "[ -d" in cmd:
+            return SimpleNamespace(stdout="yes", returncode=0)
+        if "ls " in cmd and "grep" in cmd:
+            return SimpleNamespace(stdout="U p k omega nut phi", returncode=0)
+        return SimpleNamespace(stdout="", returncode=0)
+
+    monkeypatch.setattr(run_pipeline, "_run_wsl", fake_run_wsl)
+    monkeypatch.setattr(run_pipeline, "_run_wsl_or_raise", fake_run_wsl_or_raise)
+    monkeypatch.setattr(run_pipeline, "_run_wsl_streaming",
+                         lambda *a, **k: SimpleNamespace(stdout="", returncode=0))
+    monkeypatch.setattr(run_pipeline, "read_vol_average_dat", lambda path: ([0], [0.0]))
+    monkeypatch.setattr(run_pipeline, "set_function_object_enabled", lambda *a, **k: None)
+    monkeypatch.setattr(run_pipeline, "ensure_simple_fvsolution", lambda *a, **k: None)
+    monkeypatch.setattr(run_pipeline, "write_fvoptions_file", lambda *a, **k: None)
+    monkeypatch.setattr(run_pipeline, "set_control_dict_time", lambda *a, **k: None)
+    monkeypatch.setattr(run_pipeline, "write_vol_average_dict", lambda *a, **k: None)
+    monkeypatch.setattr(run_pipeline, "_load_history", lambda case_dir: [])
+
+    try:
+        converge_flow_field(str(tmp_path), n_iterations=500, max_iterations=500,
+                             resume=True, log_fn=lambda *a: None)
+    except FlowConvergenceUndecided:
+        pass
+
+    # Only the one chunk's own end-of-loop cleanup fires (existing,
+    # unrelated behavior) - no EXTRA cold-start clear on top of it, unlike
+    # the sibling non-resume test above.
+    cleanup_cmds = [c for c in commands if "0/" in c and "rm -rf" in c and "for d in" in c]
+    assert len(cleanup_cmds) == 1, (
+        f"resume must not add a cold-start clear on top of the one chunk's own cleanup, got {cleanup_cmds!r}")
 
 
 def _fake_wsl_result(stdout):
@@ -497,13 +595,13 @@ def test_converge_flow_field_raises_flow_convergence_undecided_not_runtime_error
         return SimpleNamespace(stdout="", stderr="", returncode=0)
 
     def fake_run_wsl_or_raise(cmd, cwd_wsl, step_name):
-        if "ls -d" in cmd:
+        if "[ -d" in cmd:
             call_count["n"] += 1
             # Every chunk restarts from "0/" and targets endTime=n_iterations
             # again (by design - see converge_flow_field's own comment on
             # this), so the time directory reached is always n_iterations
             # (500 here), not a running cumulative total.
-            return SimpleNamespace(stdout="500", returncode=0)
+            return SimpleNamespace(stdout="yes", returncode=0)
         if "ls " in cmd and "grep" in cmd:
             return SimpleNamespace(stdout="U p k omega nut phi", returncode=0)
         return SimpleNamespace(stdout="", returncode=0)

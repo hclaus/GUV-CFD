@@ -337,6 +337,28 @@ def converge_flow_field(case_dir, n_iterations=500, fan_entry=None, log_fn=print
     solver = "pimpleFoam" if method == "lts" else "simpleFoam"
     solver_cmd = f"mpirun -np {n_procs} {solver} -parallel" if n_procs else solver
 
+    if not resume:
+        # A cold start must never trust a time directory it didn't just
+        # write itself - confirmed as a real incident: re-running flow
+        # convergence on a case_dir that had already been through a full
+        # Phase 1/Phase 2 (steady_state_pipeline's own chunk loop
+        # deliberately KEEPS its intermediate time directories, unlike this
+        # loop's own end-of-chunk cleanup below) left a stale "5000/"
+        # sitting there from that earlier, unrelated run. The very first
+        # chunk here wrote a genuine fresh "500/", but the "latest time
+        # directory" check further down used to trust whichever number was
+        # numerically largest, not whichever one this chunk actually wrote -
+        # so it found the stale "5000/" and concluded the solver had
+        # overrun. Below, that check was also hardened to look for the
+        # exact expected directory instead of the largest one, but a stale
+        # directory sharing an actual future chunk's name (this loop's own
+        # chunk_end could legitimately reach 5000 too) risks simpleFoam or
+        # the cp/rm steps interacting with leftover foreign field data, not
+        # just confusing the check - so it's cleared here too, not left for
+        # this loop's own per-chunk cleanup to eventually catch up with.
+        _run_wsl_or_raise('for d in [0-9]*/; do [ "$d" = "0/" ] || rm -rf "$d"; done',
+                           case_dir_wsl, "clearing stale time directories from an earlier run")
+
     if n_procs:
         log_fn(f"Decomposing mesh into {n_procs} subdomains for parallel solving (scotch method)...")
         write_decompose_par_dict(case_dir, n_procs)
@@ -453,28 +475,28 @@ def converge_flow_field(case_dir, n_iterations=500, fan_entry=None, log_fn=print
                 log_fn("  Reconstructing parallel result into a single serial time directory...")
                 _run_wsl_or_raise("reconstructPar -latestTime", case_dir_wsl, "reconstructPar")
 
-            r = _run_wsl_or_raise(
-                "ls -d [0-9]*/ 2>/dev/null | sed 's#/##' | sort -n | tail -1",
-                case_dir_wsl, "listing time directories",
-            )
-            latest = r.stdout.strip()
-            if not latest or latest == "0":
-                raise RuntimeError(f"{solver} did not write any new time directory (found: {latest!r})")
-            # `latest` is a RELATIVE per-chunk value, not cumulative - every
-            # chunk restarts from "0/" (holding the previous chunk's
-            # results, relabeled) and runs to endTime=n_iterations again
-            # (set just above), by design, so `latest` should always equal
-            # n_iterations exactly. (Earlier version of this code derived
-            # total_run from `latest` directly, on the wrong assumption
-            # that endTime accumulated across chunks like chunk_end does -
-            # it doesn't; that broke real progress tracking, since `latest`
-            # legitimately stays at n_iterations forever.) Checking it here
-            # instead - not equal to n_iterations means the endTime write
-            # or the solve itself didn't do what was requested, which is
-            # exactly the failure this used to silently mask.
-            if latest != str(n_iterations):
+            # Every chunk restarts from "0/" (holding the previous chunk's
+            # results, relabeled) and runs to endTime=n_iterations again (set
+            # just above), by design, so the ONLY directory this chunk could
+            # legitimately have written is one named exactly n_iterations -
+            # checked directly by existence, not by "whichever numbered
+            # directory is largest" (that used to falsely flag a genuine,
+            # freshly-written chunk as having overrun when a stale, larger-
+            # numbered directory from an earlier, unrelated run of this same
+            # case_dir was still sitting around - see the cold-start cleanup
+            # above, which closes the common case, but this check stays
+            # exact regardless). (Earlier version of this code derived
+            # total_run from the largest directory directly, on the wrong
+            # assumption that endTime accumulated across chunks like
+            # chunk_end does - it doesn't; that broke real progress
+            # tracking, since the chunk's own directory legitimately stays
+            # at n_iterations forever.)
+            latest = str(n_iterations)
+            r = _run_wsl_or_raise(f'[ -d "{latest}" ] && echo yes || echo no',
+                                   case_dir_wsl, "checking for this chunk's expected time directory")
+            if r.stdout.strip() != "yes":
                 raise RuntimeError(
-                    f"{solver} chunk expected to reach time {n_iterations} but reached {latest!r} instead - "
+                    f"{solver} did not write the expected time directory {latest}/ - "
                     f"endTime write may not have taken effect, or the solver stopped early.")
             total_run = chunk_end
 
