@@ -467,7 +467,8 @@ def _run_phase(case_dir, case_dir_wsl, n_iterations, write_interval, window_frac
                 live_patches=(), check_interval=None, t_inf_rel_tol=None, t_inf_streak=3,
                 keep_all_timesteps=False, iteration_offset=0, mass_balance_patches=(),
                 injection_rate_G=None, mass_balance_tol=None, status_fn=None, status_key=None,
-                should_pause=None, delta_t=1):
+                should_pause=None, delta_t=1, resume_total_run=0, resume_accumulated=None,
+                resume_tinf_history=None, pending_case_dir=None):
     """Run simpleFoam for n_iterations, tracking the room-wide (and any
     monitoring-point) volAverage(T) live, every iteration.
 
@@ -556,6 +557,17 @@ def _run_phase(case_dir, case_dir_wsl, n_iterations, write_interval, window_frac
     keep_all_timesteps=True; combining them raises, since the cumulative-
     iteration renaming in _rename_chunk_time_dirs assumes directory names
     and iteration offsets share the same units.
+
+    resume_total_run/resume_accumulated/resume_tinf_history: seed this
+    call's own loop state from a previous, interrupted call instead of
+    starting cold (0/empty/empty) - see _write_phase2_pending's own
+    docstring for why Phase 2 specifically needs this (no pause-and-ask
+    checkpoint of its own, unlike Phase 1 - stopped at any chunk boundary
+    needs to be resumable). pending_case_dir: if given, persist
+    (total_run, accumulated, tinf_history) via _write_phase2_pending
+    after every chunk, and clear that pending marker once this call
+    finishes normally - Phase 1's own call sites leave this None (Phase 1
+    keeps its separate, existing checkpoint/pending mechanism untouched).
     """
     if delta_t != 1 and keep_all_timesteps:
         raise ValueError("_run_phase: keep_all_timesteps is not supported together with delta_t != 1 "
@@ -588,14 +600,17 @@ def _run_phase(case_dir, case_dir_wsl, n_iterations, write_interval, window_frac
         _, n_open, n_close = splice_into_functions_block(case_dir, mb_block)
         assert n_open == n_close, f"Brace mismatch after live-mass-balance splice: {n_open} vs {n_close}"
 
-    accumulated = {"room": ([], [])}
-    for zone in live_monitoring_zones:
-        accumulated[zone] = ([], [])
+    if resume_accumulated is not None:
+        accumulated = resume_accumulated
+    else:
+        accumulated = {"room": ([], [])}
+        for zone in live_monitoring_zones:
+            accumulated[zone] = ([], [])
     mb_flow = {p: [] for p in mass_balance_patches}
     mb_weighted_t = {p: [] for p in mass_balance_patches}
-    tinf_history = []
+    tinf_history = list(resume_tinf_history) if resume_tinf_history is not None else []
     stopped_via_tinf = False
-    total_run = 0
+    total_run = resume_total_run
     final_dir_name = None
 
     while total_run < n_iterations:
@@ -731,6 +746,9 @@ def _run_phase(case_dir, case_dir_wsl, n_iterations, write_interval, window_frac
                            f"stopping early at {total_run}/{n_iterations} iterations.")
                     stop_early = True
 
+        if pending_case_dir is not None:
+            _write_phase2_pending(pending_case_dir, total_run, accumulated, tinf_history)
+
         if stop_early or total_run >= n_iterations:
             # Final chunk - leave its own directory in place (renamed to
             # its true CUMULATIVE iteration count; each chunk's own
@@ -771,6 +789,8 @@ def _run_phase(case_dir, case_dir_wsl, n_iterations, write_interval, window_frac
                                       "renaming final chunk's time directory")
                 final_dir_name = str(total_run)
             run_wsl_or_raise("rm -rf postProcessing", case_dir_wsl, "clearing this chunk's postProcessing")
+            if pending_case_dir is not None:
+                _clear_phase2_pending(pending_case_dir)
             break
 
         # `latest` is an OpenFOAM TIME value (chunk-local - see delta_t's
@@ -820,7 +840,8 @@ def _run_phase(case_dir, case_dir_wsl, n_iterations, write_interval, window_frac
             stopped_via_tinf, tinf_history, mass_balance_flux)
 
 
-def _room_phase_summary(live_room, window_frac, converged, iterations, sparse_t, sparse_T, log_fn):
+def _room_phase_summary(live_room, window_frac, converged, iterations, sparse_t, sparse_T, log_fn,
+                         t_inf_rel_tol=None):
     """Room-wide phase1/phase2 entry: T_ss is the trailing-window mean of
     the live per-iteration series (not the single last sample) - see
     windowed_stats. T_ss_std/T_ss_cv are the DETRENDED version
@@ -837,6 +858,26 @@ def _room_phase_summary(live_room, window_frac, converged, iterations, sparse_t,
     available - not an error, just "couldn't extrapolate this one."
     `decay_curve`/`live` (sparse postProcess read / dense per-iteration
     read) are both kept as-is for result_figures.py.
+
+    t_inf_rel_tol: reject (treat as no fit) an extrapolation whose own
+    fit_cv exceeds this, exactly like _run_phase's live accept/reject
+    decision - confirmed as a real gap this closes: this function's own
+    fit_asymptotic_value call was never gated at all, so a run whose LIVE
+    decision correctly rejected a poorly-constrained fit could still have
+    that same bad fit reported here as if it were trustworthy (a real
+    incident: a Phase 2 fit with fit_cv=7.45%, 3.7x the 2% tolerance, was
+    reported with no indication it wouldn't have been trusted for the
+    accept/reject decision itself). None (rare - only single-run callers
+    that never resolved a real t_inf_rel_tol) skips this gate.
+
+    log_fn is also where a genuinely NOT-converged result gets flagged -
+    loudly, as "WARNING:", not just narration text easy to miss in a
+    scrolling log - a real, confirmed incident: `converged` was already
+    computed and returned (see _run_phase), but the only place it was ever
+    surfaced was a passive text label deep in the docx report - the
+    headline reduction_pct/eACH_uv numbers this phase feeds were reported
+    with full confidence and no visible caveat even when built on a
+    curve that never actually plateaued.
     """
     live_t, live_T = live_room
     mean, _, _, n, span = windowed_stats(live_t, live_T, frac=window_frac)
@@ -844,9 +885,19 @@ def _room_phase_summary(live_room, window_frac, converged, iterations, sparse_t,
     cv_text = f"{cv * 100:.1f}%" if cv is not None else "n/a"
     log_fn(f"  Moving average (last {span:.4g} iterations, n={n}): {mean:.4g} (residual CV={cv_text})")
     extrap = fit_asymptotic_value(live_t, live_T)
-    if extrap is not None:
+    if extrap is not None and t_inf_rel_tol is not None and extrap["fit_cv"] is not None \
+            and extrap["fit_cv"] > t_inf_rel_tol:
+        log_fn(f"  Extrapolated T-infinity fit rejected (fit CV={extrap['fit_cv'] * 100:.2f}% exceeds "
+               f"{t_inf_rel_tol:.0%} tolerance) - not well-constrained enough to report or trust.")
+        extrap = None
+    elif extrap is not None:
         log_fn(f"  Extrapolated T-infinity (exponential-approach fit): {extrap['Tinf']:.4g} "
                f"(tau={extrap['tau']:.4g} iterations, fit CV={extrap['fit_cv'] * 100:.2f}%)")
+    if not converged:
+        log_fn(f"  WARNING: this phase's T curve did NOT plateau (trailing-{window_frac:.0%} CV={cv_text}) - "
+               f"T_ss={mean:.4g} is a windowed average of still-moving/oscillating data, not a genuine "
+               f"steady-state value. Every downstream number derived from it (reduction_pct, eACH_uv, ...) "
+               f"inherits that uncertainty.")
     return {
         "T_ss": mean, "T_ss_std": std, "T_ss_cv": cv, "T_ss_window_span": span,
         "T_ss_window_n": n, "T_ss_window_frac": window_frac,
@@ -858,7 +909,7 @@ def _room_phase_summary(live_room, window_frac, converged, iterations, sparse_t,
     }
 
 
-def _point_phase_summary(live_point, window_frac):
+def _point_phase_summary(live_point, window_frac, t_inf_rel_tol=None):
     """Same windowed treatment as _room_phase_summary, for one monitoring
     point's phase1/phase2 entry - including the same T-infinity
     extrapolation (fit_asymptotic_value), added for the same reason it was
@@ -871,11 +922,19 @@ def _point_phase_summary(live_point, window_frac):
     t_seconds/volAverage_T key names report.py/monitoring_points.
     mixing_uniformity_note already expect (misnomer for steady-state's
     pseudo-iteration t, kept for continuity).
+
+    t_inf_rel_tol: see _room_phase_summary's own docstring - same
+    fit_cv rejection gate, applied here too (no separate log line - a
+    monitoring point's own fit quality isn't narrated today, matching its
+    existing quieter treatment elsewhere in this function).
     """
     t, T = live_point
     mean, _, _, n, span = windowed_stats(t, T, frac=window_frac)
     _, std, cv, _, _ = windowed_stats_detrended(t, T, frac=window_frac)
     extrap = fit_asymptotic_value(t, T)
+    if extrap is not None and t_inf_rel_tol is not None and extrap["fit_cv"] is not None \
+            and extrap["fit_cv"] > t_inf_rel_tol:
+        extrap = None
     return {
         "T_ss": mean, "T_ss_std": std, "T_ss_cv": cv, "T_ss_window_span": span,
         "T_ss_window_n": n, "T_ss_window_frac": window_frac,
@@ -954,6 +1013,53 @@ def _read_phase1_pending(case_dir):
 
 def _clear_phase1_pending(case_dir):
     Path(_phase1_pending_path(case_dir)).unlink(missing_ok=True)
+
+
+def _phase2_pending_path(case_dir):
+    return f"{case_dir}/phase2_pending.json"
+
+
+def _write_phase2_pending(case_dir, total_run, accumulated, tinf_history):
+    """Persisted after every Phase 2 chunk (see _run_phase's own
+    pending_case_dir parameter) - unlike Phase 1, which only ever pauses
+    at an explicit Phase1ExtrapolationUndecided decision point, Phase 2
+    has no such gate (T-infinity is an early-stop nicety only there) and
+    can be stopped by the user at literally any chunk boundary - so this
+    has to be written every chunk, not just once at a specific pause
+    point, to make ANY stop resumable.
+
+    Mass balance isn't tracked here (mb_flow/mb_weighted_t) - confirmed
+    Phase 2's own _run_phase call never passes mass_balance_patches/
+    injection_rate_G at all (windowed_mass_balance's injection=removal
+    identity is Phase-1-only: Phase 2 also removes T via the UV sink
+    cellZones, see run_steady_state_scenario's own comment on this), so
+    there's nothing there to resume.
+
+    accumulated: the same {zone_name: (t_list, T_list)} dict _run_phase
+    builds internally (room + each live monitoring zone) - persisted
+    whole, not just its final point, so a resumed run's own windowed
+    CV/T-infinity extrapolation still sees the FULL history, not just
+    whatever ran after the resume (a resume that only fixed iteration
+    COUNTING but silently truncated the trailing-window statistics back
+    to zero would still be a real, if smaller, correctness gap).
+    """
+    data = {
+        "total_run": total_run,
+        "accumulated": {zone: list(series) for zone, series in accumulated.items()},
+        "tinf_history": tinf_history,
+    }
+    _write_case_file(case_dir, "phase2_pending.json", json.dumps(data))
+
+
+def _read_phase2_pending(case_dir):
+    try:
+        return json.loads(_read_case_file(case_dir, "phase2_pending.json"))
+    except (json.JSONDecodeError, OSError, RuntimeError):
+        return None
+
+
+def _clear_phase2_pending(case_dir):
+    Path(_phase2_pending_path(case_dir)).unlink(missing_ok=True)
 
 
 # target_T_ss only ever sets the source strength G (compute_source_strength) -
@@ -1280,13 +1386,14 @@ def run_steady_state_scenario(case_dir, room_x, room_y, room_z, ach, Z, nbins=25
                     f"Phase 1 extrapolation still undecided after {additional} more iterations "
                     f"(resumed) - {diagnostic['summary']}", diagnostic, iters1)
 
-            summary["phase1"] = _room_phase_summary(live1["room"], window_frac, converged1, iters1, t1, T1, log_fn)
+            summary["phase1"] = _room_phase_summary(live1["room"], window_frac, converged1, iters1, t1, T1, log_fn,
+                                                 t_inf_rel_tol=t_inf_rel_tol)
             summary["phase1"]["mass_balance"] = windowed_mass_balance(
                 live1["room"][0], mb_flux1["flow"], mb_flux1["weighted_t"], G, window_frac, mass_balance_tol)
             if phase1_resume_decision == "accept":
                 summary["phase1"]["accepted_by_user_before_stable_extrapolation"] = True
             phase1_monitoring = {
-                p["name"]: _point_phase_summary(live1[zone_name(p["name"])], window_frac)
+                p["name"]: _point_phase_summary(live1[zone_name(p["name"])], window_frac, t_inf_rel_tol=t_inf_rel_tol)
                 for p in (monitoring_points or [])
             }
             run_wsl_or_raise("cp 0/T phase1_T.snapshot", case_dir_wsl,
@@ -1396,11 +1503,12 @@ def run_steady_state_scenario(case_dir, room_x, room_y, room_z, ach, Z, nbins=25
                     f"Phase 1's {phase1_iterations}-iteration ceiling was reached without a "
                     f"stable extrapolation - {diagnostic['summary']}", diagnostic, iters1)
 
-            summary["phase1"] = _room_phase_summary(live1["room"], window_frac, converged1, iters1, t1, T1, log_fn)
+            summary["phase1"] = _room_phase_summary(live1["room"], window_frac, converged1, iters1, t1, T1, log_fn,
+                                                 t_inf_rel_tol=t_inf_rel_tol)
             summary["phase1"]["mass_balance"] = windowed_mass_balance(
                 live1["room"][0], mb_flux1["flow"], mb_flux1["weighted_t"], G, window_frac, mass_balance_tol)
             phase1_monitoring = {
-                p["name"]: _point_phase_summary(live1[zone_name(p["name"])], window_frac)
+                p["name"]: _point_phase_summary(live1[zone_name(p["name"])], window_frac, t_inf_rel_tol=t_inf_rel_tol)
                 for p in (monitoring_points or [])
             }
             # Phase 2 is about to overwrite 0/T with its own (source + UV)
@@ -1446,6 +1554,16 @@ def run_steady_state_scenario(case_dir, room_x, room_y, room_z, ach, Z, nbins=25
     # balance's injection=removal identity doesn't hold once UV sinks are
     # also removing T, see windowed_mass_balance's Phase-1-only caveat).
     status_key2 = f"Z={Z}/ACH={ach}/Phase2"
+    # Resume from a previous, stopped-mid-Phase-2 attempt if there's one
+    # on disk - see _write_phase2_pending's own docstring for why Phase 2
+    # (unlike Phase 1) needs a per-chunk marker rather than a single
+    # decision-point checkpoint. pending_case_dir is passed unconditionally
+    # below (fresh start or resume alike) so THIS attempt's own progress is
+    # always resumable too, not just the one that happened to be resumed.
+    phase2_pending = _read_phase2_pending(case_dir)
+    if phase2_pending is not None:
+        log_fn(f"  Found a Phase 2 attempt at {phase2_pending['total_run']}/{phase2_iterations} "
+               f"iterations from an earlier attempt - resuming instead of starting over.")
     try:
         latest2, iters2, t2, T2, converged2, live2, _, _, _ = _run_phase(
             case_dir, case_dir_wsl, phase2_iterations, phase2_write_interval,
@@ -1456,16 +1574,21 @@ def run_steady_state_scenario(case_dir, room_x, room_y, room_z, ach, Z, nbins=25
             keep_all_timesteps=keep_all_timesteps, iteration_offset=iters1,
             status_fn=status_fn, status_key=status_key2, should_pause=should_pause,
             delta_t=phase2_delta_t,
+            resume_total_run=phase2_pending["total_run"] if phase2_pending else 0,
+            resume_accumulated=phase2_pending["accumulated"] if phase2_pending else None,
+            resume_tinf_history=phase2_pending["tinf_history"] if phase2_pending else None,
+            pending_case_dir=case_dir,
         )
     finally:
         if status_fn is not None:
             status_fn(status_key2, None)
-    summary["phase2"] = _room_phase_summary(live2["room"], window_frac, converged2, iters2, t2, T2, log_fn)
+    summary["phase2"] = _room_phase_summary(live2["room"], window_frac, converged2, iters2, t2, T2, log_fn,
+                                       t_inf_rel_tol=t_inf_rel_tol)
     if monitoring_points:
         summary["monitoring"] = {
             p["name"]: {
                 "phase1": phase1_monitoring[p["name"]],
-                "phase2": _point_phase_summary(live2[zone_name(p["name"])], window_frac),
+                "phase2": _point_phase_summary(live2[zone_name(p["name"])], window_frac, t_inf_rel_tol=t_inf_rel_tol),
             }
             for p in monitoring_points
         }

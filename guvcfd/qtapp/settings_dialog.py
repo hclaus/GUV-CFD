@@ -8,7 +8,10 @@ from PySide6.QtWidgets import (
     QSpinBox, QVBoxLayout, QWidget,
 )
 
-from ..app_settings import ADVANCED_SETTINGS_DEFAULTS, load_advanced_settings, save_advanced_settings
+from ..app_settings import (
+    ADVANCED_SETTINGS_DEFAULTS, load_advanced_settings, merge_project_openfoam_settings,
+    PROJECT_OPENFOAM_SETTINGS_KEYS, save_advanced_settings,
+)
 
 # key -> (friendly label, hover tooltip). Anything missing here falls back
 # to showing the raw key, with no tooltip - never a hard error.
@@ -108,8 +111,22 @@ _FIELD_INFO = {
 
 
 class SettingsDialog(QDialog):
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, project_tab=None):
+        """project_tab: the currently loaded ProjectSetupTab, if any - lets
+        this dialog show and edit that project's own currently-EFFECTIVE
+        PROJECT_OPENFOAM_SETTINGS_KEYS values (its own pinned overrides if
+        it has any, else the global default) instead of a value
+        disconnected from whatever project is actually open, and lets a
+        change made here actually stick to that project on its next save
+        (see _save below and ProjectSetupTab.apply_project_openfoam_overrides's
+        own docstring for the incident this closes - previously this
+        dialog had no connection to a loaded project at all, so even a
+        deliberate, in-session change here could never survive a save).
+        None (e.g. no project loaded yet) falls back to editing only the
+        global defaults, exactly like before.
+        """
         super().__init__(parent)
+        self.project_tab = project_tab
         self.setWindowTitle("Advanced Settings")
         self.resize(560, 640)
         self.fields = {}
@@ -122,7 +139,10 @@ class SettingsDialog(QDialog):
         form = QFormLayout(inner)
         layout.addWidget(scroll, 1)
 
-        current = load_advanced_settings()
+        adv = load_advanced_settings()
+        current = dict(adv)
+        if project_tab is not None:
+            current.update(merge_project_openfoam_settings(project_tab.gather_settings(), adv))
         for key, default in ADVANCED_SETTINGS_DEFAULTS.items():
             value = current.get(key, default)
             label_text, tooltip = _FIELD_INFO.get(key, (key, None))
@@ -178,4 +198,10 @@ class SettingsDialog(QDialog):
                 "Turn one off before saving.")
             return
         save_advanced_settings(values)
+        if self.project_tab is not None:
+            # Makes this change stick to the LOADED project too, not just
+            # the global default it also always updates above - see this
+            # class's own __init__ docstring for the incident this closes.
+            self.project_tab.apply_project_openfoam_overrides(
+                {key: value for key, value in values.items() if key in PROJECT_OPENFOAM_SETTINGS_KEYS})
         self.accept()

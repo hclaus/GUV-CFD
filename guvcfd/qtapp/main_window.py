@@ -92,7 +92,7 @@ class MainWindow(QMainWindow):
             self.recent_menu.addAction(action)
 
     def _open_settings(self):
-        dlg = SettingsDialog(self)
+        dlg = SettingsDialog(self, project_tab=self.project_setup_tab)
         dlg.exec()
 
     def _show_help(self, title, markdown_text):

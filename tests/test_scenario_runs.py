@@ -2013,6 +2013,39 @@ def test_write_sweep_summary_csv_includes_phase1_spatial_cov_and_phase2_t_ss_cv(
     assert float(rows[0]["phase2_T_ss_cv_pct"]) == pytest.approx(1.2)
 
 
+def test_write_sweep_summary_csv_includes_convergence_flags(tmp_path):
+    # 2026-08-17: phase1_converged/phase2_converged - a real incident
+    # confirmed check_plateau_windowed's own "converged" result was
+    # computed but never surfaced anywhere a user would see it across a
+    # whole sweep (only a passive docx text label for a single run) - a
+    # run whose curve never actually plateaued produced a clean-looking
+    # reduction_pct with no visible caveat. Must be a real False (not
+    # blank/None) when a phase genuinely ran and didn't converge, so a
+    # sweep can be scanned for this directly.
+    import csv as csv_module
+    project_dir = str(tmp_path)
+    project_name = "myproj"
+    from guvcfd.project_status import update_combo_status
+    update_combo_status(project_dir, project_name, z=6.0, ach=3.0, status="done")
+    report = {
+        "reduction_pct_corrected": 80.0, "eACH_uv_steady_state_corrected": 10.0,
+        "phase1": {"converged": False}, "phase2": {"converged": True},
+    }
+    with open(f"{project_dir}/{project_name}_Z6_ACH3_report.json", "w") as f:
+        json.dump(report, f)
+
+    csv_path = sr.write_sweep_summary_csv(project_dir, project_name)
+    with open(csv_path, newline="") as f:
+        rows = list(csv_module.DictReader(f))
+
+    assert len(rows) == 1
+    # csv.DictWriter renders Python False/True as the literal strings
+    # "False"/"True", not blank - confirms the flag is a real value, not
+    # an accidentally-omitted column.
+    assert rows[0]["phase1_converged"] == "False"
+    assert rows[0]["phase2_converged"] == "True"
+
+
 def test_write_sweep_summary_csv_blank_convergence_quality_for_decay_rows(tmp_path):
     # Decay-mode reports have no phase1/phase2 structure at all - these
     # columns must come back blank, not raise or default to 0.

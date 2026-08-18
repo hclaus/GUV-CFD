@@ -5,9 +5,9 @@ import pytest
 
 import guvcfd.steady_state_pipeline as ssp
 from guvcfd.steady_state_pipeline import (
-    _chunk_write_interval, _clear_phase1_checkpoint, _list_time_dirs, _point_phase_summary,
-    _read_phase1_checkpoint, _rename_chunk_time_dirs, _room_phase_summary, _run_phase,
-    _write_phase1_checkpoint,
+    _chunk_write_interval, _clear_phase1_checkpoint, _clear_phase2_pending, _list_time_dirs,
+    _point_phase_summary, _read_phase1_checkpoint, _read_phase2_pending, _rename_chunk_time_dirs,
+    _room_phase_summary, _run_phase, _write_phase1_checkpoint, _write_phase2_pending,
     compute_corrected_eACH_uv, compute_corrected_eACH_uv_from_control,
     compute_scaled_delta_t, resolve_phase_delta_ts,
     run_steady_state_scenario,
@@ -491,6 +491,77 @@ def test_point_phase_summary_extrapolation_none_when_fit_unavailable():
     assert point["T_inf_extrapolation_detail"] is None
 
 
+def _oscillating_room_series(n=3000, period=400, amplitude=0.15, mean=0.6):
+    # A persistent, non-decaying oscillation (no damping term at all) -
+    # matches the real incident this test guards: a genuinely unconverged
+    # curve whose exponential-approach fit can still look well-constrained
+    # over a short trailing window, and whose reported T_ss is a windowed
+    # mean of data that never actually plateaued.
+    t = np.arange(n, dtype=float)
+    T = mean + amplitude * np.sin(2 * np.pi * t / period)
+    return t, T
+
+
+def test_room_phase_summary_rejects_poorly_constrained_extrapolation():
+    # Regression test for a real, confirmed incident: _room_phase_summary's
+    # own fit_asymptotic_value call was never gated by fit_cv, unlike
+    # _run_phase's live accept/reject decision - a real Phase 2 fit with
+    # fit_cv=7.45% (3.7x a 2% tolerance) was reported as if trustworthy,
+    # with nothing in results.json indicating it wouldn't have passed the
+    # same bar the live decision uses.
+    t, T = _oscillating_room_series()
+    phase = _room_phase_summary((t, T), window_frac=0.15, converged=False,
+                                 iterations=len(t), sparse_t=t[::10], sparse_T=T[::10],
+                                 log_fn=_log, t_inf_rel_tol=0.02)
+    # Whatever fit_asymptotic_value produced on this oscillating data, a
+    # fit_cv this bad must be rejected, not silently reported.
+    assert phase["T_inf_extrapolated"] is None
+    assert phase["T_inf_extrapolation_detail"] is None
+
+
+def test_room_phase_summary_no_gate_when_t_inf_rel_tol_not_given():
+    # Callers that never resolved a real t_inf_rel_tol (t_inf_rel_tol=None,
+    # the default) must see the old, ungated behavior - this parameter is
+    # additive, not a behavior change for existing callers that don't pass it.
+    true_Tinf, true_A, true_tau = 2.0, 0.5, 200.0
+    t = np.arange(0, 900, 1.0)
+    T = true_Tinf - true_A * np.exp(-t / true_tau)
+    phase = _room_phase_summary((t, T), window_frac=0.15, converged=True,
+                                 iterations=len(t), sparse_t=t[::10], sparse_T=T[::10], log_fn=_log)
+    assert phase["T_inf_extrapolated"] is not None
+
+
+def test_room_phase_summary_warns_loudly_when_not_converged():
+    # Regression test for a real, confirmed incident: `converged` was
+    # already computed and returned, but the only place it was ever
+    # surfaced was a passive text label buried in the docx report - a run
+    # whose curve never plateaued produced a clean, confident-looking
+    # reduction_pct with no visible caveat anywhere in the live log.
+    t, T = _oscillating_room_series()
+    logged = []
+    _room_phase_summary((t, T), window_frac=0.15, converged=False,
+                         iterations=len(t), sparse_t=t[::10], sparse_T=T[::10],
+                         log_fn=logged.append, t_inf_rel_tol=0.02)
+    assert any(line.startswith("  WARNING:") and "did NOT plateau" in line for line in logged)
+
+
+def test_room_phase_summary_no_warning_when_converged():
+    t = np.arange(100, dtype=float)
+    T = np.full(100, 0.31)
+    logged = []
+    _room_phase_summary((t, T), window_frac=0.15, converged=True,
+                         iterations=100, sparse_t=t[::10], sparse_T=T[::10], log_fn=logged.append)
+    assert not any("WARNING" in line for line in logged)
+
+
+def test_point_phase_summary_rejects_poorly_constrained_extrapolation():
+    # Same gate as the room-level test above, for a monitoring point.
+    t, T = _oscillating_room_series()
+    point = _point_phase_summary((t, T), window_frac=0.15, t_inf_rel_tol=0.02)
+    assert point["T_inf_extrapolated"] is None
+    assert point["T_inf_extrapolation_detail"] is None
+
+
 # --- Phase 1 checkpoint: resuming without redoing the more expensive phase ---
 
 def test_phase1_checkpoint_round_trips(tmp_path):
@@ -516,6 +587,97 @@ def test_phase1_checkpoint_cleared_removes_it(tmp_path):
     assert _read_phase1_checkpoint(str(tmp_path)) is not None
     _clear_phase1_checkpoint(str(tmp_path))
     assert _read_phase1_checkpoint(str(tmp_path)) is None
+
+
+# --- Phase 2 pending: resuming a stop at any chunk boundary (2026-08-18) ---
+# Unlike Phase 1, Phase 2 has no single pause-and-ask decision point -
+# T-infinity is an early-stop nicety only there, so a plain user Stop can
+# land at any chunk boundary, and every one of them needs to be resumable.
+
+def test_phase2_pending_round_trips(tmp_path):
+    assert _read_phase2_pending(str(tmp_path)) is None  # nothing yet
+
+    accumulated = {"room": ([0.0, 1.0, 2.0], [0.1, 0.15, 0.18])}
+    _write_phase2_pending(str(tmp_path), total_run=2, accumulated=accumulated, tinf_history=[None, 0.5])
+
+    pending = _read_phase2_pending(str(tmp_path))
+    assert pending["total_run"] == 2
+    assert pending["accumulated"] == {"room": [[0.0, 1.0, 2.0], [0.1, 0.15, 0.18]]}
+    assert pending["tinf_history"] == [None, 0.5]
+
+
+def test_phase2_pending_cleared_removes_it(tmp_path):
+    _write_phase2_pending(str(tmp_path), total_run=5, accumulated={"room": ([], [])}, tinf_history=[])
+    assert _read_phase2_pending(str(tmp_path)) is not None
+    _clear_phase2_pending(str(tmp_path))
+    assert _read_phase2_pending(str(tmp_path)) is None
+
+
+def _fake_wsl_ok(*a, **k):
+    from types import SimpleNamespace
+    return SimpleNamespace(stdout="", stderr="", returncode=0)
+
+
+def test_run_phase_resumes_seeded_state_and_persists_then_clears_pending(tmp_path, monkeypatch):
+    # End-to-end (real chunk loop, WSL/solver calls mocked) regression test
+    # for the actual resume mechanism added today: seed a chunk that
+    # ALREADY has 10 prior iterations' worth of accumulated history (as if
+    # read back from a previous, stopped attempt's own phase2_pending.json),
+    # run exactly one more 5-iteration chunk to completion, and confirm
+    # both the cumulative iteration count AND the full prior + new
+    # accumulated series survive - not just the post-resume tail.
+    case_dir = str(tmp_path)
+    (tmp_path / "system").mkdir()
+    # Already includes volAverageLive1 so the live-tracking splice step -
+    # irrelevant to what this test is checking - is a no-op.
+    (tmp_path / "system" / "controlDict").write_text("functions {\n  volAverageLive1 {}\n}\n")
+
+    monkeypatch.setattr(ssp, "set_control_dict_time", lambda *a, **k: None)
+    monkeypatch.setattr(ssp, "set_function_write_interval", lambda *a, **k: None)
+    monkeypatch.setattr(ssp, "run_wsl_or_raise", _fake_wsl_ok)
+
+    from types import SimpleNamespace
+    monkeypatch.setattr(ssp, "run_wsl_streaming", lambda *a, **k: SimpleNamespace(stdout="", returncode=0))
+
+    # dirs_before empty, dirs_after {"5"} - a fresh chunk-relative directory
+    # (every chunk restarts OpenFOAM's own Time at 0, see _run_phase's own
+    # docstring), regardless of how many iterations already ran before it.
+    list_calls = {"n": 0}
+
+    def fake_list_time_dirs(case_dir_wsl):
+        list_calls["n"] += 1
+        return set() if list_calls["n"] % 2 else {"5"}
+    monkeypatch.setattr(ssp, "_list_time_dirs", fake_list_time_dirs)
+
+    monkeypatch.setattr(ssp, "read_vol_average_dat", lambda path: (
+        np.array([1.0, 2.0, 3.0, 4.0, 5.0]), np.array([0.2, 0.22, 0.24, 0.26, 0.28])))
+
+    prior_t = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0]
+    prior_T = [0.0, 0.02, 0.04, 0.06, 0.08, 0.1, 0.12, 0.14, 0.16, 0.18]
+    # _run_phase mutates its resume_accumulated argument's own lists in
+    # place (extends them chunk by chunk) - pass copies, not the
+    # originals, so this test's own expected values below can't be
+    # silently mutated out from under it by the very call being tested.
+    prior_accumulated = {"room": (list(prior_t), list(prior_T))}
+
+    result = _run_phase(
+        case_dir, case_dir, n_iterations=15, write_interval=5, window_frac=0.15, plateau_rel_tol=0.01,
+        log_fn=_log, resume_total_run=10, resume_accumulated=prior_accumulated,
+        resume_tinf_history=["stale entry - t_inf_rel_tol is None here, never consulted"],
+        pending_case_dir=case_dir,
+    )
+    final_dir_name, total_run, sparse_t, sparse_T, converged, live_curves, stopped_via_tinf, \
+        tinf_history, mass_balance_flux = result
+
+    assert total_run == 15  # 10 resumed + 5 from this one chunk
+    live_t, live_T = live_curves["room"]
+    assert len(live_t) == 15  # the resumed prior 10 points PLUS this chunk's own 5 - not just the 5
+    assert list(live_t[:10]) == prior_t  # prior history preserved verbatim
+    assert list(live_t[10:]) == [11.0, 12.0, 13.0, 14.0, 15.0]  # new chunk's times, offset by resume_total_run
+
+    # Finished normally (total_run >= n_iterations) - the pending marker
+    # this same call wrote mid-chunk must be cleared, not left behind.
+    assert _read_phase2_pending(case_dir) is None
 
 
 def test_phase1_checkpoint_clear_is_a_noop_when_absent(tmp_path):

@@ -3,10 +3,13 @@ is just a 1-combination sweep, same as guvcfd.app), watch live progress/
 log, pause/stop it - the native equivalent of guvcfd.app's Run Simulations
 tab.
 
-Simplification vs. the web app (flagged here, not hidden): no resume UX
-for a flow-convergence-undecided / Phase-1-extrapolation-undecided pause -
-a run that hits one surfaces it as an error (log + status), not an
-interactive decision panel. Rerun, or use the web app to resume it.
+"Continue" (2026-08-18) resumes a stopped single Z/ACH run in place -
+see run_state.probe_resumable_state/launch_continue for exactly which
+stopped states it covers (flow convergence, steady-state Phase 1/Phase 2)
+and which it doesn't yet (a sweep of more than one combination - use
+"Extend / modify simulations..." instead; a decay run stopped before its
+own first completion - continue_decay only extends an already-finished
+one further).
 """
 import time
 from pathlib import Path
@@ -117,6 +120,15 @@ class RunTab(QWidget):
         self.stop_btn.setEnabled(False)
         self.stop_btn.clicked.connect(self.stop_run)
         btn_row.addWidget(self.stop_btn)
+        self.continue_btn = QPushButton("Continue")
+        self.continue_btn.setToolTip(
+            "Resume a stopped single Z/ACH run from where it left off (flow convergence, or "
+            "steady-state Phase 1/Phase 2), instead of starting over. For a sweep (more than one Z/ACH "
+            "combination), or a decay run stopped before its own first completion, use "
+            "\"Extend / modify simulations...\" instead.")
+        self.continue_btn.setStyleSheet(_BUTTON_STYLE)
+        self.continue_btn.clicked.connect(self.continue_run)
+        btn_row.addWidget(self.continue_btn)
         extend_btn = QPushButton("Extend / modify simulations...")
         extend_btn.setStyleSheet(_BUTTON_STYLE)
         extend_btn.clicked.connect(self.open_extend_dialog)
@@ -238,6 +250,7 @@ class RunTab(QWidget):
         self._last_log_text = ""
         self.run_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
+        self.continue_btn.setEnabled(False)
 
         if len(combos) == 1:
             self._active = "single"
@@ -249,6 +262,55 @@ class RunTab(QWidget):
             adv = merge_project_openfoam_settings(settings, load_advanced_settings())
             sweep_state.launch_sweep(self.sweep_state, tab.guv_path, tab.settings_path,
                                       settings["case-dir"], tab.room, settings, adv, z_values, ach_values)
+        self.timer.start()
+
+    def continue_run(self):
+        """Resume a stopped single Z/ACH run from where it left off,
+        instead of start_run's full setup+solve from scratch - see
+        run_state.launch_continue/probe_resumable_state for exactly what
+        "left off" means and which stopped states are covered.
+        """
+        tab = self.project_setup_tab
+        if tab.room is None or tab.guv_path is None:
+            QMessageBox.warning(self, "No project loaded", "Load a .guv project first (Project Setup tab).")
+            return
+        settings = tab.gather_settings()
+        if not settings.get("case-dir"):
+            QMessageBox.warning(self, "No project directory", "Set an OpenFOAM project directory first.")
+            return
+        try:
+            z_values, ach_values = self._parse_lists()
+        except ValueError as e:
+            QMessageBox.warning(self, "Can't parse Z/ACH list", str(e))
+            return
+        combos = sweep_combinations(z_values, ach_values)
+        if len(combos) != 1:
+            QMessageBox.warning(
+                self, "Can't Continue a sweep",
+                "Continue only resumes a single Z/ACH run. For more than one combination, use "
+                "\"Extend / modify simulations...\" instead.")
+            return
+        settings["z-value"], settings["ach"] = combos[0]
+
+        probe = run_state.probe_resumable_state(settings["case-dir"], settings["sim-type"])
+        if probe is None:
+            QMessageBox.warning(
+                self, "Nothing to resume",
+                f"{settings['case-dir']} has no stopped run to resume (it may already be finished, or "
+                f"never started) - use Start instead.")
+            return
+        if probe["stage"] == "phases" and not probe["resumable"]:
+            QMessageBox.warning(self, "Can't resume this run yet", probe["reason"])
+            return
+
+        self.log_view.clear()
+        self.table.setRowCount(0)
+        self._last_log_text = ""
+        self.run_btn.setEnabled(False)
+        self.stop_btn.setEnabled(True)
+        self.continue_btn.setEnabled(False)
+        self._active = "single"
+        run_state.launch_continue(self.state, tab.guv_path, settings["case-dir"], tab.room, settings)
         self.timer.start()
 
     def stop_run(self):
@@ -280,6 +342,7 @@ class RunTab(QWidget):
         self._last_log_text = ""
         self.run_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
+        self.continue_btn.setEnabled(False)
         self._active = "sweep"
         sweep_state.launch_sweep(self.sweep_state, guv_path, settings_path, project_dir, room, settings, adv,
                                   z_values, ach_values)
@@ -295,6 +358,7 @@ class RunTab(QWidget):
         self._last_log_text = ""
         self.run_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
+        self.continue_btn.setEnabled(False)
         self._active = "sweep"
         sweep_state.launch_extend(self.sweep_state, case_dirs, end_time, write_interval)
         self.timer.start()
@@ -368,6 +432,7 @@ class RunTab(QWidget):
             self.timer.stop()
             self.run_btn.setEnabled(True)
             self.stop_btn.setEnabled(False)
+            self.continue_btn.setEnabled(True)
             self.run_finished.emit()
 
     def _update_single_table(self, state):

@@ -77,6 +77,20 @@ class ProjectSetupTab(QWidget):
         # updates this. Distinct from guv_path, the raw room-design file a
         # .guvcfd project references (see save_project/load_guvcfd_project).
         self.settings_path = None
+        # Explicit, in-session overrides for PROJECT_OPENFOAM_SETTINGS_KEYS
+        # (mesh-cell-size, max-co, ...) applied via the Settings dialog
+        # while THIS project is loaded - takes priority in gather_settings()
+        # over both the on-disk settings_path re-read (below) and the
+        # global default. Without this, a deliberate Settings change had
+        # no way to survive ANY save (same file or Save As) - confirmed as
+        # a real incident: a mesh-cell-size change made via Settings while
+        # an old project was loaded silently never took effect, even after
+        # "Save As" to a brand new file name (settings_path still pointed
+        # at the OLD file at the moment gather_settings() re-read it - see
+        # that method's own comment). Cleared on a fresh project load
+        # (see load_project/load_guvcfd_project) - overrides are explicitly
+        # per-loaded-project, not carried across to a different one.
+        self._openfoam_overrides = {}
         self.fields = {}  # field id -> widget
         # Persisted across sessions (Windows registry, HKCU\Software\GUV-CFD\
         # qtapp) - last-used folder for file dialogs, and up to
@@ -136,6 +150,24 @@ class ProjectSetupTab(QWidget):
         elif isinstance(widget, QCheckBox):
             widget.toggled.connect(self.refresh_preview)
 
+    def _project_label_text(self):
+        """Builds project_label's text from current state - always shows
+        BOTH which .guvcfd project file is loaded (or that there isn't
+        one) and which .guv room/lamp design it references, since neither
+        alone answers "which file am I actually working with". Confirmed
+        as a real, costly gap: with no project-file indicator anywhere,
+        a mesh-size change made via Settings while an OLD .guvcfd was
+        still loaded, then saved under a NEW name, was impossible to
+        catch by eye - the display gave no way to notice which file was
+        actually in play.
+        """
+        if self.room is None:
+            return "No project loaded"
+        project_part = Path(self.settings_path).name if self.settings_path else "(unsaved project)"
+        return (f"{project_part} — {Path(self.guv_path).name if self.guv_path else '?'} — "
+                f"room {self.room.x:.2f}×{self.room.y:.2f}×{self.room.z:.2f} {self.room.units}, "
+                f"{len(self.room.lamps)} lamp(s)")
+
     def get_value(self, field_id):
         w = self.fields.get(field_id)
         if w is None:
@@ -178,12 +210,23 @@ class ProjectSetupTab(QWidget):
         settings["case-dir"] = self.case_dir_edit.text()
         settings["sim-type"] = "decay" if self.sim_type_combo.currentText().startswith("Decay") else "steady_state"
         # PROJECT_OPENFOAM_SETTINGS_KEYS (max-co, cell size, etc.) have no
-        # registered widget (self.fields) - without this, a value
-        # captured/hand-edited into self.settings_path on disk would never
-        # be seen here, and the next save_project() would silently
-        # overwrite it back to the global default. See app.py's
+        # registered widget (self.fields) - without the disk re-read
+        # below, a value captured/hand-edited into settings_path on disk
+        # would never be seen here, and the next save_project() would
+        # silently overwrite it back to the global default. See app.py's
         # _collect_settings (the Dash equivalent of this method) for the
         # same fix.
+        #
+        # self._openfoam_overrides (an explicit, in-session Settings-
+        # dialog change - see its own docstring) is applied AFTER the
+        # disk re-read, so it always wins - this is what makes a
+        # deliberate Settings change actually stick, on Save AND Save As,
+        # instead of the disk re-read silently clobbering it back (the
+        # confirmed bug this closes: Save As re-reads the OLD
+        # settings_path, since it's only updated to the NEW path afterward
+        # - see save_project - so without this override taking priority,
+        # a fresh Settings change never survives even a save to a brand
+        # new file name).
         if self.settings_path:
             try:
                 with open(self.settings_path) as f:
@@ -193,7 +236,20 @@ class ProjectSetupTab(QWidget):
                         settings[key] = raw[key]
             except (OSError, json.JSONDecodeError):
                 pass
+        settings.update(self._openfoam_overrides)
         return settings
+
+    def apply_project_openfoam_overrides(self, values):
+        """Record explicit PROJECT_OPENFOAM_SETTINGS_KEYS changes made via
+        the Settings dialog while this project is loaded - see
+        self._openfoam_overrides's own docstring for why this is needed
+        at all. `values` may contain other, non-project keys too (the
+        Settings dialog's own global fields) - only known
+        PROJECT_OPENFOAM_SETTINGS_KEYS are recorded here.
+        """
+        for key in PROJECT_OPENFOAM_SETTINGS_KEYS:
+            if key in values:
+                self._openfoam_overrides[key] = values[key]
 
     def _clamp_position_fields_to_room(self):
         """Caps every position field's max to the actual loaded room
@@ -550,9 +606,8 @@ class ProjectSetupTab(QWidget):
         self.room = room
         self._clamp_position_fields_to_room()
         self.settings_path = None  # a bare .guv load starts a fresh, never-saved project
-        self.project_label.setText(
-            f"{Path(path).name} — room {room.x:.2f}×{room.y:.2f}×{room.z:.2f} {room.units}, "
-            f"{len(room.lamps)} lamp(s)")
+        self._openfoam_overrides = {}  # overrides are per-loaded-project, not carried over
+        self.project_label.setText(self._project_label_text())
         if not self.case_dir_edit.text():
             default_dir = helpers.compute_default_run_dir()
             self.case_dir_edit.setText(helpers.fresh_case_dir(path, default_dir))
@@ -589,10 +644,9 @@ class ProjectSetupTab(QWidget):
                 return
             self.guv_path = guv_path
             self.room = room
-            self.project_label.setText(
-                f"{Path(guv_path).name} — room {room.x:.2f}×{room.y:.2f}×{room.z:.2f} {room.units}, "
-                f"{len(room.lamps)} lamp(s)")
         self.settings_path = path
+        self._openfoam_overrides = {}  # overrides are per-loaded-project, not carried over
+        self.project_label.setText(self._project_label_text())
         self._clamp_position_fields_to_room()
         self.apply_settings(settings)
         self._clamp_position_fields_to_room()
@@ -621,6 +675,7 @@ class ProjectSetupTab(QWidget):
         with open(path, "w") as f:
             json.dump(settings, f, indent=2)
         self.settings_path = path
+        self.project_label.setText(self._project_label_text())
         self._remember_project_path(path)
 
     def refresh_preview(self):

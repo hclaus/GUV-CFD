@@ -1148,19 +1148,21 @@ def _trim_decay_report(result):
 
 _SWEEP_SUMMARY_FIELDS = ["Z", "ACH", "Design", "Mode", "total_reduction_pct", "ach_efficiency_pct",
                          "uv_efficiency_pct", "mechanical_mixing_efficiency_pct", "est_ach_per_hr",
-                         "est_each_per_hr", "phase1_spatial_cov_pct", "phase2_T_ss_cv_pct"]
+                         "est_each_per_hr", "phase1_spatial_cov_pct", "phase2_T_ss_cv_pct",
+                         "phase1_converged", "phase2_converged"]
 
 
 def _convergence_quality_columns(detail):
-    """phase1_spatial_cov_pct/phase2_T_ss_cv_pct - convergence-quality
-    diagnostics for the sweep summary CSV (2026-08-13), steady-state only
-    (decay-mode reports have no phase1/phase2 structure, so both come
-    back None for a decay row - csv.DictWriter leaves them blank, not an
-    error).
+    """phase1_spatial_cov_pct/phase2_T_ss_cv_pct/phase1_converged/
+    phase2_converged - convergence-quality diagnostics for the sweep
+    summary CSV (2026-08-13), steady-state only (decay-mode reports have
+    no phase1/phase2 structure, so all four come back None for a decay
+    row - csv.DictWriter leaves them blank, not an error).
 
-    These are two DIFFERENT kinds of variability, not the same number
-    twice - see decay_analysis.spatial_coefficient_of_variation's own
-    docstring for the full contrast:
+    The *_cov_pct/*_cv_pct pair are two DIFFERENT kinds of variability,
+    not the same number twice - see
+    decay_analysis.spatial_coefficient_of_variation's own docstring for
+    the full contrast:
     - phase1_spatial_cov_pct: SPATIAL - how uniformly mixed Phase 1's
       final T field is across cells (a snapshot at the last iteration).
     - phase2_T_ss_cv_pct: TEMPORAL - how much the room-average T itself
@@ -1168,6 +1170,21 @@ def _convergence_quality_columns(detail):
       (steady_state_pipeline's detrended windowed_stats).
     Percentages, matching how report.py's own steady-state table already
     displays both.
+
+    phase1_converged/phase2_converged (2026-08-17): steady_state_pipeline
+    already computes this (check_plateau_windowed, on the RAW, non-
+    detrended CV - genuinely different from phase2_T_ss_cv_pct above,
+    which is detrended specifically for "how noisy is this" reporting,
+    not plateau detection) and stores it in every report - but until now
+    nothing surfaced it anywhere a user would actually see it across a
+    whole sweep, only a passive text label buried in the single-run docx
+    report. Confirmed as a real incident: a run whose Phase 1 AND Phase 2
+    both never actually plateaued (a persistent ~15-20% oscillation, no
+    sign of damping after running its full iteration budget) still
+    produced a clean, confident-looking reduction_pct with no visible
+    caveat anywhere. False (not blank/None) when a phase genuinely ran
+    and didn't converge - a sweep can now be scanned for this directly,
+    not just spot-checked case by case.
     """
     phase1 = detail.get("phase1") or {}
     phase2 = detail.get("phase2") or {}
@@ -1176,6 +1193,8 @@ def _convergence_quality_columns(detail):
     return {
         "phase1_spatial_cov_pct": spatial_cov1 * 100 if spatial_cov1 is not None else None,
         "phase2_T_ss_cv_pct": t_ss_cv2 * 100 if t_ss_cv2 is not None else None,
+        "phase1_converged": phase1.get("converged"),
+        "phase2_converged": phase2.get("converged"),
     }
 
 
