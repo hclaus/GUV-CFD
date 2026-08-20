@@ -1,3 +1,4 @@
+import contextlib
 import json
 import threading
 import time
@@ -160,7 +161,8 @@ def test_run_sweep_creates_expected_subfolders_and_reports(tmp_path, monkeypatch
     monkeypatch.setattr(sr, "compute_uv_fingerprint", lambda *a, **k: "fake-uv-fp")
 
     def fake_run_scenario(case_dir, room, settings, z, ach, adv, z_summary, log_fn, should_stop, solver_log_fn,
-                           status_fn=None, control_results_future=None, base_summary=None, should_pause=None):
+                           status_fn=None, control_results_future=None, base_summary=None, should_pause=None,
+                           solve_semaphore=None):
         return {"reduction_pct": 90.0, "eACH_uv_steady_state": 50.0, "phase1": {"T_ss": 1.0, "live": {"t": [1]}},
                 "phase2": {"T_ss": 0.1, "live": {"t": [1]}}}
     monkeypatch.setattr(sr, "_run_scenario", fake_run_scenario)
@@ -261,7 +263,8 @@ def test_run_sweep_captures_build_flow_base_return_value_as_base_summary(tmp_pat
     captured = {}
 
     def fake_run_scenario(case_dir, room, settings, z, ach, adv, z_summary, log_fn, should_stop, solver_log_fn,
-                           status_fn=None, control_results_future=None, base_summary=None, should_pause=None):
+                           status_fn=None, control_results_future=None, base_summary=None, should_pause=None,
+                           solve_semaphore=None):
         captured["base_summary"] = base_summary
         return {"reduction_pct": 90.0, "eACH_uv_steady_state": 50.0, "phase1": {"T_ss": 1.0, "live": {"t": [1]}},
                 "phase2": {"T_ss": 0.1, "live": {"t": [1]}}}
@@ -306,7 +309,8 @@ def test_run_sweep_passes_base_summary_to_run_shared_control(tmp_path, monkeypat
     captured = {}
 
     def strict_run_shared_control(base_dir, control_dir, ach, room, settings, adv, log_fn, should_stop,
-                                   solver_log_fn, base_summary, status_fn=None, should_pause=None, sealed=False):
+                                   solver_log_fn, base_summary, status_fn=None, should_pause=None, sealed=False,
+                                   solve_semaphore=None):
         captured["base_summary"] = base_summary
         return {"total_ach_effective": 3.0}
     monkeypatch.setattr(sr, "_run_shared_control", strict_run_shared_control)
@@ -350,7 +354,8 @@ def test_run_sweep_keeps_shared_dirs_when_setting_enabled(tmp_path, monkeypatch)
                          {"fluence_mean": 1.0, "eACH_uv_well_mixed_mean": 0.0})
 
     def fake_run_scenario(case_dir, room, settings, z, ach, adv, z_summary, log_fn, should_stop, solver_log_fn,
-                           status_fn=None, control_results_future=None, base_summary=None, should_pause=None):
+                           status_fn=None, control_results_future=None, base_summary=None, should_pause=None,
+                           solve_semaphore=None):
         return {"reduction_pct": 90.0, "eACH_uv_steady_state": 50.0, "phase1": {"T_ss": 1.0, "live": {"t": [1]}},
                 "phase2": {"T_ss": 0.1, "live": {"t": [1]}}}
     monkeypatch.setattr(sr, "_run_scenario", fake_run_scenario)
@@ -1079,7 +1084,8 @@ def test_run_sweep_skips_a_combo_that_already_has_results_json(tmp_path, monkeyp
     run_scenario_calls = []
 
     def fake_run_scenario(case_dir, room, settings, z, ach, adv, z_summary, log_fn, should_stop, solver_log_fn,
-                           status_fn=None, control_results_future=None, base_summary=None, should_pause=None):
+                           status_fn=None, control_results_future=None, base_summary=None, should_pause=None,
+                           solve_semaphore=None):
         run_scenario_calls.append(z)
         return {"reduction_pct": 90.0, "eACH_uv_steady_state": 50.0, "phase1": {"T_ss": 1.0, "live": {"t": [1]}},
                 "phase2": {"T_ss": 0.1, "live": {"t": [1]}}}
@@ -1760,6 +1766,74 @@ def test_run_decay_scenario_rebuilds_fvoptions_from_this_combos_own_kuv(tmp_path
     assert entries_z1 != entries_z6
 
 
+def test_run_decay_scenario_releases_solve_semaphore_before_waiting_on_control(tmp_path, monkeypatch):
+    # Direct regression test for the 2026-08-20 sweep-starvation bug: a
+    # thread executing _run_decay_scenario must release solve_semaphore
+    # once its OWN pimpleFoam solve finishes, well before it blocks on
+    # control_results_future.result() - otherwise a Z-combo that happens
+    # to finish faster than its ACH's shared control run silently holds a
+    # real-solve slot for the rest of control's runtime, starving other
+    # ACH groups' work that has nothing left to wait on (confirmed live:
+    # exactly this stalled a real overnight sweep at 3/5 workers for over
+    # an hour). Uses a REAL threading.Semaphore(1) and a real, not-yet-
+    # resolved Future (not _completed_future) so the wait is genuine.
+    case_dir, _ = _write_synthetic_case(tmp_path, n_cells=8)
+    sr._apply_z(case_dir, Z=6.0, nbins=5, fan_kwargs={}, log_fn=lambda m: None)
+
+    monkeypatch.setattr(sr, "write_fvoptions_file", lambda *a, **k: None)
+    monkeypatch.setattr(sr, "splice_fv_options_into_control_dict", lambda *a, **k: (None, 1, 1))
+    monkeypatch.setattr(sr, "set_control_dict_time", lambda *a, **k: None)
+    monkeypatch.setattr(sr, "splice_live_vol_average_if_needed", lambda *a, **k: None)
+    monkeypatch.setattr(sr, "run_wsl_or_raise", lambda *a, **k: None)
+    monkeypatch.setattr(sr, "run_wsl_streaming",
+                         lambda *a, **k: type("R", (), {"returncode": 0, "stdout": ""})())
+    monkeypatch.setattr(sr, "write_results_summary", lambda *a, **k: {
+        "eACH_uv_effective": 10.0, "eACH_uv_well_mixed": 20.0,
+    })
+
+    solve_semaphore = threading.Semaphore(1)
+    control_future = sr.Future()  # deliberately left unresolved - the whole point of this test
+    room = type("Room", (), {"x": 4.0, "y": 5.0, "z": 2.7})()
+    settings = {"fan-enable": False, "inlet2-enable": False, "outlet2-enable": False,
+                "inlet-wall": "xMin", "inlet-size-w": 0.3, "inlet-size-h": 0.3,
+                "monitoring-enable": False, "pimple-write-interval": 3}
+    adv = {"uv-zone-bins": 5, "pimple-delta-t": 0.5, "max-co": 5,
+           "decay-ach-min-fraction": 90.0, "decay-each-min-fraction": 90.0, "decay-each-max-fraction": 99.9}
+
+    result_holder = {}
+
+    def run_it():
+        result_holder["result"] = sr._run_decay_scenario(
+            case_dir, room, settings, z=6.0, ach=3.0, adv=adv,
+            z_summary={"eACH_uv_well_mixed_mean": 20.0}, log_fn=lambda m: None,
+            should_stop=None, solver_log_fn=lambda m: None,
+            control_results_future=control_future, solve_semaphore=solve_semaphore)
+
+    t = threading.Thread(target=run_it)
+    t.start()
+    try:
+        # The background thread's own pimpleFoam call (mocked, instant)
+        # has certainly finished by now, but it's still blocked on
+        # control_future.result() since we haven't resolved it - if the
+        # semaphore were (incorrectly) still held across that wait, this
+        # non-blocking acquire on the SAME semaphore (capacity 1) would fail.
+        deadline = time.monotonic() + 2.0
+        acquired = False
+        while time.monotonic() < deadline:
+            if solve_semaphore.acquire(blocking=False):
+                acquired = True
+                break
+            time.sleep(0.01)
+        assert acquired, "solve_semaphore was still held while merely waiting on control_results_future"
+        solve_semaphore.release()
+    finally:
+        control_future.set_result({"total_ach_effective": 3.0, "total_ach_effective_ci95": None,
+                                    "fit_se_per_s": None, "fit_n": None})
+        t.join(timeout=5)
+    assert not t.is_alive()
+    assert result_holder["result"]["eACH_uv_effective"] == 10.0
+
+
 def test_run_decay_scenario_status_fn_gets_time_lines_and_clears_on_finish(tmp_path, monkeypatch):
     # status_fn is the overwrite-in-place alternative to the scrolling log
     # for "Time = N" banners (see _throttled_solver_callback) - with
@@ -2393,6 +2467,17 @@ def test_run_decay_sweep_runs_control_and_z_decay_concurrently(tmp_path, monkeyp
 
 
 def test_run_sweep_never_exceeds_max_concurrent_solves(tmp_path, monkeypatch):
+    # The orchestration pool itself (2026-08-20) is sized generously and no
+    # longer the concurrency cap - real solve concurrency is gated by a
+    # separate solve_semaphore, acquired only around each stage's own
+    # "real work" (see run_pipeline.converge_flow_field's solve_semaphore
+    # docstring for the starvation bug this replaced: a thread merely
+    # blocked waiting on an unrelated future used to silently occupy a
+    # pool slot for free). Each mocked stage below acquires the
+    # solve_semaphore it's handed, exactly as its real counterpart does,
+    # so this test verifies run_sweep actually creates and threads a
+    # correctly-sized semaphore through every stage, not just that SOME
+    # cap exists somewhere.
     project_dir = tmp_path / "proj"
     project_dir.mkdir()
     monkeypatch.setattr(sr, "_MAX_CONCURRENT_SOLVES", 3)
@@ -2408,12 +2493,14 @@ def test_run_sweep_never_exceeds_max_concurrent_solves(tmp_path, monkeypatch):
 
     def track(fn=None):
         def wrapped(*a, **k):
-            with lock:
-                state["live"] += 1
-                state["peak"] = max(state["peak"], state["live"])
-            time.sleep(0.03)
-            with lock:
-                state["live"] -= 1
+            sem = k.get("solve_semaphore")
+            with sem if sem is not None else contextlib.nullcontext():
+                with lock:
+                    state["live"] += 1
+                    state["peak"] = max(state["peak"], state["live"])
+                time.sleep(0.03)
+                with lock:
+                    state["live"] -= 1
             return fn(*a, **k) if fn else None
         return wrapped
 
@@ -2437,10 +2524,13 @@ def test_run_sweep_never_exceeds_max_concurrent_solves(tmp_path, monkeypatch):
 def test_run_sweep_max_concurrent_solves_overridable_via_adv(tmp_path, monkeypatch):
     # Regression test for a real, confirmed incident (2026-08-20): an
     # overnight 25-combo sweep at the old hardcoded _MAX_CONCURRENT_SOLVES=9
-    # crashed itself in 5 separate waves from resource contention. The pool
-    # size must come from adv["max-concurrent-solves"] when present, not
-    # just the module-level fallback constant - this is what actually lets
-    # a user dial it down without a code change.
+    # crashed itself in 5 separate waves from resource contention. The
+    # solve_semaphore's size must come from adv["max-concurrent-solves"]
+    # when present, not just the module-level fallback constant - this is
+    # what actually lets a user dial it down without a code change. See
+    # test_run_sweep_never_exceeds_max_concurrent_solves's own comment for
+    # why track() below acquires the solve_semaphore it's handed, matching
+    # every real stage's own behavior (2026-08-20's starvation-bug fix).
     project_dir = tmp_path / "proj"
     project_dir.mkdir()
     monkeypatch.setattr(sr, "_MAX_CONCURRENT_SOLVES", 9)  # fallback stays high, adv should win anyway
@@ -2456,12 +2546,14 @@ def test_run_sweep_max_concurrent_solves_overridable_via_adv(tmp_path, monkeypat
 
     def track(fn=None):
         def wrapped(*a, **k):
-            with lock:
-                state["live"] += 1
-                state["peak"] = max(state["peak"], state["live"])
-            time.sleep(0.03)
-            with lock:
-                state["live"] -= 1
+            sem = k.get("solve_semaphore")
+            with sem if sem is not None else contextlib.nullcontext():
+                with lock:
+                    state["live"] += 1
+                    state["peak"] = max(state["peak"], state["live"])
+                time.sleep(0.03)
+                with lock:
+                    state["live"] -= 1
             return fn(*a, **k) if fn else None
         return wrapped
 

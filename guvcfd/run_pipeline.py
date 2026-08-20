@@ -5,6 +5,7 @@ fvOptions binning, and fvOptions splicing - given just a .guv project and a
 target case directory. Everything else this package's modules do piecewise
 via manual WSL shell-outs, this ties into one command.
 """
+import contextlib
 import json
 import re
 import time
@@ -208,7 +209,7 @@ def converge_flow_field(case_dir, n_iterations=500, fan_entry=None, log_fn=print
                          max_iterations=20000, check_field="p", rel_tol=0.01, should_stop=None,
                          method="simple", oscillation_window=6, oscillation_growth_tol=1.5,
                          solver_log_fn=None, resume=False, should_pause=None, skip_potential_flow=False,
-                         n_procs=None):
+                         n_procs=None, solve_semaphore=None):
     """Run simpleFoam to actually converge the flow field on this mesh,
     starting from whatever is in 0/ (e.g. a mapFields warm start), then copy
     the result back into 0/ so it becomes pimpleFoam's starting point.
@@ -332,6 +333,18 @@ def converge_flow_field(case_dir, n_iterations=500, fan_entry=None, log_fn=print
     combinations. Untested against a real solve as of the day this was
     added - verify on a real case before trusting it for anything that
     matters.
+
+    solve_semaphore: if given, acquired only around each chunk's own
+    solver invocation below (not held across the whole convergence loop,
+    and never held while merely waiting on something else) - lets a
+    caller cap how many REAL concurrent OpenFOAM processes are running
+    across a whole sweep, decoupled from how many orchestration/waiting
+    threads exist (see scenario_runs.py's own module docstring for the
+    starvation bug this closes: a thread pool sized to the same number
+    used to also gate real solve concurrency let threads that were merely
+    blocked waiting on an unrelated future silently eat a pool slot for
+    free, starving other ACH groups' work that had nothing left to wait
+    on). None (default) behaves exactly as before - unlimited.
     """
     case_dir_wsl = _wsl_path(case_dir)
     solver = "pimpleFoam" if method == "lts" else "simpleFoam"
@@ -460,11 +473,12 @@ def converge_flow_field(case_dir, n_iterations=500, fan_entry=None, log_fn=print
                 _run_wsl_or_raise("decomposePar -fields -time 0 -force", case_dir_wsl,
                                    "decomposePar (fields)")
 
-            r = _run_wsl_streaming(
-                f"{solver_cmd} 2>&1 | tee log.{solver}", case_dir_wsl,
-                on_line=solver_log_fn or log_fn, should_stop=should_stop, kill_pattern=solver,
-                should_pause=should_pause,
-            )
+            with solve_semaphore or contextlib.nullcontext():
+                r = _run_wsl_streaming(
+                    f"{solver_cmd} 2>&1 | tee log.{solver}", case_dir_wsl,
+                    on_line=solver_log_fn or log_fn, should_stop=should_stop, kill_pattern=solver,
+                    should_pause=should_pause,
+                )
             if should_stop is not None and should_stop():
                 raise StoppedByUser("Stopped during flow convergence.")
             if r.returncode != 0 or "FOAM FATAL" in r.stdout or "Floating Point Exception" in r.stdout:
@@ -885,7 +899,8 @@ def setup_case(guv_path, case_dir, template_case_dir=None, cell_size=0.1, Z=2.0,
                fan_speed=None, fan_center=None, fan_direction=(0, 0, -1),
                fan_disk_radius=0.6, fan_disk_thickness=0.2, fan_height=None,
                sealed=False, mechanical_ach_only=False,
-               log_fn=print, should_stop=None, solver_log_fn=None, should_pause=None):
+               log_fn=print, should_stop=None, solver_log_fn=None, should_pause=None,
+               solve_semaphore=None):
     """Set up an OpenFOAM case end-to-end from a .guv project. Returns a dict
     summarizing the run (room dims, lamp count, fluence/k ranges, zone count).
 
@@ -1167,7 +1182,7 @@ def setup_case(guv_path, case_dir, template_case_dir=None, cell_size=0.1, Z=2.0,
             rel_tol=flow_rel_tol, max_iterations=flow_max_iterations,
             oscillation_window=oscillation_window, oscillation_growth_tol=oscillation_growth_tol,
             solver_log_fn=solver_log_fn, should_pause=should_pause, skip_potential_flow=sealed,
-            n_procs=n_procs)
+            n_procs=n_procs, solve_semaphore=solve_semaphore)
         summary["flow_converged"] = flow_converged
         if should_stop is not None and should_stop():
             raise StoppedByUser("Stopped after flow convergence.")

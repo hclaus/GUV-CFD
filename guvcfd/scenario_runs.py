@@ -27,11 +27,13 @@ the handful of small settings-dict-to-kwargs helpers app.py also has
 (_fan_kwargs, _opening_center_frac, etc.) are duplicated locally rather
 than imported, for the same reason.
 """
+import contextlib
 import csv
 import io
 import json
 import math
 import re
+import threading
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed, wait as futures_wait
 from pathlib import Path
 
@@ -83,7 +85,7 @@ _TEMPLATE_CASE_DIR = str(Path(__file__).resolve().parent / "templates" / "case_t
 # to run except that same ACH-pool slot, one stage at a time.
 #
 # run_sweep/run_decay_sweep now submit every stage (per-ACH flow, Phase 1/
-# control, per-Z Phase 2/decay) to ONE shared pool of this size, and get
+# control, per-Z Phase 2/decay) to ONE shared ORCHESTRATION pool, and get
 # priority between stages for free from submission order rather than a
 # custom priority queue: every ACH's flow-convergence task is submitted
 # before ANY of that ACH's downstream tasks even exist (they're only
@@ -95,6 +97,21 @@ _TEMPLATE_CASE_DIR = str(Path(__file__).resolve().parent / "templates" / "case_t
 # converged flow base, not each other - so they're submitted together;
 # decay mode has no Phase 1 at all, so control and every Z's own decay
 # solve are submitted together instead, immediately once flow finishes).
+#
+# This value itself no longer sizes that orchestration pool (2026-08-20) -
+# it sizes a SEPARATE solve_semaphore instead, acquired only around each
+# actual OpenFOAM invocation (see run_pipeline.converge_flow_field's
+# solve_semaphore parameter). Confirmed as a real bug when this constant
+# doubled as the pool's own worker count: a Z-combo whose own solve
+# finished faster than its ACH's shared control run sat blocked holding a
+# pool worker for the rest of control's runtime (waiting on
+# control_results_future.result(), pure Python, no CPU/subprocess at
+# all) - invisible to any process list, but it silently starved OTHER ACH
+# groups' work of a pool slot that was never actually busy. The
+# orchestration pool is now sized generously (see run_sweep/
+# run_decay_sweep's own pool= line) so a thread merely blocked waiting on
+# a future never competes with real solve capacity again; this constant
+# now purely answers "how many REAL concurrent OpenFOAM processes."
 #
 # Fallback only when a caller's own adv dict has no "max-concurrent-solves"
 # key (e.g. an older saved advanced_settings.json, or a direct/test call
@@ -405,7 +422,7 @@ def _seed_ach_base_if_no_scratch_survives(project_dir, project_name, ach, flow_f
 # --- flow-field build/reuse ---
 
 def _build_flow_base(guv_path, base_dir, room, settings, ach, adv, log_fn, should_stop, solver_log_fn,
-                      should_pause=None, sealed=False, mechanical_ach_only=False):
+                      should_pause=None, sealed=False, mechanical_ach_only=False, solve_semaphore=None):
     """setup_case() into base_dir at this ACH - the project's currently
     configured Z is used as a placeholder (every Z-dependent file this
     writes gets overwritten by _apply_z before any subfolder actually
@@ -419,6 +436,12 @@ def _build_flow_base(guv_path, base_dir, room, settings, ach, adv, log_fn, shoul
     mechanical_ach_only: forwarded straight to setup_case - skips the
     fluence/UV pipeline entirely (see run_pipeline._finish_case_setup).
     Decay sweeps only, mirroring sealed above.
+
+    solve_semaphore: forwarded straight to setup_case/converge_flow_field
+    - caps real concurrent OpenFOAM processes across a whole sweep,
+    decoupled from the orchestration thread pool's own size (see that
+    parameter's docstring for the starvation bug this closes). A no-op on
+    the reuse branch below (no solve happens there at all).
 
     If base_dir already has a resolved flow-convergence result on disk
     from an earlier attempt at this ACH (a sweep that got interrupted or
@@ -515,7 +538,7 @@ def _build_flow_base(guv_path, base_dir, room, settings, ach, adv, log_fn, shoul
         scalar_transport_tolerance=adv["scalar-transport-tolerance"],
         max_co=adv["max-co"],
         log_fn=log_fn, should_stop=should_stop, solver_log_fn=solver_log_fn, should_pause=should_pause,
-        sealed=sealed, mechanical_ach_only=mechanical_ach_only,
+        sealed=sealed, mechanical_ach_only=mechanical_ach_only, solve_semaphore=solve_semaphore,
         **_fan_kwargs(settings),
         **_second_opening_kwargs(settings, "inlet2", room),
         **_second_opening_kwargs(settings, "outlet2", room),
@@ -586,7 +609,8 @@ def _apply_z(case_dir, Z, nbins, fan_kwargs, log_fn):
 
 
 def _run_scenario(case_dir, room, settings, z, ach, adv, z_summary, log_fn, should_stop, solver_log_fn,
-                   status_fn=None, control_results_future=None, base_summary=None, should_pause=None):
+                   status_fn=None, control_results_future=None, base_summary=None, should_pause=None,
+                   solve_semaphore=None):
     """run_steady_state_scenario() with this combination's z/ach - same
     call app._run_steady_state makes for a single run.
 
@@ -700,7 +724,7 @@ def _run_scenario(case_dir, room, settings, z, ach, adv, z_summary, log_fn, shou
         log_fn=log_fn, should_stop=should_stop, solver_log_fn=solver_log_fn, should_pause=should_pause,
         status_fn=status_fn,
         control_results_future=control_results_future,
-        phase1_delta_t=phase1_delta_t, phase2_delta_t=phase2_delta_t,
+        phase1_delta_t=phase1_delta_t, phase2_delta_t=phase2_delta_t, solve_semaphore=solve_semaphore,
     )
     result["fluence_mean"] = z_summary["fluence_mean"]
     result["eACH_uv_well_mixed"] = z_summary.get("eACH_uv_well_mixed_mean")
@@ -712,7 +736,7 @@ def _run_scenario(case_dir, room, settings, z, ach, adv, z_summary, log_fn, shou
 
 
 def _run_shared_phase1(base_dir, phase1_dir, ach, room, settings, adv, log_fn, should_stop, solver_log_fn,
-                        status_fn=None, should_pause=None):
+                        status_fn=None, should_pause=None, solve_semaphore=None):
     """Run Phase 1 ("source only, no UV") ONCE per ACH group, shared
     across every Z sharing that ACH - Phase 1's own physics (injection
     strength G/Su depend only on ach/target_T_ss/source geometry, none of
@@ -859,7 +883,7 @@ def _run_shared_phase1(base_dir, phase1_dir, ach, room, settings, adv, log_fn, s
         patches_to_monitor=patches_to_monitor,
         log_fn=log_fn, should_stop=should_stop, solver_log_fn=solver_log_fn, should_pause=should_pause,
         status_fn=status_fn, phase1_only=True, phase1_delta_t=phase1_delta_t,
-        phase1_resume_decision=phase1_resume_decision,
+        phase1_resume_decision=phase1_resume_decision, solve_semaphore=solve_semaphore,
     )
 
 
@@ -950,7 +974,7 @@ def _throttled_solver_callback(log_fn, log_prefix, on_line=None, status_fn=None,
 
 
 def _run_shared_control(base_dir, control_dir, ach, room, settings, adv, log_fn, should_stop, solver_log_fn,
-                         base_summary, status_fn=None, should_pause=None, sealed=False):
+                         base_summary, status_fn=None, should_pause=None, sealed=False, solve_semaphore=None):
     """Run the UV-off control decay ONCE per ACH group, shared across
     every Z sharing that ACH - control's own physics (uniform T=1 initial
     condition, no UV sink, same converged flow field) doesn't depend on Z
@@ -965,6 +989,11 @@ def _run_shared_control(base_dir, control_dir, ach, room, settings, adv, log_fn,
     ACH group's own _build_flow_base built - cloned here before any Z's
     own UV fvOptions get applied, so this control run is genuinely
     Z-independent from the start, not just coincidentally so.
+
+    solve_semaphore: if given, acquired only around the pimpleFoam
+    invocation below (not held while the caller later awaits this future's
+    result elsewhere) - see run_pipeline.converge_flow_field's identical
+    parameter docstring for the starvation bug this closes.
 
     base_summary: base_dir's own setup_case() summary (from
     _build_flow_base) - its inlet_velocity/inlet2_velocity are reused
@@ -992,12 +1021,13 @@ def _run_shared_control(base_dir, control_dir, ach, room, settings, adv, log_fn,
     log_fn(f"  Running pimpleFoam (shared control, {control_end_time}s)...")
     status_key = f"ACH={ach}/control"
     try:
-        r = run_wsl_streaming(
-            "pimpleFoam 2>&1 | tee log.pimpleFoam", control_dir_wsl,
-            on_line=_throttled_solver_callback(log_fn, "control", status_fn=status_fn, status_key=status_key,
-                                                total_time=control_end_time),
-            should_stop=should_stop, kill_pattern="pimpleFoam", should_pause=should_pause,
-        )
+        with solve_semaphore or contextlib.nullcontext():
+            r = run_wsl_streaming(
+                "pimpleFoam 2>&1 | tee log.pimpleFoam", control_dir_wsl,
+                on_line=_throttled_solver_callback(log_fn, "control", status_fn=status_fn, status_key=status_key,
+                                                    total_time=control_end_time),
+                should_stop=should_stop, kill_pattern="pimpleFoam", should_pause=should_pause,
+            )
     finally:
         if status_fn is not None:
             status_fn(status_key, None)
@@ -1012,7 +1042,8 @@ def _run_shared_control(base_dir, control_dir, ach, room, settings, adv, log_fn,
 
 
 def _run_decay_scenario(case_dir, room, settings, z, ach, adv, z_summary, log_fn, should_stop, solver_log_fn,
-                         control_results_future, base_summary=None, status_fn=None, should_pause=None):
+                         control_results_future, base_summary=None, status_fn=None, should_pause=None,
+                         solve_semaphore=None):
     """Decay-mode equivalent of _run_scenario() - runs this combination's
     own UV-on decay (adaptive duration) and writes the same corrected
     results.json shape a single decay run would, using control_results
@@ -1046,6 +1077,13 @@ def _run_decay_scenario(case_dir, room, settings, z, ach, adv, z_summary, log_fn
     Z's actual UV removal rate in the solver, regardless of its own kUV
     field being correctly recomputed on disk (confirmed directly: two
     different-Z combinations produced byte-identical decay curves).
+
+    solve_semaphore: if given, acquired only around this combo's own
+    pimpleFoam invocation below - released well before the
+    control_results_future.result() wait further down, which must never
+    hold it (see this function's own docstring above for why that wait
+    happens last) - see run_pipeline.converge_flow_field's identical
+    parameter for the starvation bug this closes.
     """
     case_dir_wsl = wsl_path(case_dir)
 
@@ -1074,13 +1112,14 @@ def _run_decay_scenario(case_dir, room, settings, z, ach, adv, z_summary, log_fn
     log_fn(f"  Running pimpleFoam (UV-on, {combined_end_time}s)...")
     status_key = f"Z={z}/ACH={ach}/UV-on"
     try:
-        r_uv = run_wsl_streaming(
-            "pimpleFoam 2>&1 | tee log.pimpleFoam", case_dir_wsl,
-            on_line=_throttled_solver_callback(log_fn, "UV-on", solver_log_fn,
-                                                status_fn=status_fn, status_key=status_key,
-                                                total_time=combined_end_time),
-            should_stop=should_stop, kill_pattern="pimpleFoam", should_pause=should_pause,
-        )
+        with solve_semaphore or contextlib.nullcontext():
+            r_uv = run_wsl_streaming(
+                "pimpleFoam 2>&1 | tee log.pimpleFoam", case_dir_wsl,
+                on_line=_throttled_solver_callback(log_fn, "UV-on", solver_log_fn,
+                                                    status_fn=status_fn, status_key=status_key,
+                                                    total_time=combined_end_time),
+                should_stop=should_stop, kill_pattern="pimpleFoam", should_pause=should_pause,
+            )
     finally:
         if status_fn is not None:
             status_fn(status_key, None)
@@ -1570,10 +1609,13 @@ def run_decay_sweep(guv_path, settings_path, project_dir, room, settings, adv,
     itself differs).
 
     Every stage (per-ACH flow convergence, control, per-Z decay) is
-    submitted to ONE shared pool of _MAX_CONCURRENT_SOLVES workers - see
-    that constant's own docstring for exactly how priority between stages
+    submitted to ONE orchestration pool, sized generously (see below) so a
+    thread merely blocked waiting on another future never starves real
+    work - actual concurrent-solve capacity is capped separately by
+    solve_semaphore, to _MAX_CONCURRENT_SOLVES workers (see that
+    constant's own docstring for exactly how priority between stages
     falls out of submission order, and this function's own ach_worker
-    (inside) for the per-ACH sequencing. Unlike run_sweep's Phase 1/Phase 2
+    (inside) for the per-ACH sequencing). Unlike run_sweep's Phase 1/Phase 2
     (a real dependency - Phase 2 clones Phase 1's own converged
     checkpoint), decay mode has no Phase 1 at all: control and every Z's
     own UV-on decay solve are BOTH only ever dependent on the converged
@@ -1595,7 +1637,22 @@ def run_decay_sweep(guv_path, settings_path, project_dir, room, settings, adv,
     combos = sweep_combinations(z_values, ach_values)
     achs = sorted({ach for _, ach in combos})
     project_name = _sanitize(Path(project_dir).name)
-    pool = ThreadPoolExecutor(max_workers=adv.get("max-concurrent-solves", _MAX_CONCURRENT_SOLVES))
+    # Real concurrent-solve capacity is capped by solve_semaphore (acquired
+    # only around each actual OpenFOAM invocation - see its own docstring
+    # on e.g. run_pipeline.converge_flow_field), NOT by this pool's own
+    # worker count. The pool itself is sized generously - one worker per
+    # task that could ever be in flight at once (flow-prep + control per
+    # ACH, plus every combo) - so a thread merely blocked waiting on
+    # another future (e.g. run_z_fn awaiting control_results_future) never
+    # starves a genuinely free solve slot elsewhere. Confirmed as a real
+    # bug when the pool's own worker count was the only concurrency limit:
+    # a Z-combo that finished its own solve faster than its ACH's shared
+    # control run sat blocked holding a pool worker for the rest of
+    # control's runtime, silently stealing that slot from other ACH
+    # groups' work that had nothing left to wait on (2026-08-20).
+    max_concurrent_solves = adv.get("max-concurrent-solves", _MAX_CONCURRENT_SOLVES)
+    solve_semaphore = threading.Semaphore(max_concurrent_solves)
+    pool = ThreadPoolExecutor(max_workers=len(achs) * 2 + len(combos))
 
     # Each "" for this project's original design/mode (today's exact
     # naming, unchanged) - see compute_guv_design_suffix/
@@ -1645,7 +1702,8 @@ def run_decay_sweep(guv_path, settings_path, project_dir, room, settings, adv,
         ach_log_fn("=== converging flow field (once per ACH) ===")
         base_summary = _build_flow_base(guv_path, base_dir, room, settings, ach, adv,
                                          ach_log_fn, should_stop, solver_log_fn, should_pause=should_pause,
-                                         sealed=sealed, mechanical_ach_only=mechanical_ach_only)
+                                         sealed=sealed, mechanical_ach_only=mechanical_ach_only,
+                                         solve_semaphore=solve_semaphore)
         return {"ach": ach, "base_dir": base_dir, "control_dir": control_dir, "sealed": sealed,
                 "base_summary": base_summary, "flow_fingerprint": flow_fingerprint, "reusable": reusable,
                 "fan_kw": _fan_kwargs(settings)}
@@ -1665,7 +1723,8 @@ def run_decay_sweep(guv_path, settings_path, project_dir, room, settings, adv,
             control_results = _run_shared_control(flow_ctx["base_dir"], flow_ctx["control_dir"], ach, room,
                                                    settings, adv, ach_log_fn, should_stop, solver_log_fn,
                                                    flow_ctx["base_summary"], status_fn=status_fn,
-                                                   should_pause=should_pause, sealed=False)
+                                                   should_pause=should_pause, sealed=False,
+                                                   solve_semaphore=solve_semaphore)
         _update_ach_base_status_safe(project_dir, project_name, ach, flow_ctx["flow_fingerprint"],
                                       flow_ctx["base_dir"], flow_ctx["control_dir"], control_results,
                                       guv_path=guv_path, settings_path=settings_path, sim_type="decay")
@@ -1720,7 +1779,8 @@ def run_decay_sweep(guv_path, settings_path, project_dir, room, settings, adv,
                 result = _run_decay_scenario(case_dir, room, settings, z, ach, adv,
                                               z_summary, combo_log_fn, should_stop, solver_log_fn,
                                               ctx["control_results_future"], base_summary=ctx["base_summary"],
-                                              status_fn=status_fn, should_pause=should_pause)
+                                              status_fn=status_fn, should_pause=should_pause,
+                                              solve_semaphore=solve_semaphore)
             capture_openfoam_settings(settings, adv)
             _save_run_settings(case_dir, settings, guv_path, settings_path, z, ach)
 
@@ -1868,10 +1928,13 @@ def run_sweep(guv_path, settings_path, project_dir, room, settings, adv,
     do internally.
 
     Every stage (per-ACH flow convergence, Phase 1, control, per-Z Phase 2)
-    is submitted to ONE shared pool of _MAX_CONCURRENT_SOLVES workers -
-    see that constant's own docstring for exactly how priority between
-    stages falls out of submission order, and this function's own
-    ach_worker (inside) for the per-ACH sequencing: flow first; then
+    is submitted to ONE orchestration pool, sized generously (see below)
+    so a thread merely blocked waiting on another future never starves
+    real work - actual concurrent-solve capacity is capped separately by
+    solve_semaphore, to _MAX_CONCURRENT_SOLVES workers (see that
+    constant's own docstring for exactly how priority between stages
+    falls out of submission order, and this function's own ach_worker
+    (inside) for the per-ACH sequencing): flow first; then
     Phase 1 and control together (genuine siblings - Phase 2 needs Phase
     1's converged checkpoint specifically, so that wait is a real
     dependency, not just a priority preference; control needs only the
@@ -1890,7 +1953,14 @@ def run_sweep(guv_path, settings_path, project_dir, room, settings, adv,
     combos = sweep_combinations(z_values, ach_values)
     achs = sorted({ach for _, ach in combos})
     project_name = _sanitize(Path(project_dir).name)
-    pool = ThreadPoolExecutor(max_workers=adv.get("max-concurrent-solves", _MAX_CONCURRENT_SOLVES))
+    # See run_decay_sweep's identical comment - real concurrent-solve
+    # capacity is capped by solve_semaphore, not by this pool's own worker
+    # count, which is instead sized generously (flow-prep + Phase 1 +
+    # control per ACH, plus every combo) purely for orchestration/waiting
+    # headroom.
+    max_concurrent_solves = adv.get("max-concurrent-solves", _MAX_CONCURRENT_SOLVES)
+    solve_semaphore = threading.Semaphore(max_concurrent_solves)
+    pool = ThreadPoolExecutor(max_workers=len(achs) * 3 + len(combos))
 
     # Each "" for this project's original design/mode (today's exact
     # naming, unchanged) - see compute_guv_design_suffix/
@@ -1929,7 +1999,7 @@ def run_sweep(guv_path, settings_path, project_dir, room, settings, adv,
 
         ach_log_fn("=== converging flow field (once per ACH) ===")
         base_summary = _build_flow_base(guv_path, base_dir, room, settings, ach, adv, ach_log_fn, should_stop,
-                                         solver_log_fn, should_pause=should_pause)
+                                         solver_log_fn, should_pause=should_pause, solve_semaphore=solve_semaphore)
         return {"ach": ach, "base_dir": base_dir, "phase1_dir": phase1_dir, "control_dir": control_dir,
                 "base_summary": base_summary, "flow_fingerprint": flow_fingerprint, "reusable": reusable,
                 "fan_kw": _fan_kwargs(settings)}
@@ -1945,7 +2015,8 @@ def run_sweep(guv_path, settings_path, project_dir, room, settings, adv,
         # mismatched fingerprint, so whatever's left here (if anything)
         # is safe.
         _run_shared_phase1(flow_ctx["base_dir"], flow_ctx["phase1_dir"], ach, room, settings, adv, ach_log_fn,
-                            should_stop, solver_log_fn, status_fn=status_fn, should_pause=should_pause)
+                            should_stop, solver_log_fn, status_fn=status_fn, should_pause=should_pause,
+                            solve_semaphore=solve_semaphore)
 
     def _prepare_control(flow_ctx):
         ach = flow_ctx["ach"]
@@ -1965,7 +2036,7 @@ def run_sweep(guv_path, settings_path, project_dir, room, settings, adv,
             control_results = _run_shared_control(flow_ctx["base_dir"], flow_ctx["control_dir"], ach, room,
                                                    settings, adv, ach_log_fn, should_stop, solver_log_fn,
                                                    flow_ctx["base_summary"], status_fn=status_fn,
-                                                   should_pause=should_pause)
+                                                   should_pause=should_pause, solve_semaphore=solve_semaphore)
         _update_ach_base_status_safe(project_dir, project_name, ach, flow_ctx["flow_fingerprint"],
                                       flow_ctx["base_dir"], flow_ctx["control_dir"], control_results,
                                       guv_path=guv_path, settings_path=settings_path, sim_type="steady_state")
@@ -2011,7 +2082,8 @@ def run_sweep(guv_path, settings_path, project_dir, room, settings, adv,
             result = _run_scenario(case_dir, room, settings, z, ach, adv,
                                     z_summary, combo_log_fn, should_stop, solver_log_fn,
                                     status_fn=status_fn, control_results_future=ctx["control_results_future"],
-                                    base_summary=ctx["base_summary"], should_pause=should_pause)
+                                    base_summary=ctx["base_summary"], should_pause=should_pause,
+                                    solve_semaphore=solve_semaphore)
             try:
                 snapshot_openfoam_settings(case_dir)
             except Exception:

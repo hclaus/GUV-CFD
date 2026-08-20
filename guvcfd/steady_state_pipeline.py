@@ -10,6 +10,7 @@ computed, and cellZones/fvOptions containing the UV sink zones. This
 pipeline only adds the source cellZone and orchestrates the two phases -
 it doesn't redo mesh generation or flow convergence.
 """
+import contextlib
 import json
 import math
 import re
@@ -468,7 +469,7 @@ def _run_phase(case_dir, case_dir_wsl, n_iterations, write_interval, window_frac
                 keep_all_timesteps=False, iteration_offset=0, mass_balance_patches=(),
                 injection_rate_G=None, mass_balance_tol=None, status_fn=None, status_key=None,
                 should_pause=None, delta_t=1, resume_total_run=0, resume_accumulated=None,
-                resume_tinf_history=None, pending_case_dir=None):
+                resume_tinf_history=None, pending_case_dir=None, solve_semaphore=None):
     """Run simpleFoam for n_iterations, tracking the room-wide (and any
     monitoring-point) volAverage(T) live, every iteration.
 
@@ -568,6 +569,11 @@ def _run_phase(case_dir, case_dir_wsl, n_iterations, write_interval, window_frac
     after every chunk, and clear that pending marker once this call
     finishes normally - Phase 1's own call sites leave this None (Phase 1
     keeps its separate, existing checkpoint/pending mechanism untouched).
+
+    solve_semaphore: if given, acquired only around each chunk's own
+    simpleFoam invocation below - see run_pipeline.converge_flow_field's
+    identical parameter for why (a shared-pool sweep starvation bug this
+    closes). None (default) behaves exactly as before - unlimited.
     """
     if delta_t != 1 and keep_all_timesteps:
         raise ValueError("_run_phase: keep_all_timesteps is not supported together with delta_t != 1 "
@@ -639,13 +645,14 @@ def _run_phase(case_dir, case_dir_wsl, n_iterations, write_interval, window_frac
 
         log_fn(f"Running simpleFoam ({total_run + 1}-{total_run + chunk_size} of {n_iterations} "
                f"iterations, writing every {write_interval})...")
-        r = run_wsl_streaming(
-            "simpleFoam 2>&1 | tee log.simpleFoam", case_dir_wsl,
-            on_line=_phase_solver_callback(log_fn, solver_log_fn, status_fn, status_key,
-                                           delta_t=delta_t, iteration_base=total_run,
-                                           total_time=n_iterations * delta_t),
-            should_stop=should_stop, kill_pattern="simpleFoam", should_pause=should_pause,
-        )
+        with solve_semaphore or contextlib.nullcontext():
+            r = run_wsl_streaming(
+                "simpleFoam 2>&1 | tee log.simpleFoam", case_dir_wsl,
+                on_line=_phase_solver_callback(log_fn, solver_log_fn, status_fn, status_key,
+                                               delta_t=delta_t, iteration_base=total_run,
+                                               total_time=n_iterations * delta_t),
+                should_stop=should_stop, kill_pattern="simpleFoam", should_pause=should_pause,
+            )
         if should_stop is not None and should_stop():
             raise StoppedByUser("Stopped during simpleFoam phase.")
         if r.returncode != 0 or "FOAM FATAL" in r.stdout or "Floating Point Exception" in r.stdout:
@@ -1115,7 +1122,7 @@ def run_steady_state_scenario(case_dir, room_x, room_y, room_z, ach, Z, nbins=25
                                patches_to_monitor=("outlet",), log_fn=print, should_stop=None,
                                solver_log_fn=None, status_fn=None, phase1_only=False, should_pause=None,
                                measured_ventilation_ach=None, control_results_future=None,
-                               phase1_delta_t=1, phase2_delta_t=1):
+                               phase1_delta_t=1, phase2_delta_t=1, solve_semaphore=None):
     """Run both phases of a continuous-source steady-state scenario against
     an already-converged case (mesh + flow + fluenceRate/kUV must already
     exist - see run_pipeline.setup_case()). Returns a summary dict.
@@ -1380,7 +1387,7 @@ def run_steady_state_scenario(case_dir, room_x, room_y, room_z, ach, Z, nbins=25
                     keep_all_timesteps=keep_all_timesteps, mass_balance_patches=patches_to_monitor,
                     injection_rate_G=G, mass_balance_tol=mass_balance_tol,
                     status_fn=status_fn, status_key=status_key1, should_pause=should_pause,
-                    delta_t=phase1_delta_t,
+                    delta_t=phase1_delta_t, solve_semaphore=solve_semaphore,
                 )
             finally:
                 if status_fn is not None:
@@ -1500,7 +1507,7 @@ def run_steady_state_scenario(case_dir, room_x, room_y, room_z, ach, Z, nbins=25
                     keep_all_timesteps=keep_all_timesteps, mass_balance_patches=patches_to_monitor,
                     injection_rate_G=G, mass_balance_tol=mass_balance_tol,
                     status_fn=status_fn, status_key=status_key1, should_pause=should_pause,
-                    delta_t=phase1_delta_t,
+                    delta_t=phase1_delta_t, solve_semaphore=solve_semaphore,
                 )
             finally:
                 if status_fn is not None:
@@ -1606,7 +1613,7 @@ def run_steady_state_scenario(case_dir, room_x, room_y, room_z, ach, Z, nbins=25
             resume_total_run=phase2_pending["total_run"] if phase2_pending else 0,
             resume_accumulated=phase2_pending["accumulated"] if phase2_pending else None,
             resume_tinf_history=phase2_pending["tinf_history"] if phase2_pending else None,
-            pending_case_dir=case_dir,
+            pending_case_dir=case_dir, solve_semaphore=solve_semaphore,
         )
     finally:
         if status_fn is not None:
