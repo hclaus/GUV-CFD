@@ -1192,8 +1192,8 @@ def _trim_decay_report(result):
 
 _SWEEP_SUMMARY_FIELDS = ["Z", "ACH", "Design", "Mode", "total_reduction_pct", "ach_efficiency_pct",
                          "uv_efficiency_pct", "mechanical_mixing_efficiency_pct", "est_ach_per_hr",
-                         "est_each_per_hr", "phase1_spatial_cov_pct", "phase2_T_ss_cv_pct",
-                         "phase1_converged", "phase2_converged"]
+                         "est_each_per_hr", "ach_t_measured_per_hr", "phase1_spatial_cov_pct",
+                         "phase2_T_ss_cv_pct", "phase1_converged", "phase2_converged"]
 
 
 def _convergence_quality_columns(detail):

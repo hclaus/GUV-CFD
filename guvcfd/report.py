@@ -157,14 +157,22 @@ def combo_summary_metrics(detail):
 
     Returns a dict with keys total_reduction_pct, ach_efficiency_pct,
     uv_efficiency_pct, mechanical_mixing_efficiency_pct, est_ach_per_hr,
-    est_each_per_hr - any value that isn't computable from what's in
-    `detail` (older results.json files, a control run that wasn't used,
-    etc.) is None, not an error.
+    est_each_per_hr, ach_t_measured_per_hr - any value that isn't
+    computable from what's in `detail` (older results.json files, a
+    control run that wasn't used, etc.) is None, not an error.
 
     ach_efficiency_pct: ach_delivery.ratio*100 - the measured/nominal
     ventilation-delivery ratio (same field either sim type already
     computes via run_pipeline.check_ach_delivery), i.e. how much of the
     nominal ACH the room's actual flow field delivers.
+
+    ach_t_measured_per_hr: the shared UV-off control run's own measured
+    ventilation rate (detail["ventilation_ach_measured"], or decay mode's
+    older "ventilation_ach" name) - a scalar-decay (T) curve fit, a
+    genuinely different measurement method from est_ach_per_hr above (a
+    mesh flow-rate integration via check_ach_delivery, no scalar solve
+    involved at all) - the two can legitimately disagree and both are
+    worth seeing side by side, not just one.
 
     uv_efficiency_pct: the room's real (imperfectly-mixed) eACH_uv versus
     the idealized well-mixed prediction for the same Z - decay mode
@@ -185,6 +193,13 @@ def combo_summary_metrics(detail):
     ach_delivery = detail.get("ach_delivery") or {}
     ach_efficiency_pct = ach_delivery.get("ratio") * 100 if ach_delivery.get("ratio") is not None else None
     est_ach_per_hr = ach_delivery.get("measured_ach")
+    # The shared UV-off control run's own measured ventilation rate - a
+    # scalar-decay (T) fit, genuinely different from est_ach_per_hr above
+    # (a mesh flow-rate integration via check_ach_delivery) - the two can
+    # legitimately disagree, so both are exposed rather than picking one.
+    # None whenever no control run was used (an older results.json, or a
+    # sealed/no-ventilation combo).
+    ach_t_measured_per_hr = detail.get("ventilation_ach_measured", detail.get("ventilation_ach"))
 
     if is_steady_state:
         total_reduction_pct = detail.get("reduction_pct_corrected", detail.get("reduction_pct"))
@@ -194,9 +209,8 @@ def combo_summary_metrics(detail):
                               if est_each_per_hr is not None and well_mixed else None)
     else:
         est_each_per_hr = detail.get("eACH_uv_effective_corrected", detail.get("eACH_uv_effective"))
-        ach_eff = detail.get("ventilation_ach_measured", detail.get("ventilation_ach"))
-        total_reduction_pct = (_decay_reduction_ratio(est_each_per_hr, ach_eff) * 100
-                                if est_each_per_hr is not None and ach_eff is not None else None)
+        total_reduction_pct = (_decay_reduction_ratio(est_each_per_hr, ach_t_measured_per_hr) * 100
+                                if est_each_per_hr is not None and ach_t_measured_per_hr is not None else None)
         mixing_eff = detail.get("mixing_efficiency_corrected", detail.get("mixing_efficiency"))
         uv_efficiency_pct = mixing_eff * 100 if mixing_eff is not None else None
 
@@ -211,6 +225,7 @@ def combo_summary_metrics(detail):
         "mechanical_mixing_efficiency_pct": mechanical_mixing_pct,
         "est_ach_per_hr": est_ach_per_hr,
         "est_each_per_hr": est_each_per_hr,
+        "ach_t_measured_per_hr": ach_t_measured_per_hr,
     }
 
 

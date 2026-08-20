@@ -730,6 +730,7 @@ def test_combo_summary_metrics_steady_state():
     assert metrics["ach_efficiency_pct"] == pytest.approx(98.9)
     assert metrics["est_ach_per_hr"] == 5.93
     assert metrics["uv_efficiency_pct"] == pytest.approx(76.7 / 124.9 * 100)
+    assert metrics["ach_t_measured_per_hr"] is None  # no control run in this detail
 
 
 def test_combo_summary_metrics_steady_state_falls_back_to_uncorrected():
@@ -757,10 +758,12 @@ def test_combo_summary_metrics_decay_mode():
     assert metrics["uv_efficiency_pct"] == pytest.approx(87.3)
     assert metrics["ach_efficiency_pct"] == pytest.approx(99.0)
     assert metrics["est_ach_per_hr"] == 2.97
+    assert metrics["ach_t_measured_per_hr"] == 3.0  # the control run's own scalar-decay measurement
 
 
 def test_combo_summary_metrics_missing_fields_are_none_not_errors():
     assert combo_summary_metrics({}) == {
         "total_reduction_pct": None, "ach_efficiency_pct": None, "uv_efficiency_pct": None,
         "mechanical_mixing_efficiency_pct": None, "est_ach_per_hr": None, "est_each_per_hr": None,
+        "ach_t_measured_per_hr": None,
     }

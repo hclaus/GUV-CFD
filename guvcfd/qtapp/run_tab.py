@@ -25,8 +25,8 @@ from ..report import combo_summary_metrics
 from ..scenario_runs import _MAX_CONCURRENT_SOLVES, sweep_combinations
 from . import helpers, run_state, sweep_state
 
-_TABLE_HEADERS = ["Z", "ACH", "Status", "Reduction %", "Measured UV eff. %",
-                   "Mechanical mixing eff. %", "Est. ACH /hr", "Est. eACH /hr"]
+_TABLE_HEADERS = ["Z", "ACH", "Status", "SS UV Reduction %", "Measured UV eff. %",
+                   "Mechanical mixing eff. %", "Est. ACH /hr", "Est. eACH /hr", "ACH(T) measured"]
 
 # 25% bigger than this app's ~9pt/~28px native default, bold, with a
 # raised/beveled ("3D") gradient look - the flat native buttons were hard
@@ -473,6 +473,7 @@ class RunTab(QWidget):
             f"{z:g}", f"{ach:g}", status,
             pct("total_reduction_pct"), pct("uv_efficiency_pct"),
             pct("mechanical_mixing_efficiency_pct"), rate("est_ach_per_hr"), rate("est_each_per_hr"),
+            rate("ach_t_measured_per_hr"),
         ]
         for col, text in enumerate(values):
             self.table.setItem(row, col, QTableWidgetItem(text))
