@@ -97,6 +97,14 @@ class ProjectSetupTab(QWidget):
         # (see load_project/load_guvcfd_project) - overrides are explicitly
         # per-loaded-project, not carried across to a different one.
         self._openfoam_overrides = {}
+        # Set by MainWindow right after both tabs exist (RunTab itself
+        # takes this tab as a constructor arg, so the back-reference has
+        # to be wired up after the fact) - lets gather_settings()/
+        # apply_settings() persist RunTab's own sweep Z/ACH list boxes
+        # into the .guvcfd file too, even though those widgets live on a
+        # different tab. None until then (and in any test that builds
+        # this tab standalone) - every use below is guarded accordingly.
+        self.run_tab = None
         self.fields = {}  # field id -> widget
         # Persisted across sessions (Windows registry, HKCU\Software\GUV-CFD\
         # qtapp) - last-used folder for file dialogs, and up to
@@ -243,6 +251,9 @@ class ProjectSetupTab(QWidget):
             except (OSError, json.JSONDecodeError):
                 pass
         settings.update(self._openfoam_overrides)
+        if self.run_tab is not None:
+            settings["sweep-z-values"] = self.run_tab.z_values_edit.text()
+            settings["sweep-ach-values"] = self.run_tab.ach_values_edit.text()
         return settings
 
     def apply_project_openfoam_overrides(self, values):
@@ -298,6 +309,9 @@ class ProjectSetupTab(QWidget):
             self.sim_type_combo.setCurrentIndex(1)
         elif settings.get("sim-type") == "decay":
             self.sim_type_combo.setCurrentIndex(0)
+        if self.run_tab is not None:
+            self.run_tab.z_values_edit.setText(settings.get("sweep-z-values") or "")
+            self.run_tab.ach_values_edit.setText(settings.get("sweep-ach-values") or "")
         self.refresh_preview()
 
     # -- UI groups --

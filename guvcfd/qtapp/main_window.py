@@ -24,6 +24,10 @@ class MainWindow(QMainWindow):
         self.project_setup_tab = ProjectSetupTab()
         self.run_tab = RunTab(self.project_setup_tab)
         self.analysis_tab = AnalysisTab(self.project_setup_tab)
+        # Back-reference so gather_settings()/apply_settings() can persist
+        # RunTab's own sweep Z/ACH list boxes into the .guvcfd file too -
+        # see ProjectSetupTab.run_tab's own docstring.
+        self.project_setup_tab.run_tab = self.run_tab
 
         tabs = QTabWidget()
         tabs.addTab(self.project_setup_tab, "Project Setup")
