@@ -28,6 +28,17 @@ already-finished one further). Unlike Dash's equivalent
 flow-convergence resume here is fully automatic (a sensible default
 `additional_iterations`, no interactive continue-vs-accept decision
 panel) - a deliberate, smaller-scope choice, not an oversight.
+
+Stale-marker fix (2026-08-18): run_steady_state_scenario() reads Phase
+1/2 checkpoint/pending markers UNCONDITIONALLY (see
+steady_state_pipeline.clear_phase_resume_state's own docstring) - a
+genuine fresh Start (mesh/0/ fields rebuilt from scratch) must clear
+them first, or it silently resumes stale Phase 1/2 state against fields
+it no longer matches, producing a confusing downstream solver IO error.
+_run_steady_state and launch_continue's "flow" stage branch both call
+clear_phase_resume_state() before handing off to _finish_steady_state();
+launch_continue's "phases" stage branch deliberately does NOT, since
+that path's entire purpose is to honor those same markers.
 """
 import json
 import re
@@ -51,7 +62,8 @@ from ..monitoring_points import compute_monitoring_results
 from ..run_pipeline import case_awaiting_flow_decision, resume_case_setup, setup_case
 from ..splice import set_control_dict_time
 from ..steady_state_pipeline import (
-    REFERENCE_TARGET_T_SS, merge_project_deltat_settings, resolve_phase_delta_ts, run_steady_state_scenario,
+    REFERENCE_TARGET_T_SS, clear_phase_resume_state, merge_project_deltat_settings, resolve_phase_delta_ts,
+    run_steady_state_scenario,
 )
 from ..ventilation_control import finish_ventilation_only_control, prepare_ventilation_only_control
 from ..wsl_utils import StoppedByUser, run_wsl_or_raise, run_wsl_streaming, wsl_path
@@ -349,6 +361,13 @@ def launch_continue(state, guv_path, case_dir, room, settings):
                 if settings["sim-type"] == "decay":
                     _finish_decay(state, case_dir, room, settings, summary)
                 else:
+                    # "flow" stage means the earlier attempt stopped before
+                    # Phase 1 ever started (0/fluenceRate didn't exist yet) -
+                    # no legitimate Phase 1/2 progress can exist for this
+                    # case_dir. Clear defensively, same reasoning as the
+                    # fresh-Start path in _run_steady_state, in case this
+                    # case_dir was previously used by an older attempt.
+                    clear_phase_resume_state(case_dir)
                     _finish_steady_state(state, case_dir, room, settings, summary)
             elif probe["stage"] == "phases" and probe["resumable"]:
                 state.log_fn("=== Resuming from setup already on disk (mesh/flow field/UV zones "
@@ -728,6 +747,12 @@ def _run_steady_state(state, guv_path, case_dir, room, settings):
     _save_run_settings(case_dir, settings, guv_path)
 
     state.log_fn("=== Setting up mesh, flow field, and UV zones ===")
+    # A genuinely fresh Start rebuilds the mesh/0/ fields from scratch -
+    # any Phase 1/2 checkpoint/pending marker left over from an earlier,
+    # stopped attempt at this same case_dir must not survive it, or
+    # run_steady_state_scenario()'s own unconditional checkpoint/pending
+    # detection will silently resume against fields that no longer match.
+    clear_phase_resume_state(case_dir)
     summary = _setup_case_common(state, guv_path, case_dir, room, settings, adv)
     if state.should_stop():
         raise StoppedByUser("Stopped after case setup.")

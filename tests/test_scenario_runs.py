@@ -1655,7 +1655,8 @@ def test_run_sweep_recarves_source_zone_after_apply_z_wipes_it(tmp_path, monkeyp
 
     topo_calls = []
     monkeypatch.setattr(sr, "write_source_topo_set_dict",
-                         lambda case_dir, center, size, cell_size=None: topo_calls.append((case_dir, center, size)))
+                         lambda case_dir, center, size, cell_size=None, room_dims=None:
+                         topo_calls.append((case_dir, center, size)))
     wsl_calls = []
     monkeypatch.setattr(sr, "run_wsl_or_raise", lambda cmd, *a, **k: wsl_calls.append(cmd))
 
@@ -2431,3 +2432,52 @@ def test_run_sweep_never_exceeds_max_concurrent_solves(tmp_path, monkeypatch):
     )
 
     assert state["peak"] <= 3
+
+
+def test_run_sweep_max_concurrent_solves_overridable_via_adv(tmp_path, monkeypatch):
+    # Regression test for a real, confirmed incident (2026-08-20): an
+    # overnight 25-combo sweep at the old hardcoded _MAX_CONCURRENT_SOLVES=9
+    # crashed itself in 5 separate waves from resource contention. The pool
+    # size must come from adv["max-concurrent-solves"] when present, not
+    # just the module-level fallback constant - this is what actually lets
+    # a user dial it down without a code change.
+    project_dir = tmp_path / "proj"
+    project_dir.mkdir()
+    monkeypatch.setattr(sr, "_MAX_CONCURRENT_SOLVES", 9)  # fallback stays high, adv should win anyway
+    monkeypatch.setattr(sr, "_copy_base_case", lambda base, target, log_fn: __import__("os").makedirs(target, exist_ok=True))
+    monkeypatch.setattr(sr, "_apply_z", lambda case_dir, z, nbins, fan_kwargs, log_fn:
+                         {"fluence_mean": 1.0, "eACH_uv_well_mixed_mean": 0.0})
+    monkeypatch.setattr(sr, "compute_uv_fingerprint", lambda *a, **k: "fake-uv-fp")
+    monkeypatch.setattr(sr, "write_source_topo_set_dict", lambda *a, **k: None)
+    monkeypatch.setattr(sr, "run_wsl_or_raise", lambda *a, **k: None)
+
+    lock = threading.Lock()
+    state = {"live": 0, "peak": 0}
+
+    def track(fn=None):
+        def wrapped(*a, **k):
+            with lock:
+                state["live"] += 1
+                state["peak"] = max(state["peak"], state["live"])
+            time.sleep(0.03)
+            with lock:
+                state["live"] -= 1
+            return fn(*a, **k) if fn else None
+        return wrapped
+
+    monkeypatch.setattr(sr, "_build_flow_base", track())
+    monkeypatch.setattr(sr, "_run_shared_phase1", track())
+    monkeypatch.setattr(sr, "_run_shared_control", track(lambda *a, **k: {"total_ach_effective": 3.0}))
+    monkeypatch.setattr(sr, "_run_scenario", track(lambda *a, **k: {
+        "reduction_pct": 90.0, "eACH_uv_steady_state": 50.0, "phase1": {"T_ss": 1.0, "live": {"t": [1]}},
+        "phase2": {"T_ss": 0.1, "live": {"t": [1]}}}))
+
+    room = type("Room", (), {"x": 4.0, "y": 5.0, "z": 2.7})()
+    sr.run_sweep(
+        guv_path="proj.guv", settings_path="proj.guvcfd", project_dir=str(project_dir),
+        room=room, settings=_steady_state_settings(),
+        adv={"uv-zone-bins": 25, "mesh-cell-size": 0.1, "max-concurrent-solves": 2},
+        z_values=[2, 6], ach_values=[1.5, 3, 6], log_fn=lambda m: None,
+    )
+
+    assert state["peak"] <= 2

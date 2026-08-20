@@ -63,6 +63,35 @@ def _direction_grading(length, cell_size, wall_cell_size):
     return total_n, grading
 
 
+def _axis_cell_count(length, cell_size):
+    """Number of cells blockMeshDict actually builds along one axis -
+    round the cell COUNT, then blockMesh divides the room's exact
+    dimension evenly into that many cells (see block_mesh_dict). This is
+    the single source of truth both block_mesh_dict (mesh generation) and
+    _opening_box (opening snapping) must agree on - see
+    _actual_axis_cell_size's own docstring for what goes wrong when they
+    don't.
+    """
+    return max(1, round(length / cell_size))
+
+
+def _actual_axis_cell_size(length, cell_size):
+    """The per-axis cell size blockMeshDict actually builds for `length`
+    - differs from the nominal cell_size whenever length/cell_size isn't
+    a whole number (e.g. a 5m room depth at a nominal 0.09m cell_size
+    builds 56 cells of 0.089286m each, not 0.09m). _opening_box's
+    snapping must snap to THIS, not the raw nominal cell_size, or the
+    "snap to the mesh grid" step targets a coordinate that doesn't match
+    any real cell face at all - silently reintroducing the exact
+    boxToFace floating-point boundary-tie problem this snapping exists to
+    avoid (confirmed directly: nominal-cell_size snapping at 0.09m on
+    this room's 5m depth landed the carved inlet edge 18-28mm off every
+    real grid line; at 0.08m, 18-37mm off - only cell sizes that divide
+    every room dimension exactly, like 0.1m here, were actually safe).
+    """
+    return length / _axis_cell_count(length, cell_size)
+
+
 def block_mesh_dict(Lx, Ly, Lz, cell_size=0.1, wall_cell_size=None):
     """Single-block box mesh covering the whole room, before opening carving.
 
@@ -78,9 +107,9 @@ def block_mesh_dict(Lx, Ly, Lz, cell_size=0.1, wall_cell_size=None):
         nz, gz = _direction_grading(Lz, cell_size, wall_cell_size)
         grading = f"{gx} {gy} {gz}"
     else:
-        nx = max(1, round(Lx / cell_size))
-        ny = max(1, round(Ly / cell_size))
-        nz = max(1, round(Lz / cell_size))
+        nx = _axis_cell_count(Lx, cell_size)
+        ny = _axis_cell_count(Ly, cell_size)
+        nz = _axis_cell_count(Lz, cell_size)
         grading = "1 1 1"
 
     vertices = [(vx * Lx, vy * Ly, vz * Lz) for vx, vy, vz in _HEX_VERTICES]
@@ -186,12 +215,13 @@ def _opening_box(wall, Lx, Ly, Lz, center_frac, size, cell_size=None, eps=1e-4):
     lo[a1], hi[a1] = c1 * dims[a1] - w / 2, c1 * dims[a1] + w / 2
     lo[a2], hi[a2] = c2 * dims[a2] - h / 2, c2 * dims[a2] + h / 2
     if cell_size:
-        lo[a1], hi[a1] = snap_outward(lo[a1], cell_size, "lo"), snap_outward(hi[a1], cell_size, "hi")
-        lo[a2], hi[a2] = snap_outward(lo[a2], cell_size, "lo"), snap_outward(hi[a2], cell_size, "hi")
+        cell1, cell2 = _actual_axis_cell_size(dims[a1], cell_size), _actual_axis_cell_size(dims[a2], cell_size)
+        lo[a1], hi[a1] = snap_outward(lo[a1], cell1, "lo"), snap_outward(hi[a1], cell1, "hi")
+        lo[a2], hi[a2] = snap_outward(lo[a2], cell2, "lo"), snap_outward(hi[a2], cell2, "hi")
         if hi[a1] <= lo[a1]:
-            hi[a1] = lo[a1] + cell_size
+            hi[a1] = lo[a1] + cell1
         if hi[a2] <= lo[a2]:
-            hi[a2] = lo[a2] + cell_size
+            hi[a2] = lo[a2] + cell2
     pos = normal_pos_fn(Lx, Ly, Lz)
     lo[normal_axis], hi[normal_axis] = pos - eps, pos + eps
     return tuple(lo), tuple(hi)
@@ -247,22 +277,30 @@ def opening_grid_alignment(wall, Lx, Ly, Lz, center_frac, size, cell_size):
     return nominal, actual
 
 
-def suggest_opening_size_fix(size, cell_size, fp_tol=1e-9):
+def suggest_opening_size_fix(wall, Lx, Ly, Lz, size, cell_size, fp_tol=1e-9):
     """(suggested_w, suggested_h): each axis of `size` rounded UP to the
-    next exact multiple of cell_size - unchanged (within fp_tol) if
-    already exact. Pure size-only arithmetic, deliberately NOT coupled to
-    position the way _opening_box's per-edge snap_outward is (that grows
-    an off-grid opening by up to one cell_size PER EDGE; this grows it by
-    up to one cell_size TOTAL) - see suggest_opening_center_fix for the
-    separate, sequential position step meant to run after this one, using
-    this function's own output as its `size` input.
+    next exact multiple of the REAL per-axis cell size block_mesh_dict
+    actually builds for that axis (see _actual_axis_cell_size - differs
+    from the raw nominal cell_size whenever that room dimension isn't an
+    exact multiple of it; using nominal directly here reproduced the same
+    off-real-grid bug _opening_box had, fixed 2026-08-19) - unchanged
+    (within fp_tol) if already exact. Pure size-only arithmetic,
+    deliberately NOT coupled to position the way _opening_box's per-edge
+    snap_outward is (that grows an off-grid opening by up to one cell
+    PER EDGE; this grows it by up to one cell TOTAL) - see
+    suggest_opening_center_fix for the separate, sequential position step
+    meant to run after this one, using this function's own output as its
+    `size` input.
 
-    Mathematically identical to calling snap_outward(v, cell_size, "hi")
-    on each axis value directly - ceil(v/cell_size)*cell_size is the same
-    formula whether v is a position or a length, so this just reuses that
+    Mathematically identical to calling snap_outward(v, cell, "hi") on
+    each axis value directly - ceil(v/cell)*cell is the same formula
+    whether v is a position or a length, so this just reuses that
     already-tested primitive rather than duplicating its fp_tol handling.
     """
-    return tuple(snap_outward(v, cell_size, "hi", fp_tol=fp_tol) for v in size)
+    _, _, (a1, a2) = _WALL_SPECS[wall]
+    dims = (Lx, Ly, Lz)
+    cell1, cell2 = _actual_axis_cell_size(dims[a1], cell_size), _actual_axis_cell_size(dims[a2], cell_size)
+    return (snap_outward(size[0], cell1, "hi", fp_tol=fp_tol), snap_outward(size[1], cell2, "hi", fp_tol=fp_tol))
 
 
 def _mod_phase(value, cell_size, fp_tol=1e-9):
@@ -335,12 +373,13 @@ def suggest_opening_center_fix(wall, Lx, Ly, Lz, center_frac, size, cell_size, f
     """
     _, _, (a1, a2) = _WALL_SPECS[wall]
     dims = (Lx, Ly, Lz)
+    cell1, cell2 = _actual_axis_cell_size(dims[a1], cell_size), _actual_axis_cell_size(dims[a2], cell_size)
     cur1, cur2 = center_frac[0] * dims[a1], center_frac[1] * dims[a2]
     w, h = size
-    phase1, phase2 = _mod_phase(w / 2, cell_size, fp_tol), _mod_phase(h / 2, cell_size, fp_tol)
+    phase1, phase2 = _mod_phase(w / 2, cell1, fp_tol), _mod_phase(h / 2, cell2, fp_tol)
     mid1, mid2 = dims[a1] / 2, dims[a2] / 2
-    sug1 = _nearest_lattice_point(cur1, cell_size, phase1, mid1, fp_tol)
-    sug2 = _nearest_lattice_point(cur2, cell_size, phase2, mid2, fp_tol)
+    sug1 = _nearest_lattice_point(cur1, cell1, phase1, mid1, fp_tol)
+    sug2 = _nearest_lattice_point(cur2, cell2, phase2, mid2, fp_tol)
     return (cur1, cur2), (sug1, sug2)
 
 

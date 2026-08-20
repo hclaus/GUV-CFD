@@ -14,7 +14,7 @@ def test_source_topo_set_dict_snaps_edges_when_cell_size_given():
     # (1.85/2.15 etc) sit almost exactly on a cell_size=0.1 grid line, a
     # boxToCell floating-point boundary tie. Snapped edges must instead be
     # exact multiples of cell_size.
-    text = source_topo_set_dict((2.0, 1.5, 1.35), (0.3, 0.3, 0.3), cell_size=0.1)
+    text = source_topo_set_dict((2.0, 1.5, 1.35), (0.3, 0.3, 0.3), cell_size=0.1, room_dims=(4.0, 3.0, 2.7))
     import re
     m = re.search(r"box\s+\(([^)]*)\)\s+\(([^)]*)\)", text)
     lo = [float(v) for v in m.group(1).split()]
@@ -24,7 +24,7 @@ def test_source_topo_set_dict_snaps_edges_when_cell_size_given():
 
 
 def test_source_topo_set_dict_snap_never_collapses_to_zero_width():
-    text = source_topo_set_dict((2.0, 1.5, 1.35), (0.02, 0.02, 0.02), cell_size=0.1)
+    text = source_topo_set_dict((2.0, 1.5, 1.35), (0.02, 0.02, 0.02), cell_size=0.1, room_dims=(4.0, 3.0, 2.7))
     import re
     m = re.search(r"box\s+\(([^)]*)\)\s+\(([^)]*)\)", text)
     lo = [float(v) for v in m.group(1).split()]
@@ -43,7 +43,7 @@ def test_source_topo_set_dict_matches_real_case_that_used_to_shrink():
     # (source_volume: 0.012 m^3). The outward-snap fix must not reproduce
     # that shrinkage.
     import re
-    text = source_topo_set_dict((2.0, 1.5, 1.5), (0.3, 0.3, 0.3), cell_size=0.1)
+    text = source_topo_set_dict((2.0, 1.5, 1.5), (0.3, 0.3, 0.3), cell_size=0.1, room_dims=(4.0, 3.0, 2.7))
     m = re.search(r"box\s+\(([^)]*)\)\s+\(([^)]*)\)", text)
     lo = [float(v) for v in m.group(1).split()]
     hi = [float(v) for v in m.group(2).split()]
@@ -52,6 +52,38 @@ def test_source_topo_set_dict_matches_real_case_that_used_to_shrink():
         assert h - l >= 0.3 - 1e-9
         volume *= h - l
     assert volume >= 0.027 - 1e-9
+
+
+def test_source_box_snaps_to_the_actual_mesh_grid_not_the_nominal_cell_size():
+    # Regression test for a real, confirmed bug (2026-08-19, same root
+    # cause as mesh_gen._opening_box's identical bug): _source_box used to
+    # snap against the raw nominal cell_size, but block_mesh_dict builds
+    # n = round(length/cell_size) cells spanning the room's EXACT
+    # dimension - whenever length/cell_size isn't a whole number, the
+    # ACTUAL per-axis cell size differs from nominal, and snapping
+    # against the wrong grid lands carved edges off every real mesh grid
+    # line (confirmed: an 0.8m source cube on this exact room at 0.09m
+    # nominal came out as 1000 real cells instead of the correctly-
+    # aligned 900).
+    from guvcfd.contaminant_source import _source_box
+
+    Lx, Ly, Lz = 4.0, 5.0, 3.0
+    cell_size = 0.09
+    actual = [Lx / round(Lx / cell_size), Ly / round(Ly / cell_size), Lz / round(Lz / cell_size)]
+    lo, hi = _source_box((2.0, 2.5, 1.5), 0.8, cell_size=cell_size, room_dims=(Lx, Ly, Lz))
+    for i in range(3):
+        assert abs(round(lo[i] / actual[i]) * actual[i] - lo[i]) < 1e-9
+        assert abs(round(hi[i] / actual[i]) * actual[i] - hi[i]) < 1e-9
+    # And explicitly NOT aligned to the nominal cell_size grid instead -
+    # pins the fix against silently reverting to the old (wrong) behavior.
+    assert abs(round(lo[0] / cell_size) * cell_size - lo[0]) > 1e-3
+
+
+def test_source_box_requires_room_dims_when_cell_size_given():
+    from guvcfd.contaminant_source import _source_box
+    import pytest
+    with pytest.raises(ValueError, match="room_dims"):
+        _source_box((2.0, 2.5, 1.5), 0.8, cell_size=0.09)
 
 
 def test_source_topo_set_dict_accepts_scalar_size():

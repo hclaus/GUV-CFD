@@ -96,9 +96,14 @@ _TEMPLATE_CASE_DIR = str(Path(__file__).resolve().parent / "templates" / "case_t
 # decay mode has no Phase 1 at all, so control and every Z's own decay
 # solve are submitted together instead, immediately once flow finishes).
 #
-# Sized at 9 (not the host's full core count) by explicit choice - leaves
-# headroom for the rest of the machine rather than claiming every core.
-_MAX_CONCURRENT_SOLVES = 9
+# Fallback only when a caller's own adv dict has no "max-concurrent-solves"
+# key (e.g. an older saved advanced_settings.json, or a direct/test call
+# that doesn't go through app_settings.load_advanced_settings) - the real,
+# tunable default lives in app_settings.ADVANCED_SETTINGS_DEFAULTS, see
+# its own comment for why this was lowered from 9 to 5 (a real overnight
+# sweep failure, 2026-08-20) and why it's memory/reliability, not just
+# CPU-core headroom, that should drive this number.
+_MAX_CONCURRENT_SOLVES = 5
 
 _UNSAFE_FOLDER_CHARS_RE = re.compile(r"[^A-Za-z0-9._-]+")
 # Matches pimpleFoam's per-timestep "Time = N" banner, not the residual/
@@ -1590,7 +1595,7 @@ def run_decay_sweep(guv_path, settings_path, project_dir, room, settings, adv,
     combos = sweep_combinations(z_values, ach_values)
     achs = sorted({ach for _, ach in combos})
     project_name = _sanitize(Path(project_dir).name)
-    pool = ThreadPoolExecutor(max_workers=_MAX_CONCURRENT_SOLVES)
+    pool = ThreadPoolExecutor(max_workers=adv.get("max-concurrent-solves", _MAX_CONCURRENT_SOLVES))
 
     # Each "" for this project's original design/mode (today's exact
     # naming, unchanged) - see compute_guv_design_suffix/
@@ -1885,7 +1890,7 @@ def run_sweep(guv_path, settings_path, project_dir, room, settings, adv,
     combos = sweep_combinations(z_values, ach_values)
     achs = sorted({ach for _, ach in combos})
     project_name = _sanitize(Path(project_dir).name)
-    pool = ThreadPoolExecutor(max_workers=_MAX_CONCURRENT_SOLVES)
+    pool = ThreadPoolExecutor(max_workers=adv.get("max-concurrent-solves", _MAX_CONCURRENT_SOLVES))
 
     # Each "" for this project's original design/mode (today's exact
     # naming, unchanged) - see compute_guv_design_suffix/
@@ -1992,7 +1997,7 @@ def run_sweep(guv_path, settings_path, project_dir, room, settings, adv,
             # fvOptions entry still resolves against a real cellZone.
             write_source_topo_set_dict(
                 case_dir, (settings["inject-x-input"], settings["inject-y-input"], settings["inject-z-input"]),
-                settings["source-zone-size"], cell_size=adv["mesh-cell-size"])
+                settings["source-zone-size"], cell_size=adv["mesh-cell-size"], room_dims=(room.x, room.y, room.z))
             run_wsl_or_raise("topoSet -dict system/sourceTopoSetDict", wsl_path(case_dir),
                               "topoSet (restoring source zone wiped by _apply_z)")
             # The future itself is handed through, not .result() here -

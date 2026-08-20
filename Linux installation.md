@@ -114,9 +114,10 @@ not something you need to keep doing yourself.)
 
 ### 1f. Optional but recommended - give WSL more resources for real CFD cases
 
-By default WSL2 caps itself to a fraction of your machine's RAM/CPUs,
-which can be tight for anything beyond a small mesh. On the **Windows**
-side, create/edit `C:\Users\<you>\.wslconfig`:
+By default WSL2 caps itself to a fraction of your machine's RAM/CPUs
+(with no explicit override, roughly half of total host RAM) and a small
+default swap - fine for a quick test, but a real sweep can exceed it. On
+the **Windows** side, create/edit `C:\Users\<you>\.wslconfig`:
 
 ```ini
 [wsl2]
@@ -124,9 +125,34 @@ memory=16GB
 processors=8
 ```
 
-(adjust to your machine - leave enough headroom for Windows itself) then
-`wsl --shutdown` and relaunch for it to take effect. Not required to get
-started, but worth doing before a real production sweep.
+(adjust `memory`/`processors` to your machine - leave enough headroom for
+Windows itself) then `wsl --shutdown` and relaunch for it to take effect.
+Not required to get started, but worth doing before a real production
+sweep.
+
+**This machine's actual setup (confirmed 2026-08-18)**, on a 16GB-RAM
+host:
+
+```ini
+[wsl2]
+vmIdleTimeout=-1
+memory=10GB
+swap=4GB
+```
+
+`vmIdleTimeout=-1` disables WSL's idle-shutdown timer (needed for the SSH
+transport in Part 2 to survive a quiet period without WSL tearing itself
+down mid-connection). `memory`/`swap` were raised after a real incident:
+running two concurrent flow-base builds on a fine (0.08m) mesh exceeded
+WSL's un-overridden default ceiling (~7.6GB) and crashed the whole WSL2
+VM outright - confirmed via Windows' own Hyper-V event log showing the
+WSL VM's network adapter torn down and recreated mid-solve, and both
+`log.simpleFoam` files stopping abruptly with no FOAM error (the solves
+themselves were converging cleanly right up to the last line - this
+was a VM-level OOM, not a numerical divergence). `wsl --shutdown` +
+relaunch is required for any `.wslconfig` change to take effect, and it
+kills anything currently running in WSL - check for running solves
+first (`wsl -e bash -lc "ps aux | grep -i foam"`).
 
 ### 1g. Sanity check before moving to Part 2
 

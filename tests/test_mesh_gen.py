@@ -174,6 +174,33 @@ def test_opening_box_snapping_is_a_noop_when_already_grid_aligned():
         assert abs(a - b) < 1e-9
 
 
+def test_opening_box_snaps_to_the_actual_mesh_grid_not_the_nominal_cell_size():
+    # Regression test for a real, confirmed bug (2026-08-19): _opening_box
+    # used to snap against the raw nominal cell_size, but block_mesh_dict
+    # builds n = round(length/cell_size) cells spanning the room's EXACT
+    # dimension - whenever length/cell_size isn't a whole number, that
+    # produces an ACTUAL per-axis cell size different from the nominal
+    # one (e.g. a 5m room depth at nominal 0.09m builds 56 cells of
+    # 0.089286m each). Snapping against the wrong (nominal) grid landed
+    # carved opening edges up to ~28mm off every real mesh grid line,
+    # silently reintroducing the exact boxToFace floating-point boundary-
+    # tie problem this snapping exists to prevent. Confirmed directly on
+    # this exact room/opening/cell_size combination before the fix.
+    Lx, Ly, Lz = 4.0, 5.0, 3.0
+    cell_size = 0.09
+    actual_dy = Ly / round(Ly / cell_size)  # 5.0 / 56 = 0.089285714...
+    actual_dz = Lz / round(Lz / cell_size)  # 3.0 / 33 = 0.090909090...
+    lo, hi = _opening_box("xMin", Lx, Ly, Lz, (2.5 / Ly, 2.55 / Lz), (0.4, 0.4),
+                           cell_size=cell_size, eps=0.0)
+    for v in (lo[1], hi[1]):
+        assert abs(round(v / actual_dy) * actual_dy - v) < 1e-9
+    for v in (lo[2], hi[2]):
+        assert abs(round(v / actual_dz) * actual_dz - v) < 1e-9
+    # And explicitly NOT aligned to the nominal cell_size grid instead -
+    # pins the fix against silently reverting to the old (wrong) behavior.
+    assert abs(round(lo[1] / cell_size) * cell_size - lo[1]) > 1e-3
+
+
 def test_opening_center_uses_the_same_snapped_box_as_write_mesh_dicts():
     # opening_center() must reflect the *actual* carved geometry (same
     # cell_size passed to write_mesh_dicts), not the nominal/unsnapped
@@ -226,7 +253,7 @@ def test_opening_half_extents_no_snap_matches_nominal_size_exactly():
 # --- suggest_opening_size_fix / suggest_opening_center_fix (2026-08-07) ---
 
 def test_suggest_opening_size_fix_is_a_noop_when_already_exact_multiples():
-    w, h = suggest_opening_size_fix((0.4, 0.3), 0.1)
+    w, h = suggest_opening_size_fix("xMin", 4.0, 5.0, 3.0, (0.4, 0.3), 0.1)
     assert math.isclose(w, 0.4, abs_tol=1e-9)
     assert math.isclose(h, 0.3, abs_tol=1e-9)
 
@@ -236,21 +263,47 @@ def test_suggest_opening_size_fix_stays_a_noop_under_fp_noise():
     # bump to 0.4 just because of that representation noise.
     noisy = 0.1 + 0.1 + 0.1
     assert noisy != 0.3  # sanity: confirms this IS the noisy case
-    w, h = suggest_opening_size_fix((noisy, 0.4), 0.1)
+    w, h = suggest_opening_size_fix("xMin", 4.0, 5.0, 3.0, (noisy, 0.4), 0.1)
     assert math.isclose(w, 0.3, abs_tol=1e-9)
     assert math.isclose(h, 0.4, abs_tol=1e-9)
 
 
 def test_suggest_opening_size_fix_rounds_up_only_the_off_axis():
-    w, h = suggest_opening_size_fix((0.37, 0.4), 0.1)
+    w, h = suggest_opening_size_fix("xMin", 4.0, 5.0, 3.0, (0.37, 0.4), 0.1)
     assert math.isclose(w, 0.4, abs_tol=1e-9)
     assert math.isclose(h, 0.4, abs_tol=1e-9)
 
 
 def test_suggest_opening_size_fix_rounds_up_both_axes():
-    w, h = suggest_opening_size_fix((0.23, 0.35), 0.1)
+    w, h = suggest_opening_size_fix("xMin", 4.0, 5.0, 3.0, (0.23, 0.35), 0.1)
     assert math.isclose(w, 0.3, abs_tol=1e-9)
     assert math.isclose(h, 0.4, abs_tol=1e-9)
+
+
+def test_suggest_opening_size_and_center_fix_use_the_actual_not_nominal_grid():
+    # Regression test for a real, confirmed bug (2026-08-19, same root
+    # cause as _opening_box's identical bug): both functions used to snap
+    # against the raw nominal cell_size, but block_mesh_dict builds
+    # n = round(length/cell_size) cells spanning the room's EXACT
+    # dimension - whenever length/cell_size isn't a whole number (0.09m
+    # on this room, unlike the other tests' 0.1m which divides evenly),
+    # the suggested "fix" landed on the wrong (nominal) grid instead of
+    # the real one.
+    Lx, Ly, Lz = 4.0, 5.0, 3.0
+    cell_size = 0.09
+    actual_dy = Ly / round(Ly / cell_size)
+    actual_dz = Lz / round(Lz / cell_size)
+
+    sw, sh = suggest_opening_size_fix("xMin", Lx, Ly, Lz, (0.4, 0.4), cell_size)
+    assert abs(round(sw / actual_dy) * actual_dy - sw) < 1e-9
+    assert abs(round(sh / actual_dz) * actual_dz - sh) < 1e-9
+    # not aligned to the nominal grid instead
+    assert abs(round(sw / cell_size) * cell_size - sw) > 1e-3
+
+    (_, _), (sug_y, sug_z) = suggest_opening_center_fix(
+        "xMin", Lx, Ly, Lz, (2.5 / Ly, 2.5 / Lz), (sw, sh), cell_size)
+    assert abs(round((sug_y - sw / 2) / actual_dy) * actual_dy - (sug_y - sw / 2)) < 1e-9
+    assert abs(round((sug_z - sh / 2) / actual_dz) * actual_dz - (sug_z - sh / 2)) < 1e-9
 
 
 def test_suggest_opening_center_fix_even_width_aligns_to_grid_lines():
@@ -339,7 +392,7 @@ def test_size_then_center_fix_matches_the_planning_session_worked_examples():
         (0.27, 0.40, 0.45, 2.77, 0.3, 0.4, 0.45, 2.8),
     ]
     for w, h, y, z, exp_w, exp_h, exp_y, exp_z in cases:
-        sw, sh = suggest_opening_size_fix((w, h), 0.1)
+        sw, sh = suggest_opening_size_fix("xMin", Lx, Ly, Lz, (w, h), 0.1)
         assert math.isclose(sw, exp_w, abs_tol=1e-9) and math.isclose(sh, exp_h, abs_tol=1e-9)
         (_, _), (sug_y, sug_z) = suggest_opening_center_fix(
             "xMin", Lx, Ly, Lz, (y / Ly, z / Lz), (sw, sh), 0.1)

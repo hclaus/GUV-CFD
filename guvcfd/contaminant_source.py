@@ -16,11 +16,11 @@ Two phases share this source, staying on throughout:
 import re
 
 from .decay_analysis import fit_asymptotic_value
-from .mesh_gen import snap_outward
+from .mesh_gen import snap_outward, _actual_axis_cell_size
 from .wsl_utils import wsl_path, run_wsl_or_raise, run_wsl, write_case_file as _write_case_file
 
 
-def _source_box(center, size, cell_size=None):
+def _source_box(center, size, cell_size=None, room_dims=None):
     """((xlo,ylo,zlo), (xhi,yhi,zhi)) for the source zone's box, snapped
     OUTWARD to the mesh grid if cell_size is given (floor each low edge,
     ceil each high edge) - see mesh_gen._opening_box's docstring for why
@@ -33,6 +33,17 @@ def _source_box(center, size, cell_size=None):
     0.027 m^3, because two of its three axes hit exactly this tie).
     Snapping outward instead guarantees the carved zone always contains
     the requested box.
+
+    room_dims: (Lx, Ly, Lz), REQUIRED whenever cell_size is given - snaps
+    against the ACTUAL per-axis cell size block_mesh_dict builds
+    (length / round(length/cell_size)), not the raw nominal cell_size -
+    see mesh_gen._actual_axis_cell_size's docstring for why: whenever a
+    room dimension isn't an exact multiple of cell_size (confirmed real:
+    0.09m nominal on this room's dims), snapping against nominal instead
+    of actual lands the carved zone's edges off every real mesh grid line,
+    the same bug _opening_box had (fixed 2026-08-19) - a 0.8m source cube
+    on a 0.09m mesh came out as 1000 real cells instead of the correctly-
+    aligned 900.
     """
     cx, cy, cz = center
     if isinstance(size, (tuple, list)):
@@ -42,15 +53,18 @@ def _source_box(center, size, cell_size=None):
     lo = [cx - sx / 2, cy - sy / 2, cz - sz / 2]
     hi = [cx + sx / 2, cy + sy / 2, cz + sz / 2]
     if cell_size:
+        if room_dims is None:
+            raise ValueError("_source_box: room_dims is required when cell_size is given")
+        cells = [_actual_axis_cell_size(room_dims[i], cell_size) for i in range(3)]
         for i in range(3):
-            lo[i] = snap_outward(lo[i], cell_size, "lo")
-            hi[i] = snap_outward(hi[i], cell_size, "hi")
+            lo[i] = snap_outward(lo[i], cells[i], "lo")
+            hi[i] = snap_outward(hi[i], cells[i], "hi")
             if hi[i] <= lo[i]:
-                hi[i] = lo[i] + cell_size
+                hi[i] = lo[i] + cells[i]
     return tuple(lo), tuple(hi)
 
 
-def source_box_grid_alignment(center, size, cell_size):
+def source_box_grid_alignment(center, size, cell_size, room_dims):
     """(nominal_size, actual_size) (width, height, depth) tuples for the
     source zone, comparing the raw requested box against what will
     actually be carved once snapped to cell_size - lets a caller warn
@@ -59,21 +73,22 @@ def source_box_grid_alignment(center, size, cell_size):
     it after the fact the way check_ach_delivery does for the inlet.
     """
     lo_nom, hi_nom = _source_box(center, size)
-    lo_snap, hi_snap = _source_box(center, size, cell_size=cell_size)
+    lo_snap, hi_snap = _source_box(center, size, cell_size=cell_size, room_dims=room_dims)
     nominal = tuple(h - l for l, h in zip(lo_nom, hi_nom))
     actual = tuple(h - l for l, h in zip(lo_snap, hi_snap))
     return nominal, actual
 
 
-def source_topo_set_dict(center, size, zone_name="sourceZone", cellset_name="sourceZoneCells", cell_size=None):
+def source_topo_set_dict(center, size, zone_name="sourceZone", cellset_name="sourceZoneCells", cell_size=None,
+                          room_dims=None):
     """topoSetDict actions carving a small box cellZone (cellSet -> cellZoneSet,
     the standard two-step pattern) for the contaminant source. No faces/
     patches involved - this only tags cells, doesn't touch mesh topology.
 
     cell_size: if given, snap all 6 box edges to the mesh grid - see
-    _source_box's docstring.
+    _source_box's docstring. room_dims required whenever cell_size is.
     """
-    lo, hi = _source_box(center, size, cell_size=cell_size)
+    lo, hi = _source_box(center, size, cell_size=cell_size, room_dims=room_dims)
 
     lines = [
         "FoamFile", "{", "    version     2.0;", "    format      ascii;",
@@ -93,10 +108,11 @@ def source_topo_set_dict(center, size, zone_name="sourceZone", cellset_name="sou
 
 def write_source_topo_set_dict(case_dir, center, size, zone_name="sourceZone",
                                 cellset_name="sourceZoneCells", filename="sourceTopoSetDict",
-                                cell_size=None):
+                                cell_size=None, room_dims=None):
     path = f"{case_dir}/system/{filename}"
     _write_case_file(case_dir, f"system/{filename}",
-                      source_topo_set_dict(center, size, zone_name, cellset_name, cell_size=cell_size))
+                      source_topo_set_dict(center, size, zone_name, cellset_name, cell_size=cell_size,
+                                            room_dims=room_dims))
     return path
 
 

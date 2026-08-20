@@ -19,7 +19,6 @@ _HELP_TOPICS = [
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle(f"GUV-CFD v{APP_VERSION}")
         self.resize(1400, 900)
 
         self.project_setup_tab = ProjectSetupTab()
@@ -34,9 +33,21 @@ class MainWindow(QMainWindow):
         self.tabs = tabs
 
         self.run_tab.run_finished.connect(self._on_run_finished)
+        # Which .guvcfd/.guv is loaded was only ever shown on the Project
+        # Setup tab's own label (project_setup_tab.project_label) - easy to
+        # miss entirely while working from Run Simulations/Analysis of
+        # Results, since Qt tabs hide each other's content. The window
+        # title bar is visible regardless of which tab is active, so it's
+        # kept in sync with that same label instead of just showing a bare
+        # version number - confirmed as a real, reported gap (2026-08-18).
+        self.project_setup_tab.project_loaded.connect(self._update_window_title)
+        self._update_window_title()
 
         self._build_menu()
         self.statusBar().showMessage("Ready.")
+
+    def _update_window_title(self):
+        self.setWindowTitle(f"GUV-CFD v{APP_VERSION} — {self.project_setup_tab.project_label.text()}")
 
     def _build_menu(self):
         menu = self.menuBar()

@@ -64,7 +64,13 @@ _MAX_RECENT_PROJECTS = 10
 
 
 class ProjectSetupTab(QWidget):
-    project_loaded = Signal()  # emitted after a .guv is loaded, room/lamps ready
+    # Emitted after a .guv is loaded (room/lamps ready) AND after a
+    # save (settings_path/project_label just changed) - despite the name,
+    # covers "this tab's own notion of which project is current just
+    # changed", not load-only; had zero listeners until MainWindow's own
+    # window-title fix (2026-08-18) started using it for exactly the save
+    # case too (see save_project below).
+    project_loaded = Signal()
     recent_projects_changed = Signal()  # emitted whenever the recent-projects list changes
 
     def __init__(self, parent=None):
@@ -677,6 +683,7 @@ class ProjectSetupTab(QWidget):
         self.settings_path = path
         self.project_label.setText(self._project_label_text())
         self._remember_project_path(path)
+        self.project_loaded.emit()
 
     def refresh_preview(self):
         try:

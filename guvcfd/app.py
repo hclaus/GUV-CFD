@@ -2537,9 +2537,10 @@ settings_modal = dbc.Modal(
                 _settings_field(
                     "settings-momentum-relaxation", "Momentum/turbulence relaxation",
                     "Damping factor for velocity (U) and turbulence (k, omega) each solver "
-                    "iteration. 0.7 is the standard, well-tested default for room-ventilation "
-                    "flows — raising it can speed up convergence on easy cases, but is the first "
-                    "thing to lower if a run's flow field oscillates instead of settling.",
+                    "iteration. 0.5 is the default, confirmed to fix a real case where 0.7 let "
+                    "the flow field oscillate indefinitely instead of settling. Lower this number "
+                    "a bit if oscillation is a problem; raising it can speed up convergence on "
+                    "easy cases, at the cost of the same instability risk 0.7 used to hit.",
                     "", _adv_defaults["momentum-relaxation"],
                 ),
                 _settings_field(
@@ -2767,6 +2768,16 @@ settings_modal = dbc.Modal(
                     "production sweep confirmed 10 stays stable with flat continuity error - see "
                     "ANALYSIS_LOG.md before pushing higher.",
                     "", _adv_defaults["max-co"],
+                ),
+                _settings_field(
+                    "settings-max-concurrent-solves", "Max concurrent solves (sweeps)",
+                    "How many OpenFOAM processes a sweep runs at once, any stage (flow, Phase 1, "
+                    "control, Phase 2/decay). Was 9 (sized only for CPU-core headroom); lowered to 5 "
+                    "after a real overnight sweep crashed itself in 5 separate waves from resource "
+                    "contention, some with no trace in WSL's own kernel log - see 'Linux "
+                    "installation.md'. Raise only if you've confirmed your machine has the RAM for "
+                    "it; lower this if an unsupervised sweep keeps dying.",
+                    "", _adv_defaults["max-concurrent-solves"],
                 ),
                 _settings_field(
                     "settings-decay-ach-min-fraction", "ACH fit target reduction",
@@ -3596,7 +3607,7 @@ _SETTINGS_FIELD_IDS = [
     "settings-phase1-settling-safety-multiplier", "settings-phase1-max-iterations-ceiling",
     "settings-deltat-scaling-enabled", "settings-deltat-effective-fraction", "settings-deltat-target-fraction",
     "settings-keep-all-timesteps",
-    "settings-pimple-delta-t", "settings-max-co",
+    "settings-pimple-delta-t", "settings-max-co", "settings-max-concurrent-solves",
     "settings-decay-ach-min-fraction", "settings-decay-each-min-fraction", "settings-decay-each-max-fraction",
     "settings-mesh-cell-size",
     "settings-uv-zone-bins",
@@ -3617,7 +3628,7 @@ _SETTINGS_FIELD_KEYS = [
     "phase1-settling-safety-multiplier", "phase1-max-iterations-ceiling",
     "deltat-scaling-enabled", "deltat-effective-fraction", "deltat-target-fraction",
     "keep-all-timesteps",
-    "pimple-delta-t", "max-co",
+    "pimple-delta-t", "max-co", "max-concurrent-solves",
     "decay-ach-min-fraction", "decay-each-min-fraction", "decay-each-max-fraction",
     "mesh-cell-size", "uv-zone-bins",
     "keep-shared-scratch-dirs",

@@ -29,7 +29,7 @@ from .decay_analysis import (
     spatial_coefficient_of_variation,
 )
 from .initial_fields import restore_boundary_conditions, resolve_inlet_velocity
-from .mesh_gen import opening_center, opening_half_extents
+from .mesh_gen import opening_center, opening_half_extents, _actual_axis_cell_size
 from .monitoring import write_vol_average_dict, live_vol_average_functions
 from .monitoring_points import write_monitoring_topo_set_dict, zone_name
 from .splice import (
@@ -1062,6 +1062,27 @@ def _clear_phase2_pending(case_dir):
     Path(_phase2_pending_path(case_dir)).unlink(missing_ok=True)
 
 
+def clear_phase_resume_state(case_dir):
+    """Clear every Phase 1/Phase 2 checkpoint/pending marker in case_dir.
+
+    run_steady_state_scenario() reads these UNCONDITIONALLY (see its own
+    checkpoint/pending detection near its top) - it has no way to tell a
+    deliberate resume apart from a case_dir that merely happens to still
+    have leftover markers from an earlier, unrelated attempt at this same
+    path. That's fine for scenario_runs.py's sweep reuse (which WANTS
+    unconditional reuse across separate launches), but a genuine fresh
+    rebuild (mesh/0/ fields regenerated from scratch) must call this
+    first, or a stopped-mid-phase leftover marker silently resumes
+    against fields that no longer match it - confirmed as the cause of a
+    real "simpleFoam IO error" report (2026-08-18): Stop mid-run, reload
+    the app, Start again (not Continue) reused stale Phase 1/2 state
+    against a freshly rebuilt case.
+    """
+    _clear_phase1_checkpoint(case_dir)
+    _clear_phase1_pending(case_dir)
+    _clear_phase2_pending(case_dir)
+
+
 # target_T_ss only ever sets the source strength G (compute_source_strength) -
 # the system is linear in G, so both T_ss1 and T_ss2 scale proportionally
 # with it and reduction_pct/eACH_uv (both ratios) are completely
@@ -1405,13 +1426,21 @@ def run_steady_state_scenario(case_dir, room_x, room_y, room_z, ach, Z, nbins=25
                                       n_source_cells)
         else:
             log_fn(f"Carving source cellZone at {source_center}, size {source_size}...")
-            write_source_topo_set_dict(case_dir, source_center, source_size, cell_size=cell_size)
+            room_dims = (room_x, room_y, room_z)
+            write_source_topo_set_dict(case_dir, source_center, source_size, cell_size=cell_size,
+                                        room_dims=room_dims)
             r = run_wsl_or_raise("topoSet -dict system/sourceTopoSetDict", case_dir_wsl, "topoSet (source zone)")
             m = re.search(r"cellSet sourceZoneCells now size (\d+)", r.stdout)
             if not m:
                 raise RuntimeError(f"Could not parse source cell count from topoSet output:\n{r.stdout}")
             n_source_cells = int(m.group(1))
-            source_volume = n_source_cells * cell_size ** 3
+            # Real per-cell volume, not cell_size**3 - a cell is only a
+            # cube of exactly cell_size when every room dimension divides
+            # it evenly (see _actual_axis_cell_size); otherwise the actual
+            # cell is dx*dy*dz, generally anisotropic and slightly
+            # different from the nominal value on every axis.
+            cell_dx, cell_dy, cell_dz = (_actual_axis_cell_size(room_dims[i], cell_size) for i in range(3))
+            source_volume = n_source_cells * cell_dx * cell_dy * cell_dz
             log_fn(f"  {n_source_cells} cells, source_volume={source_volume:.4g} m^3")
 
             G = compute_source_strength(room_volume, ach, target_T_ss)

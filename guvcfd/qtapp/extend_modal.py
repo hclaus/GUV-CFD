@@ -56,15 +56,47 @@ def load_extend_status(project_dir):
     swept) project_dir is NOT an error - status/combos may legitimately be
     empty; the error case is specifically "there's no status file AND no
     way to load settings for this folder at all".
+
+    Falls back to project_dir's own root run_settings.json (written by
+    run_state._save_run_settings before ANY solve starts) when
+    project_status.json has never tracked anything here at all -
+    confirmed as a real, blocking gap: a project_dir that's a completed
+    SINGLE run (launched via plain Start, not a sweep) has its own
+    run_settings.json sitting directly in its root, never inside a
+    "Z<...>_ACH<...>" subfolder the way a genuine swept combo's does, so
+    it was previously indistinguishable from a folder nothing has ever
+    run in - "Add more Z/ACH sweeps" around an already-validated single
+    run had no way to proceed. This fallback doesn't retroactively
+    register that run as a tracked combo (project_status.json is left
+    untouched) - it only resolves enough (guv_path/settings/room) to let
+    a NEW sweep launch on the SAME project_dir, which is already safe:
+    a sweep's own combos always live in their own subfolders, never
+    colliding with a root-level single run's files. settings_path comes
+    back None in this case (a bare single run has no associated .guvcfd
+    file necessarily - see ProjectSetupTab.load_project's own "a bare
+    .guv load starts a fresh, never-saved project" comment).
     """
     project_name = Path(project_dir).name if project_dir else ""
     status = load_project_status(project_dir, project_name)
-    if not status.get("combos") and not status.get("guv_path"):
-        return status, None, None, None, None, (
-            "No recorded status for this folder yet - open its project first (which creates one), "
-            "or point this at a folder a sweep has already run in."
-        )
     guv_path, settings_path = status.get("guv_path"), status.get("settings_path")
+    if not status.get("combos") and not guv_path:
+        try:
+            with open(f"{project_dir}/run_settings.json") as f:
+                bare_settings = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            bare_settings = None
+        if not bare_settings or not bare_settings.get("guv_path"):
+            return status, None, None, None, None, (
+                "No recorded status for this folder yet - open its project first (which creates one), "
+                "or point this at a folder a sweep (or a single run) has already run in."
+            )
+        guv_path = bare_settings["guv_path"]
+        try:
+            project = Project.load(guv_path)
+            room = next(iter(project.rooms.values()))
+        except Exception as e:
+            return status, None, None, guv_path, None, f"Failed to load {guv_path}: {e}"
+        return status, bare_settings, room, guv_path, None, None
     if not guv_path or not settings_path:
         return status, None, None, None, None, (
             "This folder's status file is missing its guv_path/settings_path."

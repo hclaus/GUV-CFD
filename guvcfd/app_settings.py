@@ -19,7 +19,19 @@ ADVANCED_SETTINGS_DEFAULTS = {
     "pimple-delta-t": 0.5,     # seconds - decay solver time step
     "mesh-cell-size": 0.10,    # meters
     "uv-zone-bins": 25,        # bins
-    "momentum-relaxation": 0.7,  # SIMPLE under-relaxation for U/(k|omega)
+    # Lowered from 0.7 to 0.5 on 2026-08-19 after a confirmed real case: at
+    # 0.1m mesh, 0.7 let U/(k|omega) genuinely fail to converge (Phase 1/2
+    # oscillating indefinitely, T_ss_cv ~2-3%, never settling even across
+    # the full iteration budget) - 0.5 alone fixed it, converging cleanly
+    # (T_ss_cv ~0.05%) to the SAME T_ss finer meshes independently agreed
+    # on, confirming it was a convergence-path issue, not a different
+    # physical answer at that mesh. A same-mesh diagnostic swapping
+    # div(phi,U) to plain "upwind" instead ALSO stopped the oscillation but
+    # converged to a different (wrong) T_ss - ruled out as the fix; 0.5 was
+    # adopted as the new default instead of a scheme change specifically
+    # because it doesn't alter the physics being solved, only how
+    # carefully the iteration approaches it.
+    "momentum-relaxation": 0.5,  # SIMPLE under-relaxation for U/(k|omega)
     "scalar-relaxation": 0.7,    # SIMPLE under-relaxation for T
     # scalarTransport1 (controlDict) solves T OUTSIDE PIMPLE's own outer-
     # corrector loop, once per timestep by default - scalar-relaxation only
@@ -112,6 +124,22 @@ ADVANCED_SETTINGS_DEFAULTS = {
     # not adopted as the default). Lower this project-by-project if a
     # specific case's own flow/mesh needs more numerical margin.
     "max-co": 10,
+    # scenario_runs._MAX_CONCURRENT_SOLVES's own tunable ceiling - how many
+    # OpenFOAM processes (any stage: flow convergence, Phase 1, control,
+    # Phase 2/decay) a sweep runs at once. Was a hardcoded 9, sized purely
+    # by CPU core headroom with no memory awareness at all. Lowered to 5
+    # as the default after a real, confirmed overnight sweep failure
+    # (2026-08-20): a full 25-combo sweep at 9 concurrent solves killed
+    # itself in 5 separate waves over ~4h45m - one from an actual WSL VM
+    # crash, the other four from processes being killed mid-solve (healthy,
+    # converging normally right up to an abrupt cutoff) with no trace in
+    # WSL's own kernel log, consistent with resource contention even with
+    # WSL's memory ceiling already raised to 10GB (see "Linux
+    # installation.md"). Raise this back up project-by-project only on a
+    # machine confirmed to have the RAM for it - more concurrency is pure
+    # wall-clock speed, less is reliability, and this project's own sweep
+    # runs are unsupervised overnight, where reliability wins.
+    "max-concurrent-solves": 5,
 }
 
 
@@ -162,7 +190,7 @@ PROJECT_OPENFOAM_SETTINGS_KEYS = (
     "phase1-t-initial", "phase1-extrapolation-streak",
     "phase1-settling-safety-multiplier", "phase1-max-iterations-ceiling",
     "decay-ach-min-fraction", "decay-each-min-fraction", "decay-each-max-fraction",
-    "max-co",
+    "max-co", "max-concurrent-solves",
 )
 
 

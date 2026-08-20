@@ -6,9 +6,10 @@ import pytest
 import guvcfd.steady_state_pipeline as ssp
 from guvcfd.steady_state_pipeline import (
     _chunk_write_interval, _clear_phase1_checkpoint, _clear_phase2_pending, _list_time_dirs,
-    _point_phase_summary, _read_phase1_checkpoint, _read_phase2_pending, _rename_chunk_time_dirs,
-    _room_phase_summary, _run_phase, _write_phase1_checkpoint, _write_phase2_pending,
-    compute_corrected_eACH_uv, compute_corrected_eACH_uv_from_control,
+    _point_phase_summary, _read_phase1_checkpoint, _read_phase1_pending, _read_phase2_pending,
+    _rename_chunk_time_dirs, _room_phase_summary, _run_phase, _write_phase1_checkpoint,
+    _write_phase1_pending, _write_phase2_pending,
+    clear_phase_resume_state, compute_corrected_eACH_uv, compute_corrected_eACH_uv_from_control,
     compute_scaled_delta_t, resolve_phase_delta_ts,
     run_steady_state_scenario,
 )
@@ -611,6 +612,29 @@ def test_phase2_pending_cleared_removes_it(tmp_path):
     assert _read_phase2_pending(str(tmp_path)) is not None
     _clear_phase2_pending(str(tmp_path))
     assert _read_phase2_pending(str(tmp_path)) is None
+
+
+# --- clear_phase_resume_state: the fresh-Start-vs-stale-marker fix (2026-08-18) ---
+# run_steady_state_scenario() reads phase1_checkpoint/phase1_pending/
+# phase2_pending unconditionally, with no way to tell a deliberate resume
+# apart from leftover markers from an earlier, unrelated attempt at the
+# same case_dir. A genuine fresh rebuild must clear all three first.
+
+def test_clear_phase_resume_state_removes_all_three_markers(tmp_path):
+    _write_phase1_checkpoint(str(tmp_path), {"T_ss": 1.0, "iterations": 100}, {},
+                              G=0.027, Su=1.5, source_volume=0.018, n_source_cells=18)
+    _write_phase1_pending(str(tmp_path), G=0.027, Su=1.5, source_volume=0.018, n_source_cells=18)
+    _write_phase2_pending(str(tmp_path), total_run=5, accumulated={"room": ([], [])}, tinf_history=[])
+
+    clear_phase_resume_state(str(tmp_path))
+
+    assert _read_phase1_checkpoint(str(tmp_path)) is None
+    assert _read_phase1_pending(str(tmp_path)) is None
+    assert _read_phase2_pending(str(tmp_path)) is None
+
+
+def test_clear_phase_resume_state_is_a_noop_when_nothing_present(tmp_path):
+    clear_phase_resume_state(str(tmp_path))  # must not raise
 
 
 def _fake_wsl_ok(*a, **k):

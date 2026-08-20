@@ -33,10 +33,10 @@ common source of mislabeled results in this codebase.
 
 ## Room & setup (inputs, not derived)
 
-### "Ventilation ACH"
+### "Ventilation ACH (nominal)"
 - Where shown: docx Room Setup table only (both modes)
 - Code field: `settings["ach"]`
-- Meaning: the dial-in ventilation rate — sets the inlet velocity
+- Meaning: the design-in ventilation rate — sets the inlet velocity
   boundary condition. A target the user typed in, not a measurement.
 - Formula: n/a (input)
 - Type: **[air]**, nominal
@@ -45,7 +45,7 @@ common source of mislabeled results in this codebase.
   no textual cue that this one is the dial-in value and those are CFD
   results. Suggested fix: rename to **"Ventilation ACH (nominal, dial-in)"**.
 
-### "UV inactivation constant Z" / "Susceptibility constant Z (cm² / mJ)"
+### "UV Susceptibility constant Z (cm² / mJ)"
 - Where shown: docx Room Setup ("UV inactivation constant Z") *and* docx
   results table row 2, both templates ("Susceptibility constant Z
   (cm²/mJ)") — **two different labels for the same input, inside the
@@ -55,7 +55,7 @@ common source of mislabeled results in this codebase.
 - Type: n/a (optics input)
 - Issues: pick one name and use it in both places.
 
-### "Target well-mixed steady-state T" (docx) / "Target T_ss (design)" (GUI)
+### "Target steady-state T_ss" (docx) / "Target T_ss (design)" (GUI)
 - Where shown: both, but worded differently
 - Code field: `target_T_ss`
 - Meaning: steady-state mode only — the target equilibrium concentration
@@ -66,22 +66,21 @@ common source of mislabeled results in this codebase.
 - Issues: GUI's `"T_ss"` is raw code jargon; docx's wording is clearer.
   Suggest standardizing on the docx wording everywhere.
 
-### "Set well-mixed steady-state T (entire volume)" ⚠️
+### "Initial T (for decay mode, uniform in volume)" ⚠️
+- 
 - Where shown: docx, decay-mode results table row 3, ONLY
 - Code field: none (a hardcoded constant, the value `1`)
 - Meaning: **this is actually decay mode's fixed initial condition**
-  (the whole room starts at T=1) — it is not a steady-state value at
-  all. The label is simply wrong for what it's attached to.
+  (the whole room starts at T=1) -does not apply to steady state simulation. 
 - Type: n/a
 - Issues: mislabeled; should read something like **"Initial
   contaminant concentration (uniform, decay mode)"**.
 
-### "Calculated Source injection rate Tinj (T-units/s )" (docx) / "Source injection rate (total, room-wide)" (GUI)
+### "Source injection rate Tinj (T-units/s )" 
 - Where shown: both, worded differently, docx has a stray double space
 - Code field: `injection_rate_total` (`G`)
-- Meaning: steady-state mode only — total room-wide contaminant
-  generation rate. Fixed and known exactly; doesn't depend on
-  ventilation or UV.
+- Meaning: steady-state mode only — contaminant (pathogen) injection rate through
+  injection point. Gets  internally calculated to reach a steady state Tavg of 1. Certain assumtions about effective ACH and eACH are used.
 - Formula: `Su × source_volume`
 - Type: n/a
 - Issues: cosmetic (double space, symbol `Tinj` vs. plain English) only.
@@ -90,8 +89,7 @@ common source of mislabeled results in this codebase.
 - Where shown: both GUI and docx, both modes — **the one field with
   fully consistent wording everywhere.**
 - Code field: `fluence_mean`
-- Meaning: room-average UV fluence rate — pure optics from the lamp
-  calculation, no CFD involved.
+- Meaning: room-average UV fluence rate — calculated from Illuminate guv file , no CFD involved.
 - Type: n/a
 
 ---
@@ -102,10 +100,9 @@ common source of mislabeled results in this codebase.
 - Where shown: decay docx only. Steady-state docx doesn't show this row
   at all. **Neither GUI (decay or steady-state) shows it.**
 - Code field: `ach_delivery.measured_ach`
-- Meaning: the CFD's *actual* resolved flow rate, measured at the outlet
-  patch(es). Verified directly this session against a separate inlet-side
-  measurement — they agree to ~0.1% (continuity holds in the converged
-  solution).
+- Meaning: the CFD's *actual* resolved/measured air exchange rate (based on flow and room volume), measured at the outlet
+ . Verified directly against a separate inlet-side
+  measurement — they should agree to ~0.1% .
 - Formula: `sum(outlet patches) of phi × 3600 / room_volume`
 - Type: **[air]**, measured
 - Issues: **the only place a user could ever see the true delivered
@@ -119,9 +116,7 @@ common source of mislabeled results in this codebase.
   `.within_tolerance` — rendered as one combined sentence, e.g.
   `"{measured}/hr measured vs {nominal}/hr nominal ({ratio}) - OK/MISMATCH"`
 - Meaning: pass/fail check on whether delivered airflow matches nominal
-  within tolerance. Caught two real bugs this session (a tangential
-  "ceiling" diffuser losing ~47-62% of nominal flow; a mesh
-  grid-snapping bug silently shrinking a 0.3m opening to 0.2m).
+  within tolerance. This is a check because actual flow through a certain inlet configuration and size may create a different total flow than designed.
 - Formula: `ratio = measured_ach / nominal_ach`
 - Type: **[air]**, ratio of two air quantities
 - Issues: **missing from the GUI entirely, in both modes.**
@@ -130,46 +125,44 @@ common source of mislabeled results in this codebase.
 
 ## Decay-mode results
 
-Decay mode fits an exponential to a transient decay curve (unweighted OLS
+Decay mode fits an exponential curve to a transient simulated decay curve (T over time) (unweighted 
 regression of `ln(T)` vs. `t` over the whole recorded curve).
 
-### "eACH_uv, well-mixed (idealized: Z x E_avg)" (GUI) / "Calculated eACH" (docx row 4)
+### ""Calculated eACH" (docx row 4)
 - Where shown: both, very differently worded
 - Code field: `eACH_uv_well_mixed`
 - Meaning: the **idealized ceiling** — what eACH_uv would be if the room
-  were perfectly, instantaneously mixed. Computed straight from the
-  lamp/fluence field; never touches CFD.
+  were perfectly, instantaneously mixed. Computed  from the
+ average fluence rate * Z
 - Formula: `mean(kUV over all cells) × 3600`
 - Type: **[T]**, idealized (no CFD)
 - Issues: **docx's `"Calculated eACH"` has no idealized/ceiling
   qualifier at all** — it's the largest number in the table and reads as
   the headline result rather than a theoretical maximum. The GUI's
-  wording is correct; the docx isn't. Suggest matching the GUI's wording.
+  wording is correct; the docx isn't. Suggest matching the GUI's wording. YES
 
-### "eACH_uv, CFD-fit (nominal ventilation ACH)" (GUI) / shown only as a silent fallback under docx row 9
+### "eACH_uv,  (based on design  ACH)" (GUI) / shown only as a silent fallback under docx row 9
 - Where shown: GUI always; docx only when the corrected version (below)
   is unavailable, with no label change to indicate the fallback happened
 - Code field: `eACH_uv_effective`
 - Meaning: UV's own contribution to the fitted total decay rate, using
-  the **nominal** ACH as the ventilation baseline — the older, less
-  trustworthy of the two methods.
+  the **nominal** ACH (Air) as the ventilation baseline — since actual (effective) pathogen ACH can be different to nominal ACH 
 - Formula: `(λ_total_fitted − ach_nominal/3600) × 3600`
 - Type: **[T]**, measured, nominal-anchored
 
-### "eACH_uv, CFD-fit (measured ventilation ACH)" (GUI) / "eACHeff CFD measured " (docx row 9)
+### "eACH_uv, corrected (based on measured T- ACH)" 
 - Where shown: both, worded very differently; docx has a trailing space
 - Code field: `eACH_uv_effective_corrected`
-- Meaning: same as above, but anchored to the **measured** ventilation
-  rate — the trustworthy figure.
+- Meaning: same as above, but anchored to the **measured** ACH (T) — the trustworthy figure.
 - Formula: `(λ_total_fitted − ventilation_ach_measured/3600) × 3600`
 - Type: **[T]**, measured, measured-anchored
 - Issues: docx also appends a 95% confidence interval here
   (`" (95% CI: lo–hi /hr)"`) that **the GUI never shows at all.**
 
-### "Ventilation ACH (measured, UV-off control)" (GUI) / "Effective ACHeff CFD measured" (docx row 7)
+### "Effective ACHeff (T) CFD measured" (docx row 7)
 - Where shown: both, differently worded
 - Code field: `ventilation_ach_measured`
-- Meaning: ventilation's own removal rate, measured directly from a
+- Meaning: ventilation's own T removal rate, measured directly from a
   dedicated UV-off control run (same room, no source, pre-mixed, decay
   under ventilation alone).
 - Formula: fitted decay rate of the UV-off control curve
@@ -178,16 +171,16 @@ regression of `ln(T)` vs. `t` over the whole recorded curve).
   docx's differently-defined `"EACHeff"` (see steady-state section) —
   same-looking abbreviation, different meaning across modes.
 
-### "Mixing efficiency" (GUI) / *(not shown in docx)*
+### "UV Mixing efficiency" (GUI) / *(not shown in docx)*
 - Where shown: GUI only
 - Code field: `mixing_efficiency`
-- Meaning: what fraction of the idealized UV ceiling this real,
-  imperfectly-mixed room achieves, nominal-ACH-anchored.
+- Meaning: what fraction of the calculated eACH is actually achieved,
+ 
 - Formula: `eACH_uv_effective / eACH_uv_well_mixed`
 - Type: ratio, **[T]** over idealized
 - Issues: **missing from the docx entirely.**
 
-### "Mixing efficiency (using measured ventilation ACH)" (GUI) / *(not shown in docx)*
+### "UV Mixing efficiency (using measured ventilation ACH)" (GUI) / *(not shown in docx)*
 - Where shown: GUI only
 - Code field: `mixing_efficiency_corrected`
 - Meaning: same, but using the measured-anchored eACH_uv — the number to

@@ -43,6 +43,39 @@ def test_load_extend_status_loads_settings_and_room(tmp_path, monkeypatch):
     assert guv_path == "proj.guv"
 
 
+def test_load_extend_status_falls_back_to_bare_single_run(tmp_path, monkeypatch):
+    # Regression test for a real, confirmed incident: a project_dir that's
+    # a completed SINGLE run (plain Start, not a sweep) has its own
+    # run_settings.json sitting directly in its root, never inside a
+    # "Z<...>_ACH<...>" subfolder - project_status.json never tracked it
+    # at all, so "Add more Z/ACH sweeps" around an already-validated
+    # single run used to report "No recorded status for this folder yet"
+    # even though the folder plainly held a real run.
+    (tmp_path / "run_settings.json").write_text(
+        '{"guv_path": "C:\\\\room.guv", "sim-type": "steady_state", "ach": 6.0, "z-value": 2.0}')
+
+    fake_room = SimpleNamespace(x=4.0, y=5.0, z=2.7)
+    fake_project = SimpleNamespace(rooms={"r": fake_room})
+    monkeypatch.setattr(em.Project, "load", staticmethod(lambda path: fake_project))
+
+    status, settings, room, guv_path, settings_path, error = em.load_extend_status(str(tmp_path))
+    assert error is None
+    assert room is fake_room
+    assert guv_path == "C:\\room.guv"
+    assert settings["ach"] == 6.0
+    assert settings_path is None  # no genuine .guvcfd for a bare single run
+    # project_status.json itself must stay untouched - no retroactive
+    # combo registration, only enough resolved to let a NEW sweep launch.
+    assert status.get("combos") in (None, {})
+
+
+def test_load_extend_status_bare_run_settings_without_guv_path_is_still_an_error(tmp_path):
+    (tmp_path / "run_settings.json").write_text('{"ach": 6.0}')  # no guv_path at all
+    status, settings, room, guv_path, settings_path, error = em.load_extend_status(str(tmp_path))
+    assert error is not None and "No recorded status" in error
+    assert settings is None and room is None
+
+
 def test_scratch_dirs_for_status_filters_to_existing_dirs(tmp_path):
     base_dir = tmp_path / "_base_ACH3"
     base_dir.mkdir()

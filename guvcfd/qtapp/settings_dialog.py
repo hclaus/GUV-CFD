@@ -33,6 +33,11 @@ _FIELD_INFO = {
                "limit nOuterCorrectors=3 (fixed in the template) can still keep stable/accurate "
                "each step. 5 is the original conservative default; a live production sweep "
                "confirmed 10 stays numerically stable - see ANALYSIS_LOG.md before pushing higher."),
+    "max-concurrent-solves": ("Max concurrent solves (sweeps)",
+                               "How many OpenFOAM processes a sweep runs at once. Was 9 (CPU-core "
+                               "headroom only); lowered to 5 after a real overnight sweep crashed itself "
+                               "in 5 waves from resource contention. Raise only if you've confirmed your "
+                               "machine has the RAM for it - lower this if a sweep dies overnight."),
     "mesh-cell-size": ("Mesh cell size (m)",
                         "Target grid spacing for the room mesh. Smaller = finer mesh, more accurate, "
                         "much slower."),
@@ -41,7 +46,8 @@ _FIELD_INFO = {
                       "into for the solver."),
     "momentum-relaxation": ("Momentum under-relaxation",
                              "SIMPLE under-relaxation factor for velocity/turbulence during flow "
-                             "convergence - lower is more stable but slower."),
+                             "convergence - lower is more stable but slower. Lower this number a bit "
+                             "if oscillation is a problem (Phase 1/2 T never settling)."),
     "scalar-relaxation": ("Contaminant (T) under-relaxation",
                            "Under-relaxation factor for the contaminant field."),
     "scalar-transport-ncorr": ("Contaminant solver outer correctors",

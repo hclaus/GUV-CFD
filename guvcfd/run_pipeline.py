@@ -781,7 +781,7 @@ def check_settings_grid_alignment(settings, room, cell_size, source_size=None, t
     has_source_inputs = all(k in settings for k in ("inject-x-input", "inject-y-input", "inject-z-input"))
     if source_size is not None and has_source_inputs:
         center = (settings["inject-x-input"], settings["inject-y-input"], settings["inject-z-input"])
-        nominal, actual = source_box_grid_alignment(center, source_size, cell_size)
+        nominal, actual = source_box_grid_alignment(center, source_size, cell_size, (room.x, room.y, room.z))
         if any(abs(a - n) > tol for n, a in zip(nominal, actual)):
             mismatches.append({"name": "Contaminant source zone", "nominal": nominal, "actual": actual})
 
@@ -823,7 +823,7 @@ def walk_opening_alignment_conflicts(settings, room, cell_size, tol=1e-6):
         wall = settings[f"{prefix}-wall"]
         center_frac = center_frac_for_wall(wall, settings[f"{prefix}-y-input"], settings[f"{prefix}-z-input"], room)
         nominal_size = (settings[f"{prefix}-size-w"], settings[f"{prefix}-size-h"])
-        suggested_size = suggest_opening_size_fix(nominal_size, cell_size)
+        suggested_size = suggest_opening_size_fix(wall, room.x, room.y, room.z, nominal_size, cell_size)
 
         effective_size = list(nominal_size)
         size_axis_ok = [True, True]
