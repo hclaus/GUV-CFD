@@ -29,16 +29,40 @@ solvers
         relTol          0;
     }
 
-    "(U|k|omega|T|age)"
+    "(U|k|omega|age)"
     {
         solver          smoothSolver;
         smoother        GaussSeidel;
         tolerance       1e-08;
         relTol          0.1;
     }
-    "(U|k|omega|T|age)Final"
+    "(U|k|omega|age)Final"
     {
         $U;
+        relTol          0;
+    }
+
+    // T gets its own solver, distinct from the plain smoothSolver/
+    // GaussSeidel group above - the UV sink term (constant/fvOptions'
+    // scalarSemiImplicitSource) can concentrate an 80-300x-of-neighbors
+    // coefficient into a handful of cells right at a lamp's peak-
+    // intensity direction (confirmed on a real case), and plain
+    // Gauss-Seidel smoothing struggles with that kind of extreme local
+    // coefficient heterogeneity even though the sink term itself is
+    // semi-implicit (theoretically unconditionally stable in isolation) -
+    // a real diverged run traced to exactly this. PBiCGStab+DILU is a
+    // standard, more robust choice for a scalar transport equation with a
+    // stiff, spatially uneven source/sink term.
+    T
+    {
+        solver          PBiCGStab;
+        preconditioner  DILU;
+        tolerance       1e-08;
+        relTol          0.1;
+    }
+    TFinal
+    {
+        $T;
         relTol          0;
     }
 }
