@@ -342,8 +342,17 @@ def fit_asymptotic_value(t, T, fit_frac=0.5):
             # shape) legitimately can't get a meaningful covariance
             # estimate - expected and already handled below via the
             # residual-based fit_cv, not via pcov, so this is noise, not
-            # a real problem to surface.
+            # a real problem to surface. RuntimeWarning covers the same
+            # class of thing one level earlier - an intermediate guess
+            # during the optimizer's own search (e.g. a tiny trial tau)
+            # can overflow float64 when the model/cost is evaluated there,
+            # well before curve_fit settles on (or rejects) a final
+            # answer - the tau/Tinf/fit_span checks below already catch a
+            # genuinely bad final result, so this is the same "expected,
+            # already handled downstream" situation, not a new failure
+            # mode to surface.
             warnings.filterwarnings("ignore", category=OptimizeWarning)
+            warnings.filterwarnings("ignore", category=RuntimeWarning)
             popt, _ = curve_fit(model, tf, Tf, p0=p0, maxfev=20000)
     except (RuntimeError, ValueError):
         return None
