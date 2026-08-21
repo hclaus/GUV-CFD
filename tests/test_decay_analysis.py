@@ -283,6 +283,21 @@ def test_check_plateau_windowed_none_cv_never_converges():
     assert cv is None
 
 
+def test_check_plateau_windowed_negative_mean_never_converges():
+    # Regression test for a real, confirmed incident: a diverged run whose
+    # windowed mean went deeply negative (T_ss ~ -1.5e+79) produced a
+    # NEGATIVE cv (std/mean, std always >= 0) - the old "cv <= rel_tol"
+    # check never verified cv was non-negative, so a negative number
+    # trivially satisfied it regardless of how huge the actual swing was,
+    # silently marking a completely diverged field as converged=True and
+    # propagating garbage (reduction_pct > 1e81%) into results.json.
+    t = list(range(100))
+    T = [-1.0e79, -1.02e79, -0.98e79, -1.01e79] * 25  # deeply negative, "tight"-looking relative spread
+    converged, cv = check_plateau_windowed(t, T, frac=1.0, rel_tol=0.01)
+    assert cv is not None and cv < 0  # confirms the mechanism: cv really is negative here
+    assert converged is False
+
+
 def test_windowed_stats_detrended_flat_series_matches_raw():
     t = list(range(100))
     T = [5.0] * 100
@@ -344,6 +359,23 @@ def test_fit_asymptotic_value_recovers_known_exponential_approach():
 
 def test_fit_asymptotic_value_none_for_too_little_data():
     result = fit_asymptotic_value([0, 1, 2], [1.0, 1.5, 1.8])
+    assert result is None
+
+
+def test_fit_asymptotic_value_rejects_a_negative_tinf():
+    # Regression test for the same class of bug as
+    # test_check_plateau_windowed_negative_mean_never_converges: fit_std is
+    # always >= 0, so fit_cv = fit_std/Tinf goes negative whenever Tinf
+    # does - every downstream "fit_cv > t_inf_rel_tol" rejection check in
+    # steady_state_pipeline.py would then wrongly treat a negative fit_cv
+    # as "well within tolerance" instead of catching an unphysical
+    # (negative) extrapolated value. Fit data that actually approaches a
+    # negative asymptote, and confirm it's rejected outright (None) rather
+    # than returned with a misleadingly negative fit_cv.
+    true_Tinf, true_A, true_tau = -3.0, 0.5, 200.0
+    t = np.arange(0, 1000, 2, dtype=float)
+    T = true_Tinf - true_A * np.exp(-t / true_tau)
+    result = fit_asymptotic_value(t, T)
     assert result is None
 
 

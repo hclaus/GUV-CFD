@@ -188,7 +188,18 @@ def check_plateau_windowed(t, T, frac=0.15, rel_tol=0.01):
     message and the reported value keeps them consistent by construction.
     """
     _, _, cv, _, _ = windowed_stats(t, T, frac=frac)
-    converged = cv is not None and cv <= rel_tol
+    # cv = std/mean, and std is always >= 0 - so a NEGATIVE cv means mean
+    # itself is negative, not that the window is unusually flat. T is a
+    # non-negative concentration-like scalar throughout this codebase
+    # (built up from/decaying toward 0), so a negative windowed mean is
+    # itself proof of divergence, not evidence of convergence - confirmed
+    # as a real incident: a diverged run's T_ss reached -1.5e+79, giving
+    # cv=-4.35, which the old "cv <= rel_tol" check (never checking the
+    # lower bound) happily accepted as converged=True, propagating a
+    # physically meaningless result (reduction_pct > 1e81%) into
+    # results.json instead of failing loudly like a more abrupt
+    # divergence (a floating-point exception mid-solve) already does.
+    converged = cv is not None and 0 <= cv <= rel_tol
     return converged, cv
 
 
@@ -357,7 +368,17 @@ def fit_asymptotic_value(t, T, fit_frac=0.5):
     except (RuntimeError, ValueError):
         return None
     Tinf, A, tau = (float(v) for v in popt)
-    if tau <= 0 or not np.isfinite(Tinf):
+    # Tinf <= 0 is unphysical on its own (T is a non-negative concentration-
+    # like scalar throughout this codebase) and, left unchecked, poisons
+    # every downstream fit_cv = fit_std/Tinf comparison the same way a
+    # negative windowed-CV mean does in check_plateau_windowed - fit_std is
+    # always >= 0, so a negative Tinf makes fit_cv negative, which every
+    # "fit_cv > t_inf_rel_tol" rejection check downstream (steady_state_
+    # pipeline.py's T-infinity streak-acceptance gate, in three places)
+    # would then wrongly treat as "well within tolerance" instead of
+    # rejecting outright. Caught here, at the one place Tinf is produced,
+    # rather than patching each downstream comparison separately.
+    if tau <= 0 or not np.isfinite(Tinf) or Tinf <= 0:
         return None
     fit_span = float(tf[-1] - tf[0])
     if tau >= fit_span:
