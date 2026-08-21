@@ -1724,11 +1724,24 @@ def run_steady_state_scenario(case_dir, room_x, room_y, room_z, ach, Z, nbins=25
 
     run_wsl_or_raise("touch case.foam", case_dir_wsl, "touching case.foam")
 
-    # The scenario finished end-to-end - no longer anything to resume, so
-    # clear the checkpoint rather than leave a stale one sitting around
-    # (harmless if left, since a finished case dir has results.json/
-    # fluenceRate etc. too, but there's no reason to keep it either).
-    _clear_phase1_checkpoint(case_dir)
+    # Deliberately NOT clearing the Phase 1 checkpoint here (an earlier
+    # version did, reasoning "nothing left to resume" - true, but that
+    # missed the real benefit of keeping it: a LATER call against this
+    # same case_dir - e.g. re-running Phase 2 with a different solver/
+    # relaxation to chase a convergence problem, or just a longer
+    # iterations budget - can skip Phase 1 entirely via the checkpoint-
+    # reuse branch above, instead of re-paying its full cost every time.
+    # Confirmed as a real, live incident: redoing Phase 1's own 8000
+    # iterations from scratch, unnecessarily, because this line had
+    # already deleted a checkpoint that was still perfectly valid).
+    # Sweep mode already gets this benefit for its own SHARED phase1_dir
+    # (scenario_runs._run_shared_phase1 never calls this function against
+    # that directory at all, only against each combo's own disposable
+    # per-Z clone) - this just brings the single-run path in line with
+    # it. A genuine fresh "Start" is unaffected: qtapp.run_state.
+    # _run_steady_state already calls clear_phase_resume_state() BEFORE
+    # setup, specifically to stop a stale/mismatched checkpoint from an
+    # older, unrelated attempt at this case_dir from being wrongly reused.
 
     log_fn("Steady-state scenario complete.")
     return summary
