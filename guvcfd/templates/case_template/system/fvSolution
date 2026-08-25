@@ -44,21 +44,24 @@ solvers
 
     // T gets its own solver, distinct from the plain smoothSolver/
     // GaussSeidel group above - the UV sink term (constant/fvOptions'
-    // scalarSemiImplicitSource) can concentrate an 80-300x-of-neighbors
-    // coefficient into a handful of cells right at a lamp's peak-
-    // intensity direction (confirmed on a real case), and plain
-    // Gauss-Seidel smoothing struggles with that kind of extreme local
-    // coefficient heterogeneity even though the sink term itself is
-    // semi-implicit (theoretically unconditionally stable in isolation) -
-    // a real diverged run traced to exactly this. PBiCGStab+DILU is a
-    // standard, more robust choice for a scalar transport equation with a
-    // stiff, spatially uneven source/sink term.
+    // scalarSemiImplicitSource) can concentrate an extreme coefficient
+    // (confirmed on a real case: up to 1024x its neighbors, at cells
+    // sitting in a lamp's peak-intensity direction) into a handful of
+    // cells. PBiCGStab+DILU was tried first (2026-08-21) and did NOT fix
+    // a real diverged case - the per-iteration LINEAR solve converged
+    // tightly (residual ratio ~25000x) even as the field's own value grew
+    // ~500x per OUTER iteration, meaning the instability isn't really a
+    // linear-solver-robustness problem at all, it's upstream in the outer
+    // (SIMPLE) loop's own update - but GAMG is tried next anyway since
+    // it's a genuinely different algorithm (multigrid, not Krylov) and
+    // cheap to rule out before concluding the fix has to be relaxation
+    // (or the source term itself) instead of solver choice.
     T
     {
-        solver          PBiCGStab;
-        preconditioner  DILU;
+        solver          GAMG;
         tolerance       1e-08;
         relTol          0.1;
+        smoother        GaussSeidel;
     }
     TFinal
     {
