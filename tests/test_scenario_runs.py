@@ -146,6 +146,43 @@ def test_apply_z_recarves_fan_zone_when_fan_enabled(tmp_path, monkeypatch):
     assert "topoSet" in calls[0]
 
 
+def test_apply_z_adaptive_t_relaxation_uses_this_zs_own_kuv_max(tmp_path, monkeypatch):
+    # Regression guard for a real gap: sweep mode shares ONE flow-converged
+    # base across every Z in an ACH group and only applies each Z's own
+    # kUV field here, in _apply_z, on that Z's own freshly-copied case_dir
+    # - adaptive relaxation must be computed from THIS Z's own kUV.max
+    # (not some other Z's, and not left at whatever the shared base
+    # happened to be built with).
+    monkeypatch.setattr(sr, "run_wsl_or_raise", lambda *a, **k: (_ for _ in ()).throw(
+        AssertionError("no WSL call expected without a fan")))
+    case_dir, fluence = _write_synthetic_case(tmp_path)  # fluence max = 4.0
+
+    calls = []
+    monkeypatch.setattr(sr, "set_relaxation_factors", lambda case_dir, **kw: calls.append(kw))
+
+    # kUV.max = fluence.max() * Z * 1e-3 = 4.0 * 2500 * 1e-3 = 10.0
+    summary = sr._apply_z(case_dir, Z=2500.0, nbins=5, fan_kwargs={}, log_fn=lambda m: None,
+                           adaptive_t_relaxation=True)
+
+    expected = sr.compute_adaptive_scalar_relaxation(10.0)
+    assert expected == pytest.approx(0.18)
+    assert calls == [{"scalar_factor": expected}]
+    assert summary["adaptive_scalar_relaxation"] == expected
+
+
+def test_apply_z_without_adaptive_flag_never_calls_set_relaxation_factors(tmp_path, monkeypatch):
+    monkeypatch.setattr(sr, "run_wsl_or_raise", lambda *a, **k: (_ for _ in ()).throw(
+        AssertionError("no WSL call expected without a fan")))
+    case_dir, _ = _write_synthetic_case(tmp_path)
+
+    def fail(*a, **k):
+        raise AssertionError("set_relaxation_factors must not be called when adaptive_t_relaxation=False")
+    monkeypatch.setattr(sr, "set_relaxation_factors", fail)
+
+    summary = sr._apply_z(case_dir, Z=2500.0, nbins=5, fan_kwargs={}, log_fn=lambda m: None)
+    assert "adaptive_scalar_relaxation" not in summary
+
+
 def test_run_sweep_creates_expected_subfolders_and_reports(tmp_path, monkeypatch):
     project_dir = tmp_path / "myproject"
     project_dir.mkdir()
@@ -156,7 +193,7 @@ def test_run_sweep_creates_expected_subfolders_and_reports(tmp_path, monkeypatch
     monkeypatch.setattr(sr, "_run_shared_control", lambda *a, **k: {"total_ach_effective": 3.0})
     monkeypatch.setattr(sr, "write_source_topo_set_dict", lambda *a, **k: None)
     monkeypatch.setattr(sr, "_copy_base_case", lambda base, target, log_fn: __import__("os").makedirs(target, exist_ok=True))
-    monkeypatch.setattr(sr, "_apply_z", lambda case_dir, z, nbins, fan_kwargs, log_fn:
+    monkeypatch.setattr(sr, "_apply_z", lambda case_dir, z, nbins, fan_kwargs, log_fn, **kw:
                          {"fluence_mean": 1.0, "eACH_uv_well_mixed_mean": 0.0})
     monkeypatch.setattr(sr, "compute_uv_fingerprint", lambda *a, **k: "fake-uv-fp")
 
@@ -176,7 +213,7 @@ def test_run_sweep_creates_expected_subfolders_and_reports(tmp_path, monkeypatch
                 "phase1-iterations": 100, "phase2-iterations": 100, "target-t-ss": 1.0,
                 "inject-x-input": 2, "inject-y-input": 2.5, "inject-z-input": 1.3, "z-value": 6,
                 "source-zone-size": 0.3}
-    adv = {"uv-zone-bins": 25, "mesh-cell-size": 0.1}
+    adv = {"adaptive-t-relaxation": False, "uv-zone-bins": 25, "mesh-cell-size": 0.1}
 
     results_seen = []
     sr.run_sweep(
@@ -209,6 +246,49 @@ def test_run_sweep_creates_expected_subfolders_and_reports(tmp_path, monkeypatch
         assert combo["started_at"] and combo["finished_at"]
 
 
+def test_run_sweep_passes_adaptive_t_relaxation_flag_to_apply_z_per_combo(tmp_path, monkeypatch):
+    # adv["adaptive-t-relaxation"] must reach _apply_z for EVERY combo (not
+    # just read once and dropped) - each Z needs its own kUV.max-derived
+    # relaxation, see test_apply_z_adaptive_t_relaxation_uses_this_zs_own_kuv_max.
+    project_dir = tmp_path / "myproject"
+    project_dir.mkdir()
+
+    monkeypatch.setattr(sr, "_build_flow_base", lambda *a, **k: None)
+    monkeypatch.setattr(sr, "_run_shared_phase1", lambda *a, **k: None)
+    monkeypatch.setattr(sr, "_run_shared_control", lambda *a, **k: {"total_ach_effective": 3.0})
+    monkeypatch.setattr(sr, "write_source_topo_set_dict", lambda *a, **k: None)
+    monkeypatch.setattr(sr, "_copy_base_case", lambda base, target, log_fn: __import__("os").makedirs(target, exist_ok=True))
+    monkeypatch.setattr(sr, "compute_uv_fingerprint", lambda *a, **k: "fake-uv-fp")
+    monkeypatch.setattr(sr, "run_wsl_or_raise", lambda *a, **k: None)
+
+    seen_flags = []
+
+    def fake_apply_z(case_dir, z, nbins, fan_kwargs, log_fn, adaptive_t_relaxation=False):
+        seen_flags.append((z, adaptive_t_relaxation))
+        return {"fluence_mean": 1.0, "eACH_uv_well_mixed_mean": 0.0}
+    monkeypatch.setattr(sr, "_apply_z", fake_apply_z)
+
+    monkeypatch.setattr(sr, "_run_scenario", lambda *a, **k: {
+        "reduction_pct": 90.0, "eACH_uv_steady_state": 50.0, "phase1": {"T_ss": 1.0, "live": {"t": [1]}},
+        "phase2": {"T_ss": 0.1, "live": {"t": [1]}}})
+
+    room = type("Room", (), {"x": 4.0, "y": 5.0, "z": 2.7})()
+    settings = {"sim-type": "steady_state", "fan-enable": False, "monitoring-enable": False,
+                "inlet-wall": "xMin", "inlet-size-w": 0.3, "inlet-size-h": 0.3,
+                "phase1-iterations": 100, "phase2-iterations": 100, "target-t-ss": 1.0,
+                "inject-x-input": 2, "inject-y-input": 2.5, "inject-z-input": 1.3, "z-value": 6,
+                "source-zone-size": 0.3}
+    adv = {"adaptive-t-relaxation": True, "uv-zone-bins": 25, "mesh-cell-size": 0.1}
+
+    sr.run_sweep(
+        guv_path="proj.guv", settings_path="proj.guvcfd", project_dir=str(project_dir),
+        room=room, settings=settings, adv=adv,
+        z_values=[2, 6], ach_values=[3], log_fn=lambda m: None,
+    )
+
+    assert set(seen_flags) == {(2, True), (6, True)}
+
+
 def test_run_decay_sweep_records_error_status_in_project_status(tmp_path, monkeypatch):
     project_dir = tmp_path / "proj"
     project_dir.mkdir()
@@ -217,7 +297,7 @@ def test_run_decay_sweep_records_error_status_in_project_status(tmp_path, monkey
     monkeypatch.setattr(sr, "_copy_base_case", lambda base, target, log_fn: __import__("os").makedirs(target, exist_ok=True))
     monkeypatch.setattr(sr, "run_wsl_or_raise", lambda *a, **k: None)
 
-    def fake_apply_z(case_dir, z, nbins, fan_kwargs, log_fn):
+    def fake_apply_z(case_dir, z, nbins, fan_kwargs, log_fn, **kw):
         raise RuntimeError("boom")
     monkeypatch.setattr(sr, "_apply_z", fake_apply_z)
 
@@ -225,7 +305,7 @@ def test_run_decay_sweep_records_error_status_in_project_status(tmp_path, monkey
     settings = {"sim-type": "decay", "fan-enable": False, "inlet2-enable": False, "outlet2-enable": False,
                 "inlet-wall": "xMin", "inlet-size-w": 0.3, "inlet-size-h": 0.3, "mech-ach-only": False,
                 "pimple-write-interval": 3}
-    adv = {"uv-zone-bins": 5, "pimple-delta-t": 0.5, "max-co": 5,
+    adv = {"adaptive-t-relaxation": False, "uv-zone-bins": 5, "pimple-delta-t": 0.5, "max-co": 5,
            "decay-ach-min-fraction": 90.0, "decay-each-min-fraction": 90.0, "decay-each-max-fraction": 99.9}
 
     sr.run_decay_sweep(
@@ -255,7 +335,7 @@ def test_run_sweep_captures_build_flow_base_return_value_as_base_summary(tmp_pat
     monkeypatch.setattr(sr, "_run_shared_control", lambda *a, **k: {"total_ach_effective": 3.0})
     monkeypatch.setattr(sr, "write_source_topo_set_dict", lambda *a, **k: None)
     monkeypatch.setattr(sr, "_copy_base_case", lambda base, target, log_fn: __import__("os").makedirs(target, exist_ok=True))
-    monkeypatch.setattr(sr, "_apply_z", lambda case_dir, z, nbins, fan_kwargs, log_fn:
+    monkeypatch.setattr(sr, "_apply_z", lambda case_dir, z, nbins, fan_kwargs, log_fn, **kw:
                          {"fluence_mean": 1.0, "eACH_uv_well_mixed_mean": 0.0})
     monkeypatch.setattr(sr, "compute_uv_fingerprint", lambda *a, **k: "fake-uv-fp")
     monkeypatch.setattr(sr, "run_wsl_or_raise", lambda cmd, *a, **k: None)
@@ -276,7 +356,7 @@ def test_run_sweep_captures_build_flow_base_return_value_as_base_summary(tmp_pat
                 "phase1-iterations": 100, "phase2-iterations": 100, "target-t-ss": 1.0,
                 "inject-x-input": 2, "inject-y-input": 2.5, "inject-z-input": 1.3, "z-value": 6,
                 "source-zone-size": 0.3}
-    adv = {"uv-zone-bins": 25, "mesh-cell-size": 0.1}
+    adv = {"adaptive-t-relaxation": False, "uv-zone-bins": 25, "mesh-cell-size": 0.1}
 
     sr.run_sweep(
         guv_path="proj.guv", settings_path="proj.guvcfd", project_dir=str(project_dir),
@@ -317,7 +397,7 @@ def test_run_sweep_passes_base_summary_to_run_shared_control(tmp_path, monkeypat
 
     monkeypatch.setattr(sr, "write_source_topo_set_dict", lambda *a, **k: None)
     monkeypatch.setattr(sr, "_copy_base_case", lambda base, target, log_fn: __import__("os").makedirs(target, exist_ok=True))
-    monkeypatch.setattr(sr, "_apply_z", lambda case_dir, z, nbins, fan_kwargs, log_fn:
+    monkeypatch.setattr(sr, "_apply_z", lambda case_dir, z, nbins, fan_kwargs, log_fn, **kw:
                          {"fluence_mean": 1.0, "eACH_uv_well_mixed_mean": 0.0})
     monkeypatch.setattr(sr, "run_wsl_or_raise", lambda cmd, *a, **k: None)
     monkeypatch.setattr(sr, "_run_scenario", lambda *a, **k: {
@@ -330,7 +410,7 @@ def test_run_sweep_passes_base_summary_to_run_shared_control(tmp_path, monkeypat
                 "phase1-iterations": 100, "phase2-iterations": 100, "target-t-ss": 1.0,
                 "inject-x-input": 2, "inject-y-input": 2.5, "inject-z-input": 1.3, "z-value": 6,
                 "source-zone-size": 0.3}
-    adv = {"uv-zone-bins": 25, "mesh-cell-size": 0.1}
+    adv = {"adaptive-t-relaxation": False, "uv-zone-bins": 25, "mesh-cell-size": 0.1}
 
     sr.run_sweep(
         guv_path="proj.guv", settings_path="proj.guvcfd", project_dir=str(project_dir),
@@ -350,7 +430,7 @@ def test_run_sweep_keeps_shared_dirs_when_setting_enabled(tmp_path, monkeypatch)
     monkeypatch.setattr(sr, "_run_shared_control", lambda *a, **k: {"total_ach_effective": 3.0})
     monkeypatch.setattr(sr, "write_source_topo_set_dict", lambda *a, **k: None)
     monkeypatch.setattr(sr, "_copy_base_case", lambda base, target, log_fn: __import__("os").makedirs(target, exist_ok=True))
-    monkeypatch.setattr(sr, "_apply_z", lambda case_dir, z, nbins, fan_kwargs, log_fn:
+    monkeypatch.setattr(sr, "_apply_z", lambda case_dir, z, nbins, fan_kwargs, log_fn, **kw:
                          {"fluence_mean": 1.0, "eACH_uv_well_mixed_mean": 0.0})
 
     def fake_run_scenario(case_dir, room, settings, z, ach, adv, z_summary, log_fn, should_stop, solver_log_fn,
@@ -369,7 +449,7 @@ def test_run_sweep_keeps_shared_dirs_when_setting_enabled(tmp_path, monkeypatch)
                 "phase1-iterations": 100, "phase2-iterations": 100, "target-t-ss": 1.0,
                 "inject-x-input": 2, "inject-y-input": 2.5, "inject-z-input": 1.3, "z-value": 6,
                 "source-zone-size": 0.3}
-    adv = {"uv-zone-bins": 25, "mesh-cell-size": 0.1, "keep-shared-scratch-dirs": True}
+    adv = {"adaptive-t-relaxation": False, "uv-zone-bins": 25, "mesh-cell-size": 0.1, "keep-shared-scratch-dirs": True}
 
     sr.run_sweep(
         guv_path="proj.guv", settings_path="proj.guvcfd", project_dir=str(project_dir),
@@ -387,7 +467,7 @@ def test_run_decay_sweep_keeps_shared_dirs_when_setting_enabled(tmp_path, monkey
     monkeypatch.setattr(sr, "_build_flow_base", lambda *a, **k: None)
     monkeypatch.setattr(sr, "_run_shared_control", lambda *a, **k: {"total_ach_effective": 3.0})
     monkeypatch.setattr(sr, "_copy_base_case", lambda base, target, log_fn: __import__("os").makedirs(target, exist_ok=True))
-    monkeypatch.setattr(sr, "_apply_z", lambda case_dir, z, nbins, fan_kwargs, log_fn:
+    monkeypatch.setattr(sr, "_apply_z", lambda case_dir, z, nbins, fan_kwargs, log_fn, **kw:
                          {"fluence_mean": 1.0, "eACH_uv_well_mixed_mean": 0.0})
     monkeypatch.setattr(sr, "_run_decay_scenario", lambda *a, **k: {
         "reduction_pct": 1.0, "eACH_uv_effective": 1.0, "eACH_uv_well_mixed": 1.0, "phase1": {}, "phase2": {}})
@@ -401,7 +481,7 @@ def test_run_decay_sweep_keeps_shared_dirs_when_setting_enabled(tmp_path, monkey
                 "phase1-iterations": 100, "phase2-iterations": 100, "target-t-ss": 1.0,
                 "inject-x-input": 2, "inject-y-input": 2.5, "inject-z-input": 1.3, "z-value": 6,
                 "source-zone-size": 0.3}
-    adv = {"uv-zone-bins": 25, "mesh-cell-size": 0.1, "keep-shared-scratch-dirs": True}
+    adv = {"adaptive-t-relaxation": False, "uv-zone-bins": 25, "mesh-cell-size": 0.1, "keep-shared-scratch-dirs": True}
 
     sr.run_decay_sweep(
         guv_path="proj.guv", settings_path="proj.guvcfd", project_dir=str(project_dir),
@@ -597,13 +677,13 @@ def test_run_decay_sweep_seeds_flow_base_from_existing_done_combo(tmp_path, monk
     monkeypatch.setattr(sr, "_run_shared_control", lambda *a, **k: {"total_ach_effective": 3.0})
     monkeypatch.setattr(sr, "_copy_base_case",
                          lambda base, target, log_fn: __import__("os").makedirs(target, exist_ok=True))
-    monkeypatch.setattr(sr, "_apply_z", lambda case_dir, z, nbins, fan_kwargs, log_fn:
+    monkeypatch.setattr(sr, "_apply_z", lambda case_dir, z, nbins, fan_kwargs, log_fn, **kw:
                          {"fluence_mean": 1.0, "eACH_uv_well_mixed_mean": 0.0})
     monkeypatch.setattr(sr, "compute_uv_fingerprint", lambda *a, **k: "fake-uv-fp")
     monkeypatch.setattr(sr, "_run_decay_scenario", lambda *a, **k: {
         "reduction_pct": 1.0, "eACH_uv_effective": 1.0, "eACH_uv_well_mixed": 1.0, "phase1": {}, "phase2": {}})
     monkeypatch.setattr(sr, "run_wsl_or_raise", lambda *a, **k: None)
-    adv = {"uv-zone-bins": 25, "mesh-cell-size": 0.1, "keep-shared-scratch-dirs": True}
+    adv = {"adaptive-t-relaxation": False, "uv-zone-bins": 25, "mesh-cell-size": 0.1, "keep-shared-scratch-dirs": True}
 
     sr.run_decay_sweep(
         guv_path="proj.guv", settings_path="proj.guvcfd", project_dir=str(project_dir),
@@ -645,7 +725,7 @@ def test_run_decay_sweep_second_launch_reuses_matching_flow_and_control(tmp_path
     monkeypatch.setattr(sr, "_run_shared_control", fake_run_shared_control)
     monkeypatch.setattr(sr, "_copy_base_case",
                          lambda base, target, log_fn: __import__("os").makedirs(target, exist_ok=True))
-    monkeypatch.setattr(sr, "_apply_z", lambda case_dir, z, nbins, fan_kwargs, log_fn:
+    monkeypatch.setattr(sr, "_apply_z", lambda case_dir, z, nbins, fan_kwargs, log_fn, **kw:
                          {"fluence_mean": 1.0, "eACH_uv_well_mixed_mean": 0.0})
     monkeypatch.setattr(sr, "compute_uv_fingerprint", lambda *a, **k: "fake-uv-fp")
     monkeypatch.setattr(sr, "_run_decay_scenario", lambda *a, **k: {
@@ -654,7 +734,7 @@ def test_run_decay_sweep_second_launch_reuses_matching_flow_and_control(tmp_path
 
     room = type("Room", (), {"x": 4.0, "y": 5.0, "z": 2.7})()
     settings = _decay_reuse_settings()
-    adv = {"uv-zone-bins": 25, "mesh-cell-size": 0.1, "keep-shared-scratch-dirs": True}
+    adv = {"adaptive-t-relaxation": False, "uv-zone-bins": 25, "mesh-cell-size": 0.1, "keep-shared-scratch-dirs": True}
 
     sr.run_decay_sweep(
         guv_path="proj.guv", settings_path="proj.guvcfd", project_dir=str(project_dir),
@@ -696,7 +776,7 @@ def test_run_decay_sweep_different_guv_at_same_z_ach_gets_its_own_folder(tmp_pat
     monkeypatch.setattr(sr, "_run_shared_control", fake_run_shared_control)
     monkeypatch.setattr(sr, "_copy_base_case",
                          lambda base, target, log_fn: __import__("os").makedirs(target, exist_ok=True))
-    monkeypatch.setattr(sr, "_apply_z", lambda case_dir, z, nbins, fan_kwargs, log_fn:
+    monkeypatch.setattr(sr, "_apply_z", lambda case_dir, z, nbins, fan_kwargs, log_fn, **kw:
                          {"fluence_mean": 1.0, "eACH_uv_well_mixed_mean": 0.0})
     monkeypatch.setattr(sr, "compute_uv_fingerprint", lambda *a, **k: "fake-uv-fp")
     decay_calls = []
@@ -706,7 +786,7 @@ def test_run_decay_sweep_different_guv_at_same_z_ach_gets_its_own_folder(tmp_pat
 
     room = type("Room", (), {"x": 4.0, "y": 5.0, "z": 2.7})()
     settings = _decay_reuse_settings()
-    adv = {"uv-zone-bins": 25, "mesh-cell-size": 0.1, "keep-shared-scratch-dirs": True}
+    adv = {"adaptive-t-relaxation": False, "uv-zone-bins": 25, "mesh-cell-size": 0.1, "keep-shared-scratch-dirs": True}
 
     results_seen = []
     sr.run_decay_sweep(
@@ -772,7 +852,7 @@ def test_switching_a_steady_state_project_to_decay_mode_gets_its_own_folder_and_
     monkeypatch.setattr(sr, "write_source_topo_set_dict", lambda *a, **k: None)
     monkeypatch.setattr(sr, "_copy_base_case",
                          lambda base, target, log_fn: __import__("os").makedirs(target, exist_ok=True))
-    monkeypatch.setattr(sr, "_apply_z", lambda case_dir, z, nbins, fan_kwargs, log_fn:
+    monkeypatch.setattr(sr, "_apply_z", lambda case_dir, z, nbins, fan_kwargs, log_fn, **kw:
                          {"fluence_mean": 1.0, "eACH_uv_well_mixed_mean": 0.0})
     monkeypatch.setattr(sr, "compute_uv_fingerprint", lambda *a, **k: "fake-uv-fp")
     monkeypatch.setattr(sr, "run_wsl_or_raise", lambda cmd, *a, **k: None)
@@ -798,7 +878,7 @@ def test_switching_a_steady_state_project_to_decay_mode_gets_its_own_folder_and_
         "inject-x-input": 2, "inject-y-input": 2.5, "inject-z-input": 1.3, "z-value": 6,
         "source-zone-size": 0.3,
     })
-    adv = {"uv-zone-bins": 25, "mesh-cell-size": 0.1, "keep-shared-scratch-dirs": True,
+    adv = {"adaptive-t-relaxation": False, "uv-zone-bins": 25, "mesh-cell-size": 0.1, "keep-shared-scratch-dirs": True,
            "pimple-delta-t": 0.5, "max-co": 5,
            "decay-ach-min-fraction": 90.0, "decay-each-min-fraction": 90.0, "decay-each-max-fraction": 99.9}
 
@@ -874,7 +954,7 @@ def test_run_decay_sweep_rebuilds_when_flow_settings_change_between_launches(tmp
     monkeypatch.setattr(sr, "_run_shared_control", fake_run_shared_control)
     monkeypatch.setattr(sr, "_copy_base_case",
                          lambda base, target, log_fn: __import__("os").makedirs(target, exist_ok=True))
-    monkeypatch.setattr(sr, "_apply_z", lambda case_dir, z, nbins, fan_kwargs, log_fn:
+    monkeypatch.setattr(sr, "_apply_z", lambda case_dir, z, nbins, fan_kwargs, log_fn, **kw:
                          {"fluence_mean": 1.0, "eACH_uv_well_mixed_mean": 0.0})
     monkeypatch.setattr(sr, "compute_uv_fingerprint", lambda *a, **k: "fake-uv-fp")
     monkeypatch.setattr(sr, "_run_decay_scenario", lambda *a, **k: {
@@ -883,7 +963,7 @@ def test_run_decay_sweep_rebuilds_when_flow_settings_change_between_launches(tmp
 
     room = type("Room", (), {"x": 4.0, "y": 5.0, "z": 2.7})()
     base_settings = _decay_reuse_settings()
-    adv = {"uv-zone-bins": 25, "mesh-cell-size": 0.1, "keep-shared-scratch-dirs": True}
+    adv = {"adaptive-t-relaxation": False, "uv-zone-bins": 25, "mesh-cell-size": 0.1, "keep-shared-scratch-dirs": True}
 
     sr.run_decay_sweep(
         guv_path="proj.guv", settings_path="proj.guvcfd", project_dir=str(project_dir),
@@ -933,7 +1013,7 @@ def test_run_decay_sweep_mechanical_ach_only_skips_apply_z_and_reuses_control_re
     settings = {"sim-type": "decay", "mech-ach-only": True, "fan-enable": False,
                 "inlet2-enable": False, "outlet2-enable": False, "monitoring-enable": False,
                 "inlet-wall": "xMin", "inlet-size-w": 0.3, "inlet-size-h": 0.3}
-    adv = {"uv-zone-bins": 25, "mesh-cell-size": 0.1, "keep-shared-scratch-dirs": True}
+    adv = {"adaptive-t-relaxation": False, "uv-zone-bins": 25, "mesh-cell-size": 0.1, "keep-shared-scratch-dirs": True}
 
     sr.run_decay_sweep(
         guv_path="proj.guv", settings_path="proj.guvcfd", project_dir=str(project_dir),
@@ -1077,7 +1157,7 @@ def test_run_sweep_skips_a_combo_that_already_has_results_json(tmp_path, monkeyp
     monkeypatch.setattr(sr, "_copy_base_case",
                          lambda base, target, log_fn: (copy_calls.append(target),
                                                         __import__("os").makedirs(target, exist_ok=True)))
-    monkeypatch.setattr(sr, "_apply_z", lambda case_dir, z, nbins, fan_kwargs, log_fn:
+    monkeypatch.setattr(sr, "_apply_z", lambda case_dir, z, nbins, fan_kwargs, log_fn, **kw:
                          {"fluence_mean": 1.0, "eACH_uv_well_mixed_mean": 0.0})
     monkeypatch.setattr(sr, "compute_uv_fingerprint", lambda *a, **k: "fake-uv-fp")
 
@@ -1098,7 +1178,7 @@ def test_run_sweep_skips_a_combo_that_already_has_results_json(tmp_path, monkeyp
                 "phase1-iterations": 100, "phase2-iterations": 100, "target-t-ss": 1.0,
                 "inject-x-input": 2, "inject-y-input": 2.5, "inject-z-input": 1.3, "z-value": 6,
                 "source-zone-size": 0.3}
-    adv = {"uv-zone-bins": 25, "mesh-cell-size": 0.1}
+    adv = {"adaptive-t-relaxation": False, "uv-zone-bins": 25, "mesh-cell-size": 0.1}
 
     results_seen = []
     sr.run_sweep(
@@ -1131,7 +1211,7 @@ def test_run_sweep_skips_failed_combo_and_continues(tmp_path, monkeypatch):
     monkeypatch.setattr(sr, "_copy_base_case", lambda base, target, log_fn: __import__("os").makedirs(target, exist_ok=True))
     monkeypatch.setattr(sr, "run_wsl_or_raise", lambda *a, **k: None)
 
-    def fake_apply_z(case_dir, z, nbins, fan_kwargs, log_fn):
+    def fake_apply_z(case_dir, z, nbins, fan_kwargs, log_fn, **kw):
         if z == 2:
             raise RuntimeError("boom")
         return {"fluence_mean": 1.0, "eACH_uv_well_mixed_mean": 0.0}
@@ -1150,7 +1230,7 @@ def test_run_sweep_skips_failed_combo_and_continues(tmp_path, monkeypatch):
     seen = []
     sr.run_sweep(
         guv_path="p.guv", settings_path="p.guvcfd", project_dir=str(project_dir),
-        room=room, settings=settings, adv={"uv-zone-bins": 25, "mesh-cell-size": 0.1},
+        room=room, settings=settings, adv={"uv-zone-bins": 25, "mesh-cell-size": 0.1, "adaptive-t-relaxation": False},
         z_values=[2, 6], ach_values=[3], log_fn=lambda m: None,
         on_combo_done=lambda z, ach, status, detail: seen.append((z, status)),
     )
@@ -1180,7 +1260,7 @@ def test_run_scenario_threads_control_results_into_measured_ventilation_ach(monk
                 "phase1-iterations": 100, "phase2-iterations": 100, "target-t-ss": 1.0,
                 "inject-x-input": 2, "inject-y-input": 2.5, "inject-z-input": 1.3,
                 "monitoring-enable": False, "source-zone-size": 0.3}
-    adv = {"uv-zone-bins": 25, "mesh-cell-size": 0.1,
+    adv = {"adaptive-t-relaxation": False, "uv-zone-bins": 25, "mesh-cell-size": 0.1,
            "plateau-rel-tol": 1.0, "t-infinity-early-stop-enabled": False, "phase1-require-stable-extrapolation": False, "keep-all-timesteps": False,
            "deltat-scaling-enabled": False, "deltat-effective-fraction": 0.7, "deltat-target-fraction": 0.995,
            "phase-chunk-size": 400, "phase-write-interval": 200}
@@ -1220,7 +1300,7 @@ def test_run_scenario_deltat_scaling_uses_configured_iterations_not_settling_inf
                 "phase1-iterations": 1500, "phase2-iterations": 1500, "target-t-ss": 1.0,
                 "inject-x-input": 2, "inject-y-input": 2.5, "inject-z-input": 1.3,
                 "monitoring-enable": False, "source-zone-size": 0.3}
-    adv = {"uv-zone-bins": 25, "mesh-cell-size": 0.1,
+    adv = {"adaptive-t-relaxation": False, "uv-zone-bins": 25, "mesh-cell-size": 0.1,
            "plateau-rel-tol": 1.0, "t-infinity-early-stop-enabled": False, "phase1-require-stable-extrapolation": False, "keep-all-timesteps": False,
            "deltat-scaling-enabled": True, "deltat-effective-fraction": 0.7, "deltat-target-fraction": 0.995,
            "phase-chunk-size": 400, "phase-write-interval": 200}
@@ -1253,7 +1333,7 @@ def test_run_scenario_threads_base_summary_into_flow_converged_and_ach_delivery(
                 "phase1-iterations": 100, "phase2-iterations": 100, "target-t-ss": 1.0,
                 "inject-x-input": 2, "inject-y-input": 2.5, "inject-z-input": 1.3,
                 "monitoring-enable": False, "source-zone-size": 0.3}
-    adv = {"uv-zone-bins": 25, "mesh-cell-size": 0.1,
+    adv = {"adaptive-t-relaxation": False, "uv-zone-bins": 25, "mesh-cell-size": 0.1,
            "plateau-rel-tol": 1.0, "t-infinity-early-stop-enabled": False, "phase1-require-stable-extrapolation": False, "keep-all-timesteps": False,
            "deltat-scaling-enabled": False, "deltat-effective-fraction": 0.7, "deltat-target-fraction": 0.995,
            "phase-chunk-size": 400, "phase-write-interval": 200}
@@ -1282,7 +1362,7 @@ def test_run_scenario_measured_ventilation_ach_none_without_control_results(monk
                 "phase1-iterations": 100, "phase2-iterations": 100, "target-t-ss": 1.0,
                 "inject-x-input": 2, "inject-y-input": 2.5, "inject-z-input": 1.3,
                 "monitoring-enable": False, "source-zone-size": 0.3}
-    adv = {"uv-zone-bins": 25, "mesh-cell-size": 0.1,
+    adv = {"adaptive-t-relaxation": False, "uv-zone-bins": 25, "mesh-cell-size": 0.1,
            "plateau-rel-tol": 1.0, "t-infinity-early-stop-enabled": False, "phase1-require-stable-extrapolation": False, "keep-all-timesteps": False,
            "deltat-scaling-enabled": False, "deltat-effective-fraction": 0.7, "deltat-target-fraction": 0.995,
            "phase-chunk-size": 400, "phase-write-interval": 200}
@@ -1318,7 +1398,7 @@ def test_run_shared_phase1_clones_base_dir_and_runs_phase1_only(tmp_path, monkey
                 "phase1-iterations": 100, "target-t-ss": 1.0, "z-value": 6,
                 "inject-x-input": 2, "inject-y-input": 2.5, "inject-z-input": 1.3,
                 "t-ss-window-frac": None, "monitoring-enable": False, "source-zone-size": 0.3}
-    adv = {"mesh-cell-size": 0.1, "plateau-rel-tol": 1.0,
+    adv = {"adaptive-t-relaxation": False, "mesh-cell-size": 0.1, "plateau-rel-tol": 1.0,
            "t-infinity-early-stop-enabled": False, "phase1-require-stable-extrapolation": False, "keep-all-timesteps": False,
            "phase-chunk-size": 400, "phase-write-interval": 200,
            "deltat-scaling-enabled": False, "deltat-effective-fraction": 0.7, "deltat-target-fraction": 0.995}
@@ -1367,7 +1447,7 @@ def test_build_flow_base_reuses_existing_resolved_base(tmp_path, monkeypatch):
                 "outlet-wall": "xMax", "outlet-y-input": 2.5, "outlet-z-input": 1.5,
                 "outlet-size-w": 0.3, "outlet-size-h": 0.3,
                 "fan-enable": False, "inlet2-enable": False, "outlet2-enable": False}
-    adv = {"mesh-cell-size": 0.1, "uv-zone-bins": 25, "flow-rel-tol": 1.0, "flow-max-iterations": 20000,
+    adv = {"adaptive-t-relaxation": False, "mesh-cell-size": 0.1, "uv-zone-bins": 25, "flow-rel-tol": 1.0, "flow-max-iterations": 20000,
            "momentum-relaxation": None, "scalar-relaxation": None,
            "scalar-transport-ncorr": None, "scalar-transport-tolerance": None}
 
@@ -1414,7 +1494,7 @@ def test_build_flow_base_reuse_skips_ach_delivery_check_when_sealed(tmp_path, mo
                 "outlet-wall": "xMax", "outlet-y-input": 2.5, "outlet-z-input": 1.5,
                 "outlet-size-w": 0.3, "outlet-size-h": 0.3,
                 "fan-enable": True, "inlet2-enable": False, "outlet2-enable": False}
-    adv = {"mesh-cell-size": 0.1, "uv-zone-bins": 25, "flow-rel-tol": 1.0, "flow-max-iterations": 20000,
+    adv = {"adaptive-t-relaxation": False, "mesh-cell-size": 0.1, "uv-zone-bins": 25, "flow-rel-tol": 1.0, "flow-max-iterations": 20000,
            "momentum-relaxation": None, "scalar-relaxation": None,
            "scalar-transport-ncorr": None, "scalar-transport-tolerance": None}
 
@@ -1483,7 +1563,7 @@ def test_run_shared_phase1_resumes_undecided_pending_instead_of_restarting(tmp_p
                 "phase1-iterations": 1500, "target-t-ss": 1.0, "z-value": 6,
                 "inject-x-input": 2, "inject-y-input": 2.5, "inject-z-input": 1.3,
                 "t-ss-window-frac": None, "monitoring-enable": False, "source-zone-size": 0.3}
-    adv = {"mesh-cell-size": 0.1, "plateau-rel-tol": 1.0,
+    adv = {"adaptive-t-relaxation": False, "mesh-cell-size": 0.1, "plateau-rel-tol": 1.0,
            "t-infinity-early-stop-enabled": False, "phase1-require-stable-extrapolation": False,
            "keep-all-timesteps": False, "phase-chunk-size": 400, "phase-write-interval": 200,
            "deltat-scaling-enabled": False, "deltat-effective-fraction": 0.7, "deltat-target-fraction": 0.995}
@@ -1549,7 +1629,7 @@ def test_run_shared_phase1_recomputes_fluence_when_resuming_pending(tmp_path, mo
                 "phase1-iterations": 1500, "target-t-ss": 1.0, "z-value": 6,
                 "inject-x-input": 2, "inject-y-input": 2.5, "inject-z-input": 1.3,
                 "t-ss-window-frac": None, "monitoring-enable": False, "source-zone-size": 0.3}
-    adv = {"mesh-cell-size": 0.1, "plateau-rel-tol": 1.0,
+    adv = {"adaptive-t-relaxation": False, "mesh-cell-size": 0.1, "plateau-rel-tol": 1.0,
            "t-infinity-early-stop-enabled": False, "phase1-require-stable-extrapolation": False,
            "keep-all-timesteps": False, "phase-chunk-size": 400, "phase-write-interval": 200,
            "deltat-scaling-enabled": False, "deltat-effective-fraction": 0.7, "deltat-target-fraction": 0.995}
@@ -1587,7 +1667,7 @@ def test_run_sweep_different_guv_at_same_z_ach_produces_genuinely_different_resu
     monkeypatch.setattr(sr, "write_source_topo_set_dict", lambda *a, **k: None)
     monkeypatch.setattr(sr, "_copy_base_case",
                          lambda base, target, log_fn: __import__("os").makedirs(target, exist_ok=True))
-    monkeypatch.setattr(sr, "_apply_z", lambda case_dir, z, nbins, fan_kwargs, log_fn:
+    monkeypatch.setattr(sr, "_apply_z", lambda case_dir, z, nbins, fan_kwargs, log_fn, **kw:
                          {"fluence_mean": 1.0, "eACH_uv_well_mixed_mean": 0.0})
     monkeypatch.setattr(sr, "compute_uv_fingerprint", lambda *a, **k: "fake-uv-fp")
     monkeypatch.setattr(sr, "run_wsl_or_raise", lambda cmd, *a, **k: None)
@@ -1627,7 +1707,7 @@ def test_run_sweep_different_guv_at_same_z_ach_produces_genuinely_different_resu
                 "phase1-iterations": 100, "phase2-iterations": 100, "target-t-ss": 1.0,
                 "inject-x-input": 2, "inject-y-input": 2.5, "inject-z-input": 1.3, "z-value": 6,
                 "source-zone-size": 0.3}
-    adv = {"uv-zone-bins": 25, "mesh-cell-size": 0.1}
+    adv = {"adaptive-t-relaxation": False, "uv-zone-bins": 25, "mesh-cell-size": 0.1}
 
     sr.run_sweep(
         guv_path="lampB.guv", settings_path="proj.guvcfd", project_dir=str(project_dir),
@@ -1653,7 +1733,7 @@ def test_run_sweep_recarves_source_zone_after_apply_z_wipes_it(tmp_path, monkeyp
     monkeypatch.setattr(sr, "_run_shared_phase1", lambda *a, **k: None)
     monkeypatch.setattr(sr, "_run_shared_control", lambda *a, **k: {"total_ach_effective": 3.0})
     monkeypatch.setattr(sr, "_copy_base_case", lambda base, target, log_fn: __import__("os").makedirs(target, exist_ok=True))
-    monkeypatch.setattr(sr, "_apply_z", lambda case_dir, z, nbins, fan_kwargs, log_fn:
+    monkeypatch.setattr(sr, "_apply_z", lambda case_dir, z, nbins, fan_kwargs, log_fn, **kw:
                          {"fluence_mean": 1.0, "eACH_uv_well_mixed_mean": 0.0})
     monkeypatch.setattr(sr, "compute_uv_fingerprint", lambda *a, **k: "fake-uv-fp")
     monkeypatch.setattr(sr, "_run_scenario", lambda *a, **k: {
@@ -1672,7 +1752,7 @@ def test_run_sweep_recarves_source_zone_after_apply_z_wipes_it(tmp_path, monkeyp
                 "phase1-iterations": 100, "phase2-iterations": 100, "target-t-ss": 1.0,
                 "inject-x-input": 2, "inject-y-input": 2.5, "inject-z-input": 1.3, "z-value": 6,
                 "source-zone-size": 0.3}
-    adv = {"uv-zone-bins": 25, "mesh-cell-size": 0.1}
+    adv = {"adaptive-t-relaxation": False, "uv-zone-bins": 25, "mesh-cell-size": 0.1}
 
     sr.run_sweep(
         guv_path="p.guv", settings_path="p.guvcfd", project_dir=str(project_dir),
@@ -1704,7 +1784,7 @@ def test_run_sweep_stop_between_combinations_raises_stopped_by_user(tmp_path, mo
     with pytest.raises(StoppedByUser):
         sr.run_sweep(
             guv_path="p.guv", settings_path="p.guvcfd", project_dir=str(project_dir),
-            room=room, settings=settings, adv={"uv-zone-bins": 25},
+            room=room, settings=settings, adv={"uv-zone-bins": 25, "adaptive-t-relaxation": False},
             z_values=[2, 6], ach_values=[3], log_fn=lambda m: None,
             should_stop=should_stop,
         )
@@ -1743,7 +1823,7 @@ def test_run_decay_scenario_rebuilds_fvoptions_from_this_combos_own_kuv(tmp_path
     settings = {"fan-enable": False, "inlet2-enable": False, "outlet2-enable": False,
                 "inlet-wall": "xMin", "inlet-size-w": 0.3, "inlet-size-h": 0.3,
                 "monitoring-enable": False, "pimple-write-interval": 3}
-    adv = {"uv-zone-bins": 5, "pimple-delta-t": 0.5, "max-co": 5,
+    adv = {"adaptive-t-relaxation": False, "uv-zone-bins": 5, "pimple-delta-t": 0.5, "max-co": 5,
            "decay-ach-min-fraction": 90.0, "decay-each-min-fraction": 90.0, "decay-each-max-fraction": 99.9}
 
     sr._run_decay_scenario(case_dir, room, settings, z=6.0, ach=3.0, adv=adv,
@@ -1797,7 +1877,7 @@ def test_run_decay_scenario_releases_solve_semaphore_before_waiting_on_control(t
     settings = {"fan-enable": False, "inlet2-enable": False, "outlet2-enable": False,
                 "inlet-wall": "xMin", "inlet-size-w": 0.3, "inlet-size-h": 0.3,
                 "monitoring-enable": False, "pimple-write-interval": 3}
-    adv = {"uv-zone-bins": 5, "pimple-delta-t": 0.5, "max-co": 5,
+    adv = {"adaptive-t-relaxation": False, "uv-zone-bins": 5, "pimple-delta-t": 0.5, "max-co": 5,
            "decay-ach-min-fraction": 90.0, "decay-each-min-fraction": 90.0, "decay-each-max-fraction": 99.9}
 
     result_holder = {}
@@ -1864,7 +1944,7 @@ def test_run_decay_scenario_status_fn_gets_time_lines_and_clears_on_finish(tmp_p
     settings = {"fan-enable": False, "inlet2-enable": False, "outlet2-enable": False,
                 "inlet-wall": "xMin", "inlet-size-w": 0.3, "inlet-size-h": 0.3,
                 "monitoring-enable": False, "pimple-write-interval": 3}
-    adv = {"uv-zone-bins": 5, "pimple-delta-t": 0.5, "max-co": 5,
+    adv = {"adaptive-t-relaxation": False, "uv-zone-bins": 5, "pimple-delta-t": 0.5, "max-co": 5,
            "decay-ach-min-fraction": 90.0, "decay-each-min-fraction": 90.0, "decay-each-max-fraction": 99.9}
 
     sr._run_decay_scenario(case_dir, room, settings, z=6.0, ach=3.0, adv=adv,
@@ -1898,7 +1978,7 @@ def test_run_shared_control_status_fn_gets_time_lines_and_clears_on_finish(tmp_p
     settings = {"inlet2-enable": False, "outlet2-enable": False,
                 "inlet-wall": "xMin", "inlet-size-w": 0.3, "inlet-size-h": 0.3,
                 "pimple-write-interval": 3}
-    adv = {"pimple-delta-t": 0.5, "max-co": 5, "decay-ach-min-fraction": 99.9,
+    adv = {"adaptive-t-relaxation": False, "pimple-delta-t": 0.5, "max-co": 5, "decay-ach-min-fraction": 99.9,
            "decay-each-max-fraction": 99.9, "decay-each-min-fraction": 90.0}
 
     sr._run_shared_control(str(tmp_path / "base"), str(tmp_path / "control"), ach=3.0, room=room,
@@ -1941,7 +2021,7 @@ def test_run_decay_scenario_uses_configured_write_interval_not_duration_over_100
                 "monitoring-enable": False, "pimple-write-interval": 3}
     # A duration long enough that duration // 100 (the old, wrong formula)
     # would clearly differ from the configured 3s.
-    adv = {"uv-zone-bins": 5, "pimple-delta-t": 0.5, "max-co": 5,
+    adv = {"adaptive-t-relaxation": False, "uv-zone-bins": 5, "pimple-delta-t": 0.5, "max-co": 5,
            "decay-ach-min-fraction": 99.9, "decay-each-min-fraction": 99.9, "decay-each-max-fraction": 99.9}
 
     sr._run_decay_scenario(case_dir, room, settings, z=6.0, ach=3.0, adv=adv,
@@ -1967,7 +2047,7 @@ def test_run_shared_control_uses_configured_write_interval(tmp_path, monkeypatch
     settings = {"inlet2-enable": False, "outlet2-enable": False,
                 "inlet-wall": "xMin", "inlet-size-w": 0.3, "inlet-size-h": 0.3,
                 "pimple-write-interval": 3}
-    adv = {"pimple-delta-t": 0.5, "max-co": 5, "decay-ach-min-fraction": 99.9,
+    adv = {"adaptive-t-relaxation": False, "pimple-delta-t": 0.5, "max-co": 5, "decay-ach-min-fraction": 99.9,
            "decay-each-max-fraction": 99.9, "decay-each-min-fraction": 90.0}
 
     sr._run_shared_control(str(tmp_path / "base"), str(tmp_path / "control"), ach=3.0, room=room,
@@ -2380,7 +2460,7 @@ def test_run_sweep_runs_phase1_and_control_concurrently(tmp_path, monkeypatch):
     project_dir.mkdir()
     monkeypatch.setattr(sr, "_build_flow_base", lambda *a, **k: None)
     monkeypatch.setattr(sr, "_copy_base_case", lambda base, target, log_fn: __import__("os").makedirs(target, exist_ok=True))
-    monkeypatch.setattr(sr, "_apply_z", lambda case_dir, z, nbins, fan_kwargs, log_fn:
+    monkeypatch.setattr(sr, "_apply_z", lambda case_dir, z, nbins, fan_kwargs, log_fn, **kw:
                          {"fluence_mean": 1.0, "eACH_uv_well_mixed_mean": 0.0})
     monkeypatch.setattr(sr, "compute_uv_fingerprint", lambda *a, **k: "fake-uv-fp")
     monkeypatch.setattr(sr, "write_source_topo_set_dict", lambda *a, **k: None)
@@ -2407,7 +2487,7 @@ def test_run_sweep_runs_phase1_and_control_concurrently(tmp_path, monkeypatch):
     room = type("Room", (), {"x": 4.0, "y": 5.0, "z": 2.7})()
     sr.run_sweep(
         guv_path="proj.guv", settings_path="proj.guvcfd", project_dir=str(project_dir),
-        room=room, settings=_steady_state_settings(), adv={"uv-zone-bins": 25, "mesh-cell-size": 0.1},
+        room=room, settings=_steady_state_settings(), adv={"uv-zone-bins": 25, "mesh-cell-size": 0.1, "adaptive-t-relaxation": False},
         z_values=[6], ach_values=[3], log_fn=lambda m: None,
     )
 
@@ -2423,7 +2503,7 @@ def test_run_decay_sweep_runs_control_and_z_decay_concurrently(tmp_path, monkeyp
     project_dir.mkdir()
     monkeypatch.setattr(sr, "_build_flow_base", lambda *a, **k: None)
     monkeypatch.setattr(sr, "_copy_base_case", lambda base, target, log_fn: __import__("os").makedirs(target, exist_ok=True))
-    monkeypatch.setattr(sr, "_apply_z", lambda case_dir, z, nbins, fan_kwargs, log_fn:
+    monkeypatch.setattr(sr, "_apply_z", lambda case_dir, z, nbins, fan_kwargs, log_fn, **kw:
                          {"fluence_mean": 1.0, "eACH_uv_well_mixed_mean": 0.0})
     monkeypatch.setattr(sr, "run_wsl_or_raise", lambda *a, **k: None)
     monkeypatch.setattr(sr, "compute_uv_fingerprint", lambda *a, **k: "fake-uv-fp")
@@ -2452,7 +2532,7 @@ def test_run_decay_sweep_runs_control_and_z_decay_concurrently(tmp_path, monkeyp
     room = type("Room", (), {"x": 4.0, "y": 5.0, "z": 2.7})()
     settings = dict(_decay_reuse_settings(), z_value=6)
     settings["pimple-write-interval"] = 3
-    adv = {"uv-zone-bins": 5, "pimple-delta-t": 0.5, "max-co": 5,
+    adv = {"adaptive-t-relaxation": False, "uv-zone-bins": 5, "pimple-delta-t": 0.5, "max-co": 5,
            "decay-ach-min-fraction": 90.0, "decay-each-min-fraction": 90.0, "decay-each-max-fraction": 99.9}
 
     sr.run_decay_sweep(
@@ -2482,7 +2562,7 @@ def test_run_sweep_never_exceeds_max_concurrent_solves(tmp_path, monkeypatch):
     project_dir.mkdir()
     monkeypatch.setattr(sr, "_MAX_CONCURRENT_SOLVES", 3)
     monkeypatch.setattr(sr, "_copy_base_case", lambda base, target, log_fn: __import__("os").makedirs(target, exist_ok=True))
-    monkeypatch.setattr(sr, "_apply_z", lambda case_dir, z, nbins, fan_kwargs, log_fn:
+    monkeypatch.setattr(sr, "_apply_z", lambda case_dir, z, nbins, fan_kwargs, log_fn, **kw:
                          {"fluence_mean": 1.0, "eACH_uv_well_mixed_mean": 0.0})
     monkeypatch.setattr(sr, "compute_uv_fingerprint", lambda *a, **k: "fake-uv-fp")
     monkeypatch.setattr(sr, "write_source_topo_set_dict", lambda *a, **k: None)
@@ -2514,7 +2594,7 @@ def test_run_sweep_never_exceeds_max_concurrent_solves(tmp_path, monkeypatch):
     room = type("Room", (), {"x": 4.0, "y": 5.0, "z": 2.7})()
     sr.run_sweep(
         guv_path="proj.guv", settings_path="proj.guvcfd", project_dir=str(project_dir),
-        room=room, settings=_steady_state_settings(), adv={"uv-zone-bins": 25, "mesh-cell-size": 0.1},
+        room=room, settings=_steady_state_settings(), adv={"uv-zone-bins": 25, "mesh-cell-size": 0.1, "adaptive-t-relaxation": False},
         z_values=[2, 6], ach_values=[1.5, 3, 6], log_fn=lambda m: None,
     )
 
@@ -2535,7 +2615,7 @@ def test_run_sweep_max_concurrent_solves_overridable_via_adv(tmp_path, monkeypat
     project_dir.mkdir()
     monkeypatch.setattr(sr, "_MAX_CONCURRENT_SOLVES", 9)  # fallback stays high, adv should win anyway
     monkeypatch.setattr(sr, "_copy_base_case", lambda base, target, log_fn: __import__("os").makedirs(target, exist_ok=True))
-    monkeypatch.setattr(sr, "_apply_z", lambda case_dir, z, nbins, fan_kwargs, log_fn:
+    monkeypatch.setattr(sr, "_apply_z", lambda case_dir, z, nbins, fan_kwargs, log_fn, **kw:
                          {"fluence_mean": 1.0, "eACH_uv_well_mixed_mean": 0.0})
     monkeypatch.setattr(sr, "compute_uv_fingerprint", lambda *a, **k: "fake-uv-fp")
     monkeypatch.setattr(sr, "write_source_topo_set_dict", lambda *a, **k: None)
@@ -2568,7 +2648,7 @@ def test_run_sweep_max_concurrent_solves_overridable_via_adv(tmp_path, monkeypat
     sr.run_sweep(
         guv_path="proj.guv", settings_path="proj.guvcfd", project_dir=str(project_dir),
         room=room, settings=_steady_state_settings(),
-        adv={"uv-zone-bins": 25, "mesh-cell-size": 0.1, "max-concurrent-solves": 2},
+        adv={"uv-zone-bins": 25, "mesh-cell-size": 0.1, "max-concurrent-solves": 2, "adaptive-t-relaxation": False},
         z_values=[2, 6], ach_values=[1.5, 3, 6], log_fn=lambda m: None,
     )
 

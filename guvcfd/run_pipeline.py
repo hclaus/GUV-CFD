@@ -35,6 +35,7 @@ from .splice import (
     ensure_simple_fvsolution,
     set_lts_ddt_scheme,
     set_relaxation_factors,
+    compute_adaptive_scalar_relaxation,
     set_scalar_transport_correction,
     set_pressure_reference_cell,
 )
@@ -893,7 +894,7 @@ def setup_case(guv_path, case_dir, template_case_dir=None, cell_size=0.1, Z=2.0,
                converge_flow=True, simple_foam_iterations=500, flow_convergence_method="simple",
                flow_rel_tol=0.01, flow_max_iterations=20000, n_procs=None,
                oscillation_window=6, oscillation_growth_tol=1.5, ach_delivery_tol=0.10,
-               momentum_relaxation=None, scalar_relaxation=None,
+               momentum_relaxation=None, scalar_relaxation=None, adaptive_t_relaxation=False,
                scalar_transport_ncorr=None, scalar_transport_tolerance=None,
                pimple_end_time=120, pimple_write_interval=10, pimple_delta_t=0.5, max_co=None,
                fan_speed=None, fan_center=None, fan_direction=(0, 0, -1),
@@ -954,6 +955,17 @@ def setup_case(guv_path, case_dir, template_case_dir=None, cell_size=0.1, Z=2.0,
     for U/(k|omega) and T respectively (see splice.set_relaxation_factors)
     - None (the default) leaves the template's own values untouched.
     GUI-exposed as cross-project "advanced" defaults too.
+
+    adaptive_t_relaxation: if True, scalar_relaxation is ignored and T's
+    relaxation is instead computed from THIS case's own kUV.max once it's
+    known (see splice.compute_adaptive_scalar_relaxation) - applied inside
+    _finish_case_setup, after the fluence/kUV field is written, since
+    kUV.max isn't known any earlier than that (mesh + flow convergence
+    both have to happen first). scalar_relaxation is still used for the
+    momentary static value the template starts with before that point
+    (flow convergence itself never touches T - scalarTransport1 is
+    disabled during it - so what T's relaxation is set to before then has
+    no effect on anything).
 
     scalar_transport_ncorr/scalar_transport_tolerance: the scalarTransport1
     function object's OWN outer-correction count/residual target (see
@@ -1201,12 +1213,13 @@ def setup_case(guv_path, case_dir, template_case_dir=None, cell_size=0.1, Z=2.0,
 
     return _finish_case_setup(case_dir, room, Z, nbins, source_field, fan_entry,
                                pimple_end_time, pimple_write_interval, pimple_delta_t, log_fn, summary,
-                               max_co=max_co, mechanical_ach_only=mechanical_ach_only)
+                               max_co=max_co, mechanical_ach_only=mechanical_ach_only,
+                               adaptive_t_relaxation=adaptive_t_relaxation)
 
 
 def _finish_case_setup(case_dir, room, Z, nbins, source_field, fan_entry,
                         pimple_end_time, pimple_write_interval, pimple_delta_t, log_fn, summary,
-                        max_co=None, mechanical_ach_only=False):
+                        max_co=None, mechanical_ach_only=False, adaptive_t_relaxation=False):
     """Everything setup_case() does after flow convergence is resolved
     (converged, accepted, or explicitly overridden by the user) - factored
     out so resume_case_setup() can reach the exact same steps after
@@ -1220,6 +1233,10 @@ def _finish_case_setup(case_dir, room, Z, nbins, source_field, fan_entry,
     instead, same as ventilation_control.prepare_ventilation_only_control
     does for its (normally secondary) UV-off control clone - here it's the
     ONLY thing that runs, not a paired control.
+
+    adaptive_t_relaxation: see setup_case's own docstring - applied below,
+    right after kUV.max is known, a no-op under mechanical_ach_only (no
+    kUV field exists there, nothing to size relaxation against).
     """
     case_dir_wsl = _wsl_path(case_dir)
 
@@ -1256,6 +1273,15 @@ def _finish_case_setup(case_dir, room, Z, nbins, source_field, fan_entry,
         k_values = compute_inactivation_rate(values, Z)
         summary["k_range"] = (float(k_values.min()), float(k_values.max()))
         write_scalar_field(case_dir, "kUV", k_values, patch_names)
+
+        if adaptive_t_relaxation:
+            kuv_max = summary["k_range"][1]
+            adaptive_relax = compute_adaptive_scalar_relaxation(kuv_max)
+            log_fn(f"Adaptive T-relaxation: kUV.max={kuv_max:.4g} -> scalar-relaxation="
+                   f"{adaptive_relax:.3g} (overriding whatever static value the template started with; "
+                   "see splice.compute_adaptive_scalar_relaxation for the calibration this is based on)...")
+            set_relaxation_factors(case_dir, scalar_factor=adaptive_relax)
+            summary["adaptive_scalar_relaxation"] = adaptive_relax
 
         eACH_values = compute_well_mixed_eACH(k_values)
         summary["eACH_uv_well_mixed_mean"] = float(eACH_values.mean())
@@ -1306,6 +1332,7 @@ def resume_case_setup(case_dir, guv_path, decision, ach, Z, nbins=25, source_fie
                        ach_delivery_tol=0.10,
                        pimple_end_time=120, pimple_write_interval=10, pimple_delta_t=0.5, max_co=None,
                        fan_speed=None, fan_direction=(0, 0, -1), mechanical_ach_only=False,
+                       adaptive_t_relaxation=False,
                        log_fn=print, should_stop=None, solver_log_fn=None, should_pause=None):
     """Resume a case directory whose flow convergence previously raised
     FlowConvergenceUndecided - reuses the existing mesh, 0/ fields, and
@@ -1404,4 +1431,5 @@ def resume_case_setup(case_dir, guv_path, decision, ach, Z, nbins=25, source_fie
 
     return _finish_case_setup(case_dir, room, Z, nbins, source_field, fan_entry,
                                pimple_end_time, pimple_write_interval, pimple_delta_t, log_fn, summary,
-                               max_co=max_co, mechanical_ach_only=mechanical_ach_only)
+                               max_co=max_co, mechanical_ach_only=mechanical_ach_only,
+                               adaptive_t_relaxation=adaptive_t_relaxation)

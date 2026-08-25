@@ -133,6 +133,72 @@ def test_finish_case_setup_mechanical_ach_only_skips_fluence_pipeline(monkeypatc
     assert result["fluence_mean"] is None
 
 
+def test_finish_case_setup_adaptive_t_relaxation_overrides_scalar_factor(monkeypatch):
+    # When adaptive_t_relaxation=True, the T relaxation factor actually
+    # written to fvSolution must be computed from THIS case's own
+    # kUV.max (compute_adaptive_scalar_relaxation), not left at whatever
+    # static value the template/caller supplied.
+    import numpy as np
+
+    monkeypatch.setattr(run_pipeline, "read_cell_centers", lambda case_dir, t: np.zeros((3, 3)))
+    monkeypatch.setattr(run_pipeline, "compute_fluence_at_points", lambda room, pts: np.array([100.0, 200.0, 50.0]))
+    monkeypatch.setattr(run_pipeline, "read_boundary_patch_names", lambda case_dir: [])
+    monkeypatch.setattr(run_pipeline, "write_scalar_field", lambda *a, **k: None)
+    # kUV = fluence * Z * 1e-3; Z=100 here makes kUV.max = 200*100*1e-3 = 20.0
+    monkeypatch.setattr(run_pipeline, "compute_inactivation_rate", lambda values, Z: values * Z * 1e-3)
+    monkeypatch.setattr(run_pipeline, "compute_well_mixed_eACH", lambda k_values: k_values)
+    monkeypatch.setattr(run_pipeline, "bin_decay_rates", lambda k_values, nbins: (np.zeros(3, dtype=int), [0]))
+    monkeypatch.setattr(run_pipeline, "write_cellzones", lambda case_dir, bin_idx, nbins: ([], None))
+    monkeypatch.setattr(run_pipeline, "write_fvoptions", lambda *a, **k: None)
+    monkeypatch.setattr(run_pipeline, "splice_fv_options_into_control_dict",
+                         lambda case_dir: (f"{case_dir}/system/controlDict", 1, 1))
+    monkeypatch.setattr(run_pipeline, "set_control_dict_time", lambda *a, **k: None)
+
+    calls = []
+    monkeypatch.setattr(run_pipeline, "set_relaxation_factors",
+                         lambda case_dir, **kw: calls.append(kw))
+
+    summary = {"ach": 6.0}
+    result = run_pipeline._finish_case_setup(
+        "unused_dir", room=None, Z=100.0, nbins=25, source_field="T", fan_entry=None,
+        pimple_end_time=120, pimple_write_interval=10, pimple_delta_t=0.5, log_fn=lambda *a: None,
+        summary=summary, mechanical_ach_only=False, adaptive_t_relaxation=True,
+    )
+    assert result["k_range"][1] == 20.0
+    assert len(calls) == 1
+    assert calls[0] == {"scalar_factor": run_pipeline.compute_adaptive_scalar_relaxation(20.0)}
+    assert result["adaptive_scalar_relaxation"] == run_pipeline.compute_adaptive_scalar_relaxation(20.0)
+
+
+def test_finish_case_setup_without_adaptive_flag_never_calls_set_relaxation_factors(monkeypatch):
+    import numpy as np
+
+    monkeypatch.setattr(run_pipeline, "read_cell_centers", lambda case_dir, t: np.zeros((3, 3)))
+    monkeypatch.setattr(run_pipeline, "compute_fluence_at_points", lambda room, pts: np.array([100.0, 200.0, 50.0]))
+    monkeypatch.setattr(run_pipeline, "read_boundary_patch_names", lambda case_dir: [])
+    monkeypatch.setattr(run_pipeline, "write_scalar_field", lambda *a, **k: None)
+    monkeypatch.setattr(run_pipeline, "compute_inactivation_rate", lambda values, Z: values * Z * 1e-3)
+    monkeypatch.setattr(run_pipeline, "compute_well_mixed_eACH", lambda k_values: k_values)
+    monkeypatch.setattr(run_pipeline, "bin_decay_rates", lambda k_values, nbins: (np.zeros(3, dtype=int), [0]))
+    monkeypatch.setattr(run_pipeline, "write_cellzones", lambda case_dir, bin_idx, nbins: ([], None))
+    monkeypatch.setattr(run_pipeline, "write_fvoptions", lambda *a, **k: None)
+    monkeypatch.setattr(run_pipeline, "splice_fv_options_into_control_dict",
+                         lambda case_dir: (f"{case_dir}/system/controlDict", 1, 1))
+    monkeypatch.setattr(run_pipeline, "set_control_dict_time", lambda *a, **k: None)
+
+    def fail(*a, **k):
+        raise AssertionError("set_relaxation_factors must not be called when adaptive_t_relaxation=False")
+    monkeypatch.setattr(run_pipeline, "set_relaxation_factors", fail)
+
+    summary = {"ach": 6.0}
+    result = run_pipeline._finish_case_setup(
+        "unused_dir", room=None, Z=100.0, nbins=25, source_field="T", fan_entry=None,
+        pimple_end_time=120, pimple_write_interval=10, pimple_delta_t=0.5, log_fn=lambda *a: None,
+        summary=summary, mechanical_ach_only=False, adaptive_t_relaxation=False,
+    )
+    assert "adaptive_scalar_relaxation" not in result
+
+
 def test_converge_flow_field_skip_potential_flow_never_runs_potentialfoam(monkeypatch, tmp_path):
     commands = []
 

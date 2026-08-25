@@ -60,7 +60,10 @@ from .project_status import (
 )
 from .report import combo_summary_metrics
 from .run_pipeline import check_ach_delivery, setup_case
-from .splice import set_control_dict_start_from, set_control_dict_time, splice_fv_options_into_control_dict
+from .splice import (
+    set_control_dict_start_from, set_control_dict_time, splice_fv_options_into_control_dict,
+    set_relaxation_factors, compute_adaptive_scalar_relaxation,
+)
 from .steady_state_pipeline import (
     run_steady_state_scenario, _uv_fvoptions_entries, resolve_phase_delta_ts, merge_project_deltat_settings,
     REFERENCE_TARGET_T_SS, _read_phase1_checkpoint, _read_phase1_pending,
@@ -534,6 +537,13 @@ def _build_flow_base(guv_path, base_dir, room, settings, ach, adv, log_fn, shoul
         cell_size=adv["mesh-cell-size"], nbins=adv["uv-zone-bins"],
         flow_rel_tol=adv["flow-rel-tol"] / 100.0, flow_max_iterations=adv["flow-max-iterations"],
         momentum_relaxation=adv["momentum-relaxation"], scalar_relaxation=adv["scalar-relaxation"],
+        # Deliberately NOT adaptive_t_relaxation here: this builds the ONE
+        # shared per-ACH base, using settings["z-value"] as a mere
+        # placeholder - the real per-combo Z (and therefore the real
+        # kUV.max) isn't known yet, and _apply_z() below already applies
+        # adaptive relaxation correctly, per-Z, on each combo's own copy.
+        # Doing it here too would just bake in one arbitrary Z's value and
+        # then silently override it per copy - harmless but confusing.
         scalar_transport_ncorr=adv["scalar-transport-ncorr"],
         scalar_transport_tolerance=adv["scalar-transport-tolerance"],
         max_co=adv["max-co"],
@@ -560,7 +570,7 @@ def _copy_base_case(base_dir, target_dir, log_fn):
                       parent_wsl, "copying base case")
 
 
-def _apply_z(case_dir, Z, nbins, fan_kwargs, log_fn):
+def _apply_z(case_dir, Z, nbins, fan_kwargs, log_fn, adaptive_t_relaxation=False):
     """Recompute the Z-dependent files in an already flow-converged,
     freshly-copied case dir: kUV and cellZones.
 
@@ -580,6 +590,18 @@ def _apply_z(case_dir, Z, nbins, fan_kwargs, log_fn):
     cellzones() above rewrites constant/polyMesh/cellZones from scratch,
     wiping any fan zone the base build carved, so it needs re-carving
     here too (topoSet on the existing mesh - cheap, no re-meshing).
+
+    adaptive_t_relaxation: sweep mode's own point for this - unlike a
+    single run (where setup_case()/_finish_case_setup applies it once,
+    right after Z's own kUV field is first written), a sweep shares ONE
+    flow-converged base across every Z in the ACH group and only applies
+    each Z's own kUV field here, on that Z's own freshly-copied case_dir -
+    so this is the earliest, and correct, point per-Z kUV.max is actually
+    known in a sweep. Applying it in setup_case() instead (during
+    _build_flow_base's own one-time build) would bake in whatever
+    relaxation ONE placeholder Z happened to need, then have every other
+    Z in the sweep silently inherit that same, likely-wrong value via
+    _copy_base_case - confirmed as a real gap, not just a theoretical one.
     """
     patch_names = read_boundary_patch_names(case_dir)
     fluence_values = np.array(read_openfoam_scalar_field(f"{case_dir}/0/fluenceRate"))
@@ -602,10 +624,17 @@ def _apply_z(case_dir, Z, nbins, fan_kwargs, log_fn):
         write_fan_topo_set_dict(case_dir, p1, p2, fan_kwargs["fan_disk_radius"])
         run_wsl_or_raise("topoSet -dict system/fanTopoSetDict", case_dir_wsl, "topoSet (restore fan zone)")
 
-    return {
+    result = {
         "fluence_mean": float(fluence_values.mean()),
         "eACH_uv_well_mixed_mean": float(eACH_values.mean()),
     }
+    if adaptive_t_relaxation:
+        kuv_max = float(k_values.max())
+        adaptive_relax = compute_adaptive_scalar_relaxation(kuv_max)
+        log_fn(f"  Adaptive T-relaxation: kUV.max={kuv_max:.4g} -> scalar-relaxation={adaptive_relax:.3g}...")
+        set_relaxation_factors(case_dir, scalar_factor=adaptive_relax)
+        result["adaptive_scalar_relaxation"] = adaptive_relax
+    return result
 
 
 def _run_scenario(case_dir, room, settings, z, ach, adv, z_summary, log_fn, should_stop, solver_log_fn,
@@ -728,6 +757,13 @@ def _run_scenario(case_dir, room, settings, z, ach, adv, z_summary, log_fn, shou
     )
     result["fluence_mean"] = z_summary["fluence_mean"]
     result["eACH_uv_well_mixed"] = z_summary.get("eACH_uv_well_mixed_mean")
+    # Records the actual applied value, not just the adaptive-t-relaxation
+    # flag - see this project's adaptive-t-relaxation setting for why: a
+    # reload of the same project recomputes an equivalent value from the
+    # same inputs (deterministic given the same app version), but this is
+    # what lets a specific FINISHED run's real relaxation be read back
+    # directly, without needing to trust that recomputation matches.
+    result["adaptive_scalar_relaxation"] = z_summary.get("adaptive_scalar_relaxation")
     result["flow_converged"] = (base_summary or {}).get("flow_converged")
     result["ach_delivery"] = (base_summary or {}).get("ach_delivery")
     result["n_lamps"] = (base_summary or {}).get("n_lamps")
@@ -1152,6 +1188,7 @@ def _run_decay_scenario(case_dir, room, settings, z, ach, adv, z_summary, log_fn
             "ach_delivery": (base_summary or {}).get("ach_delivery"),
             "n_lamps": (base_summary or {}).get("n_lamps"),
             "spatial_cov_final": spatial_cov,
+            "adaptive_scalar_relaxation": z_summary.get("adaptive_scalar_relaxation"),
         },
         measured_ventilation_ach=control_results["total_ach_effective"],
         measured_ventilation_ach_ci95=control_results.get("total_ach_effective_ci95"),
@@ -1766,7 +1803,8 @@ def run_decay_sweep(guv_path, settings_path, project_dir, room, settings, adv,
                 result = json.loads(control_dir_content)
                 uv_fingerprint = None  # no UV/lamp physics involved at all in this mode
             else:
-                z_summary = _apply_z(case_dir, z, adv["uv-zone-bins"], ctx["fan_kw"], combo_log_fn)
+                z_summary = _apply_z(case_dir, z, adv["uv-zone-bins"], ctx["fan_kw"], combo_log_fn,
+                                  adaptive_t_relaxation=adv["adaptive-t-relaxation"])
                 uv_fingerprint = compute_uv_fingerprint(case_dir)
                 # The future itself is handed through, not .result() here -
                 # control runs concurrently with this Z's own decay solve
@@ -2059,7 +2097,8 @@ def run_sweep(guv_path, settings_path, project_dir, room, settings, adv,
                                    combo_suffix=combo_suffix, subdir=subdir)
         try:
             _copy_base_case(ctx["phase1_dir"], case_dir, combo_log_fn)
-            z_summary = _apply_z(case_dir, z, adv["uv-zone-bins"], ctx["fan_kw"], combo_log_fn)
+            z_summary = _apply_z(case_dir, z, adv["uv-zone-bins"], ctx["fan_kw"], combo_log_fn,
+                                  adaptive_t_relaxation=adv["adaptive-t-relaxation"])
             uv_fingerprint = compute_uv_fingerprint(case_dir)
             # _apply_z's write_cellzones() rewrites cellZones from scratch,
             # wiping the source cellZone _run_shared_phase1 already carved

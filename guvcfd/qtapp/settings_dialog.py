@@ -49,7 +49,13 @@ _FIELD_INFO = {
                              "convergence - lower is more stable but slower. Lower this number a bit "
                              "if oscillation is a problem (Phase 1/2 T never settling)."),
     "scalar-relaxation": ("Contaminant (T) under-relaxation",
-                           "Under-relaxation factor for the contaminant field."),
+                           "Under-relaxation factor for the contaminant field. Ignored when "
+                           "'Use adaptive T relaxation' below is on."),
+    "adaptive-t-relaxation": ("Use adaptive T relaxation",
+                               "It has been found that for high Z*fluencerate values, significantly "
+                               "lower T-relaxation values are needed to prevent crashing. An adaptive "
+                               "equation has been established to adjust T relaxation automatically for "
+                               "non crashing and shortest simulation times."),
     "scalar-transport-ncorr": ("Contaminant solver outer correctors",
                                 "How many times the contaminant equation is re-solved per timestep - "
                                 "needs to be >0 for the relaxation factor above to matter at all."),

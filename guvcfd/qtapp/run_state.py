@@ -454,6 +454,7 @@ def _setup_case_common(state, guv_path, case_dir, room, settings, adv):
         oscillation_window=adv["oscillation-window"], oscillation_growth_tol=adv["oscillation-growth-tol"],
         ach_delivery_tol=adv["ach-delivery-tol"] / 100.0,
         momentum_relaxation=adv["momentum-relaxation"], scalar_relaxation=adv["scalar-relaxation"],
+        adaptive_t_relaxation=adv["adaptive-t-relaxation"],
         scalar_transport_ncorr=adv["scalar-transport-ncorr"],
         scalar_transport_tolerance=adv["scalar-transport-tolerance"],
         pimple_end_time=settings.get("pimple-end-time", 120),
@@ -509,6 +510,7 @@ def _resume_case_setup_common(state, guv_path, case_dir, room, settings, adv, ad
         fan_speed=settings.get("fan-speed") if settings.get("fan-enable") else None,
         fan_direction=fan_direction,
         mechanical_ach_only=bool(settings.get("mech-ach-only")),
+        adaptive_t_relaxation=adv["adaptive-t-relaxation"],
         log_fn=state.log_fn, should_stop=state.should_stop, solver_log_fn=state.solver_log_fn,
         should_pause=state.should_pause,
     )

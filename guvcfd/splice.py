@@ -404,6 +404,56 @@ def set_relaxation_factors(case_dir, momentum_factor=None, scalar_factor=None):
     return fvs_path
 
 
+def compute_adaptive_scalar_relaxation(kuv_max):
+    """The T under-relaxation factor to use for a case whose UV sink term
+    peaks at `kuv_max` (constant/fvOptions' scalarSemiImplicitSource
+    Sp=-kUV, at its single hottest cell - see compute_inactivation_rate).
+
+    Derived from a real calibration campaign (2026-08-24/25) on
+    patient_ward_4B1_v7cell008 (ACH=6): scalar-relaxation in
+    {0.1, 0.15, 0.2, 0.25, 0.3, 0.5} x Z in {1, 2, 4, 7, 10} was screened for
+    Phase 2 crash/no-crash, then Z converted to its own kuv_max (=Z *
+    fluenceRate.max * 1e-3, confirmed 2.02/4.04/8.08/14.15/20.21 for this
+    lamp design) - Z alone was explicitly rejected as the basis for this
+    formula because it's meaningless across different .guv designs (a
+    different fluence rate/lamp layout changes fluenceRate.max
+    independently of Z; kuv_max is what actually drives the instability,
+    confirmed by the solver/ncorr/tolerance experiments that ruled
+    everything else out first - see ANALYSIS_LOG.md).
+
+    Last-confirmed-STABLE relaxation at each calibration kuv_max:
+      kuv_max=8.08  -> 0.25 stable, 0.3 crashes
+      kuv_max=14.15 -> 0.15 stable, 0.2 crashes
+      kuv_max=20.21 -> 0.1  stable, 0.15 crashes
+    (kuv_max=2.02/4.04 never crashed even at the highest relaxation tested,
+    0.5 - no upper bound found there, not used to fit the curve below.)
+
+    A log-log fit through those 3 points gives relax ~= kuv_max^-0.99 (an
+    exponent of ~1 has a clean physical reading: relax*kuv_max is
+    approximately constant, i.e. this behaves like a stability/CFL-style
+    limit on the sink term's own effective per-iteration step). Using
+    relax = 2.0/kuv_max exactly reproduces the fit; the 1.8 coefficient
+    used here backs off another ~10% for margin beyond the single lamp
+    design this was calibrated on, without being so conservative it costs
+    much of the "shortest non-crashing simulation time" this exists for.
+
+    Clipped to [0.05, 0.7]: 0.7 is the long-validated template default
+    (never a source of instability at low kuv_max, so there's no reason to
+    relax less than that there); 0.05 is a floor against convergence
+    becoming impractically slow for a kuv_max far outside anything
+    calibrated here (>36) - a case landing on that floor is extrapolating
+    well beyond the calibration data and its result should be treated with
+    extra suspicion, not just accepted.
+    """
+    if kuv_max <= 0:
+        return 0.7
+    # Rounded to 3dp - the calibration itself only pins the curve to
+    # roughly a 10-15% margin (see the brackets above), so a raw float
+    # (e.g. 0.44554455445544555) would be false precision, not to
+    # mention an ugly value to land in fvSolution or a saved project file.
+    return round(max(0.05, min(0.7, 1.8 / kuv_max)), 3)
+
+
 def set_scalar_transport_correction(case_dir, ncorr=None, tolerance=None):
     """Overwrite controlDict's scalarTransport1{}.nCorr/tolerance - GUI-
     exposed as cross-project "advanced" defaults (Settings menu), like

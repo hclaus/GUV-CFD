@@ -902,6 +902,7 @@ def _run_decay(guv_path, case_dir, room, settings):
         oscillation_window=adv["oscillation-window"], oscillation_growth_tol=adv["oscillation-growth-tol"],
         ach_delivery_tol=adv["ach-delivery-tol"] / 100.0,
         momentum_relaxation=adv["momentum-relaxation"], scalar_relaxation=adv["scalar-relaxation"],
+        adaptive_t_relaxation=adv["adaptive-t-relaxation"],
         scalar_transport_ncorr=adv["scalar-transport-ncorr"],
         scalar_transport_tolerance=adv["scalar-transport-tolerance"],
         log_fn=_run_log, should_stop=_should_stop, solver_log_fn=_track_solver_time,
@@ -1259,6 +1260,7 @@ def _run_steady_state(guv_path, case_dir, room, settings):
         oscillation_window=adv["oscillation-window"], oscillation_growth_tol=adv["oscillation-growth-tol"],
         ach_delivery_tol=adv["ach-delivery-tol"] / 100.0,
         momentum_relaxation=adv["momentum-relaxation"], scalar_relaxation=adv["scalar-relaxation"],
+        adaptive_t_relaxation=adv["adaptive-t-relaxation"],
         scalar_transport_ncorr=adv["scalar-transport-ncorr"],
         scalar_transport_tolerance=adv["scalar-transport-tolerance"],
         max_co=adv["max-co"],
@@ -2549,8 +2551,17 @@ settings_modal = dbc.Modal(
                     "iteration, independent of momentum/turbulence above — a stiff or strong "
                     "source/sink term can destabilize T even when the flow field itself is "
                     "perfectly well-behaved. Lower this first if a steady-state run's T grows "
-                    "or oscillates without bound instead of settling toward equilibrium.",
+                    "or oscillates without bound instead of settling toward equilibrium. Ignored "
+                    "when adaptive T relaxation below is on.",
                     "", _adv_defaults["scalar-relaxation"],
+                ),
+                _settings_checkbox_field(
+                    "settings-adaptive-t-relaxation", "Use adaptive T relaxation",
+                    "It has been found that for high Z*fluencerate values, significantly lower "
+                    "T-relaxation values are needed to prevent crashing. An adaptive equation has "
+                    "been established to adjust T relaxation automatically for non crashing and "
+                    "shortest simulation times.",
+                    _adv_defaults["adaptive-t-relaxation"],
                 ),
                 html.Div(
                     "T is solved by its own scalarTransport function object, entirely outside "
@@ -3598,7 +3609,7 @@ _SETTINGS_FIELD_IDS = [
     "settings-flow-rel-tol", "settings-flow-max-iterations",
     "settings-oscillation-window", "settings-oscillation-growth-tol", "settings-ach-delivery-tol",
     "settings-plateau-rel-tol", "settings-mass-balance-tol",
-    "settings-momentum-relaxation", "settings-scalar-relaxation",
+    "settings-momentum-relaxation", "settings-scalar-relaxation", "settings-adaptive-t-relaxation",
     "settings-scalar-transport-ncorr", "settings-scalar-transport-tolerance",
     "settings-t-infinity-early-stop-enabled", "settings-phase1-require-stable-extrapolation",
     "settings-t-infinity-rel-tol",
@@ -3619,7 +3630,7 @@ _SETTINGS_FIELD_KEYS = [
     "flow-rel-tol", "flow-max-iterations",
     "oscillation-window", "oscillation-growth-tol", "ach-delivery-tol",
     "plateau-rel-tol", "mass-balance-tol",
-    "momentum-relaxation", "scalar-relaxation",
+    "momentum-relaxation", "scalar-relaxation", "adaptive-t-relaxation",
     "scalar-transport-ncorr", "scalar-transport-tolerance",
     "t-infinity-early-stop-enabled", "phase1-require-stable-extrapolation",
     "t-infinity-rel-tol",

@@ -33,6 +33,15 @@ ADVANCED_SETTINGS_DEFAULTS = {
     # carefully the iteration approaches it.
     "momentum-relaxation": 0.5,  # SIMPLE under-relaxation for U/(k|omega)
     "scalar-relaxation": 0.7,    # SIMPLE under-relaxation for T
+    # Off by default (opt-in) - when on, scalar-relaxation above is ignored
+    # and T's relaxation is instead computed per-case from its own
+    # kUV.max (see splice.compute_adaptive_scalar_relaxation), fit against a
+    # real calibration campaign (2026-08-24/25) showing a fixed relaxation
+    # that's safe for a low-Z lamp design can crash Phase 2 outright on a
+    # high-Z one (T growing ~500x per outer iteration, up to ~1e80 before
+    # the crash is caught) - and, conversely, that a fixed low relaxation
+    # safe enough for the worst case wastes iterations on every easier one.
+    "adaptive-t-relaxation": False,
     # scalarTransport1 (controlDict) solves T OUTSIDE PIMPLE's own outer-
     # corrector loop, once per timestep by default - scalar-relaxation only
     # avoids biasing the result if nCorr/tolerance are high/tight enough for
@@ -181,7 +190,7 @@ def save_advanced_settings(settings):
 PROJECT_OPENFOAM_SETTINGS_KEYS = (
     "flow-rel-tol", "flow-max-iterations", "plateau-rel-tol", "pimple-delta-t",
     "mesh-cell-size", "uv-zone-bins",
-    "momentum-relaxation", "scalar-relaxation",
+    "momentum-relaxation", "scalar-relaxation", "adaptive-t-relaxation",
     "scalar-transport-ncorr", "scalar-transport-tolerance",
     "t-infinity-early-stop-enabled", "t-infinity-rel-tol",
     "phase1-require-stable-extrapolation", "phase-chunk-size", "phase-write-interval",
