@@ -875,3 +875,158 @@ comparison-design artifact first. Until that's resolved, none of this
 session's Lagrangian-derived numbers (dose N/N0, washout fractions) should be
 treated as settled - they're the best rigorous estimate built so far, not a
 validated one.
+
+---
+
+## 2026-08-24/25 — Phase 2 numerical instability: kUV.max-driven divergence, root cause, and adaptive T-relaxation
+
+**Trigger**: `patient_ward_4B1_v7cell008` (patient ward v5 lamp design, ACH=6)
+reliably crashed in Phase 2 (UV-on) at moderate-to-high Z, T sometimes reaching
+~1e80 before being caught by the convergence checks.
+
+**Root cause**: `kUV.max` (the UV sink's peak coefficient - `constant/fvOptions`'
+`scalarSemiImplicitSource`, `Sp=-kUV`) spikes up to ~1024x its spatial median
+at cells sitting in a lamp's peak-beam direction (guv_calcs's lamp model is a
+directional beam pattern, not a naive isotropic point source - hot cells sit
+offset ~0.08m from the nearest lamp). Confirmed directly on a real crashing
+case: the LINEAR solve itself converged tightly every outer iteration
+(residual ratio ~25000x) even as T grew ~500x per outer iteration - the
+instability is upstream in the outer SIMPLE loop's own update, not a
+linear-solver-robustness problem.
+
+**Interventions tried, in order**, all against the same repeatedly-crashing case:
+
+| # | Change | Result |
+|---|---|---|
+| 1 | `PBiCGStab`+`DILU` for T (split from the shared smoothSolver block, `9b8b186`) | No fix - crashed in the first 400-iteration chunk (25.7s) |
+| 2 | `GAMG` (multigrid, genuinely different algorithm) for T (`cb0c651`) | No fix - crashed just as fast (30.8s) |
+| 3 | `scalar-transport-ncorr` 3->8 | No fix (230.7s to crash) |
+| 4 | `scalar-transport-tolerance` 1e-4->1e-5 (tighter) | No fix - crashed even faster (226-753s across two Z's) |
+| 5 | T-relaxation lowered 0.5->0.1 | **Fixed it** - same case ran its full 5000-iteration budget with no crash |
+
+Solver choice, `ncorr`, and tolerance were all ruled out; T-relaxation is the
+only lever that works. GAMG (intervention #2) was kept as the committed
+template default for T even though it didn't fix the crash on its own - at
+least as good as PBiCGStab+DILU, and multigrid is a reasonable general choice.
+
+**Relaxation-vs-kUV.max stability grid**: screened `scalar-relaxation` in
+{0.1, 0.15, 0.2, 0.25, 0.3, 0.5} x Z in {1, 2, 4, 7, 10} at ACH=6
+(1200-iteration screens; every "done" result individually verified against
+`results.json`'s actual `T_ss`, not just sweep status - a relax=0.5/Z=2 combo
+initially looked stable by status alone but had actually silently diverged to
+T_ss=-7.7e+30, see the convergence-check bug below). Z converted to
+`kUV.max = Z * fluenceRate.max * 1e-3` (fluenceRate.max=2020.82 for this lamp
+design) - **Z alone is meaningless across different `.guv` designs; kUV.max is
+the real driver, and is what any reuse of this data must key on.**
+
+| relax | kUV.max=2.02 | 4.04 | 8.08 | 14.15 | 20.21 |
+|---|---|---|---|---|---|
+| 0.1 | stable | stable | stable | stable | stable |
+| 0.15 | stable | stable | stable | stable | crash |
+| 0.2 | stable | stable | stable | crash | crash |
+| 0.25 | stable | stable | stable | crash | crash |
+| 0.3 | stable | stable | crash | crash | crash |
+| 0.5 | stable | stable | crash | crash | crash |
+
+(kUV.max=2.02/4.04 never crashed even at 0.5, the highest tested - no upper
+bound found there.)
+
+**Physics-bias check**: extended relax=0.3's Z=2 run from its 1200-iteration
+screen to 15000 iterations and compared against relax=0.1's Z=2 result:
+relax=0.1 (converged) T_ss=0.2087; relax=0.3 @ 15000 iterations (still
+CV=7.7%, not fully plateaued) T_ss=0.2165. Gap narrowed to 3.8% - suggestive
+(not fully proven, since the extended run still hadn't technically plateaued)
+that relaxation mainly costs convergence *speed*, not a permanent bias in the
+true converged physics.
+
+**Code bugs found and fixed along the way**:
+- **Convergence-check sign bug** (`baae328`): `check_plateau_windowed`'s
+  `cv <= rel_tol` trivially passed for a negative (diverged) mean; fixed to
+  `0 <= cv <= rel_tol`. This is exactly what let the relax=0.5/Z=2 "quiet
+  divergence" above get marked `converged=True` before the fix.
+- **Phase 1 checkpoint clearing bug** (`3f06d39`): a single-run Phase 2
+  extension was needlessly redoing all 8000 Phase 1 iterations because the
+  checkpoint was cleared unconditionally on completion; now retained.
+- **RuntimeWarning noise** (`aa071ea`): cosmetic, suppressed `curve_fit`'s
+  warnings in `fit_asymptotic_value`.
+
+**Adaptive T-relaxation (implemented 2026-08-25)**: fit a log-log curve
+through the three confirmed brackets (kUV.max=8.08->0.25 stable/0.3 crashes,
+14.15->0.15/0.2, 20.21->0.1/0.15) - the exponent came out ~=1, i.e.
+`relax * kUV.max ~= constant`, a clean CFL-style stability limit on the sink
+term's own effective per-iteration step. Formula adopted, with a ~10% safety
+margin beyond the raw fit:
+
+    scalar-relaxation = clip(1.8 / kUV.max, 0.05, 0.7), rounded to 3dp
+
+![Adaptive T-relaxation: calibration grid (stable/crashed) vs. the fitted formula, log-log R²=0.996 on the 3 bracket points](docs/adaptive_relax_fit.svg)
+
+(`splice.compute_adaptive_scalar_relaxation`). `kUV.max` = that run's own
+peak of the `0/kUV` field = `Z * fluenceRate.max * 1e-3`. 0.7 ceiling = the
+long-validated template default (never a source of instability at low
+kUV.max, so nothing below 2.57 ever gets touched); 0.05 floor guards against
+impractically slow convergence for a kUV.max far outside anything calibrated
+here (>36) - treat a case landing on that floor as extrapolating well beyond
+the calibration data, not just accepted at face value.
+
+New opt-in setting `adaptive-t-relaxation` (default off, both global and
+per-project via `.guvcfd`). Applied per-Z in `scenario_runs._apply_z` for
+sweep mode (each Z's own kUV.max, computed on that Z's own copied case_dir -
+**a real gap was found and fixed here**: applying it only once during the
+shared per-ACH base build instead would have baked in one placeholder Z's
+value and silently applied it, unchanged, to every other Z sharing that
+base/ACH group) and in `run_pipeline._finish_case_setup` for single-run mode
+(right after kUV.max is first known - mesh + flow convergence both have to
+finish first; harmless timing-wise since flow convergence never touches T,
+`scalarTransport1` is disabled during it). The actual applied value is
+additionally recorded in `results.json` as `adaptive_scalar_relaxation`, for
+audit independent of the flag alone - the flag itself is what makes a rerun
+reproducible (deterministic given the same Z/lamp inputs and app version),
+this is what lets a specific *finished* run's real value be read back
+directly without needing to trust that recomputation.
+
+At the calibration points, the formula gives: kUV.max=2.02->0.7 (capped),
+4.04->0.446, 8.08->0.223, 14.15->0.127, 20.21->0.089 - each consistently a
+bit below the last-confirmed-stable value, i.e. erring safe without being
+wastefully slow.
+
+**Independent verification** (`4x5x32_B15SSfin`, an unrelated lamp/room
+design, all combos already run and known-good before this investigation):
+fluenceRate.max=90.8 (vs. patient_ward's 2020.82 - about 1/22, not the ~1/6
+originally guessed). Highest Z tested there (7) gives kUV.max=0.636, below
+even the *lowest* calibration point (2.02). `scalar-relaxation=0.7`
+(unmodified static default) was used throughout, and every high-kUV.max combo
+checked (Z7_ACH9, Z7_ACH1.5, Z5_ACH9, Z1_ACH9) converged cleanly. The formula
+would also predict 0.7 here (1.8/0.636=2.83, clipped) - a consistent,
+confirming data point at the formula's own "don't touch it" ceiling, but NOT
+a stress-test of its actual downward-scaling behavior (that only engages
+above kUV.max~=2.57). A real stress test needs a project with kUV.max
+somewhere in the 3-20 range that isn't patient_ward.
+
+**Open questions / next steps**:
+- Whether this kUV.max-vs-relaxation relationship generalizes beyond this one
+  lamp/room design - re-evaluate the formula (more calibration points) if a
+  future project's kUV.max lands meaningfully outside the calibrated ~2-20
+  range, or if a case still crashes despite the adaptive setting being on.
+- Z=1/Z=2 (kUV.max=2.02/4.04) never crashed even at the highest relaxation
+  tested (0.5) - no upper bound found there; not chased further since 0.7 is
+  already the formula's own ceiling.
+- Whether Phase 1 and Phase 2 should get separate relaxation values (Phase 1
+  has no UV sink term, doesn't need the same caution) - raised, not
+  implemented.
+- **Flow-convergence-tolerance check (resolved)**: does the flow field's own
+  convergence tightness (`flow-rel-tol`, actually 1% by default - NOT 10% as
+  first suspected) have any influence on Phase 2 crash timing? Two fresh
+  builds (own mesh, own flow convergence, own Phase 1 - no reuse) at the same
+  known-crashing relax=0.3/Z=7/ACH=6/kUV.max=14.15, one at flow-rel-tol=1%
+  (converged in 1500 flow iterations), one at 0.2% (2300 more iterations,
+  3500 total - genuinely tighter, and it showed: Phase 1 itself plateaued
+  cleanly at 0.2% (CV=0.58%, valid T-infinity fit) vs. NOT plateauing at 1%
+  (CV=3.98%) - a real, measurable difference in flow/Phase-1 quality. **But
+  Phase 2 crashed identically in both** - same error
+  ("simpleFoam did not write any new time directory"), both within the very
+  first 400-iteration Phase 2 chunk, no delay either way. **Conclusion: flow
+  convergence tightness has no measurable effect on the Phase 2 instability**
+  - consistent with everything else found here (kUV.max vs. T-relaxation is
+  the whole story), even though tighter flow convergence is a good idea for
+  its own sake (a materially better-converged Phase 1).
