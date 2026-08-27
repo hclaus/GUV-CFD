@@ -101,6 +101,47 @@ def splice_into_functions_block(case_dir, block_text):
     return cd_path, n_open, n_close
 
 
+def splice_after_named_entry(case_dir, sibling_name, block_text):
+    """Insert `block_text` as a new sibling inside controlDict's outer
+    functions{} block, immediately after `sibling_name`'s own closing
+    brace - unlike splice_into_functions_block (always last), this lets a
+    caller control EXECUTION ORDER relative to one specific existing
+    entry. OpenFOAM's functionObjectList executes entries in the order
+    they appear in the dict (confirmed against functionObjectList.C's own
+    `for (const entry& dEntry : functionsDict)`, a plain range-based loop
+    over the dictionary's own read/insertion order), so this matters
+    whenever a later function object's own correctness depends on running
+    before (or after) another one on the SAME field within the same
+    timestep - e.g. tclamp_decay.py's TClampDecay needs to run right after
+    scalarTransport1 solves T, and BEFORE any volAverage-style tracking
+    reads T, so a room-average never includes a momentarily out-of-range
+    value that hasn't been corrected yet.
+    Returns (controlDict_path, n_open, n_close), same convention as
+    splice_into_functions_block.
+    """
+    cd_path = f"{case_dir}/system/controlDict"
+    content = _read_case_file(case_dir, "system/controlDict")
+
+    m = re.search(rf'\n(\s*){re.escape(sibling_name)}\s*\n(\s*)\{{', content)
+    if not m:
+        raise RuntimeError(f"Could not find '{sibling_name}' block inside controlDict")
+    keyword_indent = m.group(1)
+    open_brace_pos = content.index("{", m.end() - 1)
+    close_brace_pos = _find_matching_brace(content, open_brace_pos)
+
+    new_content = (
+        content[:close_brace_pos + 1]
+        + "\n\n" + keyword_indent + block_text
+        + content[close_brace_pos + 1:]
+    )
+
+    _write_case_file(case_dir, "system/controlDict", new_content)
+
+    n_open = new_content.count("{")
+    n_close = new_content.count("}")
+    return cd_path, n_open, n_close
+
+
 def set_function_object_enabled(case_dir, function_name, enabled):
     """Set (or insert) an `enabled` entry at the top of a functions{}
     sub-dict in controlDict - e.g. to disable scalarTransport1 while running

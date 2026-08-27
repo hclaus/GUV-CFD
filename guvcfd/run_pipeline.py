@@ -11,9 +11,11 @@ import re
 import time
 from pathlib import Path
 
+import numpy as np
+
 from guv_calcs import Project
 
-from .case_io import read_cell_centers, read_boundary_patch_names, write_scalar_field
+from .case_io import read_cell_centers, read_cell_volumes, read_boundary_patch_names, write_scalar_field
 from .cellzones import bin_decay_rates, write_cellzones, write_fvoptions
 from .contaminant_source import write_fvoptions_file, source_box_grid_alignment
 from .decay_analysis import read_vol_average_dat
@@ -25,6 +27,8 @@ from .initial_fields import (
 from .mesh_gen import (
     write_mesh_dicts, write_map_fields_dict, opening_center, opening_half_extents, opening_grid_alignment,
     opening_actual_area, write_decompose_par_dict, suggest_opening_size_fix, suggest_opening_center_fix,
+    write_lamp_refine_topo_set_dict, write_opening_refine_topo_set_dict, write_refine_mesh_dict,
+    _opening_refine_box,
 )
 from .monitoring import write_vol_average_dict
 from .visualization import center_frac_for_wall
@@ -900,6 +904,8 @@ def setup_case(guv_path, case_dir, template_case_dir=None, cell_size=0.1, Z=2.0,
                fan_speed=None, fan_center=None, fan_direction=(0, 0, -1),
                fan_disk_radius=0.6, fan_disk_thickness=0.2, fan_height=None,
                sealed=False, mechanical_ach_only=False,
+               refine_lamp_positions=None, refine_lamp_radius=None, refine_lamp_levels=2,
+               refine_opening_depth=None, refine_opening_levels=1,
                log_fn=print, should_stop=None, solver_log_fn=None, should_pause=None,
                solve_semaphore=None):
     """Set up an OpenFOAM case end-to-end from a .guv project. Returns a dict
@@ -1015,6 +1021,32 @@ def setup_case(guv_path, case_dir, template_case_dir=None, cell_size=0.1, Z=2.0,
     project) where there's nothing physical to bin. Independent of sealed
     and of the project's actual lamp count - this is a user choice, not a
     derived one.
+
+    refine_lamp_positions/refine_lamp_radius/refine_lamp_levels: if
+    refine_lamp_positions is given (a list of (x,y,z) lamp coordinates)
+    and refine_lamp_radius is not None, locally refine the mesh within
+    that radius of every lamp (mesh_gen.lamp_refine_topo_set_dict +
+    refineMesh, run refine_lamp_levels times - each level halves the
+    local cell size, so 2 levels = 4x finer, not 2x) before the mesh's
+    inlet/outlet patches are carved. The near-field UV fluence rate is
+    dominated by a near-singular peak right at each lamp that a uniform
+    mesh badly under-resolves (confirmed: a 0.08m mesh only captures
+    ~1.7% of the true continuum peak there) - this spends extra cells
+    only where that actually matters, instead of refining the whole room.
+    None (the default) skips this entirely, matching every mesh built
+    before this parameter existed.
+
+    refine_opening_depth/refine_opening_levels: same idea for the inlet/
+    outlet (and inlet2/outlet2, if enabled) - refines a halo extending
+    refine_opening_depth beyond each opening's own footprint (into the
+    room, plus padding on the two in-plane edges), so the near-boundary
+    flow around each opening is also better resolved. None skips this.
+
+    Both refinements run AFTER blockMesh but BEFORE the existing
+    topoSet/createPatch step that carves the inlet/outlet boundary
+    patches - so createPatch's own face selection (a box right at the
+    wall) picks up the now-finer faces there, giving genuinely finer
+    boundary patches, not just finer interior cells nearby.
     """
     if sealed and fan_speed is None:
         raise ValueError("A sealed room (ach<=0) needs a mixing fan (fan_speed) - "
@@ -1086,6 +1118,39 @@ def setup_case(guv_path, case_dir, template_case_dir=None, cell_size=0.1, Z=2.0,
 
     log_fn("Running blockMesh...")
     _run_wsl_or_raise("blockMesh", case_dir_wsl, "blockMesh")
+
+    if refine_lamp_positions and refine_lamp_radius is not None:
+        log_fn(f"Locally refining mesh within {refine_lamp_radius}m of each of "
+               f"{len(refine_lamp_positions)} lamp(s), {refine_lamp_levels} level(s) "
+               f"({2 ** refine_lamp_levels}x finer there)...")
+        write_lamp_refine_topo_set_dict(case_dir, refine_lamp_positions, refine_lamp_radius)
+        for level in range(refine_lamp_levels):
+            _run_wsl_or_raise("topoSet -dict system/lampRefineTopoSetDict",
+                               case_dir_wsl, f"topoSet (lamp refine, level {level + 1})")
+            write_refine_mesh_dict(case_dir, "lampRefineCells")
+            _run_wsl_or_raise("refineMesh -dict system/refineMeshDict -overwrite",
+                               case_dir_wsl, f"refineMesh (lamp refine, level {level + 1})")
+
+    if refine_opening_depth is not None:
+        boxes = [_opening_refine_box(inlet_wall, room.x, room.y, room.z, inlet_center, inlet_size,
+                                      refine_opening_depth, cell_size=cell_size),
+                 _opening_refine_box(outlet_wall, room.x, room.y, room.z, outlet_center, outlet_size,
+                                      refine_opening_depth, cell_size=cell_size)]
+        if inlet2_wall is not None:
+            boxes.append(_opening_refine_box(inlet2_wall, room.x, room.y, room.z, inlet2_center, inlet2_size,
+                                              refine_opening_depth, cell_size=cell_size))
+        if outlet2_wall is not None:
+            boxes.append(_opening_refine_box(outlet2_wall, room.x, room.y, room.z, outlet2_center, outlet2_size,
+                                              refine_opening_depth, cell_size=cell_size))
+        log_fn(f"Locally refining mesh within {refine_opening_depth}m of {len(boxes)} opening(s), "
+               f"{refine_opening_levels} level(s) ({2 ** refine_opening_levels}x finer there)...")
+        write_opening_refine_topo_set_dict(case_dir, boxes)
+        for level in range(refine_opening_levels):
+            _run_wsl_or_raise("topoSet -dict system/openingRefineTopoSetDict",
+                               case_dir_wsl, f"topoSet (opening refine, level {level + 1})")
+            write_refine_mesh_dict(case_dir, "openingRefineCells")
+            _run_wsl_or_raise("refineMesh -dict system/refineMeshDict -overwrite",
+                               case_dir_wsl, f"refineMesh (opening refine, level {level + 1})")
 
     log_fn("Running topoSet...")
     _run_wsl_or_raise("topoSet", case_dir_wsl, "topoSet")
@@ -1170,6 +1235,10 @@ def setup_case(guv_path, case_dir, template_case_dir=None, cell_size=0.1, Z=2.0,
 
     log_fn("Running writeCellCentres...")
     _run_wsl_or_raise("postProcess -func writeCellCentres -time 0", case_dir_wsl, "writeCellCentres")
+    log_fn("Running writeCellVolumes (needed for a true volume-weighted room-average of "
+           "fluence rate/eACH, not just a plain per-cell mean - matters once the mesh isn't "
+           "uniform, e.g. local refinement near lamps/openings)...")
+    _run_wsl_or_raise("postProcess -func writeCellVolumes -time 0", case_dir_wsl, "writeCellVolumes")
 
     if map_from_case is not None:
         log_fn("Writing mapFieldsDict...")
@@ -1178,8 +1247,10 @@ def setup_case(guv_path, case_dir, template_case_dir=None, cell_size=0.1, Z=2.0,
         log_fn(f"Running mapFields from {map_from_case} ...")
         map_from_wsl = _wsl_path(map_from_case)
         _run_wsl_or_raise(f"mapFields {map_from_wsl} -sourceTime {map_from_time}", case_dir_wsl, "mapFields")
-        log_fn("  mapFields done; regenerating true cell centers (mapFields overwrites Cx/Cy/Cz too)...")
+        log_fn("  mapFields done; regenerating true cell centers/volumes (mapFields overwrites "
+               "Cx/Cy/Cz/V too)...")
         _run_wsl_or_raise("postProcess -func writeCellCentres -time 0", case_dir_wsl, "writeCellCentres (post-map)")
+        _run_wsl_or_raise("postProcess -func writeCellVolumes -time 0", case_dir_wsl, "writeCellVolumes (post-map)")
         log_fn("  restoring our own boundary conditions (mapFields also clobbers fixedValue "
                "patches like inlet with interpolated garbage)...")
         restore_boundary_conditions(case_dir, inlet_velocity=inlet_velocity, inlet2_velocity=inlet2_velocity,
@@ -1215,6 +1286,21 @@ def setup_case(guv_path, case_dir, template_case_dir=None, cell_size=0.1, Z=2.0,
                                pimple_end_time, pimple_write_interval, pimple_delta_t, log_fn, summary,
                                max_co=max_co, mechanical_ach_only=mechanical_ach_only,
                                adaptive_t_relaxation=adaptive_t_relaxation)
+
+
+def _volume_weighted_mean(values, volumes):
+    """sum(value*volume)/sum(volume) - the true room average of a per-cell
+    field. Plain values.mean() only equals this on a UNIFORM mesh (every
+    cell the same volume) - once cell sizes vary (e.g. local refinement
+    near a lamp/opening), an unweighted mean silently overweights
+    whatever region got refined, since it then has proportionally more
+    (smaller) cells sampled there than its true share of the room's
+    volume. Confirmed as a real, ~4x error on a real locally-refined
+    case (naive mean 11.6 uW/cm^2 vs. the true volume-weighted ~2.9).
+    """
+    values = np.asarray(values, dtype=float)
+    volumes = np.asarray(volumes, dtype=float)
+    return float(np.sum(values * volumes) / np.sum(volumes))
 
 
 def _finish_case_setup(case_dir, room, Z, nbins, source_field, fan_entry,
@@ -1260,12 +1346,21 @@ def _finish_case_setup(case_dir, room, Z, nbins, source_field, fan_entry,
 
         log_fn("Computing fluence rate at cell centers...")
         points = read_cell_centers(case_dir, "0")
+        try:
+            volumes = read_cell_volumes(case_dir, "0")
+        except (RuntimeError, OSError):
+            # A case built before writeCellVolumes existed here has no 0/V -
+            # every such case is a uniform mesh anyway (local refinement is
+            # newer than this), so equal weights give the exact same
+            # (correct) answer as a real volume-weighted mean would.
+            volumes = np.ones(len(points))
         values = compute_fluence_at_points(room, points)
+        fluence_mean = _volume_weighted_mean(values, volumes)
         log_fn(f"  {len(points)} cells, fluence rate range [{values.min():.4g}, {values.max():.4g}], "
-               f"mean {values.mean():.4g}")
+               f"mean {fluence_mean:.4g} (volume-weighted)")
         summary["n_cells"] = len(points)
         summary["fluence_range"] = (float(values.min()), float(values.max()))
-        summary["fluence_mean"] = float(values.mean())
+        summary["fluence_mean"] = fluence_mean
         patch_names = read_boundary_patch_names(case_dir)
         write_scalar_field(case_dir, "fluenceRate", values, patch_names)
 
@@ -1284,7 +1379,7 @@ def _finish_case_setup(case_dir, room, Z, nbins, source_field, fan_entry,
             summary["adaptive_scalar_relaxation"] = adaptive_relax
 
         eACH_values = compute_well_mixed_eACH(k_values)
-        summary["eACH_uv_well_mixed_mean"] = float(eACH_values.mean())
+        summary["eACH_uv_well_mixed_mean"] = _volume_weighted_mean(eACH_values, volumes)
         summary["eACH_uv_well_mixed_range"] = (float(eACH_values.min()), float(eACH_values.max()))
         log_fn(f"  eACH_UV well-mixed (volume-averaged) = {summary['eACH_uv_well_mixed_mean']:.4g} /hr "
                f"(vs. ventilation ach={ach} /hr)")

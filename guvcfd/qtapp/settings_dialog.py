@@ -56,6 +56,17 @@ _FIELD_INFO = {
                                "lower T-relaxation values are needed to prevent crashing. An adaptive "
                                "equation has been established to adjust T relaxation automatically for "
                                "non crashing and shortest simulation times."),
+    "t-clamp-decay-enabled": ("Use T divergence clamp",
+                               "Independent of adaptive T relaxation above (that tunes how the solver "
+                               "approaches a diverging cell; this catches the divergence itself if it "
+                               "happens anyway). When on, any cell whose T strays outside [0, Tmax] "
+                               "each iteration is replaced by a locally sink-decayed value instead of "
+                               "a hard reset, keeping the correction physically motivated. Tmax is set "
+                               "per-run as the multiplier below times Phase 1's own converged "
+                               "source-zone max T."),
+    "t-clamp-decay-multiplier": ("T divergence clamp multiplier",
+                                  "Tmax = this value times Phase 1's own converged source-zone max T. "
+                                  "Only used when the T divergence clamp above is on."),
     "scalar-transport-ncorr": ("Contaminant solver outer correctors",
                                 "How many times the contaminant equation is re-solved per timestep - "
                                 "needs to be >0 for the relaxation factor above to matter at all."),

@@ -42,6 +42,25 @@ ADVANCED_SETTINGS_DEFAULTS = {
     # the crash is caught) - and, conversely, that a fixed low relaxation
     # safe enough for the worst case wastes iterations on every easier one.
     "adaptive-t-relaxation": False,
+    # Off by default (opt-in) - independent of adaptive-t-relaxation above
+    # (that tunes how the outer loop APPROACHES a diverging cell; this
+    # catches the divergence itself if it happens anyway). When on, a
+    # custom OpenFOAM function object (tclamp_decay.py) watches Phase 2's
+    # T field every outer iteration and, for any cell outside [0, Tmax],
+    # replaces it with a locally sink-decayed value (T*exp(-kUV*dt), then
+    # clamped) rather than a hard reset - the pure-sink ODE's own analytic
+    # solution, so the correction stays physically motivated instead of an
+    # arbitrary snap to a boundary. Tmax itself is set per-run as
+    # t-clamp-decay-multiplier times Phase 1's own converged source-zone
+    # max T (see tclamp_decay.source_zone_max_T) - the only physically
+    # meaningful reference this pipeline has for "how concentrated does
+    # the source actually get". Added 2026-08-27 after a real, confirmed
+    # divergence mechanism (see ANALYSIS_LOG.md): a single cell's outer-
+    # iteration T can blow up past 1e100 or go negative within ~20
+    # iterations at high local kUV, even with adaptive relaxation already
+    # at its floor.
+    "t-clamp-decay-enabled": False,
+    "t-clamp-decay-multiplier": 1.3,
     # scalarTransport1 (controlDict) solves T OUTSIDE PIMPLE's own outer-
     # corrector loop, once per timestep by default - scalar-relaxation only
     # avoids biasing the result if nCorr/tolerance are high/tight enough for
@@ -191,6 +210,7 @@ PROJECT_OPENFOAM_SETTINGS_KEYS = (
     "flow-rel-tol", "flow-max-iterations", "plateau-rel-tol", "pimple-delta-t",
     "mesh-cell-size", "uv-zone-bins",
     "momentum-relaxation", "scalar-relaxation", "adaptive-t-relaxation",
+    "t-clamp-decay-enabled", "t-clamp-decay-multiplier",
     "scalar-transport-ncorr", "scalar-transport-tolerance",
     "t-infinity-early-stop-enabled", "t-infinity-rel-tol",
     "phase1-require-stable-extrapolation", "phase-chunk-size", "phase-write-interval",

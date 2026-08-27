@@ -167,6 +167,26 @@ drive WSL/OpenFOAM via the existing `wsl.exe` subprocess mechanism this
 app's default transport uses - Part 2 below is what adds the *optional*,
 faster SSH transport on top of that, not a replacement prerequisite.
 
+### 1h. Optional - pre-build TClampDecay (T-divergence-clamp feature)
+
+"Use T divergence clamp" (Settings) relies on a small custom OpenFOAM
+function object (`guvcfd/openfoam_functionobjects/TClampDecay/`) compiled
+via `wmake` the first time it's enabled - `openfoam2412-default` from 1e
+already installs everything needed (`g++`/`wmake` come in as its own
+dependencies, confirmed via `apt-mark showauto` - no separate install
+step). Nothing here is required before normal use; this is only to verify
+the toolchain up front on a new machine rather than finding out mid-run:
+
+```
+BuildTClampDecay.bat
+```
+
+(or `uv run python -m guvcfd.build_tclamp_decay` directly). Expect
+`Done - TClampDecay is ready.` - if it instead reports missing `g++`/`wmake`,
+you likely installed a minimal/runtime-only OpenFOAM package rather than
+`openfoam2412-default`; either reinstall that, or run
+`sudo apt-get install -y build-essential` inside WSL directly.
+
 ---
 
 ## Part 2 - SSH (paramiko) transport setup

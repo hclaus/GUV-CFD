@@ -524,6 +524,160 @@ def write_decompose_par_dict(case_dir, n_subdomains):
     return f"{case_dir}/system/decomposeParDict"
 
 
+def _cellset_topo_set_dict(cellset_name, action_blocks):
+    """Shared body for lamp_refine_topo_set_dict/opening_refine_topo_set_dict -
+    both union N geometric primitives (sphereToCell / boxToCell) into ONE
+    named cellSet via the standard topoSet 'new' (first)/'add' (rest) idiom,
+    so a single later refineMesh pass covers every lamp/opening at once.
+    """
+    lines = [
+        "FoamFile", "{", "    version     2.0;", "    format      ascii;",
+        "    class       dictionary;", "    object      topoSetDict;", "}", "",
+        "actions", "(", *action_blocks, ");", "",
+    ]
+    return "\n".join(lines)
+
+
+def lamp_refine_topo_set_dict(lamp_positions, radius, cellset_name="lampRefineCells"):
+    """topoSetDict unioning a sphereToCell region of the given `radius`
+    around every position in `lamp_positions` into one cellSet, for
+    refineMesh to locally refine (see refine_mesh_dict) - the near-field
+    UV fluence rate is dominated by a near-singular 1/r^2-style peak right
+    at each lamp (confirmed directly: the true continuum peak there is
+    ~2 orders of magnitude above anything even an 0.08m mesh resolves),
+    so this is the one region worth spending extra cells on specifically.
+    Re-running the SAME topoSet+refineMesh pair multiple times (see
+    run_pipeline.setup_case's refine_lamp_levels) re-selects the
+    now-finer cells within this same physical sphere each time, giving
+    N successive halvings of the local cell size for N levels - 2 levels
+    is a 4x finer local resolution, not just 2x.
+    """
+    actions = []
+    for i, (x, y, z) in enumerate(lamp_positions):
+        action = "new" if i == 0 else "add"
+        actions += [
+            "    {", f"        name    {cellset_name};", "        type    cellSet;",
+            f"        action  {action};", "        source  sphereToCell;",
+            f"        origin  ({x:.6g} {y:.6g} {z:.6g});", f"        radius  {radius:.6g};",
+            "    }",
+        ]
+    return _cellset_topo_set_dict(cellset_name, actions)
+
+
+def _opening_refine_box(wall, Lx, Ly, Lz, center_frac, size, depth, cell_size=None):
+    """Like _opening_box, but a real 3D box extending `depth` INWARD from
+    the wall (instead of a razor-thin boxToFace slab) and padded by
+    `depth` on both in-plane edges too - a halo around the opening's own
+    footprint, not just its exact footprint, so the refined region covers
+    the near-boundary-layer flow around the opening, not only the patch
+    faces themselves.
+    """
+    normal_axis, normal_pos_fn, (a1, a2) = _WALL_SPECS[wall]
+    dims = (Lx, Ly, Lz)
+    c1, c2 = center_frac
+    w, h = size
+    lo, hi = [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]
+    lo[a1], hi[a1] = c1 * dims[a1] - w / 2 - depth, c1 * dims[a1] + w / 2 + depth
+    lo[a2], hi[a2] = c2 * dims[a2] - h / 2 - depth, c2 * dims[a2] + h / 2 + depth
+    if cell_size:
+        cell1, cell2 = _actual_axis_cell_size(dims[a1], cell_size), _actual_axis_cell_size(dims[a2], cell_size)
+        lo[a1], hi[a1] = snap_outward(lo[a1], cell1, "lo"), snap_outward(hi[a1], cell1, "hi")
+        lo[a2], hi[a2] = snap_outward(lo[a2], cell2, "lo"), snap_outward(hi[a2], cell2, "hi")
+    pos = normal_pos_fn(Lx, Ly, Lz)
+    # Depth always points INTO the room, regardless of which side of the
+    # domain this wall is on (a "high" wall like xMax/backWall/ceiling
+    # needs depth SUBTRACTED to point inward, a "low" wall like xMin/
+    # frontWall/floor needs it ADDED) - inferred from which one of pos's
+    # own two candidate positions (0 or the room's own extent) it matches,
+    # since _WALL_SPECS' normal_pos_fn already encodes that per wall.
+    if pos == 0.0:
+        lo[normal_axis], hi[normal_axis] = pos, pos + depth
+    else:
+        lo[normal_axis], hi[normal_axis] = pos - depth, pos
+    return tuple(lo), tuple(hi)
+
+
+def opening_refine_topo_set_dict(boxes, cellset_name="openingRefineCells"):
+    """Same union idiom as lamp_refine_topo_set_dict, but boxToCell -
+    `boxes` is a list of (lo, hi) tuples (see _opening_refine_box), one
+    per opening actually present (inlet/outlet always, inlet2/outlet2 if
+    enabled).
+    """
+    actions = []
+    for i, (lo, hi) in enumerate(boxes):
+        action = "new" if i == 0 else "add"
+        actions += [
+            "    {", f"        name    {cellset_name};", "        type    cellSet;",
+            f"        action  {action};", "        source  boxToCell;",
+            f"        box     ({lo[0]:.6g} {lo[1]:.6g} {lo[2]:.6g}) ({hi[0]:.6g} {hi[1]:.6g} {hi[2]:.6g});",
+            "    }",
+        ]
+    return _cellset_topo_set_dict(cellset_name, actions)
+
+
+def refine_mesh_dict(cellset_name):
+    """refineMeshDict for `refineMesh -dict system/refineMeshDict -overwrite`,
+    acting on an already-selected topoSet cellSet. useHexTopology=true
+    since this codebase's base mesh is always a clean single-block hex
+    mesh (blockMesh only, no snappyHexMesh) - lets refineMesh do the fast,
+    exact hex-consistent split (each selected cell -> 8 sub-cells) instead
+    of a slower, less predictable geometric cut. directions=(tan1 tan2
+    normal) - all 3 local cell directions - since every selected cellSet
+    here is a genuine 3D volumetric region (a sphere or box), not a 2D
+    surface cut that would only need 2 (required entry; OpenFOAM has no
+    "all directions" default). coordinateSystem/globalCoeffs pins tan1/
+    tan2 to explicit lab-frame axes (x/y, with normal then z) - confirmed
+    required for a wall-adjacent box selection (the opening halo) even
+    though a sphere selection (the lamp zone) didn't raise the same
+    error; included unconditionally rather than only when needed.
+    """
+    lines = [
+        "FoamFile", "{", "    version     2.0;", "    format      ascii;",
+        "    class       dictionary;", "    object      refineMeshDict;", "}", "",
+        f"set             {cellset_name};", "",
+        "useHexTopology  true;", "geometricCut    false;", "writeMesh       false;", "",
+        "directions", "(", "    tan1", "    tan2", "    normal", ");", "",
+        "coordinateSystem global;", "",
+        "globalCoeffs", "{", "    tan1            (1 0 0);", "    tan2            (0 1 0);", "}", "",
+    ]
+    return "\n".join(lines)
+
+
+def write_lamp_refine_topo_set_dict(case_dir, lamp_positions, radius, cellset_name="lampRefineCells",
+                                     filename="lampRefineTopoSetDict"):
+    content = lamp_refine_topo_set_dict(lamp_positions, radius, cellset_name=cellset_name)
+    case_dir_wsl = _wsl_path(case_dir)
+    if case_dir_wsl != case_dir:
+        _write_wsl_text(f"{case_dir_wsl}/system/{filename}", content)
+    else:
+        with open(f"{case_dir}/system/{filename}", "w") as f:
+            f.write(content)
+    return f"{case_dir}/system/{filename}"
+
+
+def write_opening_refine_topo_set_dict(case_dir, boxes, cellset_name="openingRefineCells",
+                                        filename="openingRefineTopoSetDict"):
+    content = opening_refine_topo_set_dict(boxes, cellset_name=cellset_name)
+    case_dir_wsl = _wsl_path(case_dir)
+    if case_dir_wsl != case_dir:
+        _write_wsl_text(f"{case_dir_wsl}/system/{filename}", content)
+    else:
+        with open(f"{case_dir}/system/{filename}", "w") as f:
+            f.write(content)
+    return f"{case_dir}/system/{filename}"
+
+
+def write_refine_mesh_dict(case_dir, cellset_name, filename="refineMeshDict"):
+    content = refine_mesh_dict(cellset_name)
+    case_dir_wsl = _wsl_path(case_dir)
+    if case_dir_wsl != case_dir:
+        _write_wsl_text(f"{case_dir_wsl}/system/{filename}", content)
+    else:
+        with open(f"{case_dir}/system/{filename}", "w") as f:
+            f.write(content)
+    return f"{case_dir}/system/{filename}"
+
+
 def write_mesh_dicts(case_dir, Lx, Ly, Lz, cell_size=0.1,
                       inlet_wall="xMin", inlet_center=(0.5, 0.85), inlet_size=(0.3, 0.3),
                       outlet_wall="xMax", outlet_center=(0.5, 0.15), outlet_size=(0.3, 0.3),

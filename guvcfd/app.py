@@ -54,6 +54,7 @@ from .steady_state_pipeline import (
     run_steady_state_scenario, _read_phase1_checkpoint, _clear_phase1_checkpoint, Phase1ExtrapolationUndecided,
     resolve_phase_delta_ts, merge_project_deltat_settings, REFERENCE_TARGET_T_SS,
 )
+from .tclamp_decay import ensure_tclamp_decay_compiled, splice_tclamp_decay_if_needed
 from .ventilation_control import prepare_ventilation_only_control, finish_ventilation_only_control
 from .visualization import WALL_POSITION_DIMS, center_frac_for_wall, plot_case
 from .wsl_utils import run_wsl, run_wsl_or_raise, run_wsl_streaming, wsl_path, StoppedByUser
@@ -1074,6 +1075,17 @@ def _finish_decay(case_dir, room, settings, summary):
                            write_interval=write_interval, delta_t=adv["pimple-delta-t"], max_co=adv["max-co"])
     splice_live_vol_average_if_needed(case_dir)
 
+    if adv["t-clamp-decay-enabled"]:
+        # Decay mode carves no source zone (T starts uniform at
+        # REFERENCE_TARGET_T_SS with no injection during the UV-on run,
+        # only removal) - the physical ceiling is that known starting
+        # value itself, not a converged-field lookup like steady-state's
+        # source_zone_max_T (see tclamp_decay.py's module docstring).
+        # Spliced before the UV-off control is cloned below (harmless
+        # there too - no injection, T only decreases from the same start).
+        ensure_tclamp_decay_compiled(_run_log)
+        splice_tclamp_decay_if_needed(case_dir, adv["t-clamp-decay-multiplier"] * REFERENCE_TARGET_T_SS)
+
     if _should_stop():
         raise StoppedByUser("Stopped before pimpleFoam.")
     if sealed:
@@ -1405,6 +1417,7 @@ def _finish_steady_state(case_dir, room, settings, summary,
         log_fn=_run_log, should_stop=_should_stop, solver_log_fn=_track_solver_time,
         should_pause=_should_pause,
         phase1_delta_t=phase1_delta_t, phase2_delta_t=phase2_delta_t,
+        t_clamp_decay_multiplier=adv["t-clamp-decay-multiplier"] if adv["t-clamp-decay-enabled"] else None,
     )
     result["fluence_mean"] = summary["fluence_mean"]
     result["eACH_uv_well_mixed"] = summary.get("eACH_uv_well_mixed_mean")
@@ -2563,6 +2576,22 @@ settings_modal = dbc.Modal(
                     "shortest simulation times.",
                     _adv_defaults["adaptive-t-relaxation"],
                 ),
+                _settings_checkbox_field(
+                    "settings-t-clamp-decay-enabled", "Use T divergence clamp",
+                    "Independent of adaptive T relaxation above (that tunes how the solver "
+                    "approaches a diverging cell; this catches the divergence itself if it "
+                    "happens anyway). When on, any cell whose T strays outside [0, Tmax] each "
+                    "iteration is replaced by a locally sink-decayed value instead of a hard "
+                    "reset, keeping the correction physically motivated. Tmax is set per-run as "
+                    "the multiplier below times Phase 1's own converged source-zone max T.",
+                    _adv_defaults["t-clamp-decay-enabled"],
+                ),
+                _settings_field(
+                    "settings-t-clamp-decay-multiplier", "T divergence clamp multiplier",
+                    "Tmax = this value times Phase 1's own converged source-zone max T. Only "
+                    "used when the T divergence clamp above is on.",
+                    "x", _adv_defaults["t-clamp-decay-multiplier"],
+                ),
                 html.Div(
                     "T is solved by its own scalarTransport function object, entirely outside "
                     "PIMPLE's/SIMPLE's own outer-iteration loop — the two settings below control "
@@ -3610,6 +3639,7 @@ _SETTINGS_FIELD_IDS = [
     "settings-oscillation-window", "settings-oscillation-growth-tol", "settings-ach-delivery-tol",
     "settings-plateau-rel-tol", "settings-mass-balance-tol",
     "settings-momentum-relaxation", "settings-scalar-relaxation", "settings-adaptive-t-relaxation",
+    "settings-t-clamp-decay-enabled", "settings-t-clamp-decay-multiplier",
     "settings-scalar-transport-ncorr", "settings-scalar-transport-tolerance",
     "settings-t-infinity-early-stop-enabled", "settings-phase1-require-stable-extrapolation",
     "settings-t-infinity-rel-tol",
@@ -3631,6 +3661,7 @@ _SETTINGS_FIELD_KEYS = [
     "oscillation-window", "oscillation-growth-tol", "ach-delivery-tol",
     "plateau-rel-tol", "mass-balance-tol",
     "momentum-relaxation", "scalar-relaxation", "adaptive-t-relaxation",
+    "t-clamp-decay-enabled", "t-clamp-decay-multiplier",
     "scalar-transport-ncorr", "scalar-transport-tolerance",
     "t-infinity-early-stop-enabled", "phase1-require-stable-extrapolation",
     "t-infinity-rel-tol",

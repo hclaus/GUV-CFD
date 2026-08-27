@@ -38,6 +38,9 @@ from .splice import (
     set_control_dict_time, set_function_write_interval, ensure_simple_fvsolution,
     disable_simple_residual_control,
 )
+from .tclamp_decay import (
+    source_zone_max_T, ensure_tclamp_decay_compiled, splice_tclamp_decay_if_needed,
+)
 from .wsl_utils import (
     wsl_path, run_wsl_or_raise, run_wsl_streaming, StoppedByUser,
     read_case_file as _read_case_file, write_case_file as _write_case_file,
@@ -1122,7 +1125,8 @@ def run_steady_state_scenario(case_dir, room_x, room_y, room_z, ach, Z, nbins=25
                                patches_to_monitor=("outlet",), log_fn=print, should_stop=None,
                                solver_log_fn=None, status_fn=None, phase1_only=False, should_pause=None,
                                measured_ventilation_ach=None, control_results_future=None,
-                               phase1_delta_t=1, phase2_delta_t=1, solve_semaphore=None):
+                               phase1_delta_t=1, phase2_delta_t=1, solve_semaphore=None,
+                               t_clamp_decay_multiplier=None):
     """Run both phases of a continuous-source steady-state scenario against
     an already-converged case (mesh + flow + fluenceRate/kUV must already
     exist - see run_pipeline.setup_case()). Returns a summary dict.
@@ -1293,6 +1297,16 @@ def run_steady_state_scenario(case_dir, room_x, room_y, room_z, ach, Z, nbins=25
     this key match the f"ACH={ach}" prefix _run_shared_phase1's own log_fn
     already uses, so a per-combo progress/ETA tracker can correlate the
     two without needing to know a placeholder was involved at all.
+
+    t_clamp_decay_multiplier: opt-in (None=disabled - see
+    app_settings.py's t-clamp-decay-enabled/t-clamp-decay-multiplier).
+    When set, Phase 2 gets a live per-iteration correction for the
+    outer-loop UV-sink divergence mechanism (see tclamp_decay.py's module
+    docstring) - Tmax is computed as this multiplier times Phase 1's own
+    converged source-zone max T, right before Phase 2's fvOptions are
+    written. Never applied to Phase 1 (which never diverges in this
+    pipeline, and Phase 1's own converged state is what defines Tmax in
+    the first place - applying it there would be circular).
     """
     case_dir_wsl = wsl_path(case_dir)
     room_volume = room_x * room_y * room_z
@@ -1583,6 +1597,16 @@ def run_steady_state_scenario(case_dir, room_x, room_y, room_z, ach, Z, nbins=25
     write_fvoptions_file(case_dir, [source_entry] + uv_entries + fan_entries)
     _, n_open, n_close = splice_fv_options_into_control_dict(case_dir)
     assert n_open == n_close, f"Brace mismatch: {n_open} vs {n_close}"
+
+    if t_clamp_decay_multiplier is not None:
+        zone_max_T = source_zone_max_T(case_dir, source_center, source_size,
+                                        cell_size=cell_size, room_dims=(room_x, room_y, room_z))
+        t_clamp_max = t_clamp_decay_multiplier * zone_max_T
+        log_fn(f"  T-clamp-decay: source zone's own converged max T={zone_max_T:.4g} -> "
+               f"Tmax={t_clamp_max:.4g} ({t_clamp_decay_multiplier:g}x)")
+        ensure_tclamp_decay_compiled(log_fn)
+        splice_tclamp_decay_if_needed(case_dir, t_clamp_max)
+        summary["t_clamp_decay_max"] = t_clamp_max
 
     # Phase 2 keeps T-infinity as an early-stop nicety only (not a hard
     # gate like Phase 1 - see phase1_extrapolation_gate) - stopped_via_tinf/

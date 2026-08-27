@@ -3,6 +3,7 @@ import math
 from guvcfd.mesh_gen import (
     _opening_box, opening_center, opening_half_extents, topo_set_dict, create_patch_dict, write_mesh_dicts,
     suggest_opening_size_fix, suggest_opening_center_fix, _WALL_SPECS,
+    lamp_refine_topo_set_dict, opening_refine_topo_set_dict, refine_mesh_dict, _opening_refine_box,
 )
 
 _ROOM = (3.2, 4.8, 2.57)  # Lx, Ly, Lz
@@ -398,3 +399,58 @@ def test_size_then_center_fix_matches_the_planning_session_worked_examples():
             "xMin", Lx, Ly, Lz, (y / Ly, z / Lz), (sw, sh), 0.1)
         assert math.isclose(sug_y, exp_y, abs_tol=1e-9)
         assert math.isclose(sug_z, exp_z, abs_tol=1e-9)
+
+
+def test_lamp_refine_topo_set_dict_unions_one_sphere_per_lamp():
+    text = lamp_refine_topo_set_dict([(3.0, 0.2, 2.47), (0.2, 4.6, 2.47)], radius=0.4)
+    assert text.count("sphereToCell") == 2
+    assert text.count("lampRefineCells") == 2
+    assert "action  new;" in text and "action  add;" in text
+    assert "origin  (3 0.2 2.47);" in text
+    assert "radius  0.4;" in text
+
+
+def test_lamp_refine_topo_set_dict_single_lamp_is_all_new_no_add():
+    text = lamp_refine_topo_set_dict([(1.0, 1.0, 1.0)], radius=0.3)
+    assert text.count("sphereToCell") == 1
+    assert "action  new;" in text
+    assert "action  add;" not in text
+
+
+def test_opening_refine_box_extends_inward_and_pads_in_plane():
+    Lx, Ly, Lz = _ROOM
+    lo, hi = _opening_refine_box("xMin", Lx, Ly, Lz, (0.5, 0.85), (0.3, 0.3), depth=0.3)
+    # normal axis (x): a "low" wall (pos=0) extends INTO the room, 0 -> depth
+    assert lo[0] == 0.0 and hi[0] == 0.3
+    # in-plane axes padded by depth on both sides beyond the opening's own half-size
+    assert math.isclose(lo[1], 0.5 * Ly - 0.15 - 0.3)
+    assert math.isclose(hi[1], 0.5 * Ly + 0.15 + 0.3)
+    assert math.isclose(lo[2], 0.85 * Lz - 0.15 - 0.3)
+    assert math.isclose(hi[2], 0.85 * Lz + 0.15 + 0.3)
+
+
+def test_opening_refine_box_high_wall_extends_inward_the_other_direction():
+    Lx, Ly, Lz = _ROOM
+    lo, hi = _opening_refine_box("xMax", Lx, Ly, Lz, (0.5, 0.15), (0.3, 0.3), depth=0.3)
+    # a "high" wall (pos=Lx) extends INTO the room too, i.e. Lx-depth -> Lx
+    assert math.isclose(lo[0], Lx - 0.3) and math.isclose(hi[0], Lx)
+
+
+def test_opening_refine_topo_set_dict_unions_one_box_per_opening():
+    Lx, Ly, Lz = _ROOM
+    inlet_box = _opening_refine_box("xMin", Lx, Ly, Lz, (0.5, 0.85), (0.3, 0.3), depth=0.3)
+    outlet_box = _opening_refine_box("xMax", Lx, Ly, Lz, (0.5, 0.15), (0.3, 0.3), depth=0.3)
+    text = opening_refine_topo_set_dict([inlet_box, outlet_box])
+    assert text.count("boxToCell") == 2
+    assert text.count("openingRefineCells") == 2
+    assert "action  new;" in text and "action  add;" in text
+
+
+def test_refine_mesh_dict_uses_hex_topology_not_geometric_cut():
+    text = refine_mesh_dict("lampRefineCells")
+    assert "set             lampRefineCells;" in text
+    assert "useHexTopology  true;" in text
+    assert "geometricCut    false;" in text
+    assert "tan1" in text and "tan2" in text and "normal" in text
+    assert "coordinateSystem global;" in text
+    assert "globalCoeffs" in text

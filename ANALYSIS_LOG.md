@@ -1030,3 +1030,237 @@ somewhere in the 3-20 range that isn't patient_ward.
   - consistent with everything else found here (kUV.max vs. T-relaxation is
   the whole story), even though tighter flow convergence is a good idea for
   its own sake (a materially better-converged Phase 1).
+
+---
+
+## 2026-08-26 — Local mesh refinement near lamps/openings makes the near-field peak WORSE, not better
+
+**Trigger**: a live sweep on `patient_ward_4B1_v6fin` (`patient ward 4B1 v4.guv`
+design, ACH=6, Z sweep 2-10) hit the exact same Phase 2 divergence as the
+2026-08-24/25 campaign above, on a DIFFERENT lamp design than that
+campaign was calibrated on - Z=7 (kUV.max=3.006) diverged to
+T_ss~2.5e116 even with adaptive T-relaxation correctly computing 0.599.
+Oddly, Z=10 (kUV.max=4.295, *higher*, same shared Phase 1, same
+`relax*kUV.max=1.8` product) stayed stable in the same sweep - proof the
+"relax*kUV.max~=const" boundary isn't a clean deterministic curve, at
+least not with enough margin to trust near it.
+
+**Root-cause investigation, comparing against the original calibration
+project** (see also the flow-rel-tol entry above): Phase 1 quality was
+similar between the two (not the cause). Mesh resolution WAS a real,
+measurable confound on two fronts - a synthetic near-field peak-capture
+test showed 0.08m mesh consistently resolves ~40-45% more of the true
+continuum peak than 0.1m (patient_ward_4B1_v6fin's own resolution); and
+the shared UV-off control's decay-fit gave a 4.2x different effective
+ACH between mesh resolutions (3.985 vs 0.952/hr) despite near-identical
+bulk flow delivery (~80% either way) - real, precisely-fit differences,
+not fitting noise. Neither fully explained the Z=7-vs-Z=10 flip on its
+own.
+
+**Local refinement implemented** (`mesh_gen.py`: `lamp_refine_topo_set_dict`/
+`opening_refine_topo_set_dict` (sphereToCell/boxToCell topoSet unions) +
+`refine_mesh_dict`, wired into `run_pipeline.setup_case` as
+`refine_lamp_positions`/`refine_lamp_radius`/`refine_lamp_levels` and
+`refine_opening_depth`/`refine_opening_levels`, run after `blockMesh` but
+before the existing opening-boundary `topoSet`/`createPatch` so the
+carved patches themselves land on the now-finer faces too) - refines
+within 4 cell-widths of each lamp (2 levels = 4x finer) and 3
+cell-widths of each opening (1 level = 2x finer), reusing the exact
+topoSet-driven approach already used for cellZones/source/fan regions
+elsewhere in this codebase, rather than adopting snappyHexMesh. Needed
+two real fixes to OpenFOAM-v2412's `refineMeshDict` beyond what any
+tutorial-level memory suggested: a required `directions (tan1 tan2
+normal);` entry, and - only for the wall-adjacent opening boxes, not the
+lamp spheres - a required `coordinateSystem global; globalCoeffs { tan1
+(1 0 0); tan2 (0 1 0); }` block. Smoke-tested standalone first (mesh-gen
+only, no solve): 80,284 cells (base was 39,936), `checkMesh` reports
+"Mesh OK", max skewness 0.6, max aspect ratio 1.01 - good quality, no
+mesh-generation-side problems at all.
+
+**Result: refinement made kUV.max WORSE, and Z=7 still diverged.**
+The refined mesh's captured fluence peak at the same lamp jumped from
+429.5 (0.1m uniform) to **15,690** - implying kUV.max~=109.8 at Z=7, ~36x
+higher than the coarse-mesh reading and ~5x above the highest value ever
+tested in the whole calibration campaign (20.21). The adaptive formula
+correctly computed relax=0.05 - its absolute floor, the most conservative
+value the formula can ever produce - and Phase 2 **still crashed in the
+very first 400-iteration chunk**, identically to every other crash in
+this investigation.
+
+**Why this matters more than "the fix didn't work"**: the near-field UV
+fluence rate from a point-like lamp genuinely behaves like a 1/r^2
+singularity. Refining the mesh closer to the source doesn't converge
+toward some finite "true" peak value the way mesh refinement normally
+should - it approaches an ever-larger number as the nearest cell gets
+ever closer to the singularity, with no limit. That means **local mesh
+refinement at the source is fighting the wrong problem here**: it makes
+the numerically-resolved peak MORE extreme, not more accurate-and-bounded,
+and no amount of refinement (or the adaptive formula's own floor) can
+catch up to an unbounded quantity. Per-Z, sweep-wide adaptive relaxation
+is not going to fix a case whose true continuum kUV.max is effectively
+infinite at any achievable mesh resolution.
+
+**Real fix has to be at the source model, not the mesh** - confirmed
+directly. A parallel test against a redesigned `.guv` (`patient ward
+4B1 v5.guv`: the lamp's own emission profile discretized at ~0.06m
+resolution instead of a near-point emitter, same total fluence rate,
+wall reflections now on), same Z=7/ACH=6, same local mesh refinement
+(identical radius/depth/levels) - **succeeded**: Phase 2 ran its full
+5000-iteration budget with no divergence at all, T_ss=0.062, reduction=
+96.0%. kUV.max on this refined mesh was 42.6 - still well above the
+whole calibration range, still hit the adaptive formula's 0.05 floor -
+but this time the floor actually held, where the identical floor value
+did NOT prevent v4's collapse (kUV.max=109.8, same mesh-refinement
+settings, same everything else). The only thing that differs is the
+source model itself: discretizing the emission profile measurably
+bounds the near-field peak (109.8 -> 42.6 kUV.max under the same
+refinement) by removing the near-point-source singularity, rather than
+chasing an ever-larger unbounded peak with more mesh resolution. This is
+the real fix - mesh refinement alone (previous entry) is not.
+Extended to the full original sweep (Z=2,4,7,10) on this same v5 design,
+reusing the already-built refined base/Phase1. **3 of 4 succeeded
+cleanly**: Z=2 (kUV.max~=12.2, relax=0.148, T_ss=0.200), Z=4 (kUV.max~=
+24.3, relax=0.074, T_ss=0.105), Z=7 (kUV.max=42.6, relax=0.05 floor,
+T_ss=0.065) - T_ss decreasing and reduction% increasing monotonically
+with Z exactly as expected physically, confirming these are genuine
+results, not quiet divergence. None had technically plateaued yet
+(CV 0.7-1.8%) at the 5000-iteration budget used here - a normal "needs
+more iterations" caveat, a completely different thing from the
+catastrophic divergence seen everywhere else in this investigation.
+
+**Z=10 still failed** (kUV.max=60.85, relax=0.05 floor) - but notably
+NOT an instant blowup like every other crash in this whole
+investigation: it got through 2 full chunks (800 real iterations) before
+diverging in the 3rd, vs. every previous crash failing within the very
+first 400-iteration chunk. So the fix is real and substantial (stable
+range roughly tripled, from crashing at kUV.max=3 on the original design
+to holding through kUV.max=42.6 here) but **not unconditional** - there
+remains a breaking point somewhere between kUV.max 42.6 and 60.85 even
+with the improved source model. Important caveat for interpreting "v5
+fixes it": this is a genuinely different, newer edit of the same
+`patient ward 4B1 v5.guv` file path than the one the whole 2026-08-24/25
+calibration campaign above was run against (that campaign's own
+fluenceRate.max was 2020.82; discretizing the source since then changed
+the file's own physics, not just this session's understanding of it) -
+don't conflate the two when reading `v5.guv`-labeled results from before
+vs. after 2026-08-26.
+
+**Recommendation**: the discretized-source model is the right direction
+and should be kept/extended (finer discretization and/or investigating
+why Z=10 specifically still fails - is 800 iterations before divergence
+itself informative about where the remaining stiffness comes from) -
+not yet a complete fix for the whole intended Z range. Open, not chased
+further this session: whether an even finer source discretization (or a
+physical cap on the emission profile's own peak) removes the Z=10
+failure entirely, and whether relaxing further below the adaptive
+formula's current 0.05 floor would have helped Z=10 specifically (untested
+here - the floor was hit, not gone below).
+
+**Also fixed along the way, unrelated to the crash question**:
+`cellzones.bin_decay_rates`'s representative value per bin was the
+*edge*-based geometric mean of each log-spaced bin's theoretical [lo,hi)
+range, not its actual occupant cells - confirmed as a real ~17% error on
+this refined mesh's sparse top bin (4 cells clustered at 103.7-109.8 got
+assigned 88.6, when their own geometric mean is 106.5). Now uses the
+actual cells' own geometric mean when a bin has any, falling back to the
+edge-based value only for a genuinely empty bin. Does NOT change the
+adaptive-relaxation formula's own input (`_apply_z` already reads the
+raw, unbinned `k_values.max()` directly) - this only affects the actual
+sink-term strength `fvOptions` solves, making it more accurate (here,
+higher/more aggressive, not gentler).
+
+---
+
+## 2026-08-27 — Z=10's Phase 2 divergence: mechanism identified and fixed (TClampDecay)
+
+**Follow-up to the entry above.** Z=10 (kUV.max=60.85, v5 discretized-source
+design + local refinement) still diverged after every mitigation tried so far
+(adaptive T-relaxation at its 0.05 floor, `bounded Gauss upwind` in place of
+`linearUpwind`). This entry documents the actual mechanism and the fix that
+finally holds it.
+
+**Mechanism.** Defined a Damköhler number `Da = kUV*dt` (dt=1 throughout);
+at the hottest cell, `Da~=61`. Derived the amplification factor for the
+relaxation-lag-on-ddt-reference mechanism alone: `G(Da,a) = (1-a) + a/(1+Da)`,
+provably <=1 for all Da>=0, a in (0,1] - meaning that mechanism ALONE cannot
+explain the observed blowup. A same-mesh test swapping `div(phi,T)` from
+`bounded Gauss linearUpwind grad(T)` to plain `bounded Gauss upwind` (dropping
+the deferred-correction term) changed the failure from an unbounded runaway to
+a damped oscillation within the same iteration budget - strong evidence the
+deferred-correction term (built from old-iteration gradients, an effective
+explicit source riding on top of the implicit sink) is the missing ingredient
+that lets the fixed point actually diverge.
+
+**Onset is a single-cell trigger, not a flow problem.** A clean, unbroken
+150-iteration rerun bracketing the real onset showed U/p/k/omega residuals
+staying flat (<2x drift) while T explodes ~55,000x - the sink term's own
+outer-iteration divergence, not a flow-convergence issue. At true onset, only
+the single global-max-kUV cell (idx 42441, kUV=60.85) triggers; its 3
+nearest-kUV neighbors (57.96-59.73) stay normal at the same instant, but
+contamination spreads to ~250 cells spanning the full kUV range within ~20
+iterations via ordinary advection/diffusion - kUV gates WHERE it starts, not
+which cells end up affected. Diverged runs showed T reaching 10^8-10^114, and
+some cells going *negative* - no physical mechanism allows a passive,
+non-created-elsewhere scalar to exceed its own source's peak value or go
+below zero, so both are unambiguous numerical-divergence signatures, not real
+answers.
+
+**Fix: `TClampDecay`, a custom OpenFOAM function object** (source at
+`guvcfd/openfoam_functionobjects/TClampDecay/`, Python wrapper
+`guvcfd/tclamp_decay.py`). Every outer iteration, any T cell outside
+`[0, Tmax]` is replaced by `T*exp(-kUV*dt)` then clamped into `[0, Tmax]` -
+the pure-sink ODE's own analytic decay, not an arbitrary reset, so the
+correction stays physically motivated (for the `T<0` branch specifically,
+this is mathematically *always* equivalent to a plain floor to 0, since
+decaying a negative value by a positive factor can never cross back to
+positive - written as an explicit `if T<0: T=0` branch rather than relying on
+the exp() math to degenerate to the right answer). `Tmax` is set per-run as
+`t-clamp-decay-multiplier` (default 1.3) times Phase 1's own converged
+source-zone max T (`tclamp_decay.source_zone_max_T`, reading
+`phase1_T.snapshot` filtered to the same outward-snapped box
+`contaminant_source._source_box` carves) - the only physically meaningful
+reference this pipeline has for "how concentrated does the source actually
+get". Spliced into `system/controlDict` immediately after `scalarTransport1`
+(not at the end of `functions{}`) so it runs *before* any volAverage-style
+room/patch/zone tracking reads T that same timestep - otherwise a reported
+room-average could momentarily include an out-of-range cell that hadn't been
+corrected yet. New opt-in settings: `t-clamp-decay-enabled` (default False),
+`t-clamp-decay-multiplier` (default 1.3).
+
+**Validated live against the exact failing case** (v5-refined, Z=10,
+kUV.max=60.85, adaptive relaxation still at its 0.05 floor): Phase 2 ran its
+full 3,000-iteration budget with no crash for the first time - `T_ss=0.050`,
+T-infinity fit converged (tau~=505 iterations, fit CV 1.06%, vs. every prior
+attempt's fit either rejected outright or wildly unstable), corrected
+eACH_uv=109.5/hr, reduction=96.0%. Inspected both phases' full per-iteration
+room-average series directly (8,000 + 3,000 points, not just summary stats):
+zero negative values, zero NaN, zero jump discontinuities in either phase.
+Per-cell, the clamp fires on a stable ~3,300-3,400 cells/iteration (~4% of
+the 80k-cell mesh, fluctuating but not growing - the formerly-runaway region
+is being held in check, not spreading) and correctly drives the actual
+hot cells (kUV 57-61) to ~0, matching what real physics would do there
+(`exp(-60*1)~=9e-27`) rather than saturating at the Tmax ceiling - checked
+directly, zero cells anywhere in the mesh sit at/near Tmax, confirming the
+decay term is doing the real work, not the backstop.
+
+**One open, low-priority finding**: a small number of interior cells
+(checked: 2.4-4.4 mesh-cell-widths from the nearest wall, ruling out a
+`correctBoundaryConditions()` boundary-reconstruction artifact) persist at
+small negative values (max ~-0.03, all at very low kUV ~0.01-0.03) even
+though the `T<0` branch should floor any triggered cell to exactly 0 -
+likely a one-iteration lag between when ordinary transport-scheme dispersion
+reintroduces the value and when the clamp next runs, though the exact
+mechanism (vs. some OpenFOAM `Time::run()` last-timestep-write subtlety)
+wasn't pinned down with certainty. Functionally inert - ~6 orders of
+magnitude below anything that mattered for the actual divergence.
+
+**Ported to decay mode** (`scenario_runs._run_decay_scenario`,
+`app._finish_decay`, `qtapp/run_state._finish_decay`) - same
+`scalarTransport1`+`scalarSemiImplicitSource`/kUV mechanism, structurally the
+same risk though materially lower (decay mode's `Euler` ddt scheme + small,
+Courant-capped `pimple-delta-t` keeps a real V/dt diagonal in the T equation,
+unlike steady-state Phase 2's deltaT-scaling which can gut it) and never
+observed to diverge. Decay mode carves no source zone, so `Tmax` there is
+simply `t-clamp-decay-multiplier * REFERENCE_TARGET_T_SS` (T starts uniform
+at that value with no injection during the UV-on run, only removal - the
+known starting value already IS the physical ceiling).

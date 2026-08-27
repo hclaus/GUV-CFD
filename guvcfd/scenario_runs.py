@@ -41,8 +41,8 @@ import numpy as np
 
 from .app_settings import capture_openfoam_settings
 from .case_io import (
-    read_boundary_patch_names, read_cell_centers, read_latest_time_field, read_openfoam_scalar_field,
-    write_scalar_field, snapshot_openfoam_settings,
+    read_boundary_patch_names, read_cell_centers, read_cell_volumes, read_latest_time_field,
+    read_openfoam_scalar_field, write_scalar_field, snapshot_openfoam_settings,
 )
 from .cellzones import bin_decay_rates, write_cellzones
 from .contaminant_source import write_fvoptions_file, write_source_topo_set_dict
@@ -59,7 +59,7 @@ from .project_status import (
     update_combo_status,
 )
 from .report import combo_summary_metrics
-from .run_pipeline import check_ach_delivery, setup_case
+from .run_pipeline import check_ach_delivery, setup_case, _volume_weighted_mean
 from .splice import (
     set_control_dict_start_from, set_control_dict_time, splice_fv_options_into_control_dict,
     set_relaxation_factors, compute_adaptive_scalar_relaxation,
@@ -68,6 +68,7 @@ from .steady_state_pipeline import (
     run_steady_state_scenario, _uv_fvoptions_entries, resolve_phase_delta_ts, merge_project_deltat_settings,
     REFERENCE_TARGET_T_SS, _read_phase1_checkpoint, _read_phase1_pending,
 )
+from .tclamp_decay import ensure_tclamp_decay_compiled, splice_tclamp_decay_if_needed
 from .ventilation_control import prepare_ventilation_only_control, finish_ventilation_only_control
 from .visualization import center_frac_for_wall
 from .wsl_utils import (
@@ -605,6 +606,16 @@ def _apply_z(case_dir, Z, nbins, fan_kwargs, log_fn, adaptive_t_relaxation=False
     """
     patch_names = read_boundary_patch_names(case_dir)
     fluence_values = np.array(read_openfoam_scalar_field(f"{case_dir}/0/fluenceRate"))
+    try:
+        volumes = np.array(read_cell_volumes(case_dir, "0"))
+    except (RuntimeError, OSError):
+        # A shared base built before writeCellVolumes existed here has no
+        # 0/V (it's a static geometric postProcess artifact, never solved
+        # for, so nothing regenerates it later in the pipeline either) -
+        # every such base is a uniform mesh anyway (local refinement is
+        # newer than this), so equal weights give the exact same
+        # (correct) answer as a real volume-weighted mean would.
+        volumes = np.ones(len(fluence_values))
     log_fn(f"  Recomputing kUV for Z={Z}...")
     k_values = compute_inactivation_rate(fluence_values, Z)
     write_scalar_field(case_dir, "kUV", k_values, patch_names)
@@ -625,8 +636,8 @@ def _apply_z(case_dir, Z, nbins, fan_kwargs, log_fn, adaptive_t_relaxation=False
         run_wsl_or_raise("topoSet -dict system/fanTopoSetDict", case_dir_wsl, "topoSet (restore fan zone)")
 
     result = {
-        "fluence_mean": float(fluence_values.mean()),
-        "eACH_uv_well_mixed_mean": float(eACH_values.mean()),
+        "fluence_mean": _volume_weighted_mean(fluence_values, volumes),
+        "eACH_uv_well_mixed_mean": _volume_weighted_mean(eACH_values, volumes),
     }
     if adaptive_t_relaxation:
         kuv_max = float(k_values.max())
@@ -754,6 +765,7 @@ def _run_scenario(case_dir, room, settings, z, ach, adv, z_summary, log_fn, shou
         status_fn=status_fn,
         control_results_future=control_results_future,
         phase1_delta_t=phase1_delta_t, phase2_delta_t=phase2_delta_t, solve_semaphore=solve_semaphore,
+        t_clamp_decay_multiplier=adv["t-clamp-decay-multiplier"] if adv["t-clamp-decay-enabled"] else None,
     )
     result["fluence_mean"] = z_summary["fluence_mean"]
     result["eACH_uv_well_mixed"] = z_summary.get("eACH_uv_well_mixed_mean")
@@ -1142,6 +1154,15 @@ def _run_decay_scenario(case_dir, room, settings, z, ach, adv, z_summary, log_fn
     set_control_dict_time(case_dir, end_time=combined_end_time,
                            write_interval=write_interval, delta_t=adv["pimple-delta-t"], max_co=adv["max-co"])
     splice_live_vol_average_if_needed(case_dir)
+
+    if adv["t-clamp-decay-enabled"]:
+        # Decay mode carves no source zone (T starts uniform at
+        # REFERENCE_TARGET_T_SS with no injection during the UV-on run,
+        # only removal) - the physical ceiling is that known starting
+        # value itself, not a converged-field lookup like steady-state's
+        # source_zone_max_T (see tclamp_decay.py's module docstring).
+        ensure_tclamp_decay_compiled(log_fn)
+        splice_tclamp_decay_if_needed(case_dir, adv["t-clamp-decay-multiplier"] * REFERENCE_TARGET_T_SS)
 
     if should_stop is not None and should_stop():
         raise StoppedByUser("Stopped before pimpleFoam.")

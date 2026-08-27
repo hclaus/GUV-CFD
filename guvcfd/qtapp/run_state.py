@@ -65,6 +65,7 @@ from ..steady_state_pipeline import (
     REFERENCE_TARGET_T_SS, clear_phase_resume_state, merge_project_deltat_settings, resolve_phase_delta_ts,
     run_steady_state_scenario,
 )
+from ..tclamp_decay import ensure_tclamp_decay_compiled, splice_tclamp_decay_if_needed
 from ..ventilation_control import finish_ventilation_only_control, prepare_ventilation_only_control
 from ..wsl_utils import StoppedByUser, run_wsl_or_raise, run_wsl_streaming, wsl_path
 from . import helpers
@@ -551,6 +552,17 @@ def _finish_decay(state, case_dir, room, settings, summary):
                            write_interval=write_interval, delta_t=adv["pimple-delta-t"], max_co=adv["max-co"])
     splice_live_vol_average_if_needed(case_dir)
 
+    if adv["t-clamp-decay-enabled"]:
+        # Decay mode carves no source zone (T starts uniform at
+        # REFERENCE_TARGET_T_SS with no injection during the UV-on run,
+        # only removal) - the physical ceiling is that known starting
+        # value itself, not a converged-field lookup like steady-state's
+        # source_zone_max_T (see tclamp_decay.py's module docstring).
+        # Spliced before the UV-off control is cloned below (harmless
+        # there too - no injection, T only decreases from the same start).
+        ensure_tclamp_decay_compiled(state.log_fn)
+        splice_tclamp_decay_if_needed(case_dir, adv["t-clamp-decay-multiplier"] * REFERENCE_TARGET_T_SS)
+
     if state.should_stop():
         raise StoppedByUser("Stopped before pimpleFoam.")
     if sealed:
@@ -838,6 +850,7 @@ def _finish_steady_state(state, case_dir, room, settings, summary):
         log_fn=state.log_fn, should_stop=state.should_stop, solver_log_fn=state.solver_log_fn,
         should_pause=state.should_pause,
         phase1_delta_t=phase1_delta_t, phase2_delta_t=phase2_delta_t,
+        t_clamp_decay_multiplier=adv["t-clamp-decay-multiplier"] if adv["t-clamp-decay-enabled"] else None,
     )
     result["fluence_mean"] = summary["fluence_mean"]
     result["eACH_uv_well_mixed"] = summary.get("eACH_uv_well_mixed_mean")

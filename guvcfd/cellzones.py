@@ -17,7 +17,18 @@ def bin_decay_rates(k_values, nbins):
 
     Returns (bin_idx, bin_repr): bin_idx[i] is the bin index (0 = zero-rate
     "no source" bin) for cell i; bin_repr[b] is the representative decay rate
-    (geometric mean of the bin's [lo, hi) edges) for bin b.
+    for bin b - the geometric mean of the bin's OWN actual occupant cells
+    when it has any (accurate regardless of how the cells happen to be
+    distributed within the bin's [lo, hi) edges - confirmed as a real,
+    non-trivial gap on a locally-refined mesh: a sparse, tightly-clustered
+    top bin of 4 cells at 103.7-109.8 was getting the bin's theoretical
+    edge-geometric-mean, 88.6 - a ~17% understatement of what its actual
+    cells needed, vs. their own geometric mean of 106.5). Falls back to the
+    edge-based geometric mean only for a bin with zero cells (nothing real
+    to average - a log-spaced bin can end up empty when the underlying
+    values are sparse/clustered, e.g. a handful of cells right at a
+    near-singular fluence peak with nothing between them and the next
+    edge down).
     """
     k_pos = k_values[k_values > 0]
     if len(k_pos) == 0:
@@ -38,8 +49,12 @@ def bin_decay_rates(k_values, nbins):
             bin_idx[i] = b + 1  # shift by 1 since 0 is reserved for "zero"
 
     for b in range(nbins):
-        lo, hi = edges[b], edges[b + 1]
-        bin_repr.append(np.sqrt(lo * hi))  # geometric mean as representative value
+        cell_values = k_values[bin_idx == b + 1]
+        if len(cell_values) > 0:
+            bin_repr.append(float(np.exp(np.mean(np.log(cell_values)))))
+        else:
+            lo, hi = edges[b], edges[b + 1]
+            bin_repr.append(np.sqrt(lo * hi))  # no real cells - edge-based fallback
 
     return bin_idx, bin_repr
 

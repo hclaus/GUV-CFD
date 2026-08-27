@@ -156,6 +156,24 @@ def read_cell_centers(case_dir, time_dir="0"):
     return np.column_stack([cx, cy, cz])
 
 
+def read_cell_volumes(case_dir, time_dir="0"):
+    """Read per-cell volumes from <case_dir>/<time_dir>/V.
+
+    Produced by running `postProcess -func writeCellVolumes` in the case
+    directory (same pattern as read_cell_centers/writeCellCentres).
+    Needed for any true room-average of a per-cell field (fluence rate,
+    kUV, eACH) once the mesh isn't uniform - a locally-refined region
+    packs many more (smaller) cells into the same physical space, so a
+    plain, unweighted values.mean() silently overweights whatever got
+    refined (confirmed as a real, ~4x error on a real locally-refined
+    case: naive mean 11.6 uW/cm^2 vs. the true volume-weighted ~2.9).
+    On a uniform mesh (every case before local refinement existed) this
+    made no difference at all - volume-weighted and plain mean are
+    identical when every cell has the same volume.
+    """
+    return np.array(read_openfoam_scalar_field(f"{case_dir}/{time_dir}/V"))
+
+
 def clear_stale_run_output(case_dir):
     """Remove every trace of a previous run from case_dir before starting a
     fresh one: numbered time-step directories (all but "0"), postProcessing/,

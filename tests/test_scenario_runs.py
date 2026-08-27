@@ -306,7 +306,8 @@ def test_run_decay_sweep_records_error_status_in_project_status(tmp_path, monkey
                 "inlet-wall": "xMin", "inlet-size-w": 0.3, "inlet-size-h": 0.3, "mech-ach-only": False,
                 "pimple-write-interval": 3}
     adv = {"adaptive-t-relaxation": False, "uv-zone-bins": 5, "pimple-delta-t": 0.5, "max-co": 5,
-           "decay-ach-min-fraction": 90.0, "decay-each-min-fraction": 90.0, "decay-each-max-fraction": 99.9}
+           "decay-ach-min-fraction": 90.0, "decay-each-min-fraction": 90.0, "decay-each-max-fraction": 99.9,
+           "t-clamp-decay-enabled": False, "t-clamp-decay-multiplier": 1.3}
 
     sr.run_decay_sweep(
         guv_path="p.guv", settings_path="p.guvcfd", project_dir=str(project_dir),
@@ -880,7 +881,8 @@ def test_switching_a_steady_state_project_to_decay_mode_gets_its_own_folder_and_
     })
     adv = {"adaptive-t-relaxation": False, "uv-zone-bins": 25, "mesh-cell-size": 0.1, "keep-shared-scratch-dirs": True,
            "pimple-delta-t": 0.5, "max-co": 5,
-           "decay-ach-min-fraction": 90.0, "decay-each-min-fraction": 90.0, "decay-each-max-fraction": 99.9}
+           "decay-ach-min-fraction": 90.0, "decay-each-min-fraction": 90.0, "decay-each-max-fraction": 99.9,
+           "t-clamp-decay-enabled": False, "t-clamp-decay-multiplier": 1.3}
 
     sr.run_sweep(
         guv_path="room.guv", settings_path="proj.guvcfd", project_dir=str(project_dir),
@@ -1263,7 +1265,8 @@ def test_run_scenario_threads_control_results_into_measured_ventilation_ach(monk
     adv = {"adaptive-t-relaxation": False, "uv-zone-bins": 25, "mesh-cell-size": 0.1,
            "plateau-rel-tol": 1.0, "t-infinity-early-stop-enabled": False, "phase1-require-stable-extrapolation": False, "keep-all-timesteps": False,
            "deltat-scaling-enabled": False, "deltat-effective-fraction": 0.7, "deltat-target-fraction": 0.995,
-           "phase-chunk-size": 400, "phase-write-interval": 200}
+           "phase-chunk-size": 400, "phase-write-interval": 200,
+           "t-clamp-decay-enabled": False, "t-clamp-decay-multiplier": 1.3}
 
     sr._run_scenario("case_dir", room, settings, z=6.0, ach=3.0, adv=adv,
                       z_summary={"eACH_uv_well_mixed_mean": 0.0, "fluence_mean": 1.0}, log_fn=lambda m: None,
@@ -1303,7 +1306,8 @@ def test_run_scenario_deltat_scaling_uses_configured_iterations_not_settling_inf
     adv = {"adaptive-t-relaxation": False, "uv-zone-bins": 25, "mesh-cell-size": 0.1,
            "plateau-rel-tol": 1.0, "t-infinity-early-stop-enabled": False, "phase1-require-stable-extrapolation": False, "keep-all-timesteps": False,
            "deltat-scaling-enabled": True, "deltat-effective-fraction": 0.7, "deltat-target-fraction": 0.995,
-           "phase-chunk-size": 400, "phase-write-interval": 200}
+           "phase-chunk-size": 400, "phase-write-interval": 200,
+           "t-clamp-decay-enabled": False, "t-clamp-decay-multiplier": 1.3}
 
     sr._run_scenario("case_dir", room, settings, z=6.0, ach=6.0, adv=adv,
                       z_summary={"eACH_uv_well_mixed_mean": 61.98, "fluence_mean": 1.0}, log_fn=lambda m: None,
@@ -1336,7 +1340,8 @@ def test_run_scenario_threads_base_summary_into_flow_converged_and_ach_delivery(
     adv = {"adaptive-t-relaxation": False, "uv-zone-bins": 25, "mesh-cell-size": 0.1,
            "plateau-rel-tol": 1.0, "t-infinity-early-stop-enabled": False, "phase1-require-stable-extrapolation": False, "keep-all-timesteps": False,
            "deltat-scaling-enabled": False, "deltat-effective-fraction": 0.7, "deltat-target-fraction": 0.995,
-           "phase-chunk-size": 400, "phase-write-interval": 200}
+           "phase-chunk-size": 400, "phase-write-interval": 200,
+           "t-clamp-decay-enabled": False, "t-clamp-decay-multiplier": 1.3}
 
     base_summary = {"flow_converged": True, "ach_delivery": {"measured_ach": 5.9, "ratio": 0.98}, "n_lamps": 4}
     result = sr._run_scenario("case_dir", room, settings, z=6.0, ach=3.0, adv=adv,
@@ -1365,7 +1370,8 @@ def test_run_scenario_measured_ventilation_ach_none_without_control_results(monk
     adv = {"adaptive-t-relaxation": False, "uv-zone-bins": 25, "mesh-cell-size": 0.1,
            "plateau-rel-tol": 1.0, "t-infinity-early-stop-enabled": False, "phase1-require-stable-extrapolation": False, "keep-all-timesteps": False,
            "deltat-scaling-enabled": False, "deltat-effective-fraction": 0.7, "deltat-target-fraction": 0.995,
-           "phase-chunk-size": 400, "phase-write-interval": 200}
+           "phase-chunk-size": 400, "phase-write-interval": 200,
+           "t-clamp-decay-enabled": False, "t-clamp-decay-multiplier": 1.3}
 
     sr._run_scenario("case_dir", room, settings, z=6.0, ach=3.0, adv=adv,
                       z_summary={"eACH_uv_well_mixed_mean": 0.0, "fluence_mean": 1.0}, log_fn=lambda m: None,
@@ -1824,7 +1830,8 @@ def test_run_decay_scenario_rebuilds_fvoptions_from_this_combos_own_kuv(tmp_path
                 "inlet-wall": "xMin", "inlet-size-w": 0.3, "inlet-size-h": 0.3,
                 "monitoring-enable": False, "pimple-write-interval": 3}
     adv = {"adaptive-t-relaxation": False, "uv-zone-bins": 5, "pimple-delta-t": 0.5, "max-co": 5,
-           "decay-ach-min-fraction": 90.0, "decay-each-min-fraction": 90.0, "decay-each-max-fraction": 99.9}
+           "decay-ach-min-fraction": 90.0, "decay-each-min-fraction": 90.0, "decay-each-max-fraction": 99.9,
+           "t-clamp-decay-enabled": False, "t-clamp-decay-multiplier": 1.3}
 
     sr._run_decay_scenario(case_dir, room, settings, z=6.0, ach=3.0, adv=adv,
                             z_summary={"eACH_uv_well_mixed_mean": 20.0}, log_fn=lambda m: None,
@@ -1878,7 +1885,8 @@ def test_run_decay_scenario_releases_solve_semaphore_before_waiting_on_control(t
                 "inlet-wall": "xMin", "inlet-size-w": 0.3, "inlet-size-h": 0.3,
                 "monitoring-enable": False, "pimple-write-interval": 3}
     adv = {"adaptive-t-relaxation": False, "uv-zone-bins": 5, "pimple-delta-t": 0.5, "max-co": 5,
-           "decay-ach-min-fraction": 90.0, "decay-each-min-fraction": 90.0, "decay-each-max-fraction": 99.9}
+           "decay-ach-min-fraction": 90.0, "decay-each-min-fraction": 90.0, "decay-each-max-fraction": 99.9,
+           "t-clamp-decay-enabled": False, "t-clamp-decay-multiplier": 1.3}
 
     result_holder = {}
 
@@ -1945,7 +1953,8 @@ def test_run_decay_scenario_status_fn_gets_time_lines_and_clears_on_finish(tmp_p
                 "inlet-wall": "xMin", "inlet-size-w": 0.3, "inlet-size-h": 0.3,
                 "monitoring-enable": False, "pimple-write-interval": 3}
     adv = {"adaptive-t-relaxation": False, "uv-zone-bins": 5, "pimple-delta-t": 0.5, "max-co": 5,
-           "decay-ach-min-fraction": 90.0, "decay-each-min-fraction": 90.0, "decay-each-max-fraction": 99.9}
+           "decay-ach-min-fraction": 90.0, "decay-each-min-fraction": 90.0, "decay-each-max-fraction": 99.9,
+           "t-clamp-decay-enabled": False, "t-clamp-decay-multiplier": 1.3}
 
     sr._run_decay_scenario(case_dir, room, settings, z=6.0, ach=3.0, adv=adv,
                             z_summary={"eACH_uv_well_mixed_mean": 20.0}, log_fn=lambda m: None,
@@ -2022,7 +2031,8 @@ def test_run_decay_scenario_uses_configured_write_interval_not_duration_over_100
     # A duration long enough that duration // 100 (the old, wrong formula)
     # would clearly differ from the configured 3s.
     adv = {"adaptive-t-relaxation": False, "uv-zone-bins": 5, "pimple-delta-t": 0.5, "max-co": 5,
-           "decay-ach-min-fraction": 99.9, "decay-each-min-fraction": 99.9, "decay-each-max-fraction": 99.9}
+           "decay-ach-min-fraction": 99.9, "decay-each-min-fraction": 99.9, "decay-each-max-fraction": 99.9,
+           "t-clamp-decay-enabled": False, "t-clamp-decay-multiplier": 1.3}
 
     sr._run_decay_scenario(case_dir, room, settings, z=6.0, ach=3.0, adv=adv,
                             z_summary={"eACH_uv_well_mixed_mean": 20.0}, log_fn=lambda m: None,
@@ -2533,7 +2543,8 @@ def test_run_decay_sweep_runs_control_and_z_decay_concurrently(tmp_path, monkeyp
     settings = dict(_decay_reuse_settings(), z_value=6)
     settings["pimple-write-interval"] = 3
     adv = {"adaptive-t-relaxation": False, "uv-zone-bins": 5, "pimple-delta-t": 0.5, "max-co": 5,
-           "decay-ach-min-fraction": 90.0, "decay-each-min-fraction": 90.0, "decay-each-max-fraction": 99.9}
+           "decay-ach-min-fraction": 90.0, "decay-each-min-fraction": 90.0, "decay-each-max-fraction": 99.9,
+           "t-clamp-decay-enabled": False, "t-clamp-decay-multiplier": 1.3}
 
     sr.run_decay_sweep(
         guv_path="p.guv", settings_path="p.guvcfd", project_dir=str(project_dir),
