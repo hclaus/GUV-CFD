@@ -2136,7 +2136,8 @@ def run_sweep(guv_path, settings_path, project_dir, room, settings, adv,
         try:
             _copy_base_case(ctx["phase1_dir"], case_dir, combo_log_fn)
             z_summary = _apply_z(case_dir, z, adv["uv-zone-bins"], ctx["fan_kw"], combo_log_fn,
-                                  adaptive_t_relaxation=adv["adaptive-t-relaxation"])
+                                  adaptive_t_relaxation=adv["adaptive-t-relaxation"],
+                                  scalar_relaxation=adv["scalar-relaxation"])
             uv_fingerprint = compute_uv_fingerprint(case_dir)
             # _apply_z's write_cellzones() rewrites cellZones from scratch,
             # wiping the source cellZone _run_shared_phase1 already carved

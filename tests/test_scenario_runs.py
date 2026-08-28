@@ -224,7 +224,7 @@ def test_run_sweep_creates_expected_subfolders_and_reports(tmp_path, monkeypatch
                 "phase1-iterations": 100, "phase2-iterations": 100, "target-t-ss": 1.0,
                 "inject-x-input": 2, "inject-y-input": 2.5, "inject-z-input": 1.3, "z-value": 6,
                 "source-zone-size": 0.3}
-    adv = {"adaptive-t-relaxation": False, "uv-zone-bins": 25, "mesh-cell-size": 0.1}
+    adv = {"adaptive-t-relaxation": False, "scalar-relaxation": 0.7, "uv-zone-bins": 25, "mesh-cell-size": 0.1}
 
     results_seen = []
     sr.run_sweep(
@@ -289,7 +289,7 @@ def test_run_sweep_passes_adaptive_t_relaxation_flag_to_apply_z_per_combo(tmp_pa
                 "phase1-iterations": 100, "phase2-iterations": 100, "target-t-ss": 1.0,
                 "inject-x-input": 2, "inject-y-input": 2.5, "inject-z-input": 1.3, "z-value": 6,
                 "source-zone-size": 0.3}
-    adv = {"adaptive-t-relaxation": True, "uv-zone-bins": 25, "mesh-cell-size": 0.1}
+    adv = {"adaptive-t-relaxation": True, "scalar-relaxation": 0.7, "uv-zone-bins": 25, "mesh-cell-size": 0.1}
 
     sr.run_sweep(
         guv_path="proj.guv", settings_path="proj.guvcfd", project_dir=str(project_dir),
@@ -368,7 +368,7 @@ def test_run_sweep_captures_build_flow_base_return_value_as_base_summary(tmp_pat
                 "phase1-iterations": 100, "phase2-iterations": 100, "target-t-ss": 1.0,
                 "inject-x-input": 2, "inject-y-input": 2.5, "inject-z-input": 1.3, "z-value": 6,
                 "source-zone-size": 0.3}
-    adv = {"adaptive-t-relaxation": False, "uv-zone-bins": 25, "mesh-cell-size": 0.1}
+    adv = {"adaptive-t-relaxation": False, "scalar-relaxation": 0.7, "uv-zone-bins": 25, "mesh-cell-size": 0.1}
 
     sr.run_sweep(
         guv_path="proj.guv", settings_path="proj.guvcfd", project_dir=str(project_dir),
@@ -422,7 +422,7 @@ def test_run_sweep_passes_base_summary_to_run_shared_control(tmp_path, monkeypat
                 "phase1-iterations": 100, "phase2-iterations": 100, "target-t-ss": 1.0,
                 "inject-x-input": 2, "inject-y-input": 2.5, "inject-z-input": 1.3, "z-value": 6,
                 "source-zone-size": 0.3}
-    adv = {"adaptive-t-relaxation": False, "uv-zone-bins": 25, "mesh-cell-size": 0.1}
+    adv = {"adaptive-t-relaxation": False, "scalar-relaxation": 0.7, "uv-zone-bins": 25, "mesh-cell-size": 0.1}
 
     sr.run_sweep(
         guv_path="proj.guv", settings_path="proj.guvcfd", project_dir=str(project_dir),
@@ -1199,7 +1199,7 @@ def test_run_sweep_skips_a_combo_that_already_has_results_json(tmp_path, monkeyp
                 "phase1-iterations": 100, "phase2-iterations": 100, "target-t-ss": 1.0,
                 "inject-x-input": 2, "inject-y-input": 2.5, "inject-z-input": 1.3, "z-value": 6,
                 "source-zone-size": 0.3}
-    adv = {"adaptive-t-relaxation": False, "uv-zone-bins": 25, "mesh-cell-size": 0.1}
+    adv = {"adaptive-t-relaxation": False, "scalar-relaxation": 0.7, "uv-zone-bins": 25, "mesh-cell-size": 0.1}
 
     results_seen = []
     sr.run_sweep(
@@ -1251,7 +1251,8 @@ def test_run_sweep_skips_failed_combo_and_continues(tmp_path, monkeypatch):
     seen = []
     sr.run_sweep(
         guv_path="p.guv", settings_path="p.guvcfd", project_dir=str(project_dir),
-        room=room, settings=settings, adv={"uv-zone-bins": 25, "mesh-cell-size": 0.1, "adaptive-t-relaxation": False},
+        room=room, settings=settings,
+        adv={"uv-zone-bins": 25, "mesh-cell-size": 0.1, "adaptive-t-relaxation": False, "scalar-relaxation": 0.7},
         z_values=[2, 6], ach_values=[3], log_fn=lambda m: None,
         on_combo_done=lambda z, ach, status, detail: seen.append((z, status)),
     )
@@ -1732,7 +1733,7 @@ def test_run_sweep_different_guv_at_same_z_ach_produces_genuinely_different_resu
                 "phase1-iterations": 100, "phase2-iterations": 100, "target-t-ss": 1.0,
                 "inject-x-input": 2, "inject-y-input": 2.5, "inject-z-input": 1.3, "z-value": 6,
                 "source-zone-size": 0.3}
-    adv = {"adaptive-t-relaxation": False, "uv-zone-bins": 25, "mesh-cell-size": 0.1}
+    adv = {"adaptive-t-relaxation": False, "scalar-relaxation": 0.7, "uv-zone-bins": 25, "mesh-cell-size": 0.1}
 
     sr.run_sweep(
         guv_path="lampB.guv", settings_path="proj.guvcfd", project_dir=str(project_dir),
@@ -1777,7 +1778,7 @@ def test_run_sweep_recarves_source_zone_after_apply_z_wipes_it(tmp_path, monkeyp
                 "phase1-iterations": 100, "phase2-iterations": 100, "target-t-ss": 1.0,
                 "inject-x-input": 2, "inject-y-input": 2.5, "inject-z-input": 1.3, "z-value": 6,
                 "source-zone-size": 0.3}
-    adv = {"adaptive-t-relaxation": False, "uv-zone-bins": 25, "mesh-cell-size": 0.1}
+    adv = {"adaptive-t-relaxation": False, "scalar-relaxation": 0.7, "uv-zone-bins": 25, "mesh-cell-size": 0.1}
 
     sr.run_sweep(
         guv_path="p.guv", settings_path="p.guvcfd", project_dir=str(project_dir),
@@ -1809,7 +1810,7 @@ def test_run_sweep_stop_between_combinations_raises_stopped_by_user(tmp_path, mo
     with pytest.raises(StoppedByUser):
         sr.run_sweep(
             guv_path="p.guv", settings_path="p.guvcfd", project_dir=str(project_dir),
-            room=room, settings=settings, adv={"uv-zone-bins": 25, "adaptive-t-relaxation": False},
+            room=room, settings=settings, adv={"uv-zone-bins": 25, "adaptive-t-relaxation": False, "scalar-relaxation": 0.7},
             z_values=[2, 6], ach_values=[3], log_fn=lambda m: None,
             should_stop=should_stop,
         )
@@ -2520,7 +2521,7 @@ def test_run_sweep_runs_phase1_and_control_concurrently(tmp_path, monkeypatch):
     room = type("Room", (), {"x": 4.0, "y": 5.0, "z": 2.7})()
     sr.run_sweep(
         guv_path="proj.guv", settings_path="proj.guvcfd", project_dir=str(project_dir),
-        room=room, settings=_steady_state_settings(), adv={"uv-zone-bins": 25, "mesh-cell-size": 0.1, "adaptive-t-relaxation": False},
+        room=room, settings=_steady_state_settings(), adv={"uv-zone-bins": 25, "mesh-cell-size": 0.1, "adaptive-t-relaxation": False, "scalar-relaxation": 0.7},
         z_values=[6], ach_values=[3], log_fn=lambda m: None,
     )
 
@@ -2628,7 +2629,7 @@ def test_run_sweep_never_exceeds_max_concurrent_solves(tmp_path, monkeypatch):
     room = type("Room", (), {"x": 4.0, "y": 5.0, "z": 2.7})()
     sr.run_sweep(
         guv_path="proj.guv", settings_path="proj.guvcfd", project_dir=str(project_dir),
-        room=room, settings=_steady_state_settings(), adv={"uv-zone-bins": 25, "mesh-cell-size": 0.1, "adaptive-t-relaxation": False},
+        room=room, settings=_steady_state_settings(), adv={"uv-zone-bins": 25, "mesh-cell-size": 0.1, "adaptive-t-relaxation": False, "scalar-relaxation": 0.7},
         z_values=[2, 6], ach_values=[1.5, 3, 6], log_fn=lambda m: None,
     )
 
@@ -2682,7 +2683,8 @@ def test_run_sweep_max_concurrent_solves_overridable_via_adv(tmp_path, monkeypat
     sr.run_sweep(
         guv_path="proj.guv", settings_path="proj.guvcfd", project_dir=str(project_dir),
         room=room, settings=_steady_state_settings(),
-        adv={"uv-zone-bins": 25, "mesh-cell-size": 0.1, "max-concurrent-solves": 2, "adaptive-t-relaxation": False},
+        adv={"uv-zone-bins": 25, "mesh-cell-size": 0.1, "max-concurrent-solves": 2, "adaptive-t-relaxation": False,
+             "scalar-relaxation": 0.7},
         z_values=[2, 6], ach_values=[1.5, 3, 6], log_fn=lambda m: None,
     )
 
