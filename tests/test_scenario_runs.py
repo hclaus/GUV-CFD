@@ -123,6 +123,7 @@ def _write_synthetic_case(tmp_path, n_cells=4):
 def test_apply_z_writes_kuv_matching_fluence_and_z(tmp_path, monkeypatch):
     monkeypatch.setattr(sr, "run_wsl_or_raise", lambda *a, **k: (_ for _ in ()).throw(
         AssertionError("no WSL call expected without a fan")))
+    monkeypatch.setattr(sr, "set_relaxation_factors", lambda *a, **k: None)
     case_dir, fluence = _write_synthetic_case(tmp_path)
 
     summary = sr._apply_z(case_dir, Z=2.0, nbins=5, fan_kwargs={}, log_fn=lambda m: None)
@@ -137,6 +138,7 @@ def test_apply_z_writes_kuv_matching_fluence_and_z(tmp_path, monkeypatch):
 def test_apply_z_recarves_fan_zone_when_fan_enabled(tmp_path, monkeypatch):
     calls = []
     monkeypatch.setattr(sr, "run_wsl_or_raise", lambda cmd, *a, **k: calls.append(cmd))
+    monkeypatch.setattr(sr, "set_relaxation_factors", lambda *a, **k: None)
     case_dir, _ = _write_synthetic_case(tmp_path)
 
     fan_kwargs = {"fan_center": (1.0, 1.0, 1.0), "fan_disk_thickness": 0.2, "fan_disk_radius": 0.6}
@@ -170,16 +172,25 @@ def test_apply_z_adaptive_t_relaxation_uses_this_zs_own_kuv_max(tmp_path, monkey
     assert summary["adaptive_scalar_relaxation"] == expected
 
 
-def test_apply_z_without_adaptive_flag_never_calls_set_relaxation_factors(tmp_path, monkeypatch):
+def test_apply_z_without_adaptive_flag_applies_configured_scalar_relaxation(tmp_path, monkeypatch):
+    # Regression for a real, live gap (2026-08-27): a sweep's combo case_dir
+    # is freshly copied from the ACH group's ONE shared flow base, which
+    # only has whatever scalar-relaxation was baked in when THAT base was
+    # built - without applying the configured value here too (mirroring
+    # the adaptive branch just above), every non-adaptive sweep run
+    # silently inherited that stale, unrelated value instead of its own
+    # settings. Confirmed directly: two real sweep runs configured for
+    # scalar-relaxation 0.3 and 0.7 both silently solved at 0.5 instead.
     monkeypatch.setattr(sr, "run_wsl_or_raise", lambda *a, **k: (_ for _ in ()).throw(
         AssertionError("no WSL call expected without a fan")))
     case_dir, _ = _write_synthetic_case(tmp_path)
 
-    def fail(*a, **k):
-        raise AssertionError("set_relaxation_factors must not be called when adaptive_t_relaxation=False")
-    monkeypatch.setattr(sr, "set_relaxation_factors", fail)
+    calls = []
+    monkeypatch.setattr(sr, "set_relaxation_factors", lambda case_dir, **kw: calls.append(kw))
 
-    summary = sr._apply_z(case_dir, Z=2500.0, nbins=5, fan_kwargs={}, log_fn=lambda m: None)
+    summary = sr._apply_z(case_dir, Z=2500.0, nbins=5, fan_kwargs={}, log_fn=lambda m: None,
+                           adaptive_t_relaxation=False, scalar_relaxation=0.35)
+    assert calls == [{"scalar_factor": 0.35}]
     assert "adaptive_scalar_relaxation" not in summary
 
 
@@ -263,7 +274,7 @@ def test_run_sweep_passes_adaptive_t_relaxation_flag_to_apply_z_per_combo(tmp_pa
 
     seen_flags = []
 
-    def fake_apply_z(case_dir, z, nbins, fan_kwargs, log_fn, adaptive_t_relaxation=False):
+    def fake_apply_z(case_dir, z, nbins, fan_kwargs, log_fn, adaptive_t_relaxation=False, **kw):
         seen_flags.append((z, adaptive_t_relaxation))
         return {"fluence_mean": 1.0, "eACH_uv_well_mixed_mean": 0.0}
     monkeypatch.setattr(sr, "_apply_z", fake_apply_z)
@@ -305,7 +316,7 @@ def test_run_decay_sweep_records_error_status_in_project_status(tmp_path, monkey
     settings = {"sim-type": "decay", "fan-enable": False, "inlet2-enable": False, "outlet2-enable": False,
                 "inlet-wall": "xMin", "inlet-size-w": 0.3, "inlet-size-h": 0.3, "mech-ach-only": False,
                 "pimple-write-interval": 3}
-    adv = {"adaptive-t-relaxation": False, "uv-zone-bins": 5, "pimple-delta-t": 0.5, "max-co": 5,
+    adv = {"adaptive-t-relaxation": False, "scalar-relaxation": 0.7, "uv-zone-bins": 5, "pimple-delta-t": 0.5, "max-co": 5,
            "decay-ach-min-fraction": 90.0, "decay-each-min-fraction": 90.0, "decay-each-max-fraction": 99.9,
            "t-clamp-decay-enabled": False, "t-clamp-decay-multiplier": 1.3}
 
@@ -450,7 +461,8 @@ def test_run_sweep_keeps_shared_dirs_when_setting_enabled(tmp_path, monkeypatch)
                 "phase1-iterations": 100, "phase2-iterations": 100, "target-t-ss": 1.0,
                 "inject-x-input": 2, "inject-y-input": 2.5, "inject-z-input": 1.3, "z-value": 6,
                 "source-zone-size": 0.3}
-    adv = {"adaptive-t-relaxation": False, "uv-zone-bins": 25, "mesh-cell-size": 0.1, "keep-shared-scratch-dirs": True}
+    adv = {"adaptive-t-relaxation": False, "scalar-relaxation": 0.7, "uv-zone-bins": 25, "mesh-cell-size": 0.1,
+           "keep-shared-scratch-dirs": True}
 
     sr.run_sweep(
         guv_path="proj.guv", settings_path="proj.guvcfd", project_dir=str(project_dir),
@@ -482,7 +494,8 @@ def test_run_decay_sweep_keeps_shared_dirs_when_setting_enabled(tmp_path, monkey
                 "phase1-iterations": 100, "phase2-iterations": 100, "target-t-ss": 1.0,
                 "inject-x-input": 2, "inject-y-input": 2.5, "inject-z-input": 1.3, "z-value": 6,
                 "source-zone-size": 0.3}
-    adv = {"adaptive-t-relaxation": False, "uv-zone-bins": 25, "mesh-cell-size": 0.1, "keep-shared-scratch-dirs": True}
+    adv = {"adaptive-t-relaxation": False, "scalar-relaxation": 0.7, "uv-zone-bins": 25, "mesh-cell-size": 0.1,
+           "keep-shared-scratch-dirs": True}
 
     sr.run_decay_sweep(
         guv_path="proj.guv", settings_path="proj.guvcfd", project_dir=str(project_dir),
@@ -684,7 +697,8 @@ def test_run_decay_sweep_seeds_flow_base_from_existing_done_combo(tmp_path, monk
     monkeypatch.setattr(sr, "_run_decay_scenario", lambda *a, **k: {
         "reduction_pct": 1.0, "eACH_uv_effective": 1.0, "eACH_uv_well_mixed": 1.0, "phase1": {}, "phase2": {}})
     monkeypatch.setattr(sr, "run_wsl_or_raise", lambda *a, **k: None)
-    adv = {"adaptive-t-relaxation": False, "uv-zone-bins": 25, "mesh-cell-size": 0.1, "keep-shared-scratch-dirs": True}
+    adv = {"adaptive-t-relaxation": False, "scalar-relaxation": 0.7, "uv-zone-bins": 25, "mesh-cell-size": 0.1,
+           "keep-shared-scratch-dirs": True}
 
     sr.run_decay_sweep(
         guv_path="proj.guv", settings_path="proj.guvcfd", project_dir=str(project_dir),
@@ -735,7 +749,8 @@ def test_run_decay_sweep_second_launch_reuses_matching_flow_and_control(tmp_path
 
     room = type("Room", (), {"x": 4.0, "y": 5.0, "z": 2.7})()
     settings = _decay_reuse_settings()
-    adv = {"adaptive-t-relaxation": False, "uv-zone-bins": 25, "mesh-cell-size": 0.1, "keep-shared-scratch-dirs": True}
+    adv = {"adaptive-t-relaxation": False, "scalar-relaxation": 0.7, "uv-zone-bins": 25, "mesh-cell-size": 0.1,
+           "keep-shared-scratch-dirs": True}
 
     sr.run_decay_sweep(
         guv_path="proj.guv", settings_path="proj.guvcfd", project_dir=str(project_dir),
@@ -787,7 +802,8 @@ def test_run_decay_sweep_different_guv_at_same_z_ach_gets_its_own_folder(tmp_pat
 
     room = type("Room", (), {"x": 4.0, "y": 5.0, "z": 2.7})()
     settings = _decay_reuse_settings()
-    adv = {"adaptive-t-relaxation": False, "uv-zone-bins": 25, "mesh-cell-size": 0.1, "keep-shared-scratch-dirs": True}
+    adv = {"adaptive-t-relaxation": False, "scalar-relaxation": 0.7, "uv-zone-bins": 25, "mesh-cell-size": 0.1,
+           "keep-shared-scratch-dirs": True}
 
     results_seen = []
     sr.run_decay_sweep(
@@ -879,7 +895,8 @@ def test_switching_a_steady_state_project_to_decay_mode_gets_its_own_folder_and_
         "inject-x-input": 2, "inject-y-input": 2.5, "inject-z-input": 1.3, "z-value": 6,
         "source-zone-size": 0.3,
     })
-    adv = {"adaptive-t-relaxation": False, "uv-zone-bins": 25, "mesh-cell-size": 0.1, "keep-shared-scratch-dirs": True,
+    adv = {"adaptive-t-relaxation": False, "scalar-relaxation": 0.7, "uv-zone-bins": 25, "mesh-cell-size": 0.1,
+           "keep-shared-scratch-dirs": True,
            "pimple-delta-t": 0.5, "max-co": 5,
            "decay-ach-min-fraction": 90.0, "decay-each-min-fraction": 90.0, "decay-each-max-fraction": 99.9,
            "t-clamp-decay-enabled": False, "t-clamp-decay-multiplier": 1.3}
@@ -965,7 +982,8 @@ def test_run_decay_sweep_rebuilds_when_flow_settings_change_between_launches(tmp
 
     room = type("Room", (), {"x": 4.0, "y": 5.0, "z": 2.7})()
     base_settings = _decay_reuse_settings()
-    adv = {"adaptive-t-relaxation": False, "uv-zone-bins": 25, "mesh-cell-size": 0.1, "keep-shared-scratch-dirs": True}
+    adv = {"adaptive-t-relaxation": False, "scalar-relaxation": 0.7, "uv-zone-bins": 25, "mesh-cell-size": 0.1,
+           "keep-shared-scratch-dirs": True}
 
     sr.run_decay_sweep(
         guv_path="proj.guv", settings_path="proj.guvcfd", project_dir=str(project_dir),
@@ -1015,7 +1033,8 @@ def test_run_decay_sweep_mechanical_ach_only_skips_apply_z_and_reuses_control_re
     settings = {"sim-type": "decay", "mech-ach-only": True, "fan-enable": False,
                 "inlet2-enable": False, "outlet2-enable": False, "monitoring-enable": False,
                 "inlet-wall": "xMin", "inlet-size-w": 0.3, "inlet-size-h": 0.3}
-    adv = {"adaptive-t-relaxation": False, "uv-zone-bins": 25, "mesh-cell-size": 0.1, "keep-shared-scratch-dirs": True}
+    adv = {"adaptive-t-relaxation": False, "scalar-relaxation": 0.7, "uv-zone-bins": 25, "mesh-cell-size": 0.1,
+           "keep-shared-scratch-dirs": True}
 
     sr.run_decay_sweep(
         guv_path="proj.guv", settings_path="proj.guvcfd", project_dir=str(project_dir),
@@ -1806,6 +1825,7 @@ def test_run_decay_scenario_rebuilds_fvoptions_from_this_combos_own_kuv(tmp_path
     # confirmed directly on a real sweep where two different-Z
     # combinations produced byte-identical decay curves.
     case_dir, fluence = _write_synthetic_case(tmp_path, n_cells=8)
+    monkeypatch.setattr(sr, "set_relaxation_factors", lambda *a, **k: None)
     sr._apply_z(case_dir, Z=6.0, nbins=5, fan_kwargs={}, log_fn=lambda m: None)
 
     # Everything except the fvOptions rebuild is faked out - this test is
@@ -1829,7 +1849,7 @@ def test_run_decay_scenario_rebuilds_fvoptions_from_this_combos_own_kuv(tmp_path
     settings = {"fan-enable": False, "inlet2-enable": False, "outlet2-enable": False,
                 "inlet-wall": "xMin", "inlet-size-w": 0.3, "inlet-size-h": 0.3,
                 "monitoring-enable": False, "pimple-write-interval": 3}
-    adv = {"adaptive-t-relaxation": False, "uv-zone-bins": 5, "pimple-delta-t": 0.5, "max-co": 5,
+    adv = {"adaptive-t-relaxation": False, "scalar-relaxation": 0.7, "uv-zone-bins": 5, "pimple-delta-t": 0.5, "max-co": 5,
            "decay-ach-min-fraction": 90.0, "decay-each-min-fraction": 90.0, "decay-each-max-fraction": 99.9,
            "t-clamp-decay-enabled": False, "t-clamp-decay-multiplier": 1.3}
 
@@ -1865,6 +1885,7 @@ def test_run_decay_scenario_releases_solve_semaphore_before_waiting_on_control(t
     # an hour). Uses a REAL threading.Semaphore(1) and a real, not-yet-
     # resolved Future (not _completed_future) so the wait is genuine.
     case_dir, _ = _write_synthetic_case(tmp_path, n_cells=8)
+    monkeypatch.setattr(sr, "set_relaxation_factors", lambda *a, **k: None)
     sr._apply_z(case_dir, Z=6.0, nbins=5, fan_kwargs={}, log_fn=lambda m: None)
 
     monkeypatch.setattr(sr, "write_fvoptions_file", lambda *a, **k: None)
@@ -1884,7 +1905,7 @@ def test_run_decay_scenario_releases_solve_semaphore_before_waiting_on_control(t
     settings = {"fan-enable": False, "inlet2-enable": False, "outlet2-enable": False,
                 "inlet-wall": "xMin", "inlet-size-w": 0.3, "inlet-size-h": 0.3,
                 "monitoring-enable": False, "pimple-write-interval": 3}
-    adv = {"adaptive-t-relaxation": False, "uv-zone-bins": 5, "pimple-delta-t": 0.5, "max-co": 5,
+    adv = {"adaptive-t-relaxation": False, "scalar-relaxation": 0.7, "uv-zone-bins": 5, "pimple-delta-t": 0.5, "max-co": 5,
            "decay-ach-min-fraction": 90.0, "decay-each-min-fraction": 90.0, "decay-each-max-fraction": 99.9,
            "t-clamp-decay-enabled": False, "t-clamp-decay-multiplier": 1.3}
 
@@ -1929,6 +1950,7 @@ def test_run_decay_scenario_status_fn_gets_time_lines_and_clears_on_finish(tmp_p
     # appending them all to the log would flood it the same way the raw
     # per-iteration residual dump already doesn't.
     case_dir, _ = _write_synthetic_case(tmp_path, n_cells=8)
+    monkeypatch.setattr(sr, "set_relaxation_factors", lambda *a, **k: None)
     sr._apply_z(case_dir, Z=6.0, nbins=5, fan_kwargs={}, log_fn=lambda m: None)
 
     monkeypatch.setattr(sr, "write_fvoptions_file", lambda *a, **k: None)
@@ -1952,7 +1974,7 @@ def test_run_decay_scenario_status_fn_gets_time_lines_and_clears_on_finish(tmp_p
     settings = {"fan-enable": False, "inlet2-enable": False, "outlet2-enable": False,
                 "inlet-wall": "xMin", "inlet-size-w": 0.3, "inlet-size-h": 0.3,
                 "monitoring-enable": False, "pimple-write-interval": 3}
-    adv = {"adaptive-t-relaxation": False, "uv-zone-bins": 5, "pimple-delta-t": 0.5, "max-co": 5,
+    adv = {"adaptive-t-relaxation": False, "scalar-relaxation": 0.7, "uv-zone-bins": 5, "pimple-delta-t": 0.5, "max-co": 5,
            "decay-ach-min-fraction": 90.0, "decay-each-min-fraction": 90.0, "decay-each-max-fraction": 99.9,
            "t-clamp-decay-enabled": False, "t-clamp-decay-multiplier": 1.3}
 
@@ -2007,6 +2029,7 @@ def test_run_decay_scenario_uses_configured_write_interval_not_duration_over_100
     # regardless of the user's own "Write interval (s)" setting - typing
     # 3 (say) had no effect at all once the run actually started.
     case_dir, _ = _write_synthetic_case(tmp_path, n_cells=8)
+    monkeypatch.setattr(sr, "set_relaxation_factors", lambda *a, **k: None)
     sr._apply_z(case_dir, Z=6.0, nbins=5, fan_kwargs={}, log_fn=lambda m: None)
 
     monkeypatch.setattr(sr, "write_fvoptions_file", lambda *a, **k: None)
@@ -2542,7 +2565,7 @@ def test_run_decay_sweep_runs_control_and_z_decay_concurrently(tmp_path, monkeyp
     room = type("Room", (), {"x": 4.0, "y": 5.0, "z": 2.7})()
     settings = dict(_decay_reuse_settings(), z_value=6)
     settings["pimple-write-interval"] = 3
-    adv = {"adaptive-t-relaxation": False, "uv-zone-bins": 5, "pimple-delta-t": 0.5, "max-co": 5,
+    adv = {"adaptive-t-relaxation": False, "scalar-relaxation": 0.7, "uv-zone-bins": 5, "pimple-delta-t": 0.5, "max-co": 5,
            "decay-ach-min-fraction": 90.0, "decay-each-min-fraction": 90.0, "decay-each-max-fraction": 99.9,
            "t-clamp-decay-enabled": False, "t-clamp-decay-multiplier": 1.3}
 

@@ -571,7 +571,7 @@ def _copy_base_case(base_dir, target_dir, log_fn):
                       parent_wsl, "copying base case")
 
 
-def _apply_z(case_dir, Z, nbins, fan_kwargs, log_fn, adaptive_t_relaxation=False):
+def _apply_z(case_dir, Z, nbins, fan_kwargs, log_fn, adaptive_t_relaxation=False, scalar_relaxation=0.7):
     """Recompute the Z-dependent files in an already flow-converged,
     freshly-copied case dir: kUV and cellZones.
 
@@ -603,6 +603,10 @@ def _apply_z(case_dir, Z, nbins, fan_kwargs, log_fn, adaptive_t_relaxation=False
     relaxation ONE placeholder Z happened to need, then have every other
     Z in the sweep silently inherit that same, likely-wrong value via
     _copy_base_case - confirmed as a real gap, not just a theoretical one.
+
+    scalar_relaxation: applied (also on this Z's own freshly-copied
+    case_dir, same reasoning as above) whenever adaptive_t_relaxation is
+    False - the fixed/manual scalar-relaxation value to use instead.
     """
     patch_names = read_boundary_patch_names(case_dir)
     fluence_values = np.array(read_openfoam_scalar_field(f"{case_dir}/0/fluenceRate"))
@@ -645,6 +649,18 @@ def _apply_z(case_dir, Z, nbins, fan_kwargs, log_fn, adaptive_t_relaxation=False
         log_fn(f"  Adaptive T-relaxation: kUV.max={kuv_max:.4g} -> scalar-relaxation={adaptive_relax:.3g}...")
         set_relaxation_factors(case_dir, scalar_factor=adaptive_relax)
         result["adaptive_scalar_relaxation"] = adaptive_relax
+    else:
+        # Mirrors the adaptive branch above for the same reason (see this
+        # function's own docstring): a sweep's Z10_ACH6 (etc.) case_dir is
+        # freshly copied from the ACH group's ONE shared flow base, which
+        # only ever has whatever scalar-relaxation was in effect when that
+        # base happened to be built - without this, every Z in the sweep
+        # silently inherits that one baked-in value regardless of its own
+        # configured scalar_relaxation (confirmed as a real, live gap
+        # 2026-08-27: two sweep runs configured for 0.3 and 0.7 both
+        # silently solved at a stale, unrelated 0.5 inherited from the
+        # shared base's own original build).
+        set_relaxation_factors(case_dir, scalar_factor=scalar_relaxation)
     return result
 
 
@@ -1825,7 +1841,8 @@ def run_decay_sweep(guv_path, settings_path, project_dir, room, settings, adv,
                 uv_fingerprint = None  # no UV/lamp physics involved at all in this mode
             else:
                 z_summary = _apply_z(case_dir, z, adv["uv-zone-bins"], ctx["fan_kw"], combo_log_fn,
-                                  adaptive_t_relaxation=adv["adaptive-t-relaxation"])
+                                  adaptive_t_relaxation=adv["adaptive-t-relaxation"],
+                                  scalar_relaxation=adv["scalar-relaxation"])
                 uv_fingerprint = compute_uv_fingerprint(case_dir)
                 # The future itself is handed through, not .result() here -
                 # control runs concurrently with this Z's own decay solve
