@@ -1,6 +1,33 @@
 import json
+import time
 
-from guvcfd.qtapp.run_state import RunState, _settings_mismatch, probe_resumable_state
+from guvcfd.qtapp.run_state import RunState, _settings_mismatch, launch_run, probe_resumable_state
+
+
+def test_launch_run_stores_the_launched_z_and_ach_on_state(monkeypatch):
+    # Regression for a real, reported bug: the Run tab's single-run
+    # progress table displayed Z/ACH read from the Simulation Settings
+    # dialog's own spinboxes, which can differ from what was actually
+    # typed into the Run tab's own Z/ACH fields and launched - the solve
+    # itself always used the correct values, but the table showed stale
+    # ones. state.z/state.ach must reflect what launch_run was actually
+    # given, set synchronously before the background worker thread starts,
+    # so the caller (Run tab) can render from state instead of re-querying
+    # a separate, possibly out-of-sync widget.
+    import guvcfd.qtapp.run_state as run_state_module
+    monkeypatch.setattr(run_state_module, "_run_steady_state", lambda *a, **k: None)
+
+    state = RunState()
+    settings = {"sim-type": "steady_state", "z-value": 4.0, "ach": 3.0}
+    launch_run(state, "proj.guv", "case_dir", room=None, settings=settings)
+
+    assert state.z == 4.0
+    assert state.ach == 3.0
+
+    for _ in range(50):
+        if state.status != "running":
+            break
+        time.sleep(0.02)
 
 
 def test_begin_chunked_phases_offsets_raw_time_within_a_phase():

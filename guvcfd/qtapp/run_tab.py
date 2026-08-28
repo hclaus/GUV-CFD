@@ -436,7 +436,6 @@ class RunTab(QWidget):
             self.run_finished.emit()
 
     def _update_single_table(self, state):
-        tab = self.project_setup_tab
         self.table.setRowCount(1)
         if state.status == "done" and state.results:
             status, metrics = "Finished", combo_summary_metrics(state.results)
@@ -446,7 +445,14 @@ class RunTab(QWidget):
             status, metrics = state.stage, {}  # e.g. "Setup"/"Flow field calc"/"Decay sim" - not a bare "running"
         else:
             status, metrics = state.status, {}
-        self._set_table_row(0, tab.get_value("z-value"), tab.get_value("ach"), status, metrics)
+        # state.z/state.ach (set at launch time - see run_state.launch_run/
+        # launch_continue), NOT the Simulation Settings dialog's own Z/ACH
+        # spinboxes (tab.get_value("z-value")/("ach")) - those can hold
+        # different values than what was actually launched, since they're
+        # separate widgets from the Run tab's own Z/ACH list fields
+        # (confirmed real: the table showed stale Z/ACH while the solve
+        # itself used the correct, on-screen values).
+        self._set_table_row(0, state.z, state.ach, status, metrics)
 
     def _update_sweep_table(self, state):
         self.table.setRowCount(len(state.combos))

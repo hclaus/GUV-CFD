@@ -124,6 +124,14 @@ class RunState:
         self.log = []
         self.case_dir = None
         self.sim_type = None
+        # The Z/ACH this run actually launched with - the Run tab's progress
+        # table must read these, not re-query the Simulation Settings
+        # dialog's own Z/ACH spinboxes, which can hold different values
+        # than what was typed into the Run tab's own list fields at launch
+        # time (confirmed real: the table showed stale Z/ACH while the
+        # solve itself used the correct, on-screen values).
+        self.z = None
+        self.ach = None
         self.current_time = None
         self.target_time = None
         self.phase_start_time = None
@@ -304,6 +312,8 @@ def launch_run(state, guv_path, case_dir, room, settings):
     state.status = "running"
     state.case_dir = case_dir
     state.sim_type = settings["sim-type"]
+    state.z = settings["z-value"]
+    state.ach = settings["ach"]
     state.start_time = time.time()
 
     def worker():
@@ -336,6 +346,8 @@ def launch_continue(state, guv_path, case_dir, room, settings):
     state.status = "running"
     state.case_dir = case_dir
     state.sim_type = settings["sim-type"]
+    state.z = settings["z-value"]
+    state.ach = settings["ach"]
     state.start_time = time.time()
 
     def worker():
