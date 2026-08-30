@@ -5,7 +5,8 @@ import pytest
 
 import guvcfd.steady_state_pipeline as ssp
 from guvcfd.steady_state_pipeline import (
-    _chunk_write_interval, _clear_phase1_checkpoint, _clear_phase2_pending, _list_time_dirs,
+    _apply_phase1_tclamp_decay, _chunk_write_interval, _clear_phase1_checkpoint, _clear_phase2_pending,
+    _list_time_dirs,
     _point_phase_summary, _read_phase1_checkpoint, _read_phase1_pending, _read_phase2_pending,
     _rename_chunk_time_dirs, _room_phase_summary, _run_phase, _write_phase1_checkpoint,
     _write_phase1_pending, _write_phase2_pending,
@@ -714,3 +715,44 @@ def test_phase1_checkpoint_clear_is_a_noop_when_absent(tmp_path):
 def test_phase1_checkpoint_corrupted_file_reads_as_none(tmp_path):
     (tmp_path / "phase1_checkpoint.json").write_text("{not valid json")
     assert _read_phase1_checkpoint(str(tmp_path)) is None
+
+
+# --- _apply_phase1_tclamp_decay (2026-08-28: closes the gap where Phase 1
+# never had TClampDecay protection at all, only Phase 2 - see
+# estimate_source_zone_flush_T's docstring in tclamp_decay.py for why
+# Phase 1 needs a different Tmax reference than Phase 2's source_zone_max_T,
+# which needs Phase 1's own converged result that doesn't exist yet while
+# Phase 1 itself is running) ---
+
+def test_apply_phase1_tclamp_decay_is_a_noop_when_multiplier_is_none(monkeypatch):
+    calls = []
+    monkeypatch.setattr(ssp, "estimate_source_zone_flush_T", lambda *a, **k: calls.append("estimate") or 99.0)
+    monkeypatch.setattr(ssp, "ensure_tclamp_decay_compiled", lambda *a, **k: calls.append("compile"))
+    monkeypatch.setattr(ssp, "splice_tclamp_decay_if_needed", lambda *a, **k: calls.append("splice"))
+
+    result = _apply_phase1_tclamp_decay("case_dir", (0.4, 1.2, 1.3), 0.4, 0.0658, 0.1, (3.2, 4.8, 2.57),
+                                         None, log_fn=lambda m: None)
+
+    assert result is None
+    assert calls == []  # disabled - none of the expensive/side-effecting steps should run at all
+
+
+def test_apply_phase1_tclamp_decay_computes_tmax_from_the_flush_estimate_and_splices(monkeypatch):
+    estimate_calls = []
+    def fake_estimate(case_dir, source_center, source_size, G, cell_size=None, room_dims=None):
+        estimate_calls.append((case_dir, source_center, source_size, G, cell_size, room_dims))
+        return 30.0
+    monkeypatch.setattr(ssp, "estimate_source_zone_flush_T", fake_estimate)
+    compile_calls = []
+    monkeypatch.setattr(ssp, "ensure_tclamp_decay_compiled", lambda log_fn: compile_calls.append(log_fn))
+    splice_calls = []
+    monkeypatch.setattr(ssp, "splice_tclamp_decay_if_needed",
+                         lambda case_dir, tmax: splice_calls.append((case_dir, tmax)))
+
+    result = _apply_phase1_tclamp_decay("phase1_dir", (0.4, 1.2, 1.3), 0.4, 0.0658, 0.1, (3.2, 4.8, 2.57),
+                                         1.3, log_fn=lambda m: None)
+
+    assert estimate_calls == [("phase1_dir", (0.4, 1.2, 1.3), 0.4, 0.0658, 0.1, (3.2, 4.8, 2.57))]
+    assert result == pytest.approx(1.3 * 30.0)
+    assert len(compile_calls) == 1
+    assert splice_calls == [("phase1_dir", pytest.approx(39.0))]

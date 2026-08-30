@@ -40,6 +40,7 @@ from .splice import (
 )
 from .tclamp_decay import (
     source_zone_max_T, ensure_tclamp_decay_compiled, splice_tclamp_decay_if_needed,
+    estimate_source_zone_flush_T,
 )
 from .wsl_utils import (
     wsl_path, run_wsl_or_raise, run_wsl_streaming, StoppedByUser,
@@ -1106,6 +1107,31 @@ def clear_phase_resume_state(case_dir):
 REFERENCE_TARGET_T_SS = 1.0
 
 
+def _apply_phase1_tclamp_decay(case_dir, source_center, source_size, G, cell_size, room_dims,
+                                t_clamp_decay_multiplier, log_fn):
+    """Splice TClampDecay into Phase 1's own controlDict, if enabled -
+    idempotent (safe to call whether this is a fresh start or a resume of
+    an already-spliced case, see splice_tclamp_decay_if_needed). Returns
+    the Tmax used, or None if disabled.
+
+    Uses estimate_source_zone_flush_T, NOT source_zone_max_T - Phase 2's
+    own Tmax is Phase 1's converged source-zone max T, but that reference
+    doesn't exist yet while Phase 1 itself is still running (see that
+    function's docstring for the chicken-and-egg problem this avoids and
+    the local-flush estimate that replaces it).
+    """
+    if t_clamp_decay_multiplier is None:
+        return None
+    zone_flush_T = estimate_source_zone_flush_T(case_dir, source_center, source_size, G,
+                                                 cell_size=cell_size, room_dims=room_dims)
+    t_clamp_max = t_clamp_decay_multiplier * zone_flush_T
+    log_fn(f"  T-clamp-decay (Phase 1): estimated source-zone flush T={zone_flush_T:.4g} -> "
+           f"Tmax={t_clamp_max:.4g} ({t_clamp_decay_multiplier:g}x)")
+    ensure_tclamp_decay_compiled(log_fn)
+    splice_tclamp_decay_if_needed(case_dir, t_clamp_max)
+    return t_clamp_max
+
+
 def run_steady_state_scenario(case_dir, room_x, room_y, room_z, ach, Z, nbins=25,
                                source_center=None, source_size=0.3, target_T_ss=REFERENCE_TARGET_T_SS,
                                cell_size=0.1, inlet_velocity=(0.278, 0, 0),
@@ -1376,6 +1402,9 @@ def run_steady_state_scenario(case_dir, room_x, room_y, room_z, ach, Z, nbins=25
             summary["injection_rate_total"] = G
             source_entry = source_fvoptions_entry(Su)
             fan_entries = [fan_entry] if fan_entry is not None else []
+            summary["phase1_t_clamp_decay_max"] = _apply_phase1_tclamp_decay(
+                case_dir, source_center, source_size, G, cell_size, (room_x, room_y, room_z),
+                t_clamp_decay_multiplier, log_fn)
 
             if phase1_resume_decision == "continue":
                 additional = phase1_resume_additional_iterations or phase1_iterations
@@ -1472,6 +1501,9 @@ def run_steady_state_scenario(case_dir, room_x, room_y, room_z, ach, Z, nbins=25
             # (e.g. CFU/s if T represents CFU/m^3 - see the T-field note in the report).
             summary["injection_rate_total"] = G
             log_fn(f"  G={G:.4g}, Su={Su:.4g}")
+            summary["phase1_t_clamp_decay_max"] = _apply_phase1_tclamp_decay(
+                case_dir, source_center, source_size, G, cell_size, room_dims,
+                t_clamp_decay_multiplier, log_fn)
 
             source_entry = source_fvoptions_entry(Su)
             fan_entries = [fan_entry] if fan_entry is not None else []

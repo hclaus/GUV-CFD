@@ -1264,3 +1264,155 @@ observed to diverge. Decay mode carves no source zone, so `Tmax` there is
 simply `t-clamp-decay-multiplier * REFERENCE_TARGET_T_SS` (T starts uniform
 at that value with no injection during the UV-on run, only removal - the
 known starting value already IS the physical ceiling).
+
+## 2026-08-28 — Phase 1 spatial-stability diagnostic, momentum-relaxation sweep, and extending TClampDecay to Phase 1
+
+**Context: a real production crash.** A live sweep (`patient_ward_4B1_v7`,
+momentum-relaxation=0.45) crashed Z7/Z10 with genuine sigFpe (T reaching
+1e123-1e131 at kUV.max=3-4, much lower than the 60.85 extreme case above) -
+simply because TClampDecay didn't exist yet when the run was launched.
+Retrying with the clamp enabled fixed the crash, but the non-crashed
+combos (Z2/Z4) turned out to have real per-cell outliers too (negative
+cells to -2.5 magnitude, max/mean ratios to 359x) and non-converged Phase 1
+(CV 2.4-13.9%, no accepted T-infinity fit) - "completed successfully" did
+not mean "clean field." This, plus a separately-noticed Phase 1 room-average
+oscillation, motivated a deeper look at Phase 1 specifically.
+
+**Momentum-relaxation sweep.** Phase 1's own room-average T curve
+(Z2_ACH6, momentum=0.45) showed a genuine, real oscillation independent of
+Phase 2/TClampDecay's own concern: rise to 1.45 at iter~1300, dip to 1.28 at
+iter~1950 (~12% drop), recovery to 1.67-1.75 by iter~3250+ - Phase 1 has no
+UV sink, so this is a momentum/flow-convergence issue, not a T-relaxation or
+UV-sink issue. Momentum=0.1 (single manual test) gave clean, converged
+results (T-infinity fit CV=0.21%). Momentum=0.05 broke flow-convergence's
+own plateau-detection outright: both ACH=3 and ACH=6 control runs showed
+`ACH(T)` (fit from the UV-off control's own decay curve) at only ~7.5-8% of
+the mass-flow-measured ACH - the tiny per-iteration steps fooled the
+plateau check into declaring "stable" before the flow field was actually
+fully developed (needed 2000 iterations to even *look* stable, vs. 1000 at
+momentum=0.45, with proportionally *more* relative movement remaining
+between checks: 0.001878->0.001788 at momentum=0.05 vs. 0.001530->0.001522
+at momentum=0.45). Web research found no standard scalar-vs-momentum
+relaxation ratio exists in CFD literature (case-by-case even in stiff-
+chemistry contexts, validating this project's own kUV.max-derived adaptive
+formula rather than a fixed ratio), but did surface "alpha>0.3 recommended
+even for difficult convergence cases" as a practical floor - momentum=0.05
+sits genuinely outside normal practice.
+
+**Does the T pattern stay fixed (amplitude-only) or reorganize spatially?**
+Built a dedicated diagnostic (`_build_flow_base` + `_run_shared_phase1`
+called directly, `keep_all_timesteps=True`, `t-infinity-early-stop-enabled`
+off so the full 8000-iteration budget always runs) at momentum=0.3 and 0.4,
+capturing a T-field snapshot every 200 iterations. Found pairs of iterations
+with matched room-average T (within 0.02, hundreds-to-thousands of
+iterations apart - the cleanest test of "same amplitude, different time ->
+same pattern?") and computed Spearman correlation (rank-based, robust to
+outliers) between their per-cell T fields: consistently 0.70-0.89 across
+30+ pairs at each momentum value, never approaching the >0.95 that would
+indicate pure amplitude modulation. **The T distribution genuinely
+reorganizes spatially during Phase 1 - it is not a fixed pattern with a
+modulating amplitude.**
+
+**Is the oscillation a decaying transient (tied to the T=0 "seed") or a
+sustained/natural instability?** Cycle-to-cycle amplitude clearly
+*decreases* at momentum=0.45 (first dip -0.18/12%, second dip only
+-0.05/3%, ~3.5x reduction) and at momentum=0.3 (-0.26 then -0.12, ~2x
+reduction) - the signature of a damping transient ringing as it settles
+from the abrupt "T starts at 0 + step-function source switches on" initial
+condition, not a sustained limit cycle. Momentum=0.4's run ended mid-swing
+(CV=8.45%, "NOT YET PLATEAUED") so this was inconclusive there specifically.
+Checked directly whether the oscillation's shape correlates with chunk-
+restart bookkeeping (`phase-chunk-size`=400, a fresh simpleFoam process
+re-reading from `0/` at each boundary): the momentum=0.45 curve is
+perfectly smooth through all 12 checked chunk boundaries (400-4800), and
+the momentum=0.3/0.4 diagnostics (deliberately run as single continuous
+solves, no chunking at all) show the same kind of multi-cycle oscillation
+regardless - ruling out chunk-restart artifacts as the cause of the
+large-scale oscillation (a separate, much smaller +3-4.5% jump effect at
+chunk boundaries was found elsewhere this session in different contexts;
+it does not explain this curve's own shape).
+
+**Phase 1 never had TClampDecay protection at all** - confirmed by reading
+`_run_shared_phase1` directly: it never passed `t_clamp_decay_multiplier`
+to `run_steady_state_scenario`, and that parameter's only consumer (the
+clamp-splicing code) sat entirely after `if phase1_only: return summary`,
+so it structurally could never fire for a Phase-1-only call regardless.
+Confirmed real: at momentum=0.3, Phase 1's T field had negative cells (min
+-1.55, up to 286 per snapshot) and outliers reaching 79.0 against a
+room-average of ~1.3-1.8 (~44-60x). Since T has no sink term in Phase 1
+(kUV field IS real and non-zero there - computed once during setup_case
+regardless of phase - it's just never multiplied in as an active fvOptions
+sink), negative T can't flip a sink into a source the way it does in Phase
+2's confirmed divergence mechanism, and T is a decoupled passive scalar
+here (doesn't feed back into U/p/k/omega) - so this isn't a flow-solver-
+destabilizing risk. It matters for a different reason: Phase 1's
+uncorrected field directly seeds both Phase 2's initial T and, more
+importantly, Phase 2's own Tmax reference (`source_zone_max_T` reads
+Phase 1's converged snapshot) - a spurious outlier in Phase 1 would inflate
+Phase 2's Tmax and weaken its clamp before Phase 2 even starts.
+
+**Spatial spread of the outlier peaks**: checked whether extreme cells are
+isolated single-cell spikes (candidate fix: local-neighborhood averaging)
+or a genuine broader hot region. All peaks sit right at the injection zone
+(within ~0.25m of the source center, exactly where physically expected).
+Distance-shell analysis around the peak cell showed a smooth, monotonic
+falloff - immediate neighbors retain 76-84% of the peak value, 2 cells out
+~50-55%, 3-4 cells out ~20%, only past ~0.45m (4-5 cells) dropping to
+single digits. This is a real concentration gradient at a point source, not
+numerical noise sitting on an otherwise-normal neighborhood - local
+averaging would need a 4-5-cell kernel to meaningfully reduce the peak,
+which would just smear a physically real gradient with numerical diffusion
+rather than removing an artifact. A magnitude-based ceiling (TClampDecay)
+targets the actual problem (unbounded magnitude growth, no sink to cap it)
+rather than the wrong one (spatial anomaly, which this isn't).
+
+**Fix: `estimate_source_zone_flush_T`** (`tclamp_decay.py`) - a NEW Tmax
+reference for Phase 1 specifically, since Phase 2's own reference
+(`source_zone_max_T`, Phase 1's converged source-zone max) doesn't exist
+yet while Phase 1 itself is running (chicken-and-egg). Treats the source
+cellZone as its own tiny well-mixed control volume, flushed by the LOCAL
+flow velocity through it rather than room-scale ACH (the room-average
+steady state `target_T_ss` was calibrated against via
+`compute_source_strength` - that doesn't apply locally, since T only
+leaves the injection zone via local advection/diffusion, long before it
+reaches the room's real outlet): `T_local_peak ~= G_total / (U_local *
+A_cross)`, with `U_local` read from the already-converged flow base's own
+`0/U` (available before Phase 1 ever runs - no empirical bootstrap needed)
+and `A_cross ~= source_size^2`. Validated against real data: mean local
+|U| of 0.0139 m/s in a real case gave an estimate of 29.5-42.4 (mean vs.
+most-stagnant local velocity), matching the empirically observed range
+(36.93 converged-state, up to 79.0 at a noisy peak) within roughly a
+factor of 2 - good enough for a generous safety-margin Tmax, not a tight
+physical bound. Wired into `run_steady_state_scenario` via a new
+`_apply_phase1_tclamp_decay` helper, called in both Phase 1's fresh-start
+and resume branches (idempotent, matching `splice_tclamp_decay_if_needed`'s
+existing safety); `_run_shared_phase1` now passes
+`t_clamp_decay_multiplier` through, closing the gap for every sweep call
+site. The two single-run call sites (`app.py`, `qtapp/run_state.py`)
+already passed this parameter (it simply had no effect on Phase 1 before),
+so they pick up the fix automatically with no changes needed there.
+
+**Validated on the real worst-case (momentum=0.3, Tmax=48.01 from the
+formula above)**: reran Phase 1 with the clamp active and compared against
+the unclamped run cell-by-cell. Negative-cell contamination dropped from
+24,484 to 10,016 cell-snapshot-instances across 40 snapshots (worst value
+-1.545 -> -0.133, an order of magnitude), cells-over-Tmax dropped from 129
+to 55, and the observed max capped right at/near Tmax (79.02 -> 48.98 - not
+exactly 48.01, since the clamp corrects once per iteration and a cell can
+drift out-of-range again before the next correction, same residual
+mechanism as the one open finding in the entry above). Neither eliminates
+100% of instances for the same reason. The room-average curve's overall
+shape (rise/dip/recovery timing) was unchanged; only a small systematic
+offset appeared, sign-flipping partway through the run in a way that
+tracks exactly which outlier type dominated at that point (clamped average
++0.01 to +0.05 higher early, when negative cells were dragging the mean
+down; -0.01 to -0.07 lower late, once large positive outliers like the
+79.02 spike at iter~4600 started dominating) - both effects under 5% of
+the curve's own scale. Re-ran the matched-room-average-pair spatial
+correlation check on the clamped data: still 0.73-0.88, statistically
+unchanged from the unclamped 0.70-0.89 - ruling out outlier contamination
+as the explanation for the pattern-reorganization finding above.
+**Net: TClampDecay in Phase 1 is a correctness/cleanliness fix (materially
+reduces non-physical cells and protects Phase 2's own reference/seed), not
+a fix for the oscillation itself - that remains a flow-convergence/
+momentum-relaxation question.**

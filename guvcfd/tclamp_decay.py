@@ -23,7 +23,7 @@ from pathlib import Path
 import numpy as np
 
 from .contaminant_source import _source_box
-from .case_io import read_cell_centers, read_openfoam_scalar_field
+from .case_io import read_cell_centers, read_openfoam_scalar_field, read_openfoam_vector_field
 from .splice import splice_after_named_entry
 from .wsl_utils import read_case_file, run_wsl, run_wsl_or_raise, windows_path_to_wsl_mnt
 
@@ -56,6 +56,58 @@ def source_zone_max_T(case_dir, source_center, source_size, cell_size=None, room
         raise RuntimeError(f"source_zone_max_T: {snapshot_path} has {len(t_values)} cells but "
                             f"{time_dir}/Cx has {len(centers)} - mesh/field mismatch")
     return float(t_values[mask].max())
+
+
+def estimate_source_zone_flush_T(case_dir, source_center, source_size, G_total, cell_size=None, room_dims=None,
+                                  time_dir="0", min_velocity=1e-4):
+    """A priori estimate of the injection zone's own natural local peak T,
+    usable BEFORE Phase 1 has ever run - unlike source_zone_max_T (which
+    needs Phase 1's own converged T field as its reference), this only
+    needs the case's already-converged FLOW field (0/U, present as soon as
+    the shared flow base is built) plus the source's own known injection
+    strength. Closes a real chicken-and-egg gap: Phase 2's Tmax is Phase
+    1's own converged source-zone max T, but Phase 1 has no such reference
+    for itself while it's still running.
+
+    Treats the source cellZone as its own tiny well-mixed control volume,
+    flushed by the LOCAL flow velocity through it - NOT by room-scale ACH.
+    room-average steady state (target_T_ss) was calibrated against ACH via
+    compute_source_strength precisely because T only leaves the room
+    through the room's real outlet, at the room-average rate; but T only
+    leaves the small injection zone itself via local advection/diffusion,
+    governed by the local flow speed there, which can be (and typically
+    is, confirmed empirically: ~30-60x below the room average in a
+    real case) very different from that room-average rate.
+
+    T_local_peak ~= G_total / (U_local * A_cross)
+
+    U_local: mean |U| within the source zone's own cells (order-of-
+    magnitude local flushing speed). A_cross: source_size^2 - the zone is
+    a cube, and this is a generous, direction-agnostic estimate of its
+    cross-sectional area, not a precise one (fine for a safety-margin
+    Tmax reference, not for a tight physical bound).
+
+    min_velocity floors U_local so a near-stagnant source zone (U_local
+    close to 0, a genuine local dead spot) doesn't blow this estimate up
+    to something meaningless - confirmed against a real case: mean local
+    |U| of ~0.014 m/s gave an estimate (~30) within a factor of ~2 of the
+    empirically observed peak (37-79 across a noisy run), validating this
+    as a reasonable, computable-in-advance Tmax reference.
+    """
+    centers = read_cell_centers(case_dir, time_dir)
+    U = read_openfoam_vector_field(f"{case_dir}/{time_dir}/U")
+    lo, hi = _source_box(source_center, source_size, cell_size=cell_size, room_dims=room_dims)
+    lo, hi = np.array(lo), np.array(hi)
+    mask = np.all((centers >= lo) & (centers <= hi), axis=1)
+    if not mask.any():
+        raise RuntimeError(f"estimate_source_zone_flush_T: no cells found inside the source box "
+                            f"{lo.tolist()}-{hi.tolist()} in {case_dir}")
+    if len(U) != len(centers):
+        raise RuntimeError(f"estimate_source_zone_flush_T: {time_dir}/U has {len(U)} cells but "
+                            f"{time_dir}/Cx has {len(centers)} - mesh/field mismatch")
+    u_local = max(float(np.linalg.norm(U[mask], axis=1).mean()), min_velocity)
+    a_cross = source_size ** 2
+    return G_total / (u_local * a_cross)
 
 
 def ensure_tclamp_decay_compiled(log_fn=None):

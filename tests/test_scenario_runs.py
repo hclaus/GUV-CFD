@@ -1427,7 +1427,8 @@ def test_run_shared_phase1_clones_base_dir_and_runs_phase1_only(tmp_path, monkey
     adv = {"adaptive-t-relaxation": False, "mesh-cell-size": 0.1, "plateau-rel-tol": 1.0,
            "t-infinity-early-stop-enabled": False, "phase1-require-stable-extrapolation": False, "keep-all-timesteps": False,
            "phase-chunk-size": 400, "phase-write-interval": 200,
-           "deltat-scaling-enabled": False, "deltat-effective-fraction": 0.7, "deltat-target-fraction": 0.995}
+           "deltat-scaling-enabled": False, "deltat-effective-fraction": 0.7, "deltat-target-fraction": 0.995,
+           "t-clamp-decay-enabled": False, "t-clamp-decay-multiplier": 1.3}
 
     sr._run_shared_phase1("base_dir", "phase1_dir", ach=3.0, room=room, settings=settings, adv=adv,
                            log_fn=lambda m: None, should_stop=None, solver_log_fn=None)
@@ -1439,6 +1440,40 @@ def test_run_shared_phase1_clones_base_dir_and_runs_phase1_only(tmp_path, monkey
     assert call["ach"] == 3.0
     assert call["Z"] == 6  # placeholder - Phase 1 has no UV, so Z is irrelevant
     assert call["phase1_only"] is True
+    assert call["t_clamp_decay_multiplier"] is None  # disabled in this test's adv
+
+
+def test_run_shared_phase1_passes_t_clamp_decay_multiplier_when_enabled(tmp_path, monkeypatch):
+    # Regression: _run_shared_phase1 used to never pass t_clamp_decay_multiplier
+    # to run_steady_state_scenario at all - Phase 1 had no clamp protection
+    # even when t-clamp-decay-enabled was on, unlike Phase 2 (see
+    # steady_state_pipeline._apply_phase1_tclamp_decay/
+    # estimate_source_zone_flush_T for the Phase-1-specific Tmax reference
+    # this now uses, since Phase 2's own reference - Phase 1's converged
+    # source-zone max T - doesn't exist yet while Phase 1 itself runs).
+    monkeypatch.setattr(sr, "_copy_base_case", lambda base, target, log_fn: None)
+    scenario_calls = []
+    def fake_run_steady_state_scenario(case_dir, room_x, room_y, room_z, ach, Z, **kwargs):
+        scenario_calls.append(kwargs)
+    monkeypatch.setattr(sr, "run_steady_state_scenario", fake_run_steady_state_scenario)
+
+    room = type("Room", (), {"x": 4.0, "y": 5.0, "z": 2.7})()
+    settings = {"fan-enable": False, "inlet2-enable": False, "outlet2-enable": False,
+                "inlet-wall": "xMin", "inlet-y-input": 1.5, "inlet-z-input": 1.3,
+                "inlet-size-w": 0.3, "inlet-size-h": 0.3,
+                "phase1-iterations": 100, "target-t-ss": 1.0, "z-value": 6,
+                "inject-x-input": 2, "inject-y-input": 2.5, "inject-z-input": 1.3,
+                "t-ss-window-frac": None, "monitoring-enable": False, "source-zone-size": 0.3}
+    adv = {"adaptive-t-relaxation": False, "mesh-cell-size": 0.1, "plateau-rel-tol": 1.0,
+           "t-infinity-early-stop-enabled": False, "phase1-require-stable-extrapolation": False, "keep-all-timesteps": False,
+           "phase-chunk-size": 400, "phase-write-interval": 200,
+           "deltat-scaling-enabled": False, "deltat-effective-fraction": 0.7, "deltat-target-fraction": 0.995,
+           "t-clamp-decay-enabled": True, "t-clamp-decay-multiplier": 1.3}
+
+    sr._run_shared_phase1("base_dir", "phase1_dir", ach=3.0, room=room, settings=settings, adv=adv,
+                           log_fn=lambda m: None, should_stop=None, solver_log_fn=None)
+
+    assert scenario_calls[0]["t_clamp_decay_multiplier"] == 1.3
 
 
 def test_build_flow_base_reuses_existing_resolved_base(tmp_path, monkeypatch):
@@ -1592,7 +1627,8 @@ def test_run_shared_phase1_resumes_undecided_pending_instead_of_restarting(tmp_p
     adv = {"adaptive-t-relaxation": False, "mesh-cell-size": 0.1, "plateau-rel-tol": 1.0,
            "t-infinity-early-stop-enabled": False, "phase1-require-stable-extrapolation": False,
            "keep-all-timesteps": False, "phase-chunk-size": 400, "phase-write-interval": 200,
-           "deltat-scaling-enabled": False, "deltat-effective-fraction": 0.7, "deltat-target-fraction": 0.995}
+           "deltat-scaling-enabled": False, "deltat-effective-fraction": 0.7, "deltat-target-fraction": 0.995,
+           "t-clamp-decay-enabled": False, "t-clamp-decay-multiplier": 1.3}
 
     sr._run_shared_phase1(str(phase1_dir), str(phase1_dir), ach=6.0, room=room, settings=settings, adv=adv,
                            log_fn=lambda m: None, should_stop=None, solver_log_fn=None)
@@ -1658,7 +1694,8 @@ def test_run_shared_phase1_recomputes_fluence_when_resuming_pending(tmp_path, mo
     adv = {"adaptive-t-relaxation": False, "mesh-cell-size": 0.1, "plateau-rel-tol": 1.0,
            "t-infinity-early-stop-enabled": False, "phase1-require-stable-extrapolation": False,
            "keep-all-timesteps": False, "phase-chunk-size": 400, "phase-write-interval": 200,
-           "deltat-scaling-enabled": False, "deltat-effective-fraction": 0.7, "deltat-target-fraction": 0.995}
+           "deltat-scaling-enabled": False, "deltat-effective-fraction": 0.7, "deltat-target-fraction": 0.995,
+           "t-clamp-decay-enabled": False, "t-clamp-decay-multiplier": 1.3}
 
     sr._run_shared_phase1(str(phase1_dir), str(phase1_dir), ach=6.0, room=room, settings=settings, adv=adv,
                            log_fn=lambda m: None, should_stop=None, solver_log_fn=None)

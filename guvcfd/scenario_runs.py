@@ -948,6 +948,7 @@ def _run_shared_phase1(base_dir, phase1_dir, ach, room, settings, adv, log_fn, s
         log_fn=log_fn, should_stop=should_stop, solver_log_fn=solver_log_fn, should_pause=should_pause,
         status_fn=status_fn, phase1_only=True, phase1_delta_t=phase1_delta_t,
         phase1_resume_decision=phase1_resume_decision, solve_semaphore=solve_semaphore,
+        t_clamp_decay_multiplier=adv["t-clamp-decay-multiplier"] if adv["t-clamp-decay-enabled"] else None,
     )
 
 

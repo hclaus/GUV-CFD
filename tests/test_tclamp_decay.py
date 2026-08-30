@@ -4,6 +4,7 @@ import pytest
 
 from guvcfd.tclamp_decay import (
     source_zone_max_T, tclamp_decay_function_object, splice_tclamp_decay_if_needed,
+    estimate_source_zone_flush_T,
 )
 
 _CONTROL_DICT = """FoamFile
@@ -46,6 +47,24 @@ def _make_case(tmp_path, centers, t_values, snapshot_name="phase1_T.snapshot"):
     _write_scalar_field_file(case_dir / "0" / "Cz", [c[2] for c in centers])
     _write_scalar_field_file(case_dir / snapshot_name, t_values)
     (case_dir / "system" / "controlDict").write_text(_CONTROL_DICT)
+    return str(case_dir)
+
+
+def _write_vector_field_file(path, values):
+    body = "\n".join(f"({v[0]} {v[1]} {v[2]})" for v in values)
+    path.write_text(
+        "FoamFile\n{\n    class volVectorField;\n    object U;\n}\n\n"
+        f"internalField   nonuniform List<vector>\n{len(values)}\n(\n{body}\n)\n;\n"
+    )
+
+
+def _make_flow_case(tmp_path, centers, u_values):
+    case_dir = tmp_path / "flow_case"
+    (case_dir / "0").mkdir(parents=True)
+    _write_scalar_field_file(case_dir / "0" / "Cx", [c[0] for c in centers])
+    _write_scalar_field_file(case_dir / "0" / "Cy", [c[1] for c in centers])
+    _write_scalar_field_file(case_dir / "0" / "Cz", [c[2] for c in centers])
+    _write_vector_field_file(case_dir / "0" / "U", u_values)
     return str(case_dir)
 
 
@@ -96,6 +115,60 @@ def test_source_zone_max_t_raises_on_field_cell_count_mismatch(tmp_path):
     _write_scalar_field_file(Path(case_dir) / "phase1_T.snapshot", [1.0] * (len(_GRID) - 1))
     with pytest.raises(RuntimeError, match="mesh/field mismatch"):
         source_zone_max_T(case_dir, source_center=(0.5, 0.5, 0.5), source_size=0.15)
+
+
+# --- estimate_source_zone_flush_T (Phase 1's own Tmax reference - see its
+# docstring for why Phase 1 can't use source_zone_max_T, which needs Phase
+# 1's own converged T field that doesn't exist yet while Phase 1 runs) ---
+
+def test_estimate_source_zone_flush_t_uses_mean_velocity_in_the_box(tmp_path):
+    # Only the center cell (0.5,0.5,0.5) is inside a 0.05m source box - its
+    # |U|=(3,4,0) -> magnitude 5.0 is the only one that should matter.
+    u_values = [(0.0, 0.0, 0.0)] * len(_GRID)
+    center_idx = _GRID.index((0.5, 0.5, 0.5))
+    u_values[center_idx] = (3.0, 4.0, 0.0)
+    case_dir = _make_flow_case(tmp_path, _GRID, u_values)
+
+    # G_total=10, U_local=5.0, A_cross=source_size^2=0.05^2=0.0025
+    # -> 10 / (5.0 * 0.0025) = 800.0
+    result = estimate_source_zone_flush_T(case_dir, source_center=(0.5, 0.5, 0.5), source_size=0.05, G_total=10.0)
+    assert result == pytest.approx(800.0)
+
+
+def test_estimate_source_zone_flush_t_averages_multiple_cells_in_the_box(tmp_path):
+    # A 0.25m box around (0.5,0.5,0.5) covers the center cell and its 6
+    # face neighbors at 0.1m spacing (7 cells total, matching
+    # test_source_zone_max_t_picks_the_max_among_multiple_cells_in_the_box's
+    # own box) - mean |U| over exactly those 7 cells, not all 27.
+    u_values = [(1.0, 0.0, 0.0)] * len(_GRID)  # |U|=1.0 everywhere by default
+    case_dir = _make_flow_case(tmp_path, _GRID, u_values)
+
+    result = estimate_source_zone_flush_T(case_dir, source_center=(0.5, 0.5, 0.5), source_size=0.25, G_total=1.0)
+    assert result == pytest.approx(1.0 / (1.0 * 0.25 ** 2))
+
+
+def test_estimate_source_zone_flush_t_floors_near_zero_velocity(tmp_path):
+    # A near-stagnant source zone (U~0) must not blow the estimate up to
+    # something meaningless via division by ~0 - min_velocity floors it.
+    u_values = [(1e-8, 0.0, 0.0)] * len(_GRID)
+    case_dir = _make_flow_case(tmp_path, _GRID, u_values)
+
+    result = estimate_source_zone_flush_T(case_dir, source_center=(0.5, 0.5, 0.5), source_size=0.05,
+                                           G_total=10.0, min_velocity=1e-4)
+    assert result == pytest.approx(10.0 / (1e-4 * 0.05 ** 2))
+
+
+def test_estimate_source_zone_flush_t_raises_when_box_contains_no_cells(tmp_path):
+    case_dir = _make_flow_case(tmp_path, _GRID, [(1.0, 0.0, 0.0)] * len(_GRID))
+    with pytest.raises(RuntimeError, match="no cells found"):
+        estimate_source_zone_flush_T(case_dir, source_center=(5.0, 5.0, 5.0), source_size=0.05, G_total=1.0)
+
+
+def test_estimate_source_zone_flush_t_raises_on_field_cell_count_mismatch(tmp_path):
+    case_dir = _make_flow_case(tmp_path, _GRID, [(1.0, 0.0, 0.0)] * len(_GRID))
+    _write_vector_field_file(Path(case_dir) / "0" / "U", [(1.0, 0.0, 0.0)] * (len(_GRID) - 1))
+    with pytest.raises(RuntimeError, match="mesh/field mismatch"):
+        estimate_source_zone_flush_T(case_dir, source_center=(0.5, 0.5, 0.5), source_size=0.15, G_total=1.0)
 
 
 def test_tclamp_decay_function_object_has_expected_fields():
