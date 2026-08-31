@@ -30,6 +30,7 @@ from .case_io import (
 )
 from .decay_analysis import write_results_summary, mechanical_mixing_efficiency_pct, spatial_coefficient_of_variation
 from .monitoring import splice_live_vol_average_if_needed
+from .contaminant_source import breathing_inlet_velocity_constraint
 from .fan import fan_fvoptions_entry
 from .fluence import compute_fluence_at_points, compute_inactivation_rate, compute_well_mixed_eACH
 from . import help_content
@@ -1097,6 +1098,12 @@ def _finish_decay(case_dir, room, settings, summary):
                  "(empty UV source) already IS the ventilation-only measurement.")
     else:
         _run_log("=== Preparing UV-off control (subfolder \"no_UV\") - clone before either pimpleFoam run ===")
+        # The occupant is breathing in the UV-off case too, and the
+        # constraint measurably alters the flow field this run measures the
+        # ventilation rate ON - see scenario_runs._carve_breathing_inlet.
+        control_breathing_entry = (
+            breathing_inlet_velocity_constraint(zone_name="sourceZone", velocity_magnitude=0.06)
+            if adv.get("breathing-inlet-enabled", False) else None)
         prepare_ventilation_only_control(
             case_dir, control_dir, summary["inlet_velocity"],
             control_end_time, write_interval, pimple_delta_t=adv["pimple-delta-t"], max_co=adv["max-co"],
@@ -1104,7 +1111,10 @@ def _finish_decay(case_dir, room, settings, summary):
             has_outlet2=bool(settings.get("outlet2-enable")),
             sealed=False,
             log_fn=_run_log, should_stop=_should_stop,
+            breathing_entry=control_breathing_entry,
         )
+        if control_breathing_entry is not None:
+            scenario_runs._carve_breathing_inlet(control_dir, room, settings, adv, _run_log)
 
     if skip_control:
         _run_log(f"Running pimpleFoam: UV-on ({combined_end_time}s)...")

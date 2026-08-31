@@ -2726,3 +2726,49 @@ def test_run_sweep_max_concurrent_solves_overridable_via_adv(tmp_path, monkeypat
     )
 
     assert state["peak"] <= 2
+
+
+# --- breathing inlet must reach EVERY scenario, not just steady-state Phase 1/2 ---
+# (2026-08-30) The UV-off control originally wrote an empty fvOptions, so with
+# the breathing inlet on it measured the ventilation rate on a DIFFERENT flow
+# field than the Phase 2 run it gets compared against - and the eACH formulas
+# combine the two as if they shared one.
+
+def _breathing_stub_settings():
+    return {
+        "inject-x-input": 0.4, "inject-y-input": 1.2, "inject-z-input": 1.3,
+        "source-zone-size": 0.4,
+    }
+
+
+class _Room:
+    x, y, z = 4.0, 5.0, 2.7
+
+
+def test_carve_breathing_inlet_returns_none_when_disabled(monkeypatch):
+    calls = []
+    monkeypatch.setattr(sr, "write_source_topo_set_dict",
+                         lambda *a, **k: calls.append("carved"))
+    monkeypatch.setattr(sr, "run_wsl_or_raise", lambda *a, **k: calls.append("topoSet"))
+    entry = sr._carve_breathing_inlet(
+        "/case", _Room(), _breathing_stub_settings(),
+        {"breathing-inlet-enabled": False, "mesh-cell-size": 0.1}, lambda m: None)
+    assert entry is None
+    # must not carve a zone nobody asked for
+    assert calls == []
+
+
+def test_carve_breathing_inlet_carves_and_returns_the_constraint(monkeypatch):
+    calls = []
+    monkeypatch.setattr(sr, "write_source_topo_set_dict",
+                         lambda *a, **k: calls.append("carved"))
+    monkeypatch.setattr(sr, "run_wsl_or_raise", lambda *a, **k: calls.append("topoSet"))
+    entry = sr._carve_breathing_inlet(
+        "/case", _Room(), _breathing_stub_settings(),
+        {"breathing-inlet-enabled": True, "mesh-cell-size": 0.1}, lambda m: None)
+    assert entry is not None
+    assert "vectorFixedValueConstraint" in entry
+    assert "cellZone        sourceZone;" in entry
+    # the zone the constraint binds to must actually be carved - the control
+    # clones a ventilation-only base that has no sourceZone at all
+    assert calls == ["carved", "topoSet"]

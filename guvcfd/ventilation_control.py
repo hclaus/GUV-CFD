@@ -22,7 +22,8 @@ from .wsl_utils import wsl_path, run_wsl_or_raise, StoppedByUser
 def prepare_ventilation_only_control(case_dir, control_dir, inlet_velocity, pimple_end_time,
                                       pimple_write_interval, pimple_delta_t=0.5, max_co=None,
                                       inlet2_velocity=None, has_outlet2=False,
-                                      sealed=False, log_fn=print, should_stop=None):
+                                      sealed=False, log_fn=print, should_stop=None,
+                                      breathing_entry=None):
     """Clone case_dir's mesh/converged flow field into control_dir, remove
     every UV source, reset T fresh, and set its own transient-decay duration
     - everything needed before pimpleFoam can run. Split out from actually
@@ -89,8 +90,18 @@ def prepare_ventilation_only_control(case_dir, control_dir, inlet_velocity, pimp
     restore_boundary_conditions(control_dir, inlet_velocity=inlet_velocity,
                                  inlet2_velocity=inlet2_velocity, has_outlet2=has_outlet2, sealed=sealed)
 
-    log_fn("Writing an empty constant/fvOptions (no UV source - ventilation only)...")
-    write_fvoptions_file(control_dir, [])
+    if breathing_entry is not None:
+        # NOT empty when a breathing inlet is configured: the occupant is
+        # present in the UV-off case too, and their exhale measurably
+        # changes the flow field this run is measuring the ventilation rate
+        # ON. Dropping it here would measure ventilation on a different
+        # flow field than the UV-on run it gets compared against - see
+        # scenario_runs._carve_breathing_inlet.
+        log_fn("Writing constant/fvOptions with the breathing inlet only (no UV source)...")
+        write_fvoptions_file(control_dir, [breathing_entry])
+    else:
+        log_fn("Writing an empty constant/fvOptions (no UV source - ventilation only)...")
+        write_fvoptions_file(control_dir, [])
 
     log_fn("Ensuring scalarTransport1 is enabled...")
     set_function_object_enabled(control_dir, "scalarTransport1", True)

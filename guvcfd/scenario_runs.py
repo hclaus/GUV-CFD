@@ -45,7 +45,8 @@ from .case_io import (
     read_openfoam_scalar_field, write_scalar_field, snapshot_openfoam_settings,
 )
 from .cellzones import bin_decay_rates, write_cellzones
-from .contaminant_source import write_fvoptions_file, write_source_topo_set_dict
+from .contaminant_source import (breathing_inlet_velocity_constraint, write_fvoptions_file,
+                                  write_source_topo_set_dict)
 from .decay_analysis import write_results_summary, mechanical_mixing_efficiency_pct, spatial_coefficient_of_variation
 from .fan import fan_fvoptions_entry, write_fan_topo_set_dict
 from .fluence import compute_fluence_at_points, compute_inactivation_rate, compute_well_mixed_eACH
@@ -571,6 +572,41 @@ def _copy_base_case(base_dir, target_dir, log_fn):
                       parent_wsl, "copying base case")
 
 
+def _carve_breathing_inlet(case_dir, room, settings, adv, log_fn):
+    """Carve the source cellZone and return the breathing-inlet velocity
+    constraint fvOptions entry for it - or None when the feature is off.
+
+    EVERY scenario modelling this room has to apply the same injection
+    configuration: a breathing occupant is present whether or not the UV
+    lamps are on, so the UV-off control and the decay runs need this
+    exactly as much as steady-state's Phase 1/2 do. Leaving it out of the
+    control is not a harmless omission - it silently measures the
+    ventilation rate on a DIFFERENT flow field than the one Phase 2 ran on
+    (the constraint measurably alters the flow: it roughly halves the
+    per-200-iteration velocity drift, and the jet it creates can
+    short-circuit toward an extract). The eACH formulas then combine the
+    two as if they shared a flow field. See ANALYSIS_LOG.md 2026-08-30.
+
+    The zone has to be carved HERE rather than relied upon: Phase 1 carves
+    it anyway for the volumetric T source, but the control clones the flow
+    base (which has no sourceZone at all - the base is ventilation-only),
+    and the decay path's _apply_z rewrites cellZones from scratch. Both
+    would otherwise leave the constraint pointing at a cellZone that
+    doesn't exist.
+    """
+    if not adv.get("breathing-inlet-enabled", False):
+        return None
+    write_source_topo_set_dict(
+        case_dir,
+        (settings["inject-x-input"], settings["inject-y-input"], settings["inject-z-input"]),
+        settings["source-zone-size"], cell_size=adv["mesh-cell-size"],
+        room_dims=(room.x, room.y, room.z))
+    run_wsl_or_raise("topoSet -dict system/sourceTopoSetDict", wsl_path(case_dir),
+                      "topoSet (source zone for the breathing inlet)")
+    log_fn("  Breathing inlet velocity constraint enabled (U fixed to 0.06 m/s in sourceZone)")
+    return breathing_inlet_velocity_constraint(zone_name="sourceZone", velocity_magnitude=0.06)
+
+
 def _apply_z(case_dir, Z, nbins, fan_kwargs, log_fn, adaptive_t_relaxation=False, scalar_relaxation=0.7):
     """Recompute the Z-dependent files in an already flow-converged,
     freshly-copied case dir: kUV and cellZones.
@@ -1074,6 +1110,12 @@ def _run_shared_control(base_dir, control_dir, ach, room, settings, adv, log_fn,
 
     log_fn(f"=== ACH={ach}: preparing shared UV-off control ({control_end_time}s, "
            f"once per ACH) ===")
+    # Built before the clone (it's pure text, needs no case dir) so the
+    # fvOptions prepare_ventilation_only_control writes already carries it;
+    # the cellZone it binds to is carved right after, once control_dir exists.
+    breathing_entry = (breathing_inlet_velocity_constraint(zone_name="sourceZone",
+                                                            velocity_magnitude=0.06)
+                       if adv.get("breathing-inlet-enabled", False) else None)
     prepare_ventilation_only_control(
         base_dir, control_dir, base_summary["inlet_velocity"],
         control_end_time, write_interval, pimple_delta_t=adv["pimple-delta-t"], max_co=adv["max-co"],
@@ -1081,7 +1123,12 @@ def _run_shared_control(base_dir, control_dir, ach, room, settings, adv, log_fn,
         has_outlet2=bool(settings.get("outlet2-enable")),
         sealed=sealed,
         log_fn=log_fn, should_stop=should_stop,
+        breathing_entry=breathing_entry,
     )
+    if breathing_entry is not None:
+        # The base this was cloned from is ventilation-only and has no
+        # sourceZone, so the constraint's target zone must be carved here.
+        _carve_breathing_inlet(control_dir, room, settings, adv, log_fn)
 
     if should_stop is not None and should_stop():
         raise StoppedByUser("Stopped before pimpleFoam.")
@@ -1161,7 +1208,12 @@ def _run_decay_scenario(case_dir, room, settings, z, ach, adv, z_summary, log_fn
         fan_entries = [fan_fvoptions_entry(settings["fan-speed"], direction=direction)]
     k_values = read_openfoam_scalar_field(f"{case_dir}/0/kUV")
     uv_entries = _uv_fvoptions_entries(np.array(k_values), adv["uv-zone-bins"])
-    write_fvoptions_file(case_dir, uv_entries + fan_entries)
+    # Same injection configuration as every other scenario - the occupant
+    # is breathing here too. _apply_z rewrote cellZones just above, so the
+    # helper re-carves sourceZone before the constraint binds to it.
+    breathing_entry = _carve_breathing_inlet(case_dir, room, settings, adv, log_fn)
+    breathing_entries = [breathing_entry] if breathing_entry is not None else []
+    write_fvoptions_file(case_dir, uv_entries + fan_entries + breathing_entries)
     _, n_open, n_close = splice_fv_options_into_control_dict(case_dir)
     assert n_open == n_close, f"Brace mismatch after UV fvOptions splice: open={n_open} close={n_close}"
 
