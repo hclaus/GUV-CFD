@@ -74,6 +74,22 @@ ADVANCED_SETTINGS_DEFAULTS = {
     # confirmed on a real run that zone |U| reads 0.06 and that mass balance
     # is unharmed.
     "breathing-inlet-enabled": False,
+    # Direction the exhale is blown, as a vector (normalised at use, so only
+    # the ratio matters - the 0.06 m/s magnitude is applied separately;
+    # all-zero or an unreadable value falls back to the default). NOT a
+    # cosmetic default: with the source at
+    # (0.4, 1.2, 1.3) in patient ward 4B1 v7 the +x default pointed straight
+    # into the 'outlet' patch (xMax wall, same y and z), short-circuiting two
+    # thirds of the contaminant into the extract before it mixed and dragging
+    # Phase 1's T_ss1 from ~1.13 down to 0.42. Defaults to (0,0,1) - straight
+    # up - because a vertical jet cannot line up with a wall-mounted opening,
+    # so it is the safe choice when occupant orientation is unknown. A
+    # horizontal vector models a directed exhale (breath leaves the mouth
+    # roughly level, in the direction faced); set it from the occupant's
+    # actual orientation - see ANALYSIS_LOG.md 2026-08-31.
+    "breathing-inlet-dir-x": 0.0,
+    "breathing-inlet-dir-y": 0.0,
+    "breathing-inlet-dir-z": 1.0,
     # scalarTransport1 (controlDict) solves T OUTSIDE PIMPLE's own outer-
     # corrector loop, once per timestep by default - scalar-relaxation only
     # avoids biasing the result if nCorr/tolerance are high/tight enough for
@@ -225,6 +241,7 @@ PROJECT_OPENFOAM_SETTINGS_KEYS = (
     "momentum-relaxation", "scalar-relaxation", "adaptive-t-relaxation",
     "t-clamp-decay-enabled", "t-clamp-decay-multiplier",
     "breathing-inlet-enabled",
+    "breathing-inlet-dir-x", "breathing-inlet-dir-y", "breathing-inlet-dir-z",
     "scalar-transport-ncorr", "scalar-transport-tolerance",
     "t-infinity-early-stop-enabled", "t-infinity-rel-tol",
     "phase1-require-stable-extrapolation", "phase-chunk-size", "phase-write-interval",

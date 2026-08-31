@@ -2,7 +2,8 @@ from types import SimpleNamespace
 
 import guvcfd.contaminant_source as contaminant_source
 from guvcfd.contaminant_source import (
-    breathing_inlet_momentum_source, breathing_inlet_velocity_constraint,
+    breathing_inlet_direction, breathing_inlet_momentum_source,
+    breathing_inlet_velocity_constraint,
     check_mass_balance, source_topo_set_dict,
 )
 
@@ -166,15 +167,17 @@ def test_check_mass_balance_raises_on_unparseable_output(monkeypatch, tmp_path):
 
 # --- breathing_inlet_velocity_constraint (the live implementation) ---
 
-def test_breathing_inlet_velocity_constraint_defaults_to_x_direction():
+def test_breathing_inlet_velocity_constraint_defaults_to_upward():
     text = breathing_inlet_velocity_constraint(velocity_magnitude=0.06)
     assert "breathingInletVelocity" in text
     # A CONSTRAINT (setValues replaces the matrix row), not a source that only
     # adds terms and loses to the pressure correction - see the docstring.
     assert "type            vectorFixedValueConstraint;" in text
     assert "cellZone        sourceZone;" in text
-    # the raw target velocity, NOT scaled by any coefficient
-    assert "U               (6.000000e-02 0.000000e+00 0.000000e+00);" in text
+    # the raw target velocity, NOT scaled by any coefficient; default is
+    # (0,0,1) - straight up - since a vertical jet cannot line up with a
+    # wall-mounted opening the way the old +x default did
+    assert "U               (0.000000e+00 0.000000e+00 6.000000e-02);" in text
 
 
 def test_breathing_inlet_velocity_constraint_is_not_a_semi_implicit_source():
@@ -200,7 +203,7 @@ def test_breathing_inlet_velocity_constraint_normalizes_a_non_unit_direction():
     assert "U               (0.000000e+00 5.000000e-01 0.000000e+00);" in text
 
 
-def test_breathing_inlet_velocity_constraint_falls_back_to_x_on_zero_direction():
+def test_breathing_inlet_velocity_constraint_falls_back_on_zero_direction():
     text_zero = breathing_inlet_velocity_constraint(velocity_magnitude=0.06, direction=(0, 0, 0))
     text_default = breathing_inlet_velocity_constraint(velocity_magnitude=0.06)
     assert text_zero == text_default
@@ -208,7 +211,7 @@ def test_breathing_inlet_velocity_constraint_falls_back_to_x_on_zero_direction()
 
 # --- breathing_inlet_momentum_source (SUPERSEDED - kept as a record) ---
 
-def test_breathing_inlet_momentum_source_defaults_to_x_direction():
+def test_breathing_inlet_momentum_source_defaults_to_upward():
     text = breathing_inlet_momentum_source(velocity_magnitude=0.06)
     assert "breathingInletMomentum" in text
     assert "type            vectorSemiImplicitSource;" in text
@@ -217,7 +220,7 @@ def test_breathing_inlet_momentum_source_defaults_to_x_direction():
     # The NEGATIVE Sp is the whole point: Su + Sp*U = k*(U_target - U) is a
     # restoring drag, while a positive Sp amplifies U instead (the original
     # bug - drove source-zone |U| to 21.6 m/s against a 0.06 m/s target).
-    assert "((6.00e+00 0.00e+00 0.00e+00) -1.00e+02);" in text
+    assert "((0.00e+00 0.00e+00 6.00e+00) -1.00e+02);" in text
 
 
 def test_breathing_inlet_momentum_source_uses_given_zone_and_entry_name():
@@ -232,7 +235,7 @@ def test_breathing_inlet_momentum_source_normalizes_a_non_unit_direction():
     assert "((0.00e+00 5.00e+01 0.00e+00) -1.00e+02);" in text
 
 
-def test_breathing_inlet_momentum_source_falls_back_to_x_on_zero_direction():
+def test_breathing_inlet_momentum_source_falls_back_on_zero_direction():
     text_zero = breathing_inlet_momentum_source(velocity_magnitude=0.06, direction=(0, 0, 0))
     text_default = breathing_inlet_momentum_source(velocity_magnitude=0.06)
     assert text_zero == text_default
@@ -241,7 +244,7 @@ def test_breathing_inlet_momentum_source_falls_back_to_x_on_zero_direction():
 def test_breathing_inlet_momentum_source_accepts_a_custom_sp_coeff():
     text = breathing_inlet_momentum_source(velocity_magnitude=0.06, sp_coeff=10.0)
     # Su = sp_coeff * velocity_target = 10 * 0.06 = 0.6; Sp = -10
-    assert "((6.00e-01 0.00e+00 0.00e+00) -1.00e+01);" in text
+    assert "((0.00e+00 0.00e+00 6.00e-01) -1.00e+01);" in text
 
 
 def test_breathing_inlet_momentum_source_sp_is_negative_a_drag_not_a_gain():
@@ -255,3 +258,41 @@ def test_breathing_inlet_momentum_source_sp_is_negative_a_drag_not_a_gain():
     m = re.search(r"U\s+\(\([^)]*\)\s+(-?[0-9.e+-]+)\);", text)
     assert m, f"could not find the SuSp entry in:\n{text}"
     assert float(m.group(1)) < 0, "Sp must be negative (a drag), not positive (a gain)"
+
+
+# --- jet direction (2026-08-31) ---
+# Direction is not cosmetic: with the source at (0.4, 1.2, 1.3) the +x default
+# pointed straight into the 'outlet' patch (same y and z), short-circuiting
+# contaminant into the extract and dragging T_ss1 from ~1.13 down to 0.42.
+
+def test_breathing_inlet_direction_defaults_to_upward_on_an_OLD_project_file():
+    # a .guvcfd saved before this field existed has none of these keys
+    assert breathing_inlet_direction({}) == (0.0, 0.0, 1.0)
+
+
+def test_breathing_inlet_direction_reads_the_settings():
+    adv = {"breathing-inlet-dir-x": 0.0, "breathing-inlet-dir-y": 0.0, "breathing-inlet-dir-z": 1.0}
+    assert breathing_inlet_direction(adv) == (0.0, 0.0, 1.0)
+
+
+def test_breathing_inlet_constraint_horizontal_writes_x_component():
+    text = breathing_inlet_velocity_constraint(velocity_magnitude=0.06, direction=(1, 0, 0))
+    assert "U               (6.000000e-02 0.000000e+00 0.000000e+00);" in text
+
+
+def test_breathing_inlet_direction_survives_garbage_from_a_hand_edited_project():
+    """Old/hand-edited .guvcfd files must not crash the run."""
+    for bad in ({"breathing-inlet-dir-x": "north"}, {"breathing-inlet-dir-y": None},
+                {"breathing-inlet-dir-z": ""}, {"breathing-inlet-dir-z": float("nan")}):
+        assert breathing_inlet_direction(bad) == (0.0, 0.0, 1.0)
+
+
+def test_breathing_inlet_direction_all_zero_falls_back_not_silently_zero_velocity():
+    z = {"breathing-inlet-dir-x": 0, "breathing-inlet-dir-y": 0, "breathing-inlet-dir-z": 0}
+    assert breathing_inlet_direction(z) == (0.0, 0.0, 1.0)
+
+
+def test_breathing_inlet_constraint_direction_changes_the_written_vector():
+    x = breathing_inlet_velocity_constraint(velocity_magnitude=0.06, direction=(1, 0, 0))
+    z = breathing_inlet_velocity_constraint(velocity_magnitude=0.06, direction=(0, 0, 1))
+    assert x != z, "direction must reach the fvOptions entry, not be silently ignored"

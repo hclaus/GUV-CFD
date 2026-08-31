@@ -45,7 +45,8 @@ from .case_io import (
     read_openfoam_scalar_field, write_scalar_field, snapshot_openfoam_settings,
 )
 from .cellzones import bin_decay_rates, write_cellzones
-from .contaminant_source import (breathing_inlet_velocity_constraint, write_fvoptions_file,
+from .contaminant_source import (breathing_inlet_direction, breathing_inlet_velocity_constraint,
+                                  write_fvoptions_file,
                                   write_source_topo_set_dict)
 from .decay_analysis import write_results_summary, mechanical_mixing_efficiency_pct, spatial_coefficient_of_variation
 from .fan import fan_fvoptions_entry, write_fan_topo_set_dict
@@ -604,7 +605,8 @@ def _carve_breathing_inlet(case_dir, room, settings, adv, log_fn):
     run_wsl_or_raise("topoSet -dict system/sourceTopoSetDict", wsl_path(case_dir),
                       "topoSet (source zone for the breathing inlet)")
     log_fn("  Breathing inlet velocity constraint enabled (U fixed to 0.06 m/s in sourceZone)")
-    return breathing_inlet_velocity_constraint(zone_name="sourceZone", velocity_magnitude=0.06)
+    return breathing_inlet_velocity_constraint(zone_name="sourceZone", velocity_magnitude=0.06,
+                                               direction=breathing_inlet_direction(adv))
 
 
 def _apply_z(case_dir, Z, nbins, fan_kwargs, log_fn, adaptive_t_relaxation=False, scalar_relaxation=0.7):
@@ -819,6 +821,7 @@ def _run_scenario(case_dir, room, settings, z, ach, adv, z_summary, log_fn, shou
         phase1_delta_t=phase1_delta_t, phase2_delta_t=phase2_delta_t, solve_semaphore=solve_semaphore,
         t_clamp_decay_multiplier=adv["t-clamp-decay-multiplier"] if adv["t-clamp-decay-enabled"] else None,
         breathing_inlet_enabled=adv.get("breathing-inlet-enabled", False),
+        breathing_inlet_dir=breathing_inlet_direction(adv),
     )
     result["fluence_mean"] = z_summary["fluence_mean"]
     result["eACH_uv_well_mixed"] = z_summary.get("eACH_uv_well_mixed_mean")
@@ -987,6 +990,7 @@ def _run_shared_phase1(base_dir, phase1_dir, ach, room, settings, adv, log_fn, s
         phase1_resume_decision=phase1_resume_decision, solve_semaphore=solve_semaphore,
         t_clamp_decay_multiplier=adv["t-clamp-decay-multiplier"] if adv["t-clamp-decay-enabled"] else None,
         breathing_inlet_enabled=adv.get("breathing-inlet-enabled", False),
+        breathing_inlet_dir=breathing_inlet_direction(adv),
     )
 
 
@@ -1113,8 +1117,9 @@ def _run_shared_control(base_dir, control_dir, ach, room, settings, adv, log_fn,
     # Built before the clone (it's pure text, needs no case dir) so the
     # fvOptions prepare_ventilation_only_control writes already carries it;
     # the cellZone it binds to is carved right after, once control_dir exists.
-    breathing_entry = (breathing_inlet_velocity_constraint(zone_name="sourceZone",
-                                                            velocity_magnitude=0.06)
+    breathing_entry = (breathing_inlet_velocity_constraint(
+                           zone_name="sourceZone", velocity_magnitude=0.06,
+                           direction=breathing_inlet_direction(adv))
                        if adv.get("breathing-inlet-enabled", False) else None)
     prepare_ventilation_only_control(
         base_dir, control_dir, base_summary["inlet_velocity"],

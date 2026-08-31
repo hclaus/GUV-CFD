@@ -74,6 +74,16 @@ _FIELD_INFO = {
                                  "source gets overruled by the pressure solver (measured 37x over target). "
                                  "UNVALIDATED - zone velocity and mass balance not yet confirmed on a real "
                                  "run; see contaminant_source.breathing_inlet_velocity_constraint."),
+    "breathing-inlet-dir-x": ("Breathing inlet direction X",
+                               "Direction the exhale is blown. Only the RATIO matters - the vector is "
+                               "normalised automatically and the 0.06 m/s magnitude applied "
+                               "separately. Defaults to (0,0,1), straight up. Set this from the occupant's actual "
+                               "orientation - pointing it at a vent short-circuits contaminant "
+                               "straight into the extract and inflates the apparent reduction."),
+    "breathing-inlet-dir-y": ("Breathing inlet direction Y", "See Breathing inlet direction X."),
+    "breathing-inlet-dir-z": ("Breathing inlet direction Z",
+                               "See Breathing inlet direction X. (0,0,1) - the default - models an "
+                               "upward plume; a horizontal vector models a directed exhale."),
     "scalar-transport-ncorr": ("Contaminant solver outer correctors",
                                 "How many times the contaminant equation is re-solved per timestep - "
                                 "needs to be >0 for the relaxation factor above to matter at all."),

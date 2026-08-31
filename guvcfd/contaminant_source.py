@@ -163,8 +163,42 @@ def source_fvoptions_entry(Su, zone_name="sourceZone", field_name="T", entry_nam
     return "\n".join(lines)
 
 
+BREATHING_INLET_DEFAULT_DIRECTION = (0.0, 0.0, 1.0)
+
+
+def breathing_inlet_direction(adv):
+    """(dx, dy, dz) exhale direction from an advanced-settings dict.
+
+    Not cosmetic: pointing this at a vent short-circuits contaminant into the
+    extract. With the source at (0.4, 1.2, 1.3) in patient ward 4B1 v7 an old
+    +x default pointed straight into the 'outlet' patch (same y and z),
+    dragging Phase 1's T_ss1 from ~1.13 down to 0.42 - see ANALYSIS_LOG.md
+    2026-08-31. The default is now (0,0,1), straight up, which cannot line up
+    with a wall-mounted opening.
+
+    Tolerant of pre-2026-08-31 .guvcfd projects and hand-edited settings: the
+    keys simply won't exist in an older file, and a hand-edit can leave a
+    string/null/garbage value behind. Anything missing or non-numeric falls
+    back to the default component rather than raising - a project saved before
+    this field existed must still open and run.
+    """
+    def _f(key, fallback):
+        try:
+            v = float(adv.get(key, fallback))
+        except (TypeError, ValueError):
+            return fallback
+        return v if v == v and abs(v) != float("inf") else fallback  # reject NaN/inf
+
+    dx, dy, dz = BREATHING_INLET_DEFAULT_DIRECTION
+    d = (_f("breathing-inlet-dir-x", dx), _f("breathing-inlet-dir-y", dy), _f("breathing-inlet-dir-z", dz))
+    # An all-zero vector has no direction to normalise; fall back rather than
+    # emit a zero-velocity "constraint" that silently does nothing.
+    return d if any(d) else BREATHING_INLET_DEFAULT_DIRECTION
+
+
 def breathing_inlet_velocity_constraint(zone_name="sourceZone", entry_name="breathingInletVelocity",
-                                        velocity_magnitude=0.06, direction=(1, 0, 0)):
+                                        velocity_magnitude=0.06,
+                                        direction=BREATHING_INLET_DEFAULT_DIRECTION):
     """fvOptions entry for the experimental breathing inlet: CONSTRAIN U to
     velocity_magnitude*direction inside the source cellZone (~0.06 m/s ~=
     resting tidal breathing), so the contaminant the volumetric T source
@@ -194,7 +228,8 @@ def breathing_inlet_velocity_constraint(zone_name="sourceZone", entry_name="brea
     """
     dir_norm = (direction[0]**2 + direction[1]**2 + direction[2]**2)**0.5
     if dir_norm == 0:
-        direction = (1, 0, 0)
+        direction = BREATHING_INLET_DEFAULT_DIRECTION
+        dir_norm = 1.0
     else:
         direction = tuple(d / dir_norm for d in direction)
     vx, vy, vz = [velocity_magnitude * d for d in direction]
@@ -219,7 +254,8 @@ def breathing_inlet_velocity_constraint(zone_name="sourceZone", entry_name="brea
 
 
 def breathing_inlet_momentum_source(zone_name="sourceZone", entry_name="breathingInletMomentum",
-                                    velocity_magnitude=0.06, direction=(1, 0, 0), sp_coeff=100.0):
+                                    velocity_magnitude=0.06,
+                                    direction=BREATHING_INLET_DEFAULT_DIRECTION, sp_coeff=100.0):
     """SUPERSEDED by breathing_inlet_velocity_constraint - kept as a record of
     an approach that provably cannot do this job, not as a live option.
 
@@ -248,7 +284,8 @@ def breathing_inlet_momentum_source(zone_name="sourceZone", entry_name="breathin
     """
     dir_norm = (direction[0]**2 + direction[1]**2 + direction[2]**2)**0.5
     if dir_norm == 0:
-        direction = (1, 0, 0)
+        direction = BREATHING_INLET_DEFAULT_DIRECTION
+        dir_norm = 1.0
     else:
         direction = tuple(d / dir_norm for d in direction)
     vx, vy, vz = [velocity_magnitude * d for d in direction]

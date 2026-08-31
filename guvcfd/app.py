@@ -30,7 +30,7 @@ from .case_io import (
 )
 from .decay_analysis import write_results_summary, mechanical_mixing_efficiency_pct, spatial_coefficient_of_variation
 from .monitoring import splice_live_vol_average_if_needed
-from .contaminant_source import breathing_inlet_velocity_constraint
+from .contaminant_source import breathing_inlet_direction, breathing_inlet_velocity_constraint
 from .fan import fan_fvoptions_entry
 from .fluence import compute_fluence_at_points, compute_inactivation_rate, compute_well_mixed_eACH
 from . import help_content
@@ -1102,7 +1102,8 @@ def _finish_decay(case_dir, room, settings, summary):
         # constraint measurably alters the flow field this run measures the
         # ventilation rate ON - see scenario_runs._carve_breathing_inlet.
         control_breathing_entry = (
-            breathing_inlet_velocity_constraint(zone_name="sourceZone", velocity_magnitude=0.06)
+            breathing_inlet_velocity_constraint(zone_name="sourceZone", velocity_magnitude=0.06,
+                                                direction=breathing_inlet_direction(adv))
             if adv.get("breathing-inlet-enabled", False) else None)
         prepare_ventilation_only_control(
             case_dir, control_dir, summary["inlet_velocity"],
@@ -1429,6 +1430,7 @@ def _finish_steady_state(case_dir, room, settings, summary,
         phase1_delta_t=phase1_delta_t, phase2_delta_t=phase2_delta_t,
         t_clamp_decay_multiplier=adv["t-clamp-decay-multiplier"] if adv["t-clamp-decay-enabled"] else None,
         breathing_inlet_enabled=adv.get("breathing-inlet-enabled", False),
+        breathing_inlet_dir=breathing_inlet_direction(adv),
     )
     result["fluence_mean"] = summary["fluence_mean"]
     result["eACH_uv_well_mixed"] = summary.get("eACH_uv_well_mixed_mean")
@@ -2613,6 +2615,26 @@ settings_modal = dbc.Modal(
                     "the jet direction is currently a hardcoded +x and was not chosen from room layout.",
                     _adv_defaults["breathing-inlet-enabled"],
                 ),
+                _settings_field(
+                    "settings-breathing-inlet-dir-x", "Breathing inlet direction X",
+                    "Direction the exhale is blown. Only the RATIO matters — the vector is normalised "
+                    "automatically and the 0.06 m/s magnitude applied separately. Defaults to (0,0,1), "
+                    "straight up. Set this from the occupant's actual orientation — pointing it at a "
+                    "vent short-circuits contaminant straight into the extract and inflates the "
+                    "apparent reduction.",
+                    "", _adv_defaults["breathing-inlet-dir-x"],
+                ),
+                _settings_field(
+                    "settings-breathing-inlet-dir-y", "Breathing inlet direction Y",
+                    "See Breathing inlet direction X.",
+                    "", _adv_defaults["breathing-inlet-dir-y"],
+                ),
+                _settings_field(
+                    "settings-breathing-inlet-dir-z", "Breathing inlet direction Z",
+                    "See Breathing inlet direction X. (0,0,1) — the default — models an upward plume; "
+                    "a horizontal vector models a directed exhale.",
+                    "", _adv_defaults["breathing-inlet-dir-z"],
+                ),
                 html.Div(
                     "T is solved by its own scalarTransport function object, entirely outside "
                     "PIMPLE's/SIMPLE's own outer-iteration loop — the two settings below control "
@@ -3662,6 +3684,8 @@ _SETTINGS_FIELD_IDS = [
     "settings-momentum-relaxation", "settings-scalar-relaxation", "settings-adaptive-t-relaxation",
     "settings-t-clamp-decay-enabled", "settings-t-clamp-decay-multiplier",
     "settings-breathing-inlet-enabled",
+    "settings-breathing-inlet-dir-x", "settings-breathing-inlet-dir-y",
+    "settings-breathing-inlet-dir-z",
     "settings-scalar-transport-ncorr", "settings-scalar-transport-tolerance",
     "settings-t-infinity-early-stop-enabled", "settings-phase1-require-stable-extrapolation",
     "settings-t-infinity-rel-tol",
@@ -3685,6 +3709,7 @@ _SETTINGS_FIELD_KEYS = [
     "momentum-relaxation", "scalar-relaxation", "adaptive-t-relaxation",
     "t-clamp-decay-enabled", "t-clamp-decay-multiplier",
     "breathing-inlet-enabled",
+    "breathing-inlet-dir-x", "breathing-inlet-dir-y", "breathing-inlet-dir-z",
     "scalar-transport-ncorr", "scalar-transport-tolerance",
     "t-infinity-early-stop-enabled", "phase1-require-stable-extrapolation",
     "t-infinity-rel-tol",
