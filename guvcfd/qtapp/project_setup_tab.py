@@ -540,11 +540,28 @@ class ProjectSetupTab(QWidget):
         form.addRow("X position (m)", self._register("inject-x-input", _dspin(0, 50, 0.05, 3, 2.0)))
         form.addRow("Y position (m)", self._register("inject-y-input", _dspin(0, 50, 0.05, 3, 1.5)))
         form.addRow("Z position (m)", self._register("inject-z-input", _dspin(0, 20, 0.05, 3, 1.5)))
-        size_field = self._register("source-zone-size", _dspin(0.05, 2.0, 0.05, 3, 0.3))
-        _add_row(form, "Source zone size (m)", size_field,
-                  "Side length of the cube-shaped cellZone the contaminant source injects into. "
-                  "Larger zones dilute the injection over more cells; smaller zones concentrate it "
-                  "into fewer, higher-rate cells. Only used for steady-state runs.")
+        size_field = self._register("source-zone-cells", _ispin(1, 20, 1))
+        _add_row(form, "Source zone size (cells)", size_field,
+                  "Side length of the cellZone the contaminant source injects into, in MESH CELLS. "
+                  "In cells rather than metres because \"one cell\" is not one number - blockMesh "
+                  "divides each room dimension into round(L/cell size) cells, so a 2.57 m ceiling at "
+                  "a 0.1 m cell size builds 26 cells of 0.0988 m. A metre value therefore cannot mean "
+                  "one cell on every axis. Larger zones dilute the injection over more cells; the "
+                  "total injection rate is unaffected either way (it is divided by the ACTUAL carved "
+                  "volume). Only used for steady-state runs.")
+        vel_field = self._register("breathing-velocity", _dspin(0.0, 5.0, 0.01, 3, 0.06))
+        _add_row(form, "Breathing velocity (m/s)", vel_field,
+                  "Speed of the air the source blows, carrying the contaminant with it instead of "
+                  "letting it appear in still air. 0.06 m/s is resting tidal breathing. Set 0 for no "
+                  "airflow (the contaminant then appears with no associated velocity).")
+        for axis, default in (("x", 0.0), ("y", 0.0), ("z", 1.0)):
+            f = self._register(f"breathing-dir-{axis}", _dspin(-1e3, 1e3, 0.1, 3, default))
+            _add_row(form, f"Breathing direction {axis.upper()}", f,
+                      "Direction the air is blown. Only the RATIO of X:Y:Z matters - the vector is "
+                      "normalised automatically and the velocity above applied to it. Defaults to "
+                      "(0,0,1), straight up. Aiming it at a vent short-circuits contaminant into the "
+                      "extract and inflates the apparent reduction - in one real case that dropped "
+                      "the steady-state concentration by a factor of 2.7.")
         layout.addLayout(form)
         self.form_layout.addWidget(box)
 

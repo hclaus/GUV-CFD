@@ -1823,7 +1823,11 @@ def test_run_sweep_recarves_source_zone_after_apply_z_wipes_it(tmp_path, monkeyp
         z_values=[6], ach_values=[3], log_fn=lambda m: None,
     )
 
-    assert topo_calls == [(f"{project_dir}/Z6_ACH3", (2, 2.5, 1.3), 0.3)]
+    # size is now a per-axis tuple in metres, resolved from the cell count
+    assert len(topo_calls) == 1
+    assert topo_calls[0][0] == f"{project_dir}/Z6_ACH3"
+    assert topo_calls[0][1] == (2, 2.5, 1.3)
+    assert all(abs(v - 0.3) < 1e-6 for v in topo_calls[0][2])
     assert any("topoSet" in cmd and "sourceTopoSetDict" in cmd for cmd in wsl_calls)
 
 
@@ -2745,14 +2749,14 @@ class _Room:
     x, y, z = 4.0, 5.0, 2.7
 
 
-def test_carve_breathing_inlet_returns_none_when_disabled(monkeypatch):
+def test_carve_breathing_inlet_returns_none_at_zero_velocity(monkeypatch):
     calls = []
     monkeypatch.setattr(sr, "write_source_topo_set_dict",
                          lambda *a, **k: calls.append("carved"))
     monkeypatch.setattr(sr, "run_wsl_or_raise", lambda *a, **k: calls.append("topoSet"))
     entry = sr._carve_breathing_inlet(
-        "/case", _Room(), _breathing_stub_settings(),
-        {"breathing-inlet-enabled": False, "mesh-cell-size": 0.1}, lambda m: None)
+        "/case", _Room(), dict(_breathing_stub_settings(), **{"breathing-velocity": 0}),
+        {"mesh-cell-size": 0.1}, lambda m: None)
     assert entry is None
     # must not carve a zone nobody asked for
     assert calls == []
@@ -2765,7 +2769,7 @@ def test_carve_breathing_inlet_carves_and_returns_the_constraint(monkeypatch):
     monkeypatch.setattr(sr, "run_wsl_or_raise", lambda *a, **k: calls.append("topoSet"))
     entry = sr._carve_breathing_inlet(
         "/case", _Room(), _breathing_stub_settings(),
-        {"breathing-inlet-enabled": True, "mesh-cell-size": 0.1}, lambda m: None)
+        {"mesh-cell-size": 0.1}, lambda m: None)
     assert entry is not None
     assert "vectorFixedValueConstraint" in entry
     assert "cellZone        sourceZone;" in entry

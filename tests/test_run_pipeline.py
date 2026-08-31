@@ -427,10 +427,17 @@ def test_check_settings_grid_alignment_flags_the_real_shrinking_case():
     # LARGER than typed" note, not a silent shortfall, and not a shrink.
     room = SimpleNamespace(x=3.2, y=4.8, z=2.57)
     settings = _patient_ward_settings()
-    mismatches = run_pipeline.check_settings_grid_alignment(settings, room, cell_size=0.1, source_size=0.3)
+    mismatches = run_pipeline.check_settings_grid_alignment(settings, room, cell_size=0.1)
     names = {m["name"] for m in mismatches}
-    assert names == {"Inlet", "Outlet", "Contaminant source zone"}
+    assert names == {"Inlet", "Outlet", "Contaminant source position"}
     for m in mismatches:
+        if m["name"] == "Contaminant source position":
+            # The source entry reports a CENTRE, not a size (2026-08-31): its
+            # size is configured in whole cells and is exact by construction,
+            # so the "never a shortfall" invariant below - which is about
+            # opening SIZES snapping outward - does not apply. A suggested
+            # centre legitimately moves either way along an axis.
+            continue
         for nominal, actual in zip(m["nominal"], m["actual"]):
             assert actual >= nominal - 1e-9  # never a shortfall
 
@@ -455,7 +462,7 @@ def test_check_settings_grid_alignment_skips_disabled_second_openings():
         "outlet2-enable": False, "outlet2-wall": "floor", "outlet2-y-input": 2.0, "outlet2-z-input": 1.5,
         "outlet2-size-w": 0.3, "outlet2-size-h": 0.3,
     })
-    mismatches = run_pipeline.check_settings_grid_alignment(settings, room, cell_size=0.1, source_size=0.3)
+    mismatches = run_pipeline.check_settings_grid_alignment(settings, room, cell_size=0.1)
     names = {m["name"] for m in mismatches}
     assert "2nd inlet" not in names and "2nd outlet" not in names
 

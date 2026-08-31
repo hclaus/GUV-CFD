@@ -49,6 +49,7 @@ from pathlib import Path
 from guv_calcs import Project
 
 from .. import scenario_runs
+from ..contaminant_source import resolve_source_size
 from ..app_settings import load_advanced_settings, merge_project_openfoam_settings, capture_openfoam_settings
 from ..case_io import read_latest_time_field, snapshot_openfoam_settings
 from ..decay_analysis import (
@@ -850,7 +851,7 @@ def _finish_steady_state(state, case_dir, room, settings, summary):
         phase1_write_interval=adv["phase-write-interval"], phase2_write_interval=adv["phase-write-interval"],
         window_frac=settings.get("t-ss-window-frac") or 0.15,
         cell_size=adv["mesh-cell-size"], nbins=adv["uv-zone-bins"],
-        source_size=settings["source-zone-size"],
+        source_size=resolve_source_size(settings, adv["mesh-cell-size"], (room.x, room.y, room.z)),
         plateau_rel_tol=adv["plateau-rel-tol"] / 100.0, mass_balance_tol=adv["mass-balance-tol"] / 100.0,
         t_inf_check_interval=adv["phase-chunk-size"] if adv["t-infinity-early-stop-enabled"] else None,
         t_inf_rel_tol=(adv["t-infinity-rel-tol"] / 100.0) if adv["t-infinity-early-stop-enabled"] else None,

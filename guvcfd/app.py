@@ -30,7 +30,8 @@ from .case_io import (
 )
 from .decay_analysis import write_results_summary, mechanical_mixing_efficiency_pct, spatial_coefficient_of_variation
 from .monitoring import splice_live_vol_average_if_needed
-from .contaminant_source import breathing_inlet_direction, breathing_inlet_velocity_constraint
+from .contaminant_source import (breathing_inlet_direction, breathing_inlet_velocity,
+                                  breathing_inlet_velocity_constraint, resolve_source_size)
 from .fan import fan_fvoptions_entry
 from .fluence import compute_fluence_at_points, compute_inactivation_rate, compute_well_mixed_eACH
 from . import help_content
@@ -91,7 +92,8 @@ SETTINGS_FIELDS = [
     "fan-enable", "fan-speed", "fan-direction", "fan-radius", "fan-thickness",
     "fan-x-input", "fan-y-input", "fan-z-input",
     "sim-type", "mech-ach-only", "pimple-end-time", "pimple-write-interval",
-    "inject-x-input", "inject-y-input", "inject-z-input", "source-zone-size",
+    "inject-x-input", "inject-y-input", "inject-z-input", "source-zone-cells",
+    "breathing-velocity", "breathing-dir-x", "breathing-dir-y", "breathing-dir-z",
     "phase1-iterations", "phase2-iterations", "t-ss-window-frac",
     "deltat-scaling-enabled", "deltat-effective-fraction", "deltat-target-fraction",
     "scenario-z-values", "scenario-ach-values",
@@ -778,7 +780,9 @@ _OUTLET2_REQUIRED_FIELDS = {
 _STEADY_STATE_REQUIRED_FIELDS = {
     # target-t-ss removed - no longer a UI field, see REFERENCE_TARGET_T_SS.
     "inject-x-input": "Injection X position", "inject-y-input": "Injection Y position",
-    "inject-z-input": "Injection Z position", "source-zone-size": "Source zone size",
+    "inject-z-input": "Injection Z position", "source-zone-cells": "Source zone size (cells)",
+    "breathing-velocity": "Breathing velocity", "breathing-dir-x": "Breathing direction X",
+    "breathing-dir-y": "Breathing direction Y", "breathing-dir-z": "Breathing direction Z",
     "phase1-iterations": "Phase 1 iterations", "phase2-iterations": "Phase 2 iterations",
 }
 
@@ -1101,10 +1105,11 @@ def _finish_decay(case_dir, room, settings, summary):
         # The occupant is breathing in the UV-off case too, and the
         # constraint measurably alters the flow field this run measures the
         # ventilation rate ON - see scenario_runs._carve_breathing_inlet.
+        _bv = breathing_inlet_velocity(settings)
         control_breathing_entry = (
-            breathing_inlet_velocity_constraint(zone_name="sourceZone", velocity_magnitude=0.06,
-                                                direction=breathing_inlet_direction(adv))
-            if adv.get("breathing-inlet-enabled", False) else None)
+            breathing_inlet_velocity_constraint(zone_name="sourceZone", velocity_magnitude=_bv,
+                                                direction=breathing_inlet_direction(settings))
+            if _bv > 0 else None)
         prepare_ventilation_only_control(
             case_dir, control_dir, summary["inlet_velocity"],
             control_end_time, write_interval, pimple_delta_t=adv["pimple-delta-t"], max_co=adv["max-co"],
@@ -1408,7 +1413,7 @@ def _finish_steady_state(case_dir, room, settings, summary,
         phase2_write_interval=adv["phase-write-interval"],
         window_frac=settings.get("t-ss-window-frac") or 0.15,
         cell_size=adv["mesh-cell-size"], nbins=adv["uv-zone-bins"],
-        source_size=settings["source-zone-size"],
+        source_size=resolve_source_size(settings, adv["mesh-cell-size"], (room.x, room.y, room.z)),
         plateau_rel_tol=adv["plateau-rel-tol"] / 100.0,
         mass_balance_tol=adv["mass-balance-tol"] / 100.0,
         # GUI-exposed cross-project "advanced" default (Settings menu) - only
@@ -1429,8 +1434,8 @@ def _finish_steady_state(case_dir, room, settings, summary,
         should_pause=_should_pause,
         phase1_delta_t=phase1_delta_t, phase2_delta_t=phase2_delta_t,
         t_clamp_decay_multiplier=adv["t-clamp-decay-multiplier"] if adv["t-clamp-decay-enabled"] else None,
-        breathing_inlet_enabled=adv.get("breathing-inlet-enabled", False),
-        breathing_inlet_dir=breathing_inlet_direction(adv),
+        breathing_inlet_velocity=breathing_inlet_velocity(settings),
+        breathing_inlet_dir=breathing_inlet_direction(settings),
     )
     result["fluence_mean"] = summary["fluence_mean"]
     result["eACH_uv_well_mixed"] = summary.get("eACH_uv_well_mixed_mean")
@@ -1963,13 +1968,40 @@ project_setup_tab = dbc.Row([
         _card("Contaminant source geometry", [
             html.Div(_GRID_SNAP_NOTE, className="form-text small mb-2"),
             *_injection_position_controls(),
-            _labeled("Source zone size (m)", dcc.Input(
-                id="source-zone-size", type="number", value=0.3, min=0.05, max=2.0, step=0.05,
+            _labeled("Source zone size (cells)", dcc.Input(
+                id="source-zone-cells", type="number", value=1, min=1, max=20, step=1,
                 className="form-control form-control-sm"),
-                help_text="Side length of the cube-shaped cellZone the contaminant source "
-                          "injects into. Larger zones dilute the injection over more cells; "
-                          "smaller zones concentrate it into fewer, higher-rate cells. Only used "
-                          "for steady-state runs."),
+                help_text="Side length of the cellZone the contaminant source injects into, in "
+                          "MESH CELLS. In cells rather than metres because \"one cell\" is not one "
+                          "number — blockMesh divides each room dimension into round(L/cell size) "
+                          "cells, so a 2.57 m ceiling at a 0.1 m cell size builds 26 cells of "
+                          "0.0988 m, and a metre value cannot mean one cell on every axis. The "
+                          "total injection rate is unaffected by the size — it is divided by the "
+                          "ACTUAL carved volume. Only used for steady-state runs."),
+            _labeled("Breathing velocity (m/s)", dcc.Input(
+                id="breathing-velocity", type="number", value=0.06, min=0, max=5, step=0.01,
+                className="form-control form-control-sm"),
+                help_text="Speed of the air the source blows, carrying the contaminant with it "
+                          "instead of letting it appear in still air. 0.06 m/s is resting tidal "
+                          "breathing. Set 0 for no airflow."),
+            _labeled("Breathing direction X", dcc.Input(
+                id="breathing-dir-x", type="number", value=0.0, step=0.1,
+                className="form-control form-control-sm"),
+                help_text="Direction the air is blown. Only the RATIO of X:Y:Z matters — the "
+                          "vector is normalised automatically and the velocity above applied to "
+                          "it. Defaults to (0,0,1), straight up. Aiming it at a vent "
+                          "short-circuits contaminant into the extract and inflates the apparent "
+                          "reduction — in one real case that lowered the steady-state "
+                          "concentration by a factor of 2.7."),
+            _labeled("Breathing direction Y", dcc.Input(
+                id="breathing-dir-y", type="number", value=0.0, step=0.1,
+                className="form-control form-control-sm"),
+                help_text="See Breathing direction X."),
+            _labeled("Breathing direction Z", dcc.Input(
+                id="breathing-dir-z", type="number", value=1.0, step=0.1,
+                className="form-control form-control-sm"),
+                help_text="See Breathing direction X. (0,0,1) — the default — models an upward "
+                          "plume; a horizontal vector models a directed exhale."),
         ]),
 
         # sim-type/pimple-end-time/pimple-write-interval/phase1-iterations/
@@ -2604,36 +2636,6 @@ settings_modal = dbc.Modal(
                     "Tmax = this value times Phase 1's own converged source-zone max T. Only "
                     "used when the T divergence clamp above is on.",
                     "x", _adv_defaults["t-clamp-decay-multiplier"],
-                ),
-                _settings_checkbox_field(
-                    "settings-breathing-inlet-enabled", "Use breathing inlet velocity constraint (experimental)",
-                    "Adds airflow to the source zone so the contaminant is carried by moving air "
-                    "(~0.06 m/s, resting tidal breathing) instead of appearing in still air. Constrains "
-                    "U in that zone rather than adding a momentum source — a source only adds terms to "
-                    "the momentum equation and gets overruled by the pressure solver (measured 37× over "
-                    "target). UNVALIDATED — a first run holds 0.059 m/s and conserves mass to 1.4%, but "
-                    "the jet direction is currently a hardcoded +x and was not chosen from room layout.",
-                    _adv_defaults["breathing-inlet-enabled"],
-                ),
-                _settings_field(
-                    "settings-breathing-inlet-dir-x", "Breathing inlet direction X",
-                    "Direction the exhale is blown. Only the RATIO matters — the vector is normalised "
-                    "automatically and the 0.06 m/s magnitude applied separately. Defaults to (0,0,1), "
-                    "straight up. Set this from the occupant's actual orientation — pointing it at a "
-                    "vent short-circuits contaminant straight into the extract and inflates the "
-                    "apparent reduction.",
-                    "", _adv_defaults["breathing-inlet-dir-x"],
-                ),
-                _settings_field(
-                    "settings-breathing-inlet-dir-y", "Breathing inlet direction Y",
-                    "See Breathing inlet direction X.",
-                    "", _adv_defaults["breathing-inlet-dir-y"],
-                ),
-                _settings_field(
-                    "settings-breathing-inlet-dir-z", "Breathing inlet direction Z",
-                    "See Breathing inlet direction X. (0,0,1) — the default — models an upward plume; "
-                    "a horizontal vector models a directed exhale.",
-                    "", _adv_defaults["breathing-inlet-dir-z"],
                 ),
                 html.Div(
                     "T is solved by its own scalarTransport function object, entirely outside "
@@ -3683,9 +3685,6 @@ _SETTINGS_FIELD_IDS = [
     "settings-plateau-rel-tol", "settings-mass-balance-tol",
     "settings-momentum-relaxation", "settings-scalar-relaxation", "settings-adaptive-t-relaxation",
     "settings-t-clamp-decay-enabled", "settings-t-clamp-decay-multiplier",
-    "settings-breathing-inlet-enabled",
-    "settings-breathing-inlet-dir-x", "settings-breathing-inlet-dir-y",
-    "settings-breathing-inlet-dir-z",
     "settings-scalar-transport-ncorr", "settings-scalar-transport-tolerance",
     "settings-t-infinity-early-stop-enabled", "settings-phase1-require-stable-extrapolation",
     "settings-t-infinity-rel-tol",
@@ -3708,8 +3707,6 @@ _SETTINGS_FIELD_KEYS = [
     "plateau-rel-tol", "mass-balance-tol",
     "momentum-relaxation", "scalar-relaxation", "adaptive-t-relaxation",
     "t-clamp-decay-enabled", "t-clamp-decay-multiplier",
-    "breathing-inlet-enabled",
-    "breathing-inlet-dir-x", "breathing-inlet-dir-y", "breathing-inlet-dir-z",
     "scalar-transport-ncorr", "scalar-transport-tolerance",
     "t-infinity-early-stop-enabled", "phase1-require-stable-extrapolation",
     "t-infinity-rel-tol",
@@ -3821,7 +3818,9 @@ _NEW_FIELD_DEFAULTS = {
     # source-zone-size used to be a global advanced setting, not saved per-
     # project - this is that old global default, for any .guvcfd saved
     # before it moved to a per-project field.
-    "source-zone-size": 0.3,
+    "source-zone-cells": 1,
+    "breathing-velocity": 0.06,
+    "breathing-dir-x": 0.0, "breathing-dir-y": 0.0, "breathing-dir-z": 1.0,
     # deltaT scaling used to be a global advanced setting too - same
     # defaults as ADVANCED_SETTINGS_DEFAULTS at the time it moved to a
     # per-project field, for the same backward-compat reason.
@@ -3838,7 +3837,7 @@ _NEW_FIELD_DEFAULTS = {
 # cube with no width/height/position-pair/wall-center-bias distinction
 # for the new per-opening flow to add value to.
 _GRID_ALIGN_FIELD_IDS = {
-    "Contaminant source zone": ("source-zone-size",),
+    "Contaminant source position": ("inject-x-input", "inject-y-input", "inject-z-input"),
 }
 _GRID_ALIGN_ALL_FIELD_IDS = [fid for fids in _GRID_ALIGN_FIELD_IDS.values() for fid in fids]
 
@@ -3867,8 +3866,8 @@ _pending_alignment_walk = {"walker": None, "current": None, "any_applied": False
 
 
 def _check_grid_alignment(settings, room):
-    """Mismatches for this project's contaminant source zone size against
-    the current mesh cell size (see run_pipeline.check_settings_grid_alignment's
+    """Mismatches for this project's contaminant source POSITION against
+    the current mesh grid (see run_pipeline.check_settings_grid_alignment's
     docstring for the real bug this catches early) - empty list if
     already grid-aligned, or if the check itself can't run (e.g. a
     hand-edited project file missing a core field - not worth failing the
@@ -3880,8 +3879,8 @@ def _check_grid_alignment(settings, room):
     try:
         adv = merge_project_openfoam_settings(settings, load_advanced_settings())
         mismatches = check_settings_grid_alignment(
-            settings, room, adv["mesh-cell-size"], source_size=settings.get("source-zone-size", 0.3))
-        return [m for m in mismatches if m["name"] == "Contaminant source zone"]
+            settings, room, adv["mesh-cell-size"])
+        return [m for m in mismatches if m["name"] == "Contaminant source position"]
     except Exception:
         return []
 
@@ -4072,7 +4071,7 @@ def _apply_grid_align_fix(n_clicks, current_status):
             for fid, val in zip(fids, m["actual"]):
                 updates[fid] = round(val, 6)
     _pending_grid_fix["mismatches"] = None
-    note = (current_status or "") + (" | Project settings updated to match the mesh-snapped sizes - "
+    note = (current_status or "") + (" | Project settings updated to match the mesh grid - "
                                       "this project has changed and must be saved manually "
                                       "(File > Save Project) to keep the fix.")
     return (False, note) + tuple(updates[fid] for fid in _GRID_ALIGN_ALL_FIELD_IDS)

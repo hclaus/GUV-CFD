@@ -16,7 +16,7 @@ Two phases share this source, staying on throughout:
 import re
 
 from .decay_analysis import fit_asymptotic_value
-from .mesh_gen import snap_outward, _actual_axis_cell_size
+from .mesh_gen import snap_outward, _actual_axis_cell_size, _mod_phase, _nearest_lattice_point
 from .wsl_utils import wsl_path, run_wsl_or_raise, run_wsl, write_case_file as _write_case_file
 
 
@@ -77,6 +77,106 @@ def source_box_grid_alignment(center, size, cell_size, room_dims):
     nominal = tuple(h - l for l, h in zip(lo_nom, hi_nom))
     actual = tuple(h - l for l, h in zip(lo_snap, hi_snap))
     return nominal, actual
+
+
+DEFAULT_SOURCE_ZONE_CELLS = 1
+
+
+def source_size_from_cells(n_cells, cell_size, room_dims):
+    """Per-axis (sx, sy, sz) size in METRES for a source zone of n_cells cells
+    per axis.
+
+    The zone size is configured in CELLS, not metres, because "one cell" is not
+    one number: blockMesh divides each room dimension into round(L/cell_size)
+    cells, so the ACTUAL cell size differs per axis whenever a dimension isn't
+    a whole multiple of the nominal (a 2.57 m ceiling at a nominal 0.1 m builds
+    26 cells of 0.098846 m). A single metre value therefore cannot mean "one
+    cell" on every axis - 0.1 m is exactly 1 cell on a 3.2 m axis but 1.012
+    cells on a 2.57 m one, which snaps outward to 2 cells and silently doubles
+    the zone on that axis. Expressed in cells it is exact everywhere, and the
+    box needs no snapping at all.
+
+    Everything downstream still takes metres (and already accepts a per-axis
+    tuple), so this is the only place the two representations meet.
+    """
+    n = max(1, int(round(n_cells)))
+    return tuple(n * _actual_axis_cell_size(room_dims[i], cell_size) for i in range(3))
+
+
+def resolve_source_zone_cells(settings, cell_size):
+    """Source zone size in CELLS from a settings dict, migrating pre-2026-08-31
+    projects that stored `source-zone-size` in metres.
+
+    Old projects have no `source-zone-cells` key at all; their metre value is
+    converted with the NOMINAL cell size (the actual per-axis sizes disagree,
+    and any of them is as good an approximation as another for a one-time
+    migration). Anything missing or unreadable falls back to the default rather
+    than raising - an older .guvcfd must still open.
+    """
+    raw = settings.get("source-zone-cells")
+    if raw is not None:
+        try:
+            return max(1, int(round(float(raw))))
+        except (TypeError, ValueError):
+            return DEFAULT_SOURCE_ZONE_CELLS
+    legacy = settings.get("source-zone-size")
+    if legacy is not None and cell_size:
+        try:
+            return max(1, int(round(float(legacy) / float(cell_size))))
+        except (TypeError, ValueError, ZeroDivisionError):
+            return DEFAULT_SOURCE_ZONE_CELLS
+    return DEFAULT_SOURCE_ZONE_CELLS
+
+
+def resolve_source_size(settings, cell_size, room_dims):
+    """Per-axis (sx, sy, sz) source zone size in metres, from whichever of the
+    cell-count or legacy metre setting the project has. The single entry point
+    call sites should use instead of reading `source-zone-size` directly.
+    """
+    return source_size_from_cells(resolve_source_zone_cells(settings, cell_size), cell_size, room_dims)
+
+
+def suggest_source_center_fix(center, size, cell_size, room_dims, fp_tol=1e-9):
+    """(current, suggested) absolute (x, y, z) centers for the source zone -
+    the 3D equivalent of mesh_gen.suggest_opening_center_fix, which does the
+    same job for an inlet/outlet's two in-plane axes.
+
+    Same lattice math, applied per axis: a box edge lands on a grid line
+    exactly when (center - size/2) mod cell == 0, so the valid centers form
+    a lattice spaced one cell apart, offset by phase = (size/2) mod cell.
+    That phase matters - for an EVEN cell count the valid centers are grid
+    lines, for an ODD count they sit at cell-CENTRE offsets instead, and a
+    naive "round the centre to the nearest cell multiple" gets the odd case
+    wrong. Ties break toward the room's midpoint on that axis so repeated
+    snapping can't walk the source into a wall.
+
+    Uses the ACTUAL per-axis cell size (_actual_axis_cell_size), not the
+    nominal one, for the reason mesh_gen documents at length: whenever a room
+    dimension isn't a whole multiple of cell_size, the real grid lines sit
+    somewhere else entirely and snapping to nominal targets coordinates that
+    match no real cell face.
+
+    Only meaningful when `size` is already an exact multiple of the actual
+    cell size on that axis - otherwise the two edges can never both land on
+    the grid whatever centre is chosen. A one-cell source zone (the default)
+    always satisfies this.
+
+    Without this the source box is merely snapped OUTWARD (see _source_box),
+    which keeps it grid-aligned but lets it grow up to a cell per axis;
+    moving the centre instead keeps the requested size exactly.
+    """
+    cx, cy, cz = center
+    if isinstance(size, (tuple, list)):
+        sizes = tuple(size)
+    else:
+        sizes = (size, size, size)
+    cur, sug = [], []
+    for i, c in enumerate((cx, cy, cz)):
+        cell = _actual_axis_cell_size(room_dims[i], cell_size)
+        phase = _mod_phase(sizes[i] / 2, cell, fp_tol)
+        cur.append(c)
+        sug.append(_nearest_lattice_point(c, cell, phase, room_dims[i] / 2, fp_tol))
+    return tuple(cur), tuple(sug)
 
 
 def source_topo_set_dict(center, size, zone_name="sourceZone", cellset_name="sourceZoneCells", cell_size=None,
@@ -164,9 +264,26 @@ def source_fvoptions_entry(Su, zone_name="sourceZone", field_name="T", entry_nam
 
 
 BREATHING_INLET_DEFAULT_DIRECTION = (0.0, 0.0, 1.0)
+DEFAULT_BREATHING_VELOCITY = 0.06
 
 
-def breathing_inlet_direction(adv):
+def breathing_inlet_velocity(settings):
+    """Exhale speed [m/s] from a project settings dict; 0 means no airflow.
+
+    There is no separate enable flag - a velocity of 0 writes no constraint at
+    all, which is exactly the old no-velocity behaviour. Missing or unreadable
+    values fall back to the default so an older .guvcfd still opens.
+    """
+    try:
+        v = float(settings.get("breathing-velocity", DEFAULT_BREATHING_VELOCITY))
+    except (TypeError, ValueError):
+        return DEFAULT_BREATHING_VELOCITY
+    if v != v or abs(v) == float("inf") or v < 0:
+        return DEFAULT_BREATHING_VELOCITY
+    return v
+
+
+def breathing_inlet_direction(settings):
     """(dx, dy, dz) exhale direction from an advanced-settings dict.
 
     Not cosmetic: pointing this at a vent short-circuits contaminant into the
@@ -184,13 +301,13 @@ def breathing_inlet_direction(adv):
     """
     def _f(key, fallback):
         try:
-            v = float(adv.get(key, fallback))
+            v = float(settings.get(key, fallback))
         except (TypeError, ValueError):
             return fallback
         return v if v == v and abs(v) != float("inf") else fallback  # reject NaN/inf
 
     dx, dy, dz = BREATHING_INLET_DEFAULT_DIRECTION
-    d = (_f("breathing-inlet-dir-x", dx), _f("breathing-inlet-dir-y", dy), _f("breathing-inlet-dir-z", dz))
+    d = (_f("breathing-dir-x", dx), _f("breathing-dir-y", dy), _f("breathing-dir-z", dz))
     # An all-zero vector has no direction to normalise; fall back rather than
     # emit a zero-velocity "constraint" that silently does nothing.
     return d if any(d) else BREATHING_INLET_DEFAULT_DIRECTION

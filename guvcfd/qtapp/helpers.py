@@ -43,7 +43,9 @@ _OUTLET2_REQUIRED_FIELDS = {
 }
 _STEADY_STATE_REQUIRED_FIELDS = {
     "inject-x-input": "Injection X position", "inject-y-input": "Injection Y position",
-    "inject-z-input": "Injection Z position", "source-zone-size": "Source zone size",
+    "inject-z-input": "Injection Z position", "source-zone-cells": "Source zone size (cells)",
+    "breathing-velocity": "Breathing velocity", "breathing-dir-x": "Breathing direction X",
+    "breathing-dir-y": "Breathing direction Y", "breathing-dir-z": "Breathing direction Z",
     "phase1-iterations": "Phase 1 iterations", "phase2-iterations": "Phase 2 iterations",
 }
 

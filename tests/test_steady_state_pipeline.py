@@ -780,7 +780,7 @@ def _mock_run_steady_state_scenario_deps(monkeypatch):
     monkeypatch.setattr(ssp, "_run_phase", fake_run_phase)
 
 
-def test_breathing_inlet_disabled_by_default_omits_the_constraint(tmp_path, monkeypatch):
+def test_breathing_inlet_omitted_at_zero_velocity(tmp_path, monkeypatch):
     _mock_run_steady_state_scenario_deps(monkeypatch)
     fv_calls = []
     monkeypatch.setattr(ssp, "write_fvoptions_file", lambda case_dir, entries: fv_calls.append(entries))
@@ -795,7 +795,7 @@ def test_breathing_inlet_disabled_by_default_omits_the_constraint(tmp_path, monk
     assert not any("breathingInletVelocity" in entry for entry in fv_calls[0])
 
 
-def test_breathing_inlet_enabled_adds_the_velocity_constraint_to_phase1(tmp_path, monkeypatch):
+def test_breathing_velocity_adds_the_velocity_constraint_to_phase1(tmp_path, monkeypatch):
     _mock_run_steady_state_scenario_deps(monkeypatch)
     fv_calls = []
     monkeypatch.setattr(ssp, "write_fvoptions_file", lambda case_dir, entries: fv_calls.append(entries))
@@ -803,7 +803,7 @@ def test_breathing_inlet_enabled_adds_the_velocity_constraint_to_phase1(tmp_path
     run_steady_state_scenario(
         str(tmp_path), 4.0, 5.0, 2.7, ach=6.0, Z=6.0,
         phase1_iterations=1500, phase2_iterations=1500,
-        phase1_only=True, breathing_inlet_enabled=True, log_fn=lambda m: None,
+        phase1_only=True, breathing_inlet_velocity=0.06, log_fn=lambda m: None,
     )
 
     assert len(fv_calls) == 1

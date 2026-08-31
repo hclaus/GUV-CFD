@@ -12,24 +12,26 @@ def _patient_ward_settings():
         "outlet-wall": "xMax", "outlet-y-input": 1.5, "outlet-z-input": 0.4,
         "outlet-size-w": 0.3, "outlet-size-h": 0.3,
         "inject-x-input": 2.0, "inject-y-input": 1.5, "inject-z-input": 1.5,
-        "source-zone-size": 0.3,
+        "source-zone-cells": 1, "breathing-velocity": 0.06,
+                "breathing-dir-x": 0.0, "breathing-dir-y": 0.0, "breathing-dir-z": 1.0,
     }
 
 
 # --- _check_grid_alignment - source-zone-only now, inlet/outlet moved to
 # the new sequential walk_opening_alignment_conflicts flow ---
 
-def test_check_grid_alignment_is_source_zone_only(monkeypatch):
+def test_check_grid_alignment_is_source_position_only(monkeypatch):
     # Regression guard for the 2026-08-07 scope narrowing: inlet/outlet
-    # mismatches used to appear here too - they must NOT anymore, even
-    # though the settings below (same real patient-ward case) still has
-    # both an inlet/outlet AND a source-zone mismatch. Inlet/outlet now
-    # live exclusively in walk_opening_alignment_conflicts.
+    # mismatches used to appear here too - they must NOT anymore. Inlet/outlet
+    # live exclusively in walk_opening_alignment_conflicts. What this reports
+    # is now the source POSITION (2026-08-31): the zone's size is configured
+    # in whole cells and so is exact by construction, but an off-lattice
+    # centre still forces the box edges to snap outward and grow the zone.
     monkeypatch.setattr(guvcfd_app, "load_advanced_settings", lambda: {"mesh-cell-size": 0.1})
     room = SimpleNamespace(x=3.2, y=4.8, z=2.57)
     mismatches = guvcfd_app._check_grid_alignment(_patient_ward_settings(), room)
     names = {m["name"] for m in mismatches}
-    assert names == {"Contaminant source zone"}
+    assert names == {"Contaminant source position"}
 
 
 def test_check_grid_alignment_empty_when_already_grid_aligned(monkeypatch):
@@ -40,7 +42,6 @@ def test_check_grid_alignment_empty_when_already_grid_aligned(monkeypatch):
         "inlet-size-w": 0.4, "inlet-size-h": 0.4,
         "outlet-wall": "xMax", "outlet-y-input": 2.0, "outlet-z-input": 2.0,
         "outlet-size-w": 0.4, "outlet-size-h": 0.4,
-        "source-zone-size": 0.4,
     }
     assert guvcfd_app._check_grid_alignment(settings, room) == []
 
@@ -79,7 +80,6 @@ def test_apply_grid_align_fix_writes_only_the_mismatched_fields(monkeypatch):
     values_by_id = dict(zip(guvcfd_app._GRID_ALIGN_ALL_FIELD_IDS, field_values))
     assert is_open is False
     assert "must be saved manually" in note
-    assert values_by_id["source-zone-size"] == 0.4  # max of the actual (0.3, 0.4, 0.4)
     assert guvcfd_app._pending_grid_fix["mismatches"] is None
 
 

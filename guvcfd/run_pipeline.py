@@ -17,7 +17,8 @@ from guv_calcs import Project
 
 from .case_io import read_cell_centers, read_cell_volumes, read_boundary_patch_names, write_scalar_field
 from .cellzones import bin_decay_rates, write_cellzones, write_fvoptions
-from .contaminant_source import write_fvoptions_file, source_box_grid_alignment
+from .contaminant_source import (write_fvoptions_file, source_box_grid_alignment,
+                                  resolve_source_size, suggest_source_center_fix)
 from .decay_analysis import read_vol_average_dat
 from .fan import write_fan_topo_set_dict, fan_fvoptions_entry
 from .fluence import compute_fluence_at_points, compute_inactivation_rate, compute_well_mixed_eACH
@@ -755,9 +756,9 @@ def check_ach_delivery(case_dir, room_volume, ach, outlet_patches=("outlet",), t
     }
 
 
-def check_settings_grid_alignment(settings, room, cell_size, source_size=None, tol=1e-6):
+def check_settings_grid_alignment(settings, room, cell_size, tol=1e-6):
     """Check whether the inlet/outlet/inlet2/outlet2 openings and the
-    contaminant source zone (if source_size is given) will be resized
+    contaminant source position will be moved
     once their positions/sizes snap to the mesh grid (see
     mesh_gen.opening_grid_alignment / contaminant_source.
     source_box_grid_alignment) - lets a caller warn a user BEFORE running
@@ -770,7 +771,7 @@ def check_settings_grid_alignment(settings, room, cell_size, source_size=None, t
 
     settings: a project's settings dict (inlet-wall/inlet-y-input/etc,
     the same shape run_pipeline/scenario_runs already expect).
-    inject-x/y/z-input, if present and source_size is given, gets
+    inject-x/y/z-input, if present, gets
     checked too.
 
     Returns a list of dicts, one per opening/zone whose actual carved
@@ -797,12 +798,19 @@ def check_settings_grid_alignment(settings, room, cell_size, source_size=None, t
     _check_opening("2nd inlet", "inlet2", enabled=bool(settings.get("inlet2-enable")))
     _check_opening("2nd outlet", "outlet2", enabled=bool(settings.get("outlet2-enable")))
 
+    # The source zone's SIZE can no longer mismatch - it is configured in whole
+    # mesh cells (contaminant_source.source_size_from_cells), so it is exact by
+    # construction. Its CENTRE still can: an off-lattice centre forces the box
+    # edges to snap outward, growing the zone by up to a cell per axis. Report
+    # that instead, as a position the caller can offer to correct - the same
+    # treatment openings get from suggest_opening_center_fix.
     has_source_inputs = all(k in settings for k in ("inject-x-input", "inject-y-input", "inject-z-input"))
-    if source_size is not None and has_source_inputs:
+    if has_source_inputs:
         center = (settings["inject-x-input"], settings["inject-y-input"], settings["inject-z-input"])
-        nominal, actual = source_box_grid_alignment(center, source_size, cell_size, (room.x, room.y, room.z))
-        if any(abs(a - n) > tol for n, a in zip(nominal, actual)):
-            mismatches.append({"name": "Contaminant source zone", "nominal": nominal, "actual": actual})
+        size = resolve_source_size(settings, cell_size, (room.x, room.y, room.z))
+        cur, sug = suggest_source_center_fix(center, size, cell_size, (room.x, room.y, room.z))
+        if any(abs(a - b) > tol for a, b in zip(cur, sug)):
+            mismatches.append({"name": "Contaminant source position", "nominal": cur, "actual": sug})
 
     return mismatches
 

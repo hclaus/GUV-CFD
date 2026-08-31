@@ -22,7 +22,8 @@ from .case_io import read_openfoam_scalar_field, read_latest_time_field
 from .cellzones import bin_decay_rates
 from .contaminant_source import (
     write_source_topo_set_dict, compute_source_strength, source_Su, source_fvoptions_entry,
-    BREATHING_INLET_DEFAULT_DIRECTION, breathing_inlet_velocity_constraint, write_fvoptions_file, live_mass_balance_functions, windowed_mass_balance,
+    BREATHING_INLET_DEFAULT_DIRECTION, breathing_inlet_velocity_constraint,
+    suggest_source_center_fix, write_fvoptions_file, live_mass_balance_functions, windowed_mass_balance,
 )
 from .decay_analysis import (
     read_vol_average_dat, check_plateau_windowed, windowed_stats,
@@ -1152,7 +1153,7 @@ def run_steady_state_scenario(case_dir, room_x, room_y, room_z, ach, Z, nbins=25
                                solver_log_fn=None, status_fn=None, phase1_only=False, should_pause=None,
                                measured_ventilation_ach=None, control_results_future=None,
                                phase1_delta_t=1, phase2_delta_t=1, solve_semaphore=None,
-                               t_clamp_decay_multiplier=None, breathing_inlet_enabled=False,
+                               t_clamp_decay_multiplier=None, breathing_inlet_velocity=0.0,
                                breathing_inlet_dir=BREATHING_INLET_DEFAULT_DIRECTION):
     """Run both phases of a continuous-source steady-state scenario against
     an already-converged case (mesh + flow + fluenceRate/kUV must already
@@ -1476,8 +1477,23 @@ def run_steady_state_scenario(case_dir, room_x, room_y, room_z, ach, Z, nbins=25
             _write_phase1_checkpoint(case_dir, summary["phase1"], phase1_monitoring, G, Su, source_volume,
                                       n_source_cells)
         else:
-            log_fn(f"Carving source cellZone at {source_center}, size {source_size}...")
             room_dims = (room_x, room_y, room_z)
+            # Snap the centre onto the grid lattice first (the same treatment
+            # inlet/outlet openings get via suggest_opening_center_fix). Without
+            # it _source_box has to snap the EDGES outward instead, which keeps
+            # the zone grid-aligned but lets it grow by up to a cell per axis -
+            # a one-cell zone can silently become two cells on an axis whose
+            # room dimension isn't a whole multiple of the cell size.
+            aligned_center, _snap = source_center, None
+            cur, sug = suggest_source_center_fix(source_center, source_size, cell_size, room_dims)
+            if any(abs(a - b) > 1e-9 for a, b in zip(cur, sug)):
+                aligned_center = sug
+                _snap = tuple(round(b - a, 4) for a, b in zip(cur, sug))
+                log_fn(f"  Source centre snapped to the mesh grid: {tuple(round(v, 4) for v in cur)} "
+                       f"-> {tuple(round(v, 4) for v in sug)} (moved {_snap} m)")
+            source_center = aligned_center
+            summary["source_center"] = source_center
+            log_fn(f"Carving source cellZone at {source_center}, size {source_size}...")
             write_source_topo_set_dict(case_dir, source_center, source_size, cell_size=cell_size,
                                         room_dims=room_dims)
             r = run_wsl_or_raise("topoSet -dict system/sourceTopoSetDict", case_dir_wsl, "topoSet (source zone)")
@@ -1537,12 +1553,13 @@ def run_steady_state_scenario(case_dir, room_x, room_y, room_z, ach, Z, nbins=25
             # --- Phase 1: source only, no UV ---
             log_fn("=== Phase 1: source only (no UV) ===")
             fv_entries = [source_entry] + fan_entries
-            if breathing_inlet_enabled:
+            if breathing_inlet_velocity > 0:
                 breathing_entry = breathing_inlet_velocity_constraint(
-                    zone_name="sourceZone", velocity_magnitude=0.06, direction=breathing_inlet_dir)
+                    zone_name="sourceZone", velocity_magnitude=breathing_inlet_velocity,
+                    direction=breathing_inlet_dir)
                 fv_entries.append(breathing_entry)
                 log_fn(f"  Breathing inlet velocity constraint enabled "
-                       f"(U fixed to 0.06 m/s in sourceZone, direction={tuple(breathing_inlet_dir)})")
+                       f"(U fixed to {breathing_inlet_velocity:g} m/s in sourceZone, direction={tuple(breathing_inlet_dir)})")
             write_fvoptions_file(case_dir, fv_entries)
             _, n_open, n_close = splice_fv_options_into_control_dict(case_dir)
             assert n_open == n_close, f"Brace mismatch: {n_open} vs {n_close}"
@@ -1635,9 +1652,10 @@ def run_steady_state_scenario(case_dir, room_x, room_y, room_z, ach, Z, nbins=25
     k_values = read_openfoam_scalar_field(f"{case_dir}/0/kUV")
     uv_entries = _uv_fvoptions_entries(np.array(k_values), nbins)
     fv_entries_p2 = [source_entry] + uv_entries + fan_entries
-    if breathing_inlet_enabled:
+    if breathing_inlet_velocity > 0:
         breathing_entry = breathing_inlet_velocity_constraint(
-            zone_name="sourceZone", velocity_magnitude=0.06, direction=breathing_inlet_dir)
+            zone_name="sourceZone", velocity_magnitude=breathing_inlet_velocity,
+                    direction=breathing_inlet_dir)
         fv_entries_p2.append(breathing_entry)
     write_fvoptions_file(case_dir, fv_entries_p2)
     _, n_open, n_close = splice_fv_options_into_control_dict(case_dir)

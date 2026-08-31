@@ -45,7 +45,8 @@ from .case_io import (
     read_openfoam_scalar_field, write_scalar_field, snapshot_openfoam_settings,
 )
 from .cellzones import bin_decay_rates, write_cellzones
-from .contaminant_source import (breathing_inlet_direction, breathing_inlet_velocity_constraint,
+from .contaminant_source import (breathing_inlet_direction, breathing_inlet_velocity,
+                                  breathing_inlet_velocity_constraint, resolve_source_size,
                                   write_fvoptions_file,
                                   write_source_topo_set_dict)
 from .decay_analysis import write_results_summary, mechanical_mixing_efficiency_pct, spatial_coefficient_of_variation
@@ -595,18 +596,28 @@ def _carve_breathing_inlet(case_dir, room, settings, adv, log_fn):
     would otherwise leave the constraint pointing at a cellZone that
     doesn't exist.
     """
-    if not adv.get("breathing-inlet-enabled", False):
+    velocity = breathing_inlet_velocity(settings)
+    if velocity <= 0:
+        return None   # 0 m/s IS the "no breathing inlet" case - no separate flag
+    # No injection position means there is nowhere to put the jet. Every real
+    # project has these (they are the source-geometry fields right above the
+    # velocity one), but decay-only settings dicts and older/partial projects
+    # may not - degrade to "no breathing inlet" rather than raising KeyError,
+    # since velocity now defaults to 0.06 and this runs for every scenario.
+    if not all(k in settings for k in ("inject-x-input", "inject-y-input", "inject-z-input")):
         return None
     write_source_topo_set_dict(
         case_dir,
         (settings["inject-x-input"], settings["inject-y-input"], settings["inject-z-input"]),
-        settings["source-zone-size"], cell_size=adv["mesh-cell-size"],
-        room_dims=(room.x, room.y, room.z))
+        resolve_source_size(settings, adv["mesh-cell-size"], (room.x, room.y, room.z)),
+        cell_size=adv["mesh-cell-size"], room_dims=(room.x, room.y, room.z))
     run_wsl_or_raise("topoSet -dict system/sourceTopoSetDict", wsl_path(case_dir),
                       "topoSet (source zone for the breathing inlet)")
-    log_fn("  Breathing inlet velocity constraint enabled (U fixed to 0.06 m/s in sourceZone)")
-    return breathing_inlet_velocity_constraint(zone_name="sourceZone", velocity_magnitude=0.06,
-                                               direction=breathing_inlet_direction(adv))
+    direction = breathing_inlet_direction(settings)
+    log_fn(f"  Breathing inlet velocity constraint enabled "
+           f"(U fixed to {velocity:g} m/s in sourceZone, direction={direction})")
+    return breathing_inlet_velocity_constraint(zone_name="sourceZone", velocity_magnitude=velocity,
+                                               direction=direction)
 
 
 def _apply_z(case_dir, Z, nbins, fan_kwargs, log_fn, adaptive_t_relaxation=False, scalar_relaxation=0.7):
@@ -802,7 +813,7 @@ def _run_scenario(case_dir, room, settings, z, ach, adv, z_summary, log_fn, shou
         phase2_write_interval=adv["phase-write-interval"],
         window_frac=settings.get("t-ss-window-frac") or 0.15,
         cell_size=adv["mesh-cell-size"], nbins=adv["uv-zone-bins"],
-        source_size=settings["source-zone-size"],
+        source_size=resolve_source_size(settings, adv["mesh-cell-size"], (room.x, room.y, room.z)),
         plateau_rel_tol=adv["plateau-rel-tol"] / 100.0,
         t_inf_check_interval=adv["phase-chunk-size"] if adv["t-infinity-early-stop-enabled"] else None,
         t_inf_rel_tol=(adv["t-infinity-rel-tol"] / 100.0) if adv["t-infinity-early-stop-enabled"] else None,
@@ -820,8 +831,8 @@ def _run_scenario(case_dir, room, settings, z, ach, adv, z_summary, log_fn, shou
         control_results_future=control_results_future,
         phase1_delta_t=phase1_delta_t, phase2_delta_t=phase2_delta_t, solve_semaphore=solve_semaphore,
         t_clamp_decay_multiplier=adv["t-clamp-decay-multiplier"] if adv["t-clamp-decay-enabled"] else None,
-        breathing_inlet_enabled=adv.get("breathing-inlet-enabled", False),
-        breathing_inlet_dir=breathing_inlet_direction(adv),
+        breathing_inlet_velocity=breathing_inlet_velocity(settings),
+        breathing_inlet_dir=breathing_inlet_direction(settings),
     )
     result["fluence_mean"] = z_summary["fluence_mean"]
     result["eACH_uv_well_mixed"] = z_summary.get("eACH_uv_well_mixed_mean")
@@ -977,7 +988,7 @@ def _run_shared_phase1(base_dir, phase1_dir, ach, room, settings, adv, log_fn, s
         phase1_write_interval=adv["phase-write-interval"],
         window_frac=settings.get("t-ss-window-frac") or 0.15,
         cell_size=adv["mesh-cell-size"],
-        source_size=settings["source-zone-size"],
+        source_size=resolve_source_size(settings, adv["mesh-cell-size"], (room.x, room.y, room.z)),
         plateau_rel_tol=adv["plateau-rel-tol"] / 100.0,
         t_inf_check_interval=adv["phase-chunk-size"] if adv["t-infinity-early-stop-enabled"] else None,
         t_inf_rel_tol=(adv["t-infinity-rel-tol"] / 100.0) if adv["t-infinity-early-stop-enabled"] else None,
@@ -989,8 +1000,8 @@ def _run_shared_phase1(base_dir, phase1_dir, ach, room, settings, adv, log_fn, s
         status_fn=status_fn, phase1_only=True, phase1_delta_t=phase1_delta_t,
         phase1_resume_decision=phase1_resume_decision, solve_semaphore=solve_semaphore,
         t_clamp_decay_multiplier=adv["t-clamp-decay-multiplier"] if adv["t-clamp-decay-enabled"] else None,
-        breathing_inlet_enabled=adv.get("breathing-inlet-enabled", False),
-        breathing_inlet_dir=breathing_inlet_direction(adv),
+        breathing_inlet_velocity=breathing_inlet_velocity(settings),
+        breathing_inlet_dir=breathing_inlet_direction(settings),
     )
 
 
@@ -1117,10 +1128,11 @@ def _run_shared_control(base_dir, control_dir, ach, room, settings, adv, log_fn,
     # Built before the clone (it's pure text, needs no case dir) so the
     # fvOptions prepare_ventilation_only_control writes already carries it;
     # the cellZone it binds to is carved right after, once control_dir exists.
+    _bv = breathing_inlet_velocity(settings)
     breathing_entry = (breathing_inlet_velocity_constraint(
-                           zone_name="sourceZone", velocity_magnitude=0.06,
-                           direction=breathing_inlet_direction(adv))
-                       if adv.get("breathing-inlet-enabled", False) else None)
+                           zone_name="sourceZone", velocity_magnitude=_bv,
+                           direction=breathing_inlet_direction(settings))
+                       if _bv > 0 else None)
     prepare_ventilation_only_control(
         base_dir, control_dir, base_summary["inlet_velocity"],
         control_end_time, write_interval, pimple_delta_t=adv["pimple-delta-t"], max_co=adv["max-co"],
@@ -2206,7 +2218,8 @@ def run_sweep(guv_path, settings_path, project_dir, room, settings, adv,
             # fvOptions entry still resolves against a real cellZone.
             write_source_topo_set_dict(
                 case_dir, (settings["inject-x-input"], settings["inject-y-input"], settings["inject-z-input"]),
-                settings["source-zone-size"], cell_size=adv["mesh-cell-size"], room_dims=(room.x, room.y, room.z))
+                resolve_source_size(settings, adv["mesh-cell-size"], (room.x, room.y, room.z)),
+                cell_size=adv["mesh-cell-size"], room_dims=(room.x, room.y, room.z))
             run_wsl_or_raise("topoSet -dict system/sourceTopoSetDict", wsl_path(case_dir),
                               "topoSet (restoring source zone wiped by _apply_z)")
             # The future itself is handed through, not .result() here -
