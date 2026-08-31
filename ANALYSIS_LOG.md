@@ -1514,3 +1514,69 @@ knob for this case. Raising Tmax 10x (43.25 -> 432.5) produced a
 **bit-identical** T field at every snapshot, because the field's maximum
 never exceeds 6.8 - the ceiling branch is never taken and every clamp event
 is the T<0 floor.
+
+### 2026-08-31 follow-up: the source position WAS the artifact - and the jet direction is horizontal, not vertical
+
+**Interactive dashboard for this result:**
+https://claude.ai/code/artifact/768637ad-8837-4ac2-b789-07179a5604da
+(Phase 1/2 curves for both source positions, the measured-vs-implied T_ss1
+diagnostic, the three-way control comparison, and the consistency checks.)
+
+Moving the injection point off the outlet axis - (0.4, 1.2, 1.3) ->
+(0.4, 2.4, 1.3), same wall distance and breathing height, y moved to the
+midpoint between the two opening columns at y=1.2/y=3.6, 0.70 m clear of each,
+grid-aligned - resolves the caveat flagged above.
+
+| | source AT outlet axis | source MOVED off axis |
+|---|---|---|
+| Phase 1 T_ss1 | 0.4247 | **1.130** |
+| tau | 760 iters | 1771 iters |
+| trailing CV | 0.49% | 0.19% |
+| control ventilation | 3.929 /hr | 3.671 /hr |
+| control-IMPLIED T_ss1 | 1.527 | 1.634 |
+| **measured-vs-implied gap** | **3.60x** | **1.45x** |
+
+The gap collapsing 3.60x -> 1.45x is the proof: aiming the exhale down the
+barrel of the extract was removing roughly two thirds of the contaminant
+before it ever mixed into the room. The residual 1.45x is the transport-lag
+bias `compute_corrected_eACH_uv_from_control` already documents. Corroborating:
+tau more than doubled (no express route to the extract) and the plateau got
+TIGHTER (CV 0.19% vs 0.49%), so the higher value is not noise.
+
+**The UV-off control agrees independently** (it contains no contaminant source
+at all): 3.666 /hr with no breathing inlet, 3.671 /hr with the jet off-axis
+(+0.1%), but 3.929 /hr with the jet aimed at the extract (+7%). A breath into
+open room does not change how well the room clears; one aimed into the extract
+does.
+
+**First methodologically complete Phase 2** (`ventilation_measurement_method
+== "control_run"`, not the biased `phase1_buildup` fallback): T_ss1=1.130,
+T_ss2=0.0803, reduction_pct=92.90%, reduction_pct_corrected=95.09%,
+eACH_uv_steady_state=78.51/hr, eACH_uv_steady_state_corrected=71.09/hr,
+eACH_uv_well_mixed=72.39/hr, ventilation_ach_measured=3.671/hr. Two checks that
+FAILED at the old position and pass here: the Phase-1-derived and
+control-derived reductions now agree within 2.2 points (was a 12-point gap,
+83.2% vs 95.2%), and corrected eACH_uv lands within 1.8% of the independently
+computed well-mixed value.
+
+**Clarifying the jet direction - it is HORIZONTAL (+x), not vertical.**
+`breathing_inlet_velocity_constraint` defaults to `direction=(1, 0, 0)` and no
+call site overrides it, so every run so far wrote
+`U (6.0e-02 0.0e+00 0.0e+00)` - 0.06 m/s along +x, zero in y and z. This is
+inherited from the original momentum-source prototype; it was never derived
+from room layout or from any occupant orientation. Two consequences worth
+keeping in view:
+
+- A horizontal jet is defensible for an *exhale* (breath leaves the mouth
+  roughly horizontally, in the direction the person faces). A vertical (+z)
+  jet would model something different - a thermal plume off a warm body -
+  which this feature does not attempt.
+- **In this room +x still points at the wall carrying every opening.** The
+  source sits at x=0.4 and all four openings are on the xMax wall (x=3.2), so
+  the jet always blows toward the vent wall; moving to y=2.4 only means it now
+  hits a blank part of that wall instead of the outlet itself. The geometric
+  coupling is reduced, not eliminated.
+
+Before this feature is used for exposure numbers in any new geometry, the
+direction needs to become a real modelling input (occupant orientation, or at
+minimum a documented worst/typical case) rather than an inherited default.
