@@ -82,7 +82,8 @@ def estimate_source_zone_flush_T(case_dir, source_center, source_size, G_total, 
     T_local_peak ~= G_total / (U_local * A_cross)
 
     U_local: mean |U| within the source zone's own cells (order-of-
-    magnitude local flushing speed). A_cross: source_size^2 - the zone is
+    magnitude local flushing speed). A_cross: the equivalent cube's face area
+    (carved volume^(2/3), == source_size^2 for a cube) - the zone is
     a cube, and this is a generous, direction-agnostic estimate of its
     cross-sectional area, not a precise one (fine for a safety-margin
     Tmax reference, not for a tight physical bound).
@@ -106,7 +107,15 @@ def estimate_source_zone_flush_T(case_dir, source_center, source_size, G_total, 
         raise RuntimeError(f"estimate_source_zone_flush_T: {time_dir}/U has {len(U)} cells but "
                             f"{time_dir}/Cx has {len(centers)} - mesh/field mismatch")
     u_local = max(float(np.linalg.norm(U[mask], axis=1).mean()), min_velocity)
-    a_cross = source_size ** 2
+    # Cross-section of the ACTUAL carved box, as the equivalent cube's face
+    # area (volume^(2/3)). Not source_size**2: source_size is a per-axis
+    # (sx, sy, sz) tuple since the zone size became a cell count (a cell is
+    # only a cube when every room dimension divides the cell size evenly), so
+    # squaring it raises TypeError. V^(2/3) reduces to exactly source_size**2
+    # for a cube, so this preserves the original behaviour where it applied,
+    # and uses the real snapped extents rather than the nominal ones.
+    extents = hi - lo
+    a_cross = float(np.prod(extents)) ** (2.0 / 3.0)
     return G_total / (u_local * a_cross)
 
 

@@ -61,6 +61,18 @@ ADVANCED_SETTINGS_DEFAULTS = {
     # at its floor.
     "t-clamp-decay-enabled": False,
     "t-clamp-decay-multiplier": 1.3,
+    # Phase 1's own Tmax = this x target_T_ss. Phase 2 can use Phase 1's
+    # converged source-zone max T as a reference; Phase 1 has no such
+    # reference while it is still running, and an earlier attempt to estimate
+    # one from the live flow field (G/(u_local*A)) collapsed Tmax below the
+    # real peak once a breathing jet was present, clamping every iteration.
+    # target_T_ss needs no measurement - G is calibrated from it - so this is
+    # known before the first iteration. The ceiling is a DIVERGENCE BACKSTOP
+    # (the T<0 floor does the real work and is unconditional), so it wants to
+    # sit far above anything physically reachable: a source-zone peak of ~6x
+    # the room average is normal, making 10-20x a comfortable margin that
+    # never touches real physics.
+    "phase1-tmax-multiplier": 20.0,
     # scalarTransport1 (controlDict) solves T OUTSIDE PIMPLE's own outer-
     # corrector loop, once per timestep by default - scalar-relaxation only
     # avoids biasing the result if nCorr/tolerance are high/tight enough for
@@ -210,7 +222,7 @@ PROJECT_OPENFOAM_SETTINGS_KEYS = (
     "flow-rel-tol", "flow-max-iterations", "plateau-rel-tol", "pimple-delta-t",
     "mesh-cell-size", "uv-zone-bins",
     "momentum-relaxation", "scalar-relaxation", "adaptive-t-relaxation",
-    "t-clamp-decay-enabled", "t-clamp-decay-multiplier",
+    "t-clamp-decay-enabled", "t-clamp-decay-multiplier", "phase1-tmax-multiplier",
     "scalar-transport-ncorr", "scalar-transport-tolerance",
     "t-infinity-early-stop-enabled", "t-infinity-rel-tol",
     "phase1-require-stable-extrapolation", "phase-chunk-size", "phase-write-interval",

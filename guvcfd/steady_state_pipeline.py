@@ -41,7 +41,6 @@ from .splice import (
 )
 from .tclamp_decay import (
     source_zone_max_T, ensure_tclamp_decay_compiled, splice_tclamp_decay_if_needed,
-    estimate_source_zone_flush_T,
 )
 from .wsl_utils import (
     wsl_path, run_wsl_or_raise, run_wsl_streaming, StoppedByUser,
@@ -1108,26 +1107,38 @@ def clear_phase_resume_state(case_dir):
 REFERENCE_TARGET_T_SS = 1.0
 
 
-def _apply_phase1_tclamp_decay(case_dir, source_center, source_size, G, cell_size, room_dims,
-                                t_clamp_decay_multiplier, log_fn):
+def _apply_phase1_tclamp_decay(case_dir, target_T_ss, phase1_tmax_multiplier, log_fn):
     """Splice TClampDecay into Phase 1's own controlDict, if enabled -
     idempotent (safe to call whether this is a fresh start or a resume of
     an already-spliced case, see splice_tclamp_decay_if_needed). Returns
     the Tmax used, or None if disabled.
 
-    Uses estimate_source_zone_flush_T, NOT source_zone_max_T - Phase 2's
-    own Tmax is Phase 1's converged source-zone max T, but that reference
-    doesn't exist yet while Phase 1 itself is still running (see that
-    function's docstring for the chicken-and-egg problem this avoids and
-    the local-flush estimate that replaces it).
+    Tmax = phase1_tmax_multiplier * target_T_ss. The clamp is a DIVERGENCE
+    BACKSTOP, not a peak shaver: the T<0 floor is what does the real work
+    (and is a separate branch in TClampDecay.C, unaffected by Tmax), while
+    the ceiling exists only to catch a cell running away to 1e80. Tmax
+    therefore wants to sit far above any physically reachable value - a
+    source-zone peak of ~6x the room average is normal, so 10-20x the
+    expected room average is a comfortable backstop that never touches real
+    physics.
+
+    Replaces an earlier estimate_source_zone_flush_T-based Tmax, which was
+    G/(u_local*A) measured from the case's own flow field. That was fragile
+    in exactly the way an a-priori estimator should not be: it is meant to
+    run against the jet-free base flow, and evaluating it on a field that
+    already carries a 0.06 m/s breathing jet drove u_local ~4x higher and
+    collapsed Tmax from 43.25 to 9.175 - below the field's real peak of
+    12.3, so the clamp fired on EVERY iteration (mean ~1040 cells) and
+    silently altered the physics it exists to protect. target_T_ss needs no
+    measurement at all: G is calibrated from it (compute_source_strength),
+    so it is known before the first iteration and cannot drift.
     """
-    if t_clamp_decay_multiplier is None:
+    if phase1_tmax_multiplier is None:
         return None
-    zone_flush_T = estimate_source_zone_flush_T(case_dir, source_center, source_size, G,
-                                                 cell_size=cell_size, room_dims=room_dims)
-    t_clamp_max = t_clamp_decay_multiplier * zone_flush_T
-    log_fn(f"  T-clamp-decay (Phase 1): estimated source-zone flush T={zone_flush_T:.4g} -> "
-           f"Tmax={t_clamp_max:.4g} ({t_clamp_decay_multiplier:g}x)")
+    t_clamp_max = phase1_tmax_multiplier * target_T_ss
+    log_fn(f"  T-clamp-decay (Phase 1): Tmax={t_clamp_max:.4g} "
+           f"({phase1_tmax_multiplier:g}x target T_ss={target_T_ss:g}) - divergence backstop; "
+           f"the T<0 floor is unconditional")
     ensure_tclamp_decay_compiled(log_fn)
     splice_tclamp_decay_if_needed(case_dir, t_clamp_max)
     return t_clamp_max
@@ -1154,7 +1165,8 @@ def run_steady_state_scenario(case_dir, room_x, room_y, room_z, ach, Z, nbins=25
                                measured_ventilation_ach=None, control_results_future=None,
                                phase1_delta_t=1, phase2_delta_t=1, solve_semaphore=None,
                                t_clamp_decay_multiplier=None, breathing_inlet_velocity=0.0,
-                               breathing_inlet_dir=BREATHING_INLET_DEFAULT_DIRECTION):
+                               breathing_inlet_dir=BREATHING_INLET_DEFAULT_DIRECTION,
+                               phase1_tmax_multiplier=None):
     """Run both phases of a continuous-source steady-state scenario against
     an already-converged case (mesh + flow + fluenceRate/kUV must already
     exist - see run_pipeline.setup_case()). Returns a summary dict.
@@ -1405,8 +1417,7 @@ def run_steady_state_scenario(case_dir, room_x, room_y, room_z, ach, Z, nbins=25
             source_entry = source_fvoptions_entry(Su)
             fan_entries = [fan_entry] if fan_entry is not None else []
             summary["phase1_t_clamp_decay_max"] = _apply_phase1_tclamp_decay(
-                case_dir, source_center, source_size, G, cell_size, (room_x, room_y, room_z),
-                t_clamp_decay_multiplier, log_fn)
+                case_dir, target_T_ss, phase1_tmax_multiplier, log_fn)
 
             if phase1_resume_decision == "continue":
                 additional = phase1_resume_additional_iterations or phase1_iterations
@@ -1519,8 +1530,7 @@ def run_steady_state_scenario(case_dir, room_x, room_y, room_z, ach, Z, nbins=25
             summary["injection_rate_total"] = G
             log_fn(f"  G={G:.4g}, Su={Su:.4g}")
             summary["phase1_t_clamp_decay_max"] = _apply_phase1_tclamp_decay(
-                case_dir, source_center, source_size, G, cell_size, room_dims,
-                t_clamp_decay_multiplier, log_fn)
+                case_dir, target_T_ss, phase1_tmax_multiplier, log_fn)
 
             source_entry = source_fvoptions_entry(Su)
             fan_entries = [fan_entry] if fan_entry is not None else []

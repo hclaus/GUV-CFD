@@ -208,3 +208,26 @@ def test_splice_tclamp_decay_runs_before_volaverage_tracking(tmp_path):
     splice_tclamp_decay_if_needed(case_dir, 29.9)
     content = (tmp_path / "case" / "system" / "controlDict").read_text()
     assert content.index("scalarTransport1") < content.index("TClampDecay1") < content.index("volAverageLive1")
+
+
+def test_estimate_source_zone_flush_T_accepts_a_per_axis_size_tuple(monkeypatch, tmp_path):
+    """Regression: the source zone size became a CELL COUNT (2026-08-31), so
+    callers now pass a per-axis (sx, sy, sz) tuple - a cell is only a cube when
+    every room dimension divides the cell size evenly. `source_size ** 2` raised
+    TypeError on that, killing a real run at the T-clamp step. The full test
+    suite missed it; only a live run caught it.
+    """
+    import numpy as np
+    import guvcfd.tclamp_decay as td
+
+    centers = np.array([[0.4, 1.2, 1.3]])
+    monkeypatch.setattr(td, "read_cell_centers", lambda *a, **k: centers)
+    monkeypatch.setattr(td, "read_openfoam_vector_field",
+                         lambda *a, **k: np.array([[0.06, 0.0, 0.0]]))
+
+    cube = td.estimate_source_zone_flush_T(
+        str(tmp_path), (0.4, 1.2, 1.3), 0.2, G_total=0.0658)
+    tup = td.estimate_source_zone_flush_T(
+        str(tmp_path), (0.4, 1.2, 1.3), (0.2, 0.2, 0.2), G_total=0.0658)
+    # a cube passed as a tuple must give the same answer as the scalar form
+    assert abs(cube - tup) < 1e-9

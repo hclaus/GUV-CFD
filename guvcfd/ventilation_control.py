@@ -6,6 +6,8 @@ to set the inlet boundary condition, which imperfect real-world mixing
 doesn't fully deliver on - see decay_analysis.compute_effective_eACH's
 measured_ventilation_lambda_per_s parameter, which this feeds).
 """
+from pathlib import Path
+
 from .decay_analysis import write_results_summary
 from .contaminant_source import write_fvoptions_file
 from .initial_fields import restore_boundary_conditions
@@ -67,7 +69,14 @@ def prepare_ventilation_only_control(case_dir, control_dir, inlet_velocity, pimp
     # (definitely outside the source tree), then mv it into its final nested
     # location - mv on the same filesystem is a metadata rename, not a
     # second full copy.
-    staging_wsl = f"{case_dir_wsl_src}-no-uv-staging"
+    # Suffixed with the control dir's own name, not just the source's: two
+    # controls cloned from the SAME base concurrently would otherwise compute
+    # the identical staging path and race - one mv consumes the directory and
+    # the other fails with "cannot stat ...-no-uv-staging". That could not
+    # happen while the control was source-independent (one control per ACH
+    # group), but the control now carries the breathing inlet and so depends on
+    # the source position, making two controls off one base a real case.
+    staging_wsl = f"{case_dir_wsl_src}-no-uv-staging-{Path(control_dir).name}"
     run_wsl_or_raise(f'rm -rf "{staging_wsl}"', "$HOME", "clearing any stale staging dir")
     run_wsl_or_raise(f'cp -r "{case_dir_wsl_src}" "{staging_wsl}"', "$HOME",
                       "copying case into staging dir")

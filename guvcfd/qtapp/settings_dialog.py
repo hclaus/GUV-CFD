@@ -67,6 +67,13 @@ _FIELD_INFO = {
     "t-clamp-decay-multiplier": ("T divergence clamp multiplier",
                                   "Tmax = this value times Phase 1's own converged source-zone max T. "
                                   "Only used when the T divergence clamp above is on."),
+    "phase1-tmax-multiplier": ("Phase 1 clamp ceiling (x target T_ss)",
+                                "Phase 1's own Tmax, as a multiple of the design target room "
+                                "average. The ceiling is a divergence backstop, not a peak shaver "
+                                "- the T<0 floor does the real work and is always on. A "
+                                "source-zone peak around 6x the room average is normal, so 10-20x "
+                                "leaves the ceiling clear of real physics while still catching a "
+                                "cell running away toward 1e80."),
     "scalar-transport-ncorr": ("Contaminant solver outer correctors",
                                 "How many times the contaminant equation is re-solved per timestep - "
                                 "needs to be >0 for the relaxation factor above to matter at all."),

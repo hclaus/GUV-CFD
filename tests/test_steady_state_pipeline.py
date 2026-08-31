@@ -726,41 +726,65 @@ def test_phase1_checkpoint_corrupted_file_reads_as_none(tmp_path):
 
 def test_apply_phase1_tclamp_decay_is_a_noop_when_multiplier_is_none(monkeypatch):
     calls = []
-    monkeypatch.setattr(ssp, "estimate_source_zone_flush_T", lambda *a, **k: calls.append("estimate") or 99.0)
     monkeypatch.setattr(ssp, "ensure_tclamp_decay_compiled", lambda *a, **k: calls.append("compile"))
     monkeypatch.setattr(ssp, "splice_tclamp_decay_if_needed", lambda *a, **k: calls.append("splice"))
 
-    result = _apply_phase1_tclamp_decay("case_dir", (0.4, 1.2, 1.3), 0.4, 0.0658, 0.1, (3.2, 4.8, 2.57),
-                                         None, log_fn=lambda m: None)
+    result = _apply_phase1_tclamp_decay("case_dir", 1.0, None, log_fn=lambda m: None)
 
     assert result is None
     assert calls == []  # disabled - none of the expensive/side-effecting steps should run at all
 
 
-def test_apply_phase1_tclamp_decay_computes_tmax_from_the_flush_estimate_and_splices(monkeypatch):
-    estimate_calls = []
-    def fake_estimate(case_dir, source_center, source_size, G, cell_size=None, room_dims=None):
-        estimate_calls.append((case_dir, source_center, source_size, G, cell_size, room_dims))
-        return 30.0
-    monkeypatch.setattr(ssp, "estimate_source_zone_flush_T", fake_estimate)
-    compile_calls = []
+def test_apply_phase1_tclamp_decay_scales_tmax_off_target_t_ss(monkeypatch):
+    """Tmax = multiplier * target_T_ss, with NO dependence on the flow field.
+
+    It used to be multiplier * estimate_source_zone_flush_T(...), i.e.
+    G/(u_local*A) measured from the case's own 0/U. That estimator is meant to
+    see the jet-free base flow; run against a field already carrying a 0.06 m/s
+    breathing jet it drove u_local ~4x higher and collapsed Tmax from 43.25 to
+    9.175 - under the field's real peak of 12.3 - so the ceiling fired every
+    iteration and altered the physics it exists to protect. target_T_ss is
+    known before the first iteration (G is calibrated from it) and cannot
+    drift, which is the whole point.
+    """
+    compile_calls, splice_calls = [], []
     monkeypatch.setattr(ssp, "ensure_tclamp_decay_compiled", lambda log_fn: compile_calls.append(log_fn))
-    splice_calls = []
     monkeypatch.setattr(ssp, "splice_tclamp_decay_if_needed",
                          lambda case_dir, tmax: splice_calls.append((case_dir, tmax)))
 
-    result = _apply_phase1_tclamp_decay("phase1_dir", (0.4, 1.2, 1.3), 0.4, 0.0658, 0.1, (3.2, 4.8, 2.57),
-                                         1.3, log_fn=lambda m: None)
+    result = _apply_phase1_tclamp_decay("phase1_dir", 1.0, 20.0, log_fn=lambda m: None)
 
-    assert estimate_calls == [("phase1_dir", (0.4, 1.2, 1.3), 0.4, 0.0658, 0.1, (3.2, 4.8, 2.57))]
-    assert result == pytest.approx(1.3 * 30.0)
+    assert result == pytest.approx(20.0)
+    assert splice_calls == [("phase1_dir", pytest.approx(20.0))]
     assert len(compile_calls) == 1
-    assert splice_calls == [("phase1_dir", pytest.approx(39.0))]
 
 
-# --- breathing_inlet_enabled (2026-08-30, experimental) - run_steady_state_
-# scenario's Phase 1 fvOptions must include the momentum-source entry only
-# when the flag is on, and leave it out entirely by default. ---
+def test_phase1_tmax_default_clears_a_realistic_source_zone_peak(monkeypatch):
+    """The ceiling is a divergence backstop, not a peak shaver.
+
+    Measured on a real +z-jet run: room average 1.88 with a source-zone peak of
+    12.3, i.e. a peak ~6.5x the room average. At the shipped default the
+    ceiling must sit clear of that, or it starts clamping real physics - which
+    is exactly what happened when Tmax was derived from the live flow field and
+    landed at 9.175, under that 12.3 peak.
+    """
+    from guvcfd.app_settings import ADVANCED_SETTINGS_DEFAULTS
+
+    splice_calls = []
+    monkeypatch.setattr(ssp, "ensure_tclamp_decay_compiled", lambda log_fn: None)
+    monkeypatch.setattr(ssp, "splice_tclamp_decay_if_needed",
+                         lambda case_dir, tmax: splice_calls.append(tmax))
+
+    multiplier = ADVANCED_SETTINGS_DEFAULTS["phase1-tmax-multiplier"]
+    target = ssp.REFERENCE_TARGET_T_SS
+    tmax = _apply_phase1_tclamp_decay("d", target, multiplier, log_fn=lambda m: None)
+
+    measured_peak = 12.3          # real run, against a 1.88 room average
+    measured_room_average = 1.88
+    assert tmax == splice_calls[0]
+    # scaled to this run's own overshoot, the ceiling must clear the peak
+    assert tmax > measured_peak / measured_room_average * target
+
 
 def _mock_run_steady_state_scenario_deps(monkeypatch):
     for fn in ("ensure_simple_fvsolution", "disable_simple_residual_control", "write_vol_average_dict",

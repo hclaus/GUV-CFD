@@ -1434,6 +1434,7 @@ def _finish_steady_state(case_dir, room, settings, summary,
         should_pause=_should_pause,
         phase1_delta_t=phase1_delta_t, phase2_delta_t=phase2_delta_t,
         t_clamp_decay_multiplier=adv["t-clamp-decay-multiplier"] if adv["t-clamp-decay-enabled"] else None,
+        phase1_tmax_multiplier=adv["phase1-tmax-multiplier"] if adv["t-clamp-decay-enabled"] else None,
         breathing_inlet_velocity=breathing_inlet_velocity(settings),
         breathing_inlet_dir=breathing_inlet_direction(settings),
     )
@@ -2637,6 +2638,16 @@ settings_modal = dbc.Modal(
                     "used when the T divergence clamp above is on.",
                     "x", _adv_defaults["t-clamp-decay-multiplier"],
                 ),
+                _settings_field(
+                    "settings-phase1-tmax-multiplier", "Phase 1 clamp ceiling (x target T_ss)",
+                    "Phase 1's own Tmax, as a multiple of the design target room average. The "
+                    "ceiling is a DIVERGENCE BACKSTOP, not a peak shaver — the T<0 floor does the "
+                    "real work and is always on. A source-zone peak around 6x the room average is "
+                    "normal, so 10–20x leaves the ceiling clear of real physics while still "
+                    "catching a cell running away toward 1e80. Phase 2 uses its own reference "
+                    "(the multiplier above x Phase 1's converged source-zone max T).",
+                    "x", _adv_defaults["phase1-tmax-multiplier"],
+                ),
                 html.Div(
                     "T is solved by its own scalarTransport function object, entirely outside "
                     "PIMPLE's/SIMPLE's own outer-iteration loop — the two settings below control "
@@ -3685,6 +3696,7 @@ _SETTINGS_FIELD_IDS = [
     "settings-plateau-rel-tol", "settings-mass-balance-tol",
     "settings-momentum-relaxation", "settings-scalar-relaxation", "settings-adaptive-t-relaxation",
     "settings-t-clamp-decay-enabled", "settings-t-clamp-decay-multiplier",
+    "settings-phase1-tmax-multiplier",
     "settings-scalar-transport-ncorr", "settings-scalar-transport-tolerance",
     "settings-t-infinity-early-stop-enabled", "settings-phase1-require-stable-extrapolation",
     "settings-t-infinity-rel-tol",
@@ -3706,7 +3718,7 @@ _SETTINGS_FIELD_KEYS = [
     "oscillation-window", "oscillation-growth-tol", "ach-delivery-tol",
     "plateau-rel-tol", "mass-balance-tol",
     "momentum-relaxation", "scalar-relaxation", "adaptive-t-relaxation",
-    "t-clamp-decay-enabled", "t-clamp-decay-multiplier",
+    "t-clamp-decay-enabled", "t-clamp-decay-multiplier", "phase1-tmax-multiplier",
     "scalar-transport-ncorr", "scalar-transport-tolerance",
     "t-infinity-early-stop-enabled", "phase1-require-stable-extrapolation",
     "t-infinity-rel-tol",

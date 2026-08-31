@@ -831,6 +831,7 @@ def _run_scenario(case_dir, room, settings, z, ach, adv, z_summary, log_fn, shou
         control_results_future=control_results_future,
         phase1_delta_t=phase1_delta_t, phase2_delta_t=phase2_delta_t, solve_semaphore=solve_semaphore,
         t_clamp_decay_multiplier=adv["t-clamp-decay-multiplier"] if adv["t-clamp-decay-enabled"] else None,
+        phase1_tmax_multiplier=adv["phase1-tmax-multiplier"] if adv["t-clamp-decay-enabled"] else None,
         breathing_inlet_velocity=breathing_inlet_velocity(settings),
         breathing_inlet_dir=breathing_inlet_direction(settings),
     )
@@ -1000,6 +1001,7 @@ def _run_shared_phase1(base_dir, phase1_dir, ach, room, settings, adv, log_fn, s
         status_fn=status_fn, phase1_only=True, phase1_delta_t=phase1_delta_t,
         phase1_resume_decision=phase1_resume_decision, solve_semaphore=solve_semaphore,
         t_clamp_decay_multiplier=adv["t-clamp-decay-multiplier"] if adv["t-clamp-decay-enabled"] else None,
+        phase1_tmax_multiplier=adv["phase1-tmax-multiplier"] if adv["t-clamp-decay-enabled"] else None,
         breathing_inlet_velocity=breathing_inlet_velocity(settings),
         breathing_inlet_dir=breathing_inlet_direction(settings),
     )
