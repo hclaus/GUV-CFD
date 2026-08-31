@@ -1418,6 +1418,7 @@ def _finish_steady_state(case_dir, room, settings, summary,
         should_pause=_should_pause,
         phase1_delta_t=phase1_delta_t, phase2_delta_t=phase2_delta_t,
         t_clamp_decay_multiplier=adv["t-clamp-decay-multiplier"] if adv["t-clamp-decay-enabled"] else None,
+        breathing_inlet_enabled=adv.get("breathing-inlet-enabled", False),
     )
     result["fluence_mean"] = summary["fluence_mean"]
     result["eACH_uv_well_mixed"] = summary.get("eACH_uv_well_mixed_mean")
@@ -2592,6 +2593,16 @@ settings_modal = dbc.Modal(
                     "used when the T divergence clamp above is on.",
                     "x", _adv_defaults["t-clamp-decay-multiplier"],
                 ),
+                _settings_checkbox_field(
+                    "settings-breathing-inlet-enabled", "Use breathing inlet velocity constraint (experimental)",
+                    "Adds airflow to the source zone so the contaminant is carried by moving air "
+                    "(~0.06 m/s, resting tidal breathing) instead of appearing in still air. Constrains "
+                    "U in that zone rather than adding a momentum source — a source only adds terms to "
+                    "the momentum equation and gets overruled by the pressure solver (measured 37× over "
+                    "target). UNVALIDATED — a first run holds 0.059 m/s and conserves mass to 1.4%, but "
+                    "the jet direction is currently a hardcoded +x and was not chosen from room layout.",
+                    _adv_defaults["breathing-inlet-enabled"],
+                ),
                 html.Div(
                     "T is solved by its own scalarTransport function object, entirely outside "
                     "PIMPLE's/SIMPLE's own outer-iteration loop — the two settings below control "
@@ -3640,6 +3651,7 @@ _SETTINGS_FIELD_IDS = [
     "settings-plateau-rel-tol", "settings-mass-balance-tol",
     "settings-momentum-relaxation", "settings-scalar-relaxation", "settings-adaptive-t-relaxation",
     "settings-t-clamp-decay-enabled", "settings-t-clamp-decay-multiplier",
+    "settings-breathing-inlet-enabled",
     "settings-scalar-transport-ncorr", "settings-scalar-transport-tolerance",
     "settings-t-infinity-early-stop-enabled", "settings-phase1-require-stable-extrapolation",
     "settings-t-infinity-rel-tol",
@@ -3662,6 +3674,7 @@ _SETTINGS_FIELD_KEYS = [
     "plateau-rel-tol", "mass-balance-tol",
     "momentum-relaxation", "scalar-relaxation", "adaptive-t-relaxation",
     "t-clamp-decay-enabled", "t-clamp-decay-multiplier",
+    "breathing-inlet-enabled",
     "scalar-transport-ncorr", "scalar-transport-tolerance",
     "t-infinity-early-stop-enabled", "phase1-require-stable-extrapolation",
     "t-infinity-rel-tol",

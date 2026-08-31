@@ -1,7 +1,10 @@
 from types import SimpleNamespace
 
 import guvcfd.contaminant_source as contaminant_source
-from guvcfd.contaminant_source import check_mass_balance, source_topo_set_dict
+from guvcfd.contaminant_source import (
+    breathing_inlet_momentum_source, breathing_inlet_velocity_constraint,
+    check_mass_balance, source_topo_set_dict,
+)
 
 
 def test_source_topo_set_dict_no_snap_by_default():
@@ -159,3 +162,96 @@ def test_check_mass_balance_raises_on_unparseable_output(monkeypatch, tmp_path):
         assert False, "expected RuntimeError"
     except RuntimeError:
         pass
+
+
+# --- breathing_inlet_velocity_constraint (the live implementation) ---
+
+def test_breathing_inlet_velocity_constraint_defaults_to_x_direction():
+    text = breathing_inlet_velocity_constraint(velocity_magnitude=0.06)
+    assert "breathingInletVelocity" in text
+    # A CONSTRAINT (setValues replaces the matrix row), not a source that only
+    # adds terms and loses to the pressure correction - see the docstring.
+    assert "type            vectorFixedValueConstraint;" in text
+    assert "cellZone        sourceZone;" in text
+    # the raw target velocity, NOT scaled by any coefficient
+    assert "U               (6.000000e-02 0.000000e+00 0.000000e+00);" in text
+
+
+def test_breathing_inlet_velocity_constraint_is_not_a_semi_implicit_source():
+    """Guard against regressing to the superseded approach: a source cannot
+    dictate a velocity - even with correct coefficients it converged to
+    2.25 m/s against a 0.06 m/s target because SIMPLE's pressure correction
+    re-solves U afterwards.
+    """
+    text = breathing_inlet_velocity_constraint()
+    assert "SemiImplicitSource" not in text
+    assert "injectionRateSuSp" not in text
+
+
+def test_breathing_inlet_velocity_constraint_uses_given_zone_and_entry_name():
+    text = breathing_inlet_velocity_constraint(zone_name="myZone", entry_name="myEntry")
+    assert text.startswith("myEntry")
+    assert "cellZone        myZone;" in text
+
+
+def test_breathing_inlet_velocity_constraint_normalizes_a_non_unit_direction():
+    # (0, 2, 0) normalizes to (0, 1, 0) - full velocity_magnitude on y only
+    text = breathing_inlet_velocity_constraint(velocity_magnitude=0.5, direction=(0, 2, 0))
+    assert "U               (0.000000e+00 5.000000e-01 0.000000e+00);" in text
+
+
+def test_breathing_inlet_velocity_constraint_falls_back_to_x_on_zero_direction():
+    text_zero = breathing_inlet_velocity_constraint(velocity_magnitude=0.06, direction=(0, 0, 0))
+    text_default = breathing_inlet_velocity_constraint(velocity_magnitude=0.06)
+    assert text_zero == text_default
+
+
+# --- breathing_inlet_momentum_source (SUPERSEDED - kept as a record) ---
+
+def test_breathing_inlet_momentum_source_defaults_to_x_direction():
+    text = breathing_inlet_momentum_source(velocity_magnitude=0.06)
+    assert "breathingInletMomentum" in text
+    assert "type            vectorSemiImplicitSource;" in text
+    assert "cellZone        sourceZone;" in text
+    # Su = sp_coeff*U_target = 100*0.06 in x, zero in y/z; Sp = -sp_coeff.
+    # The NEGATIVE Sp is the whole point: Su + Sp*U = k*(U_target - U) is a
+    # restoring drag, while a positive Sp amplifies U instead (the original
+    # bug - drove source-zone |U| to 21.6 m/s against a 0.06 m/s target).
+    assert "((6.00e+00 0.00e+00 0.00e+00) -1.00e+02);" in text
+
+
+def test_breathing_inlet_momentum_source_uses_given_zone_and_entry_name():
+    text = breathing_inlet_momentum_source(zone_name="myZone", entry_name="myEntry")
+    assert text.startswith("myEntry")
+    assert "cellZone        myZone;" in text
+
+
+def test_breathing_inlet_momentum_source_normalizes_a_non_unit_direction():
+    # (0, 2, 0) normalizes to (0, 1, 0) - full velocity_magnitude on y only
+    text = breathing_inlet_momentum_source(velocity_magnitude=0.5, direction=(0, 2, 0))
+    assert "((0.00e+00 5.00e+01 0.00e+00) -1.00e+02);" in text
+
+
+def test_breathing_inlet_momentum_source_falls_back_to_x_on_zero_direction():
+    text_zero = breathing_inlet_momentum_source(velocity_magnitude=0.06, direction=(0, 0, 0))
+    text_default = breathing_inlet_momentum_source(velocity_magnitude=0.06)
+    assert text_zero == text_default
+
+
+def test_breathing_inlet_momentum_source_accepts_a_custom_sp_coeff():
+    text = breathing_inlet_momentum_source(velocity_magnitude=0.06, sp_coeff=10.0)
+    # Su = sp_coeff * velocity_target = 10 * 0.06 = 0.6; Sp = -10
+    assert "((6.00e-01 0.00e+00 0.00e+00) -1.00e+01);" in text
+
+
+def test_breathing_inlet_momentum_source_sp_is_negative_a_drag_not_a_gain():
+    """Regression guard for the sign bug: Sp must be NEGATIVE. OpenFOAM adds
+    Su + Sp*U, so Sp>0 is positive feedback that amplifies velocity without
+    bound instead of relaxing it toward the target - it drove a real run's
+    source-zone |U| to 21.6 m/s against a 0.06 m/s target.
+    """
+    import re
+    text = breathing_inlet_momentum_source(velocity_magnitude=0.06, sp_coeff=100.0)
+    m = re.search(r"U\s+\(\([^)]*\)\s+(-?[0-9.e+-]+)\);", text)
+    assert m, f"could not find the SuSp entry in:\n{text}"
+    assert float(m.group(1)) < 0, "Sp must be negative (a drag), not positive (a gain)"

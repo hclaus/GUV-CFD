@@ -163,6 +163,119 @@ def source_fvoptions_entry(Su, zone_name="sourceZone", field_name="T", entry_nam
     return "\n".join(lines)
 
 
+def breathing_inlet_velocity_constraint(zone_name="sourceZone", entry_name="breathingInletVelocity",
+                                        velocity_magnitude=0.06, direction=(1, 0, 0)):
+    """fvOptions entry for the experimental breathing inlet: CONSTRAIN U to
+    velocity_magnitude*direction inside the source cellZone (~0.06 m/s ~=
+    resting tidal breathing), so the contaminant the volumetric T source
+    injects there is carried by moving air instead of appearing in still air.
+
+    A constraint, not a source, and the distinction is the whole point.
+    An fvOption SOURCE adds terms to a cell's row of the A*x=b system (Su to
+    the RHS, Sp to the diagonal) and leaves every other term in that row
+    intact - so the value it "wants" is only one voice in the balance, and
+    SIMPLE's pressure correction (U = HbyA - rAU*grad(p), which re-solves U
+    to enforce continuity) can and does overrule it. A CONSTRAINT calls
+    eqn.setValues(cells, value), which REPLACES the row with 1*U = value.
+    No negotiation - the surrounding field adapts instead.
+
+    That difference was measured, not assumed: breathing_inlet_momentum_source
+    below (the superseded approach) balances at exactly 0.06 m/s on paper,
+    yet a real Phase-1 run converged to 2.25 m/s in the zone - 37x the
+    target, zone Courant ~22, TClampDecay firing every iteration. See
+    ANALYSIS_LOG.md's 2026-08-30 entry.
+
+    Still to verify on a real run (a constraint has its own failure mode -
+    it prescribes a velocity the pressure field must remain consistent with):
+    that zone |U| now actually reads velocity_magnitude, and that continuity
+    /mass balance is unharmed. The zone is a through-flow (air in one face,
+    out the other, no net mass added), so this should be satisfiable, but
+    "should be" is not "was checked".
+    """
+    dir_norm = (direction[0]**2 + direction[1]**2 + direction[2]**2)**0.5
+    if dir_norm == 0:
+        direction = (1, 0, 0)
+    else:
+        direction = tuple(d / dir_norm for d in direction)
+    vx, vy, vz = [velocity_magnitude * d for d in direction]
+
+    lines = [
+        f"{entry_name}",
+        "{",
+        "    type            vectorFixedValueConstraint;",
+        "    active          true;",
+        "",
+        "    selectionMode   cellZone;",
+        f"    cellZone        {zone_name};",
+        "",
+        "    fieldValues",
+        "    {",
+        f"        U               ({vx:.6e} {vy:.6e} {vz:.6e});",
+        "    }",
+        "}",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def breathing_inlet_momentum_source(zone_name="sourceZone", entry_name="breathingInletMomentum",
+                                    velocity_magnitude=0.06, direction=(1, 0, 0), sp_coeff=100.0):
+    """SUPERSEDED by breathing_inlet_velocity_constraint - kept as a record of
+    an approach that provably cannot do this job, not as a live option.
+
+    Momentum source that drags U toward velocity_magnitude*direction within
+    the source cellZone. OpenFOAM's SemiImplicitSource adds `Su + Sp*psi`, so
+    relaxing toward a target is Su = sp_coeff*U_target with Sp = -sp_coeff,
+    giving sp_coeff*(U_target - U) - a restoring drag. The Sp sign is NOT
+    free: the same convention already applies to this module's UV sink terms
+    (Su=0, Sp=-k, see source_fvoptions_entry's own docstring).
+
+    Two things were wrong, discovered in that order:
+
+    1. It originally shipped with Sp = +sp_coeff - positive feedback rather
+       than drag, amplifying U instead of pulling it to the target. Measured
+       at iteration 2000 of a real Phase-1 run: source-zone |U| was 21.6 m/s
+       against a 0.06 m/s target (360x) at sp_coeff=100 and 2.6 m/s (43x) at
+       sp_coeff=10, blowing whole-room mean velocity from the control's
+       0.0147 m/s to 5.03 m/s.
+    2. With the sign corrected it STILL converged to 2.25 m/s (37x target,
+       zone Courant ~22, TClampDecay firing on every iteration) - because a
+       source cannot dictate a velocity at all: it only adds terms to a row
+       that SIMPLE's pressure correction then re-solves. Hence the constraint.
+
+    Any result produced through this path is an artifact, not a breathing
+    effect - see ANALYSIS_LOG.md's 2026-08-30 entry.
+    """
+    dir_norm = (direction[0]**2 + direction[1]**2 + direction[2]**2)**0.5
+    if dir_norm == 0:
+        direction = (1, 0, 0)
+    else:
+        direction = tuple(d / dir_norm for d in direction)
+    vx, vy, vz = [velocity_magnitude * d for d in direction]
+
+    lines = [
+        f"{entry_name}",
+        "{",
+        "    type            vectorSemiImplicitSource;",
+        "    active          true;",
+        "",
+        "    vectorSemiImplicitSourceCoeffs",
+        "    {",
+        "        selectionMode   cellZone;",
+        f"        cellZone        {zone_name};",
+        "        volumeMode      specific;",
+        "",
+        "        injectionRateSuSp",
+        "        {",
+        f"            U           (({vx*sp_coeff:.2e} {vy*sp_coeff:.2e} {vz*sp_coeff:.2e}) {-sp_coeff:.2e});",
+        "        }",
+        "    }",
+        "}",
+        "",
+    ]
+    return "\n".join(lines)
+
+
 def write_fvoptions_file(case_dir, entries):
     """Write constant/fvOptions combining multiple pre-formatted entry text
     blocks (e.g. the contaminant source + UV cellZones from cellzones.py)

@@ -61,6 +61,19 @@ ADVANCED_SETTINGS_DEFAULTS = {
     # at its floor.
     "t-clamp-decay-enabled": False,
     "t-clamp-decay-multiplier": 1.3,
+    # Experimental (2026-08-30) - off by default. Adds airflow to the source
+    # cellZone so the contaminant the volumetric T source injects there is
+    # carried by moving air (~0.06 m/s, resting tidal breathing) instead of
+    # appearing in still air. Implemented as a CONSTRAINT on U in that zone
+    # (vectorFixedValueConstraint), not a momentum source: a source only adds
+    # terms to the momentum equation and gets overruled by SIMPLE's pressure
+    # correction - measured converging to 2.25 m/s against a 0.06 m/s target
+    # (37x) even with correct coefficients. See
+    # contaminant_source.breathing_inlet_velocity_constraint's docstring and
+    # ANALYSIS_LOG.md's 2026-08-30 entry. Still UNVALIDATED: nobody has yet
+    # confirmed on a real run that zone |U| reads 0.06 and that mass balance
+    # is unharmed.
+    "breathing-inlet-enabled": False,
     # scalarTransport1 (controlDict) solves T OUTSIDE PIMPLE's own outer-
     # corrector loop, once per timestep by default - scalar-relaxation only
     # avoids biasing the result if nCorr/tolerance are high/tight enough for
@@ -211,6 +224,7 @@ PROJECT_OPENFOAM_SETTINGS_KEYS = (
     "mesh-cell-size", "uv-zone-bins",
     "momentum-relaxation", "scalar-relaxation", "adaptive-t-relaxation",
     "t-clamp-decay-enabled", "t-clamp-decay-multiplier",
+    "breathing-inlet-enabled",
     "scalar-transport-ncorr", "scalar-transport-tolerance",
     "t-infinity-early-stop-enabled", "t-infinity-rel-tol",
     "phase1-require-stable-extrapolation", "phase-chunk-size", "phase-write-interval",

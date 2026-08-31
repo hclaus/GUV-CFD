@@ -1416,3 +1416,101 @@ as the explanation for the pattern-reorganization finding above.
 reduces non-physical cells and protects Phase 2's own reference/seed), not
 a fix for the oscillation itself - that remains a flow-convergence/
 momentum-relaxation question.**
+
+## 2026-08-30 — Breathing inlet: a velocity constraint on the source zone
+
+**Motivation.** Both phases inject the contaminant as a pure volumetric
+source (`source_fvoptions_entry`, Su-only on T, Sp=0) - concentration
+appears in the source cellZone with no associated airflow, unlike a real
+person's exhale.
+
+**Two approaches were tried and abandoned before the one that works.**
+
+1. *A real inlet patch in the mesh* (a scratch `breathing_inlet.py`,
+   deliberately NOT committed): the mesh is already committed by the time
+   Phase 1 runs, and adding patch faces post-mesh needs boundary-file
+   surgery that never got past a placeholder.
+2. *A momentum source* (`breathing_inlet_momentum_source`, kept in-file but
+   marked SUPERSEDED and no longer called). This failed twice over, and both
+   failures are worth remembering:
+   - **Sp sign bug.** OpenFOAM's `SemiImplicitSource` adds `Su + Sp*psi`, so
+     relaxing toward a target needs `Sp = -k` (a drag). It shipped with
+     `Sp = +k` - positive feedback that AMPLIFIES U. Measured source-zone
+     |U| at iteration 2000: **21.6 m/s against a 0.06 m/s target** (360x) at
+     sp_coeff=100, 2.6 m/s (43x) at sp_coeff=10, blowing whole-room mean
+     velocity from the control's 0.0147 m/s to 5.03 m/s. Note the same
+     module's UV sinks already use the correct convention (`T (0 -k)`, see
+     `source_fvoptions_entry`) - the new entry was inconsistent with working
+     code directly beside it.
+   - **A source cannot dictate a velocity at all.** With the sign corrected
+     it still converged to **2.25 m/s (37x target)**, zone Courant ~22,
+     TClampDecay firing every iteration. An fvOption source only ADDS terms
+     to a cell's row of the `A*x=b` system, leaving every other term intact;
+     SIMPLE's pressure correction (`U = HbyA - rAU*grad(p)`) then re-solves U
+     to enforce continuity and overrules it.
+
+**What ships**: `contaminant_source.breathing_inlet_velocity_constraint`, a
+`vectorFixedValueConstraint` fvOption. A CONSTRAINT calls
+`eqn.setValues(cells, value)`, which REPLACES the matrix row with `1*U =
+value` - no negotiation with the pressure solver. It coexists with (does not
+replace) the volumetric T source, so the existing G/Su calibration is
+untouched. Wired through `run_steady_state_scenario` (`breathing_inlet_enabled`,
+appends to both phases' fvOptions), both call sites
+(`scenario_runs._run_scenario`/`_run_shared_phase1`), and gated by the
+`breathing-inlet-enabled` advanced setting (off by default) in both UIs and
+in `PROJECT_OPENFOAM_SETTINGS_KEYS`.
+
+**Verified on real runs** (Z=7, ACH=6, m=0.4, 8000 iterations):
+
+| check | control | momentum source | constraint |
+|---|---|---|---|
+| source-zone \|U\| (target 0.06) | 0.0138 | 2.25 - 21.6 | **0.0587** |
+| room mean \|U\| | 0.0147 | 0.124 - 5.03 | **0.0139** |
+| zone Courant | 0.1 | 22 - 215 | **0.59** |
+| mass balance (removal/G) | - | - | **1.014** |
+| cells with T < -1e-3 @iter 200 | 2,386 | - | **142** |
+
+It hits the target velocity, leaves the rest of the room's flow field alone,
+stays stable, conserves mass to 1.4%, and is BETTER bounded than the control
+(whose stagnant source pocket reaches T=29.4 vs the constraint's 6.8, giving
+it steeper gradients and worse undershoot). Phase 2 runs end-to-end on it:
+T_ss1=0.4355 -> T_ss2=0.07315, reduction 83.2%.
+
+**Momentum relaxation is no longer decisive here.** m=0.4 and m=0.7 both
+plateau with the constraint in place and agree to 3% at 8000 iterations
+(T_ss 0.4223 vs 0.4096); at 2000 iterations they disagreed by 10%, which was
+two under-converged trajectories, not physics.
+
+**Three things still gate trusting its numbers**, in priority order:
+
+1. **The jet direction is a hardcoded `+x` that was never chosen from the
+   room layout.** In `patient ward 4B1 v7` the source sits at (0.40, 1.20,
+   1.30) and the outlet is on the xMax wall at y=1.20, z=1.30 - identical
+   height and lateral position. The exhale is aimed straight down the barrel
+   of the extract: a best-case short-circuit. That is why room-average T
+   settles at 0.43 against a well-mixed 1.0, with outlet T at 2.28 and the
+   Patient zone at 0.056. Sweep the direction (at minimum -x and a lateral
+   one) before reading any exposure number.
+2. **The flow field never converges - in any configuration, including the
+   control.** Measured as mean|U(t)-U(t-200)|/mean|U|: the control sits at
+   ~25% early and is STILL ~20% at iteration 8000, with no downward trend.
+   The constraint roughly halves it (~13% at m=0.4, ~9% at m=0.7) but also
+   plateaus rather than converging. Critically, **T_ss reports "plateaued" at
+   CV 0.3% while this is happening**, because room-average T is an integral
+   quantity blind to spatial reorganization (cf. the pattern-reorganization
+   finding above). "Plateaued" is therefore NOT a sufficient convergence
+   gate; a drift check like this one is cheap and much stronger.
+3. **eACH_uv from this path used the biased fallback.** The Phase 2 run above
+   had no control run, so it fell back to `ventilation_measurement_method =
+   "phase1_buildup"`, which `compute_corrected_eACH_uv_from_control`'s own
+   docstring warns underestimates T_ss1 and thereby inflates the derived
+   ventilation rate. It reported 13.78 /hr against a nominal 6 /hr, inflating
+   eACH_uv from 29.72 to 68.25 /hr - a factor of exactly 1/0.4355 = 2.30x.
+   `reduction_pct` (a pure T_ss1/T_ss2 ratio) is unaffected; the eACH figures
+   need a real UV-off control run.
+
+**Also worth recording**: `t-clamp-decay-multiplier` is not a usable tuning
+knob for this case. Raising Tmax 10x (43.25 -> 432.5) produced a
+**bit-identical** T field at every snapshot, because the field's maximum
+never exceeds 6.8 - the ceiling branch is never taken and every clamp event
+is the T<0 floor.

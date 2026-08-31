@@ -756,3 +756,58 @@ def test_apply_phase1_tclamp_decay_computes_tmax_from_the_flush_estimate_and_spl
     assert result == pytest.approx(1.3 * 30.0)
     assert len(compile_calls) == 1
     assert splice_calls == [("phase1_dir", pytest.approx(39.0))]
+
+
+# --- breathing_inlet_enabled (2026-08-30, experimental) - run_steady_state_
+# scenario's Phase 1 fvOptions must include the momentum-source entry only
+# when the flag is on, and leave it out entirely by default. ---
+
+def _mock_run_steady_state_scenario_deps(monkeypatch):
+    for fn in ("ensure_simple_fvsolution", "disable_simple_residual_control", "write_vol_average_dict",
+               "write_source_topo_set_dict", "restore_boundary_conditions"):
+        monkeypatch.setattr(ssp, fn, lambda *a, **k: None)
+    monkeypatch.setattr(ssp, "splice_fv_options_into_control_dict", lambda *a, **k: (None, 1, 1))
+
+    class _FakeResult:
+        stdout = "cellSet sourceZoneCells now size 64"
+        returncode = 0
+    monkeypatch.setattr(ssp, "run_wsl_or_raise", lambda *a, **k: _FakeResult())
+    monkeypatch.setattr(ssp, "_copy_latest_to_zero", lambda *a, **k: None)
+
+    def fake_run_phase(*a, **k):
+        return ("1500", 1500, np.array([0, 1]), np.array([0.1, 0.2]), False,
+                {"room": (np.array([0, 1]), np.array([0.1, 0.2]))}, False, [None, None], {"flow": {}, "weighted_t": {}})
+    monkeypatch.setattr(ssp, "_run_phase", fake_run_phase)
+
+
+def test_breathing_inlet_disabled_by_default_omits_the_constraint(tmp_path, monkeypatch):
+    _mock_run_steady_state_scenario_deps(monkeypatch)
+    fv_calls = []
+    monkeypatch.setattr(ssp, "write_fvoptions_file", lambda case_dir, entries: fv_calls.append(entries))
+
+    run_steady_state_scenario(
+        str(tmp_path), 4.0, 5.0, 2.7, ach=6.0, Z=6.0,
+        phase1_iterations=1500, phase2_iterations=1500,
+        phase1_only=True, log_fn=lambda m: None,
+    )
+
+    assert len(fv_calls) == 1
+    assert not any("breathingInletVelocity" in entry for entry in fv_calls[0])
+
+
+def test_breathing_inlet_enabled_adds_the_velocity_constraint_to_phase1(tmp_path, monkeypatch):
+    _mock_run_steady_state_scenario_deps(monkeypatch)
+    fv_calls = []
+    monkeypatch.setattr(ssp, "write_fvoptions_file", lambda case_dir, entries: fv_calls.append(entries))
+
+    run_steady_state_scenario(
+        str(tmp_path), 4.0, 5.0, 2.7, ach=6.0, Z=6.0,
+        phase1_iterations=1500, phase2_iterations=1500,
+        phase1_only=True, breathing_inlet_enabled=True, log_fn=lambda m: None,
+    )
+
+    assert len(fv_calls) == 1
+    assert any("breathingInletVelocity" in entry for entry in fv_calls[0])
+    # must be the CONSTRAINT, not the superseded momentum source that the
+    # pressure correction overrules (measured 37x over target)
+    assert any("vectorFixedValueConstraint" in entry for entry in fv_calls[0])

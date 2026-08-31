@@ -67,6 +67,13 @@ _FIELD_INFO = {
     "t-clamp-decay-multiplier": ("T divergence clamp multiplier",
                                   "Tmax = this value times Phase 1's own converged source-zone max T. "
                                   "Only used when the T divergence clamp above is on."),
+    "breathing-inlet-enabled": ("Use breathing inlet velocity constraint (experimental)",
+                                 "Adds airflow to the source zone so the contaminant is carried by moving "
+                                 "air (~0.06 m/s, resting tidal breathing) instead of appearing in still "
+                                 "air. Constrains U in that zone rather than adding a momentum source - a "
+                                 "source gets overruled by the pressure solver (measured 37x over target). "
+                                 "UNVALIDATED - zone velocity and mass balance not yet confirmed on a real "
+                                 "run; see contaminant_source.breathing_inlet_velocity_constraint."),
     "scalar-transport-ncorr": ("Contaminant solver outer correctors",
                                 "How many times the contaminant equation is re-solved per timestep - "
                                 "needs to be >0 for the relaxation factor above to matter at all."),

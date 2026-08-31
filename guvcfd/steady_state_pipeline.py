@@ -22,7 +22,7 @@ from .case_io import read_openfoam_scalar_field, read_latest_time_field
 from .cellzones import bin_decay_rates
 from .contaminant_source import (
     write_source_topo_set_dict, compute_source_strength, source_Su, source_fvoptions_entry,
-    write_fvoptions_file, live_mass_balance_functions, windowed_mass_balance,
+    breathing_inlet_velocity_constraint, write_fvoptions_file, live_mass_balance_functions, windowed_mass_balance,
 )
 from .decay_analysis import (
     read_vol_average_dat, check_plateau_windowed, windowed_stats,
@@ -1152,7 +1152,7 @@ def run_steady_state_scenario(case_dir, room_x, room_y, room_z, ach, Z, nbins=25
                                solver_log_fn=None, status_fn=None, phase1_only=False, should_pause=None,
                                measured_ventilation_ach=None, control_results_future=None,
                                phase1_delta_t=1, phase2_delta_t=1, solve_semaphore=None,
-                               t_clamp_decay_multiplier=None):
+                               t_clamp_decay_multiplier=None, breathing_inlet_enabled=False):
     """Run both phases of a continuous-source steady-state scenario against
     an already-converged case (mesh + flow + fluenceRate/kUV must already
     exist - see run_pipeline.setup_case()). Returns a summary dict.
@@ -1535,7 +1535,13 @@ def run_steady_state_scenario(case_dir, room_x, room_y, room_z, ach, Z, nbins=25
 
             # --- Phase 1: source only, no UV ---
             log_fn("=== Phase 1: source only (no UV) ===")
-            write_fvoptions_file(case_dir, [source_entry] + fan_entries)
+            fv_entries = [source_entry] + fan_entries
+            if breathing_inlet_enabled:
+                breathing_entry = breathing_inlet_velocity_constraint(zone_name="sourceZone",
+                                                                         velocity_magnitude=0.06)
+                fv_entries.append(breathing_entry)
+                log_fn("  Breathing inlet velocity constraint enabled (U fixed to 0.06 m/s in sourceZone)")
+            write_fvoptions_file(case_dir, fv_entries)
             _, n_open, n_close = splice_fv_options_into_control_dict(case_dir)
             assert n_open == n_close, f"Brace mismatch: {n_open} vs {n_close}"
             restore_boundary_conditions(case_dir, inlet_velocity=inlet_velocity, T_initial=phase1_t_initial,
@@ -1626,7 +1632,12 @@ def run_steady_state_scenario(case_dir, room_x, room_y, room_z, ach, Z, nbins=25
     log_fn("=== Phase 2: source + UV ===")
     k_values = read_openfoam_scalar_field(f"{case_dir}/0/kUV")
     uv_entries = _uv_fvoptions_entries(np.array(k_values), nbins)
-    write_fvoptions_file(case_dir, [source_entry] + uv_entries + fan_entries)
+    fv_entries_p2 = [source_entry] + uv_entries + fan_entries
+    if breathing_inlet_enabled:
+        breathing_entry = breathing_inlet_velocity_constraint(zone_name="sourceZone",
+                                                                 velocity_magnitude=0.06)
+        fv_entries_p2.append(breathing_entry)
+    write_fvoptions_file(case_dir, fv_entries_p2)
     _, n_open, n_close = splice_fv_options_into_control_dict(case_dir)
     assert n_open == n_close, f"Brace mismatch: {n_open} vs {n_close}"
 
