@@ -968,7 +968,8 @@ def setup_case(guv_path, case_dir, template_case_dir=None, cell_size=0.1, Z=2.0,
                outlet2_wall=None, outlet2_center=None, outlet2_size=None,
                converge_flow=True, simple_foam_iterations=500, flow_convergence_method="simple",
                flow_rel_tol=0.01, flow_max_iterations=20000, n_procs=None,
-               oscillation_window=6, oscillation_growth_tol=1.5, ach_delivery_tol=0.10,
+               oscillation_window=6, oscillation_growth_tol=1.5, converged_chunks=3,
+               ach_delivery_tol=0.10,
                momentum_relaxation=None, scalar_relaxation=None, adaptive_t_relaxation=False,
                scalar_transport_ncorr=None, scalar_transport_tolerance=None,
                pimple_end_time=120, pimple_write_interval=10, pimple_delta_t=0.5, max_co=None,
@@ -1335,6 +1336,7 @@ def setup_case(guv_path, case_dir, template_case_dir=None, cell_size=0.1, Z=2.0,
             log_fn=log_fn, should_stop=should_stop, method=flow_convergence_method,
             rel_tol=flow_rel_tol, max_iterations=flow_max_iterations,
             oscillation_window=oscillation_window, oscillation_growth_tol=oscillation_growth_tol,
+            converged_chunks=converged_chunks,
             solver_log_fn=solver_log_fn, should_pause=should_pause, skip_potential_flow=sealed,
             n_procs=n_procs, solve_semaphore=solve_semaphore)
         summary["flow_converged"] = flow_converged
@@ -1495,6 +1497,7 @@ def resume_case_setup(case_dir, guv_path, decision, ach, Z, nbins=25, source_fie
                        cell_size=0.1, additional_iterations=None,
                        simple_foam_iterations=500, flow_convergence_method="simple",
                        flow_rel_tol=0.01, oscillation_window=6, oscillation_growth_tol=1.5,
+                       converged_chunks=3,
                        ach_delivery_tol=0.10,
                        pimple_end_time=120, pimple_write_interval=10, pimple_delta_t=0.5, max_co=None,
                        fan_speed=None, fan_direction=(0, 0, -1), mechanical_ach_only=False,
@@ -1567,6 +1570,7 @@ def resume_case_setup(case_dir, guv_path, decision, ach, Z, nbins=25, source_fie
             case_dir, additional_iterations, n_iterations=simple_foam_iterations, fan_entry=fan_entry,
             log_fn=log_fn, should_stop=should_stop, method=flow_convergence_method, rel_tol=flow_rel_tol,
             oscillation_window=oscillation_window, oscillation_growth_tol=oscillation_growth_tol,
+            converged_chunks=converged_chunks,
             solver_log_fn=solver_log_fn, should_pause=should_pause)
         summary["flow_converged"] = flow_converged
     else:
