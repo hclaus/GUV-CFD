@@ -429,3 +429,57 @@ def test_t_infinity_stability_respects_custom_streak():
 def test_t_infinity_stability_zero_mean_never_stable():
     history = [1.0, -1.0, 0.0]
     assert check_t_infinity_stability(history, rel_tol=0.02, streak=3) is False
+
+
+# --- decay run-length re-check (2026-09-01) ---
+# The durations come from an ASSUMED rate; nothing used to compare them against
+# the rate the run actually produced. Real case (patient ward 4B1 v9, ceiling
+# fan opposing upper-room UV): control sized for 90% at an assumed 6/hr, really
+# decayed at 0.427/hr, reached 13%, and its 11-point fit gave a negative
+# eACH_uv and 9% mixing efficiency with no error raised anywhere.
+
+def test_decay_target_shortfall_reproduces_the_v9_control():
+    import numpy as np
+    from guvcfd.decay_analysis import decay_target_shortfall
+    lam = 0.00011850568839023181                 # 0.427 /hr, the real measured rate
+    t = np.linspace(0, 1269, 11); T = np.exp(-lam * t)
+    sf = decay_target_shortfall(t, T, 0.90, ceiling=7200)
+    assert not sf["met"]
+    assert 0.13 < sf["achieved_fraction"] < 0.16   # it reached ~14% of a 90% target
+    assert sf["capped"] is True                    # 90% would need ~19400s, past the cap
+    assert sf["extra_seconds"] > 5000
+
+
+def test_decay_target_shortfall_is_a_noop_once_the_target_is_met():
+    import numpy as np
+    from guvcfd.decay_analysis import decay_target_shortfall
+    t = np.linspace(0, 5000, 200); T = np.exp(-0.0014 * t)
+    sf = decay_target_shortfall(t, T, 0.90)
+    assert sf["met"] and sf["extra_seconds"] == 0
+
+
+def test_decay_target_shortfall_refuses_to_extend_a_flat_curve():
+    """A flat or rising curve has no meaningful time-to-target - extending it
+    would burn hours for nothing."""
+    import numpy as np
+    from guvcfd.decay_analysis import decay_target_shortfall
+    t = np.linspace(0, 500, 20)
+    sf = decay_target_shortfall(t, np.ones(20), 0.90)
+    assert sf["extra_seconds"] == 0 and not sf["met"]
+
+
+def test_run_decay_to_target_extends_then_warns_when_capped():
+    import numpy as np
+    from guvcfd.decay_analysis import run_decay_to_target
+    lam = 0.00011850568839023181
+    state = {"end": 0}
+    logs = []
+    def run_fn(e): state["end"] = e; return f"ran:{e:.0f}"
+    def curve_fn():
+        t = np.linspace(0, state["end"], max(11, int(state["end"] / 50)))
+        return t, np.exp(-lam * t)
+    _, info = run_decay_to_target("control", 0.90, 1382, 7200, run_fn,
+                                   lambda e: None, curve_fn, log_fn=logs.append)
+    assert info["rounds"] >= 1 and info["end_time"] == 7200
+    assert not info["met"] and info["capped"]
+    assert any("WARNING" in m and "unreliable" in m for m in logs), logs

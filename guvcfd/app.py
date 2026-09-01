@@ -2648,6 +2648,21 @@ settings_modal = dbc.Modal(
                     "(the multiplier above x Phase 1's converged source-zone max T).",
                     "x", _adv_defaults["phase1-tmax-multiplier"],
                 ),
+                _settings_checkbox_field(
+                    "settings-decay-extend-to-target", "Extend decay runs until the target is met",
+                    "Decay mode only. Run lengths are computed from an ASSUMED removal rate; when on, "
+                    "each run is re-checked against the rate it actually achieved and continued if it "
+                    "fell short. Without this a poorly-mixed room silently gets a run far too short to "
+                    "measure and reports a negative eACH rather than an error.",
+                    _adv_defaults["decay-extend-to-target"],
+                ),
+                _settings_field(
+                    "settings-decay-max-total-time", "Decay run hard cap",
+                    "Maximum simulated seconds for one decay run, extensions included. A run that still "
+                    "hasn't met its target here is reported as capped and its figures flagged "
+                    "unreliable, rather than quietly accepted.",
+                    "s", _adv_defaults["decay-max-total-time"],
+                ),
                 html.Div(
                     "T is solved by its own scalarTransport function object, entirely outside "
                     "PIMPLE's/SIMPLE's own outer-iteration loop — the two settings below control "
@@ -3707,6 +3722,7 @@ _SETTINGS_FIELD_IDS = [
     "settings-keep-all-timesteps",
     "settings-pimple-delta-t", "settings-max-co", "settings-max-concurrent-solves",
     "settings-decay-ach-min-fraction", "settings-decay-each-min-fraction", "settings-decay-each-max-fraction",
+    "settings-decay-extend-to-target", "settings-decay-max-total-time",
     "settings-mesh-cell-size",
     "settings-uv-zone-bins",
     "settings-keep-shared-scratch-dirs",
@@ -3729,6 +3745,7 @@ _SETTINGS_FIELD_KEYS = [
     "keep-all-timesteps",
     "pimple-delta-t", "max-co", "max-concurrent-solves",
     "decay-ach-min-fraction", "decay-each-min-fraction", "decay-each-max-fraction",
+    "decay-extend-to-target", "decay-max-total-time",
     "mesh-cell-size", "uv-zone-bins",
     "keep-shared-scratch-dirs",
 ]

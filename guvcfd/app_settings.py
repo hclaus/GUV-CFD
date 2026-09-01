@@ -141,7 +141,25 @@ ADVANCED_SETTINGS_DEFAULTS = {
     "phase1-max-iterations-ceiling": 40000,  # hard backstop - see Phase1ExtrapolationUndecided
     "decay-ach-min-fraction": 90.0,   # % - decay-mode UV-off control run's target reduction
     "decay-each-min-fraction": 90.0,  # % - decay-mode UV-on run's baseline target reduction
-    "decay-each-max-fraction": 99.9,  # % - decay-mode UV-on run's target when eACH is high (cheap to reach)
+    "decay-each-max-fraction": 99.9,
+    # DECAY MODE ONLY. The three targets above size each run by solving
+    # t = -ln(1-target)/rate using an ASSUMED rate (nominal ACH for the
+    # control, ACH + WELL-MIXED eACH for the UV-on run). Both are best-case,
+    # and nothing used to compare them against the rate the run actually
+    # produced - so a poorly-mixed room silently got a run far too short to
+    # measure. Confirmed on patient ward 4B1 v9 (a ceiling fan opposing
+    # upper-room UV): the control was sized for 90% at an assumed 6/hr, really
+    # decayed at 0.427/hr, reached 13%, and its 11-point fit produced a
+    # negative eACH_uv and a 9% mixing efficiency with no error anywhere.
+    # When on, each decay run is re-checked against its own observed rate and
+    # continued if it fell short - see decay_analysis.decay_target_shortfall.
+    "decay-extend-to-target": True,
+    # Hard cap on total simulated seconds for ONE decay run, extensions
+    # included (was a hardcoded 7200 shared with the GUI's own end-time slider
+    # max). Raise it for badly-mixed rooms: at v9's real 0.427/hr the control
+    # needs ~19400s to reach 90%, so 7200 still falls short and the run is
+    # reported as capped rather than silently accepted.
+    "decay-max-total-time": 7200,  # % - decay-mode UV-on run's target when eACH is high (cheap to reach)
     # Default flipped True->True is intentional (2026-08-10): a later sweep
     # launch on the same project_dir now validates reuse by flow_fingerprint
     # (see project_status.find_reusable_ach_base) rather than blind file
@@ -231,6 +249,7 @@ PROJECT_OPENFOAM_SETTINGS_KEYS = (
     "phase1-t-initial", "phase1-extrapolation-streak",
     "phase1-settling-safety-multiplier", "phase1-max-iterations-ceiling",
     "decay-ach-min-fraction", "decay-each-min-fraction", "decay-each-max-fraction",
+    "decay-extend-to-target", "decay-max-total-time",
     "max-co", "max-concurrent-solves",
 )
 

@@ -61,13 +61,14 @@ from ..mesh_gen import opening_actual_area
 from ..monitoring import splice_live_vol_average_if_needed
 from ..monitoring_points import compute_monitoring_results
 from ..run_pipeline import case_awaiting_flow_decision, resume_case_setup, setup_case
-from ..splice import set_control_dict_time
+from ..splice import set_control_dict_start_from, set_control_dict_time
 from ..steady_state_pipeline import (
     REFERENCE_TARGET_T_SS, clear_phase_resume_state, merge_project_deltat_settings, resolve_phase_delta_ts,
     run_steady_state_scenario,
 )
 from ..tclamp_decay import ensure_tclamp_decay_compiled, splice_tclamp_decay_if_needed
 from ..ventilation_control import finish_ventilation_only_control, prepare_ventilation_only_control
+from ..decay_analysis import read_vol_average_dat, run_decay_to_target
 from ..wsl_utils import StoppedByUser, run_wsl_or_raise, run_wsl_streaming, wsl_path
 from . import helpers
 
@@ -609,6 +610,19 @@ def _finish_decay(state, case_dir, room, settings, summary):
             tail = "\n".join(r.stdout.splitlines()[-25:]) or "(no output captured)"
             raise RuntimeError(f"{label} pimpleFoam failed (exit {r.returncode}):\n{tail}")
 
+    # DECAY MODE ONLY: the durations above came from ASSUMED rates; check each
+    # run against the rate it actually produced and continue if it fell short.
+    # mirrors _decay_run_durations' own choice: the ambitious target when it
+    # was judged cheap, the baseline otherwise
+    _cheap = combined_end_time <= adv.get("decay-max-total-time", 7200)
+    uv_target = (adv["decay-each-max-fraction"] if _cheap else adv["decay-each-min-fraction"]) / 100.0
+    _extend_decay_if_short(state, case_dir, "UV-on", uv_target, combined_end_time, adv,
+                            write_interval=write_interval, on_line=state.solver_log_fn)
+    if not skip_control:
+        _extend_decay_if_short(state, control_dir, "control",
+                                adv["decay-ach-min-fraction"] / 100.0, control_end_time, adv,
+                                write_interval=write_interval)
+
     try:
         spatial_cov = spatial_coefficient_of_variation(read_latest_time_field(case_dir, "T"))
     except Exception:
@@ -656,6 +670,58 @@ def _finish_decay(state, case_dir, room, settings, summary):
     state.results = results
     state.log_fn(f"Done. eACH_uv effective={results['eACH_uv_effective']:.4g} /hr "
                  f"(well-mixed={results['eACH_uv_well_mixed']:.4g} /hr)")
+
+
+
+_DECAY_LIVE_DAT = "postProcessing/volAverageLive1/0/volFieldValue.dat"
+
+
+def _extend_decay_if_short(state, case_dir, label, target_fraction, end_time, adv,
+                            write_interval=10, on_line=None):
+    """DECAY MODE ONLY: continue one already-finished pimpleFoam decay until it
+    actually reaches its reduction target, re-measuring the rate from its own
+    curve (see decay_analysis.run_decay_to_target). No-op when
+    decay-extend-to-target is off or the target was already met.
+
+    Steady-state is untouched by this - it sizes its phases off iteration
+    budgets and residence-time-scaled deltaT, not a reduction target.
+    """
+    if not adv.get("decay-extend-to-target", True):
+        return None
+    case_wsl = wsl_path(case_dir)
+
+    def run_fn(_end_time):
+        callback = scenario_runs._throttled_solver_callback(
+            state.log_fn, label, on_line=on_line, status_fn=state.live_status_fn,
+            status_key=label, total_time=_end_time)
+        return run_wsl_streaming("pimpleFoam 2>&1 | tee -a log.pimpleFoam", case_wsl,
+                                  on_line=callback, should_stop=state.should_stop,
+                                  kill_pattern="pimpleFoam", should_pause=state.should_pause)
+
+    def set_end_time_fn(new_end):
+        set_control_dict_start_from(case_dir, "latestTime")
+        set_control_dict_time(case_dir, end_time=new_end,
+                               write_interval=write_interval,
+                               delta_t=adv["pimple-delta-t"], max_co=adv["max-co"])
+
+    def curve_fn():
+        return read_vol_average_dat(f"{case_dir}/{_DECAY_LIVE_DAT}")
+
+    # the first solve already happened; run_decay_to_target's own first call
+    # would repeat it, so hand it a no-op for round zero
+    first = {"done": False}
+
+    def run_or_skip(e):
+        if not first["done"]:
+            first["done"] = True
+            return None
+        return run_fn(e)
+
+    _, info = run_decay_to_target(label, target_fraction, end_time,
+                                   adv.get("decay-max-total-time", 7200),
+                                   run_or_skip, set_end_time_fn, curve_fn,
+                                   log_fn=state.log_fn)
+    return info
 
 
 def _run_decay_pair(state, case_dir_wsl, control_dir_wsl, combined_end_time=None, control_end_time=None):

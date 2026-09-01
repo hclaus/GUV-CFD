@@ -74,6 +74,17 @@ _FIELD_INFO = {
                                 "source-zone peak around 6x the room average is normal, so 10-20x "
                                 "leaves the ceiling clear of real physics while still catching a "
                                 "cell running away toward 1e80."),
+    "decay-extend-to-target": ("Extend decay runs until the target is met",
+                                "Decay mode only. The run lengths above are computed from an ASSUMED "
+                                "removal rate (nominal ACH for the control, ACH + well-mixed eACH for "
+                                "the UV-on run). When on, each run is re-checked against the rate it "
+                                "ACTUALLY achieved and continued if it fell short - without this a "
+                                "poorly-mixed room silently gets a run far too short to measure, and "
+                                "reports a negative eACH rather than an error."),
+    "decay-max-total-time": ("Decay run hard cap (s)",
+                              "Maximum simulated seconds for ONE decay run, extensions included. If a "
+                              "run still hasn't met its target here it is reported as capped and its "
+                              "eACH/mixing figures flagged unreliable, rather than quietly accepted."),
     "scalar-transport-ncorr": ("Contaminant solver outer correctors",
                                 "How many times the contaminant equation is re-solved per timestep - "
                                 "needs to be >0 for the relaxation factor above to matter at all."),

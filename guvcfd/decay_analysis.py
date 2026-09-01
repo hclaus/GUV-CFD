@@ -62,6 +62,116 @@ def read_vol_average_dat(path):
     return np.array(t), np.array(values)
 
 
+DECAY_EXTENSION_MIN_POINTS = 8
+
+
+def decay_target_shortfall(t, T, target_fraction, ceiling=None):
+    """How far a decay run fell short of its intended reduction target, and how
+    much longer it would need AT THE RATE IT ACTUALLY ACHIEVED.
+
+    Returns a dict: achieved_fraction, lambda_per_s, needed_total_seconds,
+    extra_seconds, met (bool), capped (bool when `ceiling` truncates the ask).
+    `extra_seconds` is 0 whenever the target is already met, the curve is too
+    short to fit, or the fitted rate is non-positive (a flat or rising curve
+    has no meaningful time-to-target).
+
+    DECAY MODE ONLY - steady-state phases size themselves off iteration budgets
+    and residence-time-scaled deltaT, not a reduction target, and must not use
+    this.
+
+    Why this exists: the run durations come from `_decay_run_durations`, which
+    solves t = -ln(1-target)/rate using an ASSUMED rate - nominal ACH for the
+    control, ACH + the WELL-MIXED eACH for the UV-on run. Both assumptions are
+    best-case, and nothing ever compared them against the rate the run actually
+    produced. Confirmed on a real case (patient ward 4B1 v9, a ceiling fan
+    opposing upper-room UV): the control was sized for 90% reduction at an
+    assumed 6/hr, actually decayed at 0.427/hr and reached 13%; the UV-on run
+    was sized for 99.9% at an assumed 78.4/hr, actually managed 4.88/hr and
+    reached 50%. Both fits then ran on a fraction of a decay, producing a
+    negative eACH_uv and a 9% mixing efficiency, with no error anywhere -
+    the solver did exactly what it was told.
+    """
+    t = np.asarray(t, dtype=float)
+    T = np.asarray(T, dtype=float)
+    out = {"achieved_fraction": None, "lambda_per_s": None, "needed_total_seconds": None,
+           "extra_seconds": 0.0, "met": False, "capped": False}
+    if len(t) < DECAY_EXTENSION_MIN_POINTS or T[0] <= 0:
+        return out
+    achieved = 1.0 - T[-1] / T[0]
+    out["achieved_fraction"] = float(achieved)
+    out["met"] = bool(achieved >= target_fraction)
+    if out["met"]:
+        return out
+    lam = fit_effective_decay_rate(t, T)["lambda_per_s"]
+    out["lambda_per_s"] = float(lam)
+    if not np.isfinite(lam) or lam <= 0:
+        return out                      # flat/rising: extending cannot help
+    needed = -np.log(1.0 - target_fraction) / lam
+    out["needed_total_seconds"] = float(needed)
+    if ceiling is not None and needed > ceiling:
+        needed = float(ceiling)
+        out["capped"] = True
+    out["extra_seconds"] = float(max(0.0, needed - t[-1]))
+    return out
+
+
+def run_decay_to_target(label, target_fraction, initial_end_time, max_total_time,
+                        run_fn, set_end_time_fn, curve_fn, log_fn=print, max_rounds=3):
+    """Run a decay solve, then keep continuing it until it actually reaches
+    `target_fraction` - re-measuring the rate from its OWN curve each round
+    rather than trusting the assumed rate the initial duration came from.
+
+    DECAY MODE ONLY. Steady-state phases size themselves off iteration budgets
+    and residence-time-scaled deltaT and must not call this.
+
+    Dependency-injected so the three decay drivers (Qt run_state, sweep
+    scenario_runs, Dash app) can share it without this module importing WSL or
+    controlDict helpers:
+      run_fn(end_time)          -> runs the solver to end_time, returns its result
+      set_end_time_fn(end_time) -> rewrites controlDict (endTime + startFrom latestTime)
+      curve_fn()                -> (t, T) of the decay so far
+
+    Returns (last_run_result, info) where info records achieved_fraction,
+    rounds, final end time, and whether it gave up short - `met` False with
+    `capped` True means the cap stopped it, which the caller should surface
+    loudly rather than write a quietly-wrong results.json.
+    """
+    result = run_fn(initial_end_time)
+    end_time = initial_end_time
+    info = {"target_fraction": target_fraction, "rounds": 0, "end_time": end_time,
+            "achieved_fraction": None, "met": False, "capped": False}
+    for _ in range(max_rounds):
+        try:
+            t, T = curve_fn()
+        except Exception as e:                     # a missing/short curve must not kill the run
+            log_fn(f"  {label}: could not read the decay curve to check its target ({e})")
+            return result, info
+        sf = decay_target_shortfall(t, T, target_fraction, ceiling=max_total_time)
+        info["achieved_fraction"] = sf["achieved_fraction"]
+        info["met"], info["capped"] = sf["met"], sf["capped"]
+        if sf["met"] or sf["extra_seconds"] <= 0:
+            break
+        new_end = min(max_total_time, end_time + sf["extra_seconds"])
+        if new_end <= end_time + 1:                # nothing meaningful left to add
+            break
+        log_fn(f"  {label}: reached {100*sf['achieved_fraction']:.1f}% of a "
+               f"{100*target_fraction:.1f}% target at a measured {sf['lambda_per_s']*3600:.3g}/hr "
+               f"(the duration assumed a faster rate) - extending {end_time:.0f}s -> {new_end:.0f}s")
+        set_end_time_fn(new_end)
+        result = run_fn(new_end)
+        end_time = new_end
+        info["rounds"] += 1
+        info["end_time"] = end_time
+    if not info["met"] and info["achieved_fraction"] is not None:
+        log_fn(f"  WARNING: {label} reached only {100*info['achieved_fraction']:.1f}% reduction "
+               f"against a {100*target_fraction:.1f}% target after {end_time:.0f}s"
+               + (f" (capped at decay-max-total-time={max_total_time:.0f}s)" if info["capped"] else "")
+               + ". Its fitted rate is based on a fraction of one decay, so eACH/mixing figures "
+                 "from this run are unreliable - raise decay-max-total-time or investigate why "
+                 "removal is so slow.")
+    return result, info
+
+
 def fit_effective_decay_rate(t, T):
     """Least-squares fit of ln(T) = -lambda*t + c.
 
