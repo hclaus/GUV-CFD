@@ -28,7 +28,9 @@ from .app_settings import (
 from .case_io import (
     clear_stale_run_output, read_cell_centers, read_latest_time_field, snapshot_openfoam_settings,
 )
-from .decay_analysis import write_results_summary, mechanical_mixing_efficiency_pct, spatial_coefficient_of_variation
+from .decay_analysis import (write_results_summary, mechanical_mixing_efficiency_pct,
+                              spatial_coefficient_of_variation, read_vol_average_dat,
+                              run_decay_to_target)
 from .monitoring import splice_live_vol_average_if_needed
 from .contaminant_source import (breathing_inlet_direction, breathing_inlet_velocity,
                                   breathing_inlet_velocity_constraint, resolve_source_size)
@@ -961,6 +963,43 @@ def _decay_run_durations(ach, eACH_well_mixed_est, adv):
     return combined_end_time, control_end_time
 
 
+def _extend_decay_if_short_dash(case_dir, label, target_fraction, end_time, adv, write_interval):
+    """DECAY MODE ONLY: continue an already-finished pimpleFoam decay until it
+    actually reaches its reduction target, re-measuring the rate from its own
+    curve. Dash-side twin of the Qt/sweep helpers - see
+    decay_analysis.run_decay_to_target. No-op when decay-extend-to-target is
+    off or the target was already met.
+    """
+    if not adv.get("decay-extend-to-target", True):
+        return None
+    case_wsl = wsl_path(case_dir)
+
+    def run_fn(_end):
+        return run_wsl_streaming("pimpleFoam 2>&1 | tee -a log.pimpleFoam", case_wsl,
+                                  on_line=_track_solver_time, should_stop=_should_stop,
+                                  kill_pattern="pimpleFoam", should_pause=_should_pause)
+
+    def set_end_time_fn(new_end):
+        set_control_dict_start_from(case_dir, "latestTime")
+        set_control_dict_time(case_dir, end_time=new_end, write_interval=write_interval,
+                               delta_t=adv["pimple-delta-t"], max_co=adv["max-co"])
+
+    first = {"done": False}
+
+    def run_or_skip(e):
+        if not first["done"]:                 # the initial solve already happened
+            first["done"] = True
+            return None
+        return run_fn(e)
+
+    _, info = run_decay_to_target(
+        label, target_fraction, end_time, adv.get("decay-max-total-time", 7200),
+        run_or_skip, set_end_time_fn,
+        lambda: read_vol_average_dat(f"{case_dir}/postProcessing/volAverageLive1/0/volFieldValue.dat"),
+        log_fn=_run_log)
+    return info
+
+
 def _run_decay_pair(case_dir_wsl, control_dir_wsl, combined_end_time=None, control_end_time=None):
     """Run the UV-on and (if control_dir_wsl is given) UV-off-control
     pimpleFoam solves CONCURRENTLY - both only depend on the shared,
@@ -1137,6 +1176,18 @@ def _finish_decay(case_dir, room, settings, summary):
         if r.returncode != 0 or "FOAM FATAL" in r.stdout or "Floating Point Exception" in r.stdout:
             tail = "\n".join(r.stdout.splitlines()[-25:]) or "(no output captured)"
             raise RuntimeError(f"{label} pimpleFoam failed (exit {r.returncode}):\n{tail}")
+
+    # DECAY MODE ONLY: both durations came from ASSUMED rates - re-check each
+    # against the rate actually achieved and continue if short.
+    _cheap = combined_end_time <= adv.get("decay-max-total-time", 7200)
+    _extend_decay_if_short_dash(
+        case_dir, "UV-on",
+        (adv["decay-each-max-fraction"] if _cheap else adv["decay-each-min-fraction"]) / 100.0,
+        combined_end_time, adv, write_interval)
+    if not skip_control:
+        _extend_decay_if_short_dash(control_dir, "control",
+                                     adv["decay-ach-min-fraction"] / 100.0,
+                                     control_end_time, adv, write_interval)
 
     _run_log("Computing spatial coefficient of variation (final concentration field, "
              "across all cells - how uniformly the room actually cleared, not just on average)...")

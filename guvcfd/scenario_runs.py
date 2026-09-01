@@ -63,6 +63,7 @@ from .project_status import (
 )
 from .report import combo_summary_metrics
 from .run_pipeline import check_ach_delivery, setup_case, _volume_weighted_mean
+from .decay_analysis import read_vol_average_dat, run_decay_to_target
 from .splice import (
     set_control_dict_start_from, set_control_dict_time, splice_fv_options_into_control_dict,
     set_relaxation_factors, compute_adaptive_scalar_relaxation,
@@ -1012,6 +1013,56 @@ def _run_shared_phase1(base_dir, phase1_dir, ach, room, settings, adv, log_fn, s
 # than the Dash app's globals - see module docstring for why this module
 # doesn't import app.py) ---
 
+
+_DECAY_LIVE_DAT = "postProcessing/volAverageLive1/0/volFieldValue.dat"
+
+
+def _extend_decay_if_short(case_dir, label, target_fraction, end_time, adv, write_interval,
+                            log_fn, should_stop=None, should_pause=None, solver_log_fn=None,
+                            status_fn=None, status_key=None, solve_semaphore=None):
+    """DECAY MODE ONLY: continue an already-finished pimpleFoam decay until it
+    actually reaches its reduction target, re-measuring the rate from its own
+    curve. See decay_analysis.run_decay_to_target and the Qt driver's identical
+    helper. No-op when decay-extend-to-target is off or the target was met.
+    """
+    if not adv.get("decay-extend-to-target", True):
+        return None
+    case_wsl = wsl_path(case_dir)
+
+    def run_fn(_end):
+        try:
+            with solve_semaphore or contextlib.nullcontext():
+                return run_wsl_streaming(
+                    "pimpleFoam 2>&1 | tee -a log.pimpleFoam", case_wsl,
+                    on_line=_throttled_solver_callback(log_fn, label, solver_log_fn,
+                                                        status_fn=status_fn, status_key=status_key,
+                                                        total_time=_end),
+                    should_stop=should_stop, kill_pattern="pimpleFoam", should_pause=should_pause)
+        finally:
+            if status_fn is not None and status_key is not None:
+                status_fn(status_key, None)
+
+    def set_end_time_fn(new_end):
+        set_control_dict_start_from(case_dir, "latestTime")
+        set_control_dict_time(case_dir, end_time=new_end, write_interval=write_interval,
+                               delta_t=adv["pimple-delta-t"], max_co=adv["max-co"])
+
+    first = {"done": False}
+
+    def run_or_skip(e):
+        if not first["done"]:                 # the initial solve already happened
+            first["done"] = True
+            return None
+        return run_fn(e)
+
+    _, info = run_decay_to_target(label, target_fraction, end_time,
+                                   adv.get("decay-max-total-time", 7200),
+                                   run_or_skip, set_end_time_fn,
+                                   lambda: read_vol_average_dat(f"{case_dir}/{_DECAY_LIVE_DAT}"),
+                                   log_fn=log_fn)
+    return info
+
+
 def _decay_run_durations(ach, eACH_well_mixed_est, adv):
     """Same rule as app._decay_run_durations: the UV-off control run
     targets decay-ach-min-fraction alone (ventilation-only decay is often
@@ -1170,6 +1221,15 @@ def _run_shared_control(base_dir, control_dir, ach, room, settings, adv, log_fn,
         tail = "\n".join(r.stdout.splitlines()[-25:]) or "(no output captured)"
         raise RuntimeError(f"Shared UV-off control pimpleFoam failed (exit {r.returncode}):\n{tail}")
 
+    # DECAY MODE ONLY: control_end_time assumed the NOMINAL ACH, which is
+    # circular - measuring the real ventilation rate is this run's whole point.
+    # Re-check it against the rate actually achieved and continue if short.
+    _extend_decay_if_short(control_dir, "control", adv["decay-ach-min-fraction"] / 100.0,
+                            control_end_time, adv, write_interval, log_fn,
+                            should_stop=should_stop, should_pause=should_pause,
+                            status_fn=status_fn, status_key=status_key,
+                            solve_semaphore=solve_semaphore)
+
     log_fn("  Post-processing shared UV-off control...")
     return finish_ventilation_only_control(control_dir, ach, log_fn=log_fn)
 
@@ -1275,6 +1335,16 @@ def _run_decay_scenario(case_dir, room, settings, z, ach, adv, z_summary, log_fn
     if r_uv.returncode != 0 or "FOAM FATAL" in r_uv.stdout or "Floating Point Exception" in r_uv.stdout:
         tail = "\n".join(r_uv.stdout.splitlines()[-25:]) or "(no output captured)"
         raise RuntimeError(f"UV-on pimpleFoam failed (exit {r_uv.returncode}):\n{tail}")
+
+    # DECAY MODE ONLY: the duration came from an ASSUMED rate - re-check against
+    # the rate actually achieved and continue if short.
+    _cheap = combined_end_time <= adv.get("decay-max-total-time", 7200)
+    _extend_decay_if_short(
+        case_dir, "UV-on",
+        (adv["decay-each-max-fraction"] if _cheap else adv["decay-each-min-fraction"]) / 100.0,
+        combined_end_time, adv, write_interval, log_fn, should_stop=should_stop,
+        should_pause=should_pause, solver_log_fn=solver_log_fn, status_fn=status_fn,
+        status_key=status_key, solve_semaphore=solve_semaphore)
 
     log_fn("  Computing spatial coefficient of variation (final concentration field, "
            "across all cells - how uniformly the room actually cleared, not just on average)...")
