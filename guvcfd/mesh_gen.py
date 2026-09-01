@@ -222,6 +222,22 @@ def _opening_box(wall, Lx, Ly, Lz, center_frac, size, cell_size=None, eps=1e-4):
             hi[a1] = lo[a1] + cell1
         if hi[a2] <= lo[a2]:
             hi[a2] = lo[a2] + cell2
+        # ...but the outward snap can push an opening that sits flush against
+        # a room edge PAST that edge, and blockMesh/topoSet can only carve
+        # faces that exist - so the real patch is the intersection with the
+        # wall, while every area/center/half-extent derived from this box
+        # would still describe the unclipped one. That gap silently
+        # under-delivers ventilation: the inlet velocity is sized as
+        # ACH*V/area on the too-large area, then applied across the smaller
+        # carved patch, delivering exactly (carved/unclipped) of the target.
+        # Confirmed on patient ward 4B1 v10 - a 0.4 m inlet at z=2.4 in a
+        # 2.57 m room (real dz 0.098846) snapped to 5 cells ending at 2.6688,
+        # 0.0988 m above the ceiling; the mesh carved 4 rows, and the case
+        # delivered 4.80 /hr against a nominal 6 /hr, exactly the 4/5 ratio.
+        # Clipping here makes the reported area the carved area, so the
+        # velocity is sized against what actually exists.
+        lo[a1], hi[a1] = max(lo[a1], 0.0), min(hi[a1], dims[a1])
+        lo[a2], hi[a2] = max(lo[a2], 0.0), min(hi[a2], dims[a2])
     pos = normal_pos_fn(Lx, Ly, Lz)
     lo[normal_axis], hi[normal_axis] = pos - eps, pos + eps
     return tuple(lo), tuple(hi)
