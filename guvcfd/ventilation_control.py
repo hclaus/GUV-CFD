@@ -25,7 +25,7 @@ def prepare_ventilation_only_control(case_dir, control_dir, inlet_velocity, pimp
                                       pimple_write_interval, pimple_delta_t=0.5, max_co=None,
                                       inlet2_velocity=None, has_outlet2=False,
                                       sealed=False, log_fn=print, should_stop=None,
-                                      breathing_entry=None):
+                                      breathing_entry=None, fan_entry=None):
     """Clone case_dir's mesh/converged flow field into control_dir, remove
     every UV source, reset T fresh, and set its own transient-decay duration
     - everything needed before pimpleFoam can run. Split out from actually
@@ -99,15 +99,30 @@ def prepare_ventilation_only_control(case_dir, control_dir, inlet_velocity, pimp
     restore_boundary_conditions(control_dir, inlet_velocity=inlet_velocity,
                                  inlet2_velocity=inlet2_velocity, has_outlet2=has_outlet2, sealed=sealed)
 
-    if breathing_entry is not None:
-        # NOT empty when a breathing inlet is configured: the occupant is
-        # present in the UV-off case too, and their exhale measurably
-        # changes the flow field this run is measuring the ventilation rate
-        # ON. Dropping it here would measure ventilation on a different
-        # flow field than the UV-on run it gets compared against - see
-        # scenario_runs._carve_breathing_inlet.
-        log_fn("Writing constant/fvOptions with the breathing inlet only (no UV source)...")
-        write_fvoptions_file(control_dir, [breathing_entry])
+    # Every FLOW-driving fvOption carries over; only the UV sources (which
+    # act on T) are dropped. The occupant is still breathing and the fan is
+    # still running in the UV-off case - they change the flow field this run
+    # measures the ventilation rate ON, so dropping either would measure
+    # ventilation on a DIFFERENT flow field than the UV-on run it is
+    # subtracted from, which is the one thing this control exists to avoid.
+    #
+    # The fan was missed here originally, and the failure was silent and
+    # severe: control_dir inherits the fan-driven velocity field as its
+    # initial condition, so t=0 looks right, but with no momentum source
+    # sustaining it the circulation spins down within ~300 s. Measured on
+    # patient ward 4B1 v10 - room mean |U| fell 0.15102 -> 0.01465 m/s (10x)
+    # while the UV-on run it was compared against held 0.15102 throughout.
+    # That put lambda_total (5.13 /hr, fan running) and lambda_vent (0.397
+    # /hr, fan dead) in different rooms, reported the fan-less room's poor
+    # mixing as an 8.3% "mechanical mixing efficiency", and made every
+    # control-derived number blind to fan direction - the control was
+    # bit-identical whether the fan pointed up or down.
+    flow_entries = [e for e in (breathing_entry, fan_entry) if e is not None]
+    if flow_entries:
+        what = " + ".join(n for n, e in (("breathing inlet", breathing_entry), ("fan", fan_entry))
+                           if e is not None)
+        log_fn(f"Writing constant/fvOptions with the {what} (no UV source)...")
+        write_fvoptions_file(control_dir, flow_entries)
     else:
         log_fn("Writing an empty constant/fvOptions (no UV source - ventilation only)...")
         write_fvoptions_file(control_dir, [])

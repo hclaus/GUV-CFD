@@ -34,7 +34,7 @@ from .decay_analysis import (write_results_summary, mechanical_mixing_efficiency
 from .monitoring import splice_live_vol_average_if_needed
 from .contaminant_source import (breathing_inlet_direction, breathing_inlet_velocity,
                                   breathing_inlet_velocity_constraint, resolve_source_size)
-from .fan import fan_fvoptions_entry
+from .fan import fan_fvoptions_entry, fan_entry_from_settings
 from .fluence import compute_fluence_at_points, compute_inactivation_rate, compute_well_mixed_eACH
 from . import help_content
 from .version import APP_VERSION
@@ -1158,6 +1158,7 @@ def _finish_decay(case_dir, room, settings, summary):
             sealed=False,
             log_fn=_run_log, should_stop=_should_stop,
             breathing_entry=control_breathing_entry,
+            fan_entry=fan_entry_from_settings(settings),
         )
         if control_breathing_entry is not None:
             scenario_runs._carve_breathing_inlet(control_dir, room, settings, adv, _run_log)

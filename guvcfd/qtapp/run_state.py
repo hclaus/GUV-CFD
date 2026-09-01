@@ -55,7 +55,7 @@ from ..case_io import read_latest_time_field, snapshot_openfoam_settings
 from ..decay_analysis import (
     mechanical_mixing_efficiency_pct, spatial_coefficient_of_variation, write_results_summary,
 )
-from ..fan import fan_fvoptions_entry
+from ..fan import fan_fvoptions_entry, fan_entry_from_settings
 from ..initial_fields import compute_inlet_velocities
 from ..mesh_gen import opening_actual_area
 from ..monitoring import splice_live_vol_average_if_needed
@@ -596,6 +596,7 @@ def _finish_decay(state, case_dir, room, settings, summary):
             inlet2_velocity=summary.get("inlet2_velocity") if has_inlet2 else None,
             has_outlet2=bool(settings.get("outlet2-enable")),
             sealed=False, log_fn=state.log_fn, should_stop=state.should_stop,
+            fan_entry=fan_entry_from_settings(settings),
         )
 
     state.log_fn(f"Running pimpleFoam: UV-on ({combined_end_time}s)"

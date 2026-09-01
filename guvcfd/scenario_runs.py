@@ -50,7 +50,7 @@ from .contaminant_source import (breathing_inlet_direction, breathing_inlet_velo
                                   write_fvoptions_file,
                                   write_source_topo_set_dict)
 from .decay_analysis import write_results_summary, mechanical_mixing_efficiency_pct, spatial_coefficient_of_variation
-from .fan import fan_fvoptions_entry, write_fan_topo_set_dict
+from .fan import fan_fvoptions_entry, write_fan_topo_set_dict, fan_entry_from_settings
 from .fluence import compute_fluence_at_points, compute_inactivation_rate, compute_well_mixed_eACH
 from .initial_fields import compute_inlet_velocities, resolve_case_inlet_velocities
 from .mesh_gen import opening_actual_area
@@ -1194,6 +1194,7 @@ def _run_shared_control(base_dir, control_dir, ach, room, settings, adv, log_fn,
         sealed=sealed,
         log_fn=log_fn, should_stop=should_stop,
         breathing_entry=breathing_entry,
+        fan_entry=fan_entry_from_settings(settings),
     )
     if breathing_entry is not None:
         # The base this was cloned from is ventilation-only and has no

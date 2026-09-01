@@ -97,3 +97,20 @@ def fan_fvoptions_entry(speed, direction=(0, 0, -1), zone_name="fanZone",
         "",
     ]
     return "\n".join(lines)
+
+
+def fan_entry_from_settings(settings):
+    """The fan's fvOptions entry for `settings`, or None when no fan is
+    enabled - the single place that turns the GUI's fan-enable/fan-speed/
+    fan-direction keys into an entry.
+
+    Exists so the UV-off control can run the SAME fan as the case it is
+    measuring against. The control clones the fan-driven flow field but
+    solves its own transient, so without the momentum source the
+    circulation spins down and the control ends up measuring a different
+    room - see ventilation_control.prepare_ventilation_only_control.
+    """
+    if not settings.get("fan-enable"):
+        return None
+    direction = (0, 0, -1) if settings.get("fan-direction") == "down" else (0, 0, 1)
+    return fan_fvoptions_entry(settings["fan-speed"], direction=direction)
