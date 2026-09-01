@@ -68,7 +68,7 @@ from ..steady_state_pipeline import (
 )
 from ..tclamp_decay import ensure_tclamp_decay_compiled, splice_tclamp_decay_if_needed
 from ..ventilation_control import finish_ventilation_only_control, prepare_ventilation_only_control
-from ..decay_analysis import read_vol_average_dat, run_decay_to_target
+from ..decay_analysis import read_vol_average_dat, run_decay_to_target, read_decay_curve
 from ..wsl_utils import StoppedByUser, run_wsl_or_raise, run_wsl_streaming, wsl_path
 from . import helpers
 
@@ -676,7 +676,6 @@ def _finish_decay(state, case_dir, room, settings, summary):
 
 
 
-_DECAY_LIVE_DAT = "postProcessing/volAverageLive1/0/volFieldValue.dat"
 
 
 def _extend_decay_if_short(state, case_dir, label, target_fraction, end_time, adv,
@@ -708,7 +707,7 @@ def _extend_decay_if_short(state, case_dir, label, target_fraction, end_time, ad
                                delta_t=adv["pimple-delta-t"], max_co=adv["max-co"])
 
     def curve_fn():
-        return read_vol_average_dat(f"{case_dir}/{_DECAY_LIVE_DAT}")
+        return read_decay_curve(case_dir)
 
     # the first solve already happened; run_decay_to_target's own first call
     # would repeat it, so hand it a no-op for round zero

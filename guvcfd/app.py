@@ -30,7 +30,7 @@ from .case_io import (
 )
 from .decay_analysis import (write_results_summary, mechanical_mixing_efficiency_pct,
                               spatial_coefficient_of_variation, read_vol_average_dat,
-                              run_decay_to_target)
+                              run_decay_to_target, read_decay_curve)
 from .monitoring import splice_live_vol_average_if_needed
 from .contaminant_source import (breathing_inlet_direction, breathing_inlet_velocity,
                                   breathing_inlet_velocity_constraint, resolve_source_size)
@@ -996,7 +996,7 @@ def _extend_decay_if_short_dash(case_dir, label, target_fraction, end_time, adv,
     _, info = run_decay_to_target(
         label, target_fraction, end_time, adv.get("decay-max-total-time", 7200),
         run_or_skip, set_end_time_fn,
-        lambda: read_vol_average_dat(f"{case_dir}/postProcessing/volAverageLive1/0/volFieldValue.dat"),
+        lambda: read_decay_curve(case_dir),
         log_fn=_run_log)
     return info
 

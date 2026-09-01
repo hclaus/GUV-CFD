@@ -14,7 +14,8 @@ from scipy import stats
 from scipy.optimize import curve_fit, OptimizeWarning
 
 from .case_io import snapshot_openfoam_settings as _snapshot_openfoam_settings
-from .wsl_utils import wsl_path as _wsl_path, read_wsl_text as _read_wsl_text, write_case_file as _write_case_file
+from .wsl_utils import (wsl_path as _wsl_path, read_wsl_text as _read_wsl_text,
+                         write_case_file as _write_case_file, run_wsl as _run_wsl)
 
 
 def read_vol_average_dat(path):
@@ -63,6 +64,79 @@ def read_vol_average_dat(path):
 
 
 DECAY_EXTENSION_MIN_POINTS = 8
+
+
+DECAY_MONITOR = "volAverageLive1"
+
+
+def decay_monitor_legs(case_dir, monitor=DECAY_MONITOR):
+    """Every leg directory under postProcessing/<monitor>/, oldest first.
+
+    A decay extended to reach its target restarts from latestTime (see
+    run_decay_to_target), and OpenFOAM then opens a NEW
+    postProcessing/<monitor>/<restart time>/ directory while the original
+    0/ file stops growing. Returns ["0"] for an un-extended run.
+    """
+    import os
+
+    base = f"{case_dir}/postProcessing/{monitor}"
+    base_wsl = _wsl_path(base)
+    names = None
+    if base_wsl == base and not base.startswith("/"):
+        # Genuine Windows-side path (e.g. a test fixture) - list it directly.
+        try:
+            names = os.listdir(base)
+        except OSError:
+            return []
+    if names is None:
+        # WSL-side: list through a WSL-native process, never Windows pathlib -
+        # a brand-new case directory is not reliably visible across the
+        # boundary (see wsl_utils.write_wsl_text).
+        names = _run_wsl(f"ls -1 {base_wsl} 2>/dev/null", base_wsl).stdout.split()
+    legs = []
+    for n in names:
+        try:
+            legs.append((float(n), n))
+        except ValueError:
+            continue
+    return [n for _, n in sorted(legs)]
+
+
+def read_decay_curve(case_dir, monitor=DECAY_MONITOR, filename="volFieldValue.dat"):
+    """The FULL decay curve, concatenating every restart leg in time order.
+
+    Reading only the "0" leg fits the rate on whatever the run's first,
+    deliberately-provisional duration happened to be and silently discards
+    everything an extension produced - the exact data the extension exists
+    to generate. Confirmed on patient ward 4B1 v10: the 0/ leg alone is
+    500 s and 50.77% reduction (lambda_total 5.064 /hr), while the real
+    curve runs to 4889.7 s and 99.91% (5.130 /hr).
+
+    Samples at or before the previous leg's last time are dropped - a
+    restart re-reports its start point, and a duplicated t would otherwise
+    be weighted twice by the least-squares fit.
+    """
+    ts, vs = [], []
+    first_error = None
+    for leg in decay_monitor_legs(case_dir, monitor):
+        try:
+            t, v = read_vol_average_dat(f"{case_dir}/postProcessing/{monitor}/{leg}/{filename}")
+        except (OSError, RuntimeError) as exc:
+            # A leg directory without this monitor's file is possible (another
+            # function object's output). Remember why, but keep going.
+            first_error = first_error or exc
+            continue
+        for ti, vi in zip(t, v):
+            if ts and ti <= ts[-1]:
+                continue
+            ts.append(float(ti)); vs.append(float(vi))
+    if not ts:
+        # Never return an empty curve quietly - a caller would fit it, or
+        # divide by it, and produce a confidently wrong number. Fail the way
+        # the old single-path read did.
+        raise first_error or FileNotFoundError(
+            f"No readable {filename} under {case_dir}/postProcessing/{monitor}/")
+    return np.array(ts), np.array(vs)
 
 
 def decay_target_shortfall(t, T, target_fraction, ceiling=None):
@@ -602,8 +676,17 @@ def write_results_summary(case_dir, out_path, ventilation_ach, well_mixed_eACH_m
     (see compute_effective_eACH's docstring) instead of treating the
     measured baseline as an exact constant.
     """
-    dat_path = f"{case_dir}/{vol_average_dat}"
-    t, T = read_vol_average_dat(dat_path)
+    # Read EVERY restart leg, not just the one `vol_average_dat` names. A
+    # decay extended to reach its target reopens postProcessing under the
+    # restart time, leaving the named (usually "0") file frozen at the
+    # provisional first duration - fitting that alone throws away exactly
+    # the data the extension was run to produce. Falls back to the literal
+    # path for a caller that passed a non-default monitor.
+    monitor = vol_average_dat.split("postProcessing/")[-1].split("/")[0]
+    try:
+        t, T = read_decay_curve(case_dir, monitor=monitor)
+    except (OSError, RuntimeError):
+        t, T = read_vol_average_dat(f"{case_dir}/{vol_average_dat}")
     fit = compute_effective_eACH(t, T, ventilation_ach)
     eACH_eff = fit["eACH_uv_effective"]
     lambda_eff = fit["lambda_total_effective_per_s"]

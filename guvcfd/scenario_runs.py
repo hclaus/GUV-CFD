@@ -63,7 +63,7 @@ from .project_status import (
 )
 from .report import combo_summary_metrics
 from .run_pipeline import check_ach_delivery, setup_case, _volume_weighted_mean
-from .decay_analysis import read_vol_average_dat, run_decay_to_target
+from .decay_analysis import read_vol_average_dat, run_decay_to_target, read_decay_curve
 from .splice import (
     set_control_dict_start_from, set_control_dict_time, splice_fv_options_into_control_dict,
     set_relaxation_factors, compute_adaptive_scalar_relaxation,
@@ -1014,7 +1014,6 @@ def _run_shared_phase1(base_dir, phase1_dir, ach, room, settings, adv, log_fn, s
 # doesn't import app.py) ---
 
 
-_DECAY_LIVE_DAT = "postProcessing/volAverageLive1/0/volFieldValue.dat"
 
 
 def _extend_decay_if_short(case_dir, label, target_fraction, end_time, adv, write_interval,
@@ -1058,7 +1057,7 @@ def _extend_decay_if_short(case_dir, label, target_fraction, end_time, adv, writ
     _, info = run_decay_to_target(label, target_fraction, end_time,
                                    adv.get("decay-max-total-time", 7200),
                                    run_or_skip, set_end_time_fn,
-                                   lambda: read_vol_average_dat(f"{case_dir}/{_DECAY_LIVE_DAT}"),
+                                   lambda: read_decay_curve(case_dir),
                                    log_fn=log_fn)
     return info
 
