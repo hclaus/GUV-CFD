@@ -11,7 +11,8 @@ control run, "Continue").
 """
 import re
 
-from .decay_analysis import read_vol_average_dat, compute_effective_eACH, windowed_stats
+from .decay_analysis import (read_vol_average_dat, compute_effective_eACH, windowed_stats,
+                              read_decay_curve)
 from .wsl_utils import wsl_path, run_wsl_or_raise, write_case_file as _write_case_file
 
 _UNSAFE_ZONE_CHARS_RE = re.compile(r"[^A-Za-z0-9_]+")
@@ -167,8 +168,14 @@ def compute_monitoring_results(case_dir, points, cell_size=0.1,
     results = {}
     for p in points:
         zname = zone_name(p["name"])
-        dat_path = f"{case_dir}/postProcessing/monitor_{zname}/0/volFieldValue.dat"
-        t, T = read_vol_average_dat(dat_path)
+        # NOT a hardcoded "0" leg. `postProcess` names its output directory
+        # after the run's START time, and a decay that extended itself to
+        # reach its target restarts with `startFrom latestTime` - so this
+        # pass writes postProcessing/monitor_<zone>/<latest time>/ instead.
+        # Confirmed on patient ward 4B1 v9: the monitors landed under 5100/
+        # (holding the complete t=0..5100 series - only the directory name
+        # differs) and summarising died with "No such file" on 0/.
+        t, T = read_decay_curve(case_dir, monitor=f"monitor_{zname}")
         entry = {"t_seconds": t.tolist(), "volAverage_T": T.tolist()}
         if fit_decay and ventilation_ach is not None and len(t) > 2:
             fit = compute_effective_eACH(t, T, ventilation_ach)

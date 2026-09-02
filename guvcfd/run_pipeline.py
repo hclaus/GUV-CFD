@@ -19,7 +19,7 @@ from .case_io import read_cell_centers, read_cell_volumes, read_boundary_patch_n
 from .cellzones import bin_decay_rates, write_cellzones, write_fvoptions
 from .contaminant_source import (write_fvoptions_file, source_box_grid_alignment,
                                   resolve_source_size, suggest_source_center_fix)
-from .decay_analysis import read_vol_average_dat
+from .decay_analysis import read_decay_curve, read_vol_average_dat
 from .fan import write_fan_topo_set_dict, fan_fvoptions_entry
 from .fluence import compute_fluence_at_points, compute_inactivation_rate, compute_well_mixed_eACH
 from .initial_fields import (
@@ -665,7 +665,12 @@ def converge_flow_field(case_dir, n_iterations=500, fan_entry=None, log_fn=print
 
             _run_wsl_or_raise("rm -rf postProcessing", case_dir_wsl, "clearing stale postProcessing")
             _run_wsl_or_raise("postProcess -dict system/volAverageDict", case_dir_wsl, "postProcess flow monitor")
-            _, vals = read_vol_average_dat(f"{case_dir}/postProcessing/volAverage1/0/volFieldValue.dat")
+            # postProcessing was just wiped and regenerated, so exactly one
+            # leg exists - but its NAME is the run's start time, which is
+            # only "0" while startFrom is startTime. Reading it by listing
+            # rather than by assuming "0" keeps this correct even on a case
+            # that a decay extension previously left at startFrom latestTime.
+            _, vals = read_decay_curve(case_dir, monitor="volAverage1")
             cur_avg = vals[-1]
 
             prev_avg = cur_avg

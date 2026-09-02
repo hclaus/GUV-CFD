@@ -223,6 +223,10 @@ def test_converge_flow_field_skip_potential_flow_never_runs_potentialfoam(monkey
     monkeypatch.setattr(run_pipeline, "_run_wsl_or_raise", fake_run_wsl_or_raise)
     monkeypatch.setattr(run_pipeline, "_run_wsl_streaming", fake_run_wsl_streaming)
     monkeypatch.setattr(run_pipeline, "read_vol_average_dat", lambda path: ([0], [0.0]))
+    # converge_flow_field reads its chunk monitor by LISTING the
+    # postProcessing legs - the directory is named after the run's start
+    # time, not necessarily "0" (see test_monitor_leg_naming).
+    monkeypatch.setattr(run_pipeline, "read_decay_curve", lambda *a, **k: ([0], [0.0]))
     monkeypatch.setattr(run_pipeline, "set_function_object_enabled", lambda *a, **k: None)
     monkeypatch.setattr(run_pipeline, "ensure_simple_fvsolution", lambda *a, **k: None)
     monkeypatch.setattr(run_pipeline, "write_fvoptions_file", lambda *a, **k: None)
@@ -269,6 +273,10 @@ def test_converge_flow_field_clears_stale_time_dirs_on_cold_start(monkeypatch, t
     monkeypatch.setattr(run_pipeline, "_run_wsl_streaming",
                          lambda *a, **k: SimpleNamespace(stdout="", returncode=0))
     monkeypatch.setattr(run_pipeline, "read_vol_average_dat", lambda path: ([0], [0.0]))
+    # converge_flow_field reads its chunk monitor by LISTING the
+    # postProcessing legs - the directory is named after the run's start
+    # time, not necessarily "0" (see test_monitor_leg_naming).
+    monkeypatch.setattr(run_pipeline, "read_decay_curve", lambda *a, **k: ([0], [0.0]))
     monkeypatch.setattr(run_pipeline, "set_function_object_enabled", lambda *a, **k: None)
     monkeypatch.setattr(run_pipeline, "ensure_simple_fvsolution", lambda *a, **k: None)
     monkeypatch.setattr(run_pipeline, "write_fvoptions_file", lambda *a, **k: None)
@@ -318,6 +326,10 @@ def test_converge_flow_field_resume_does_not_clear_time_dirs(monkeypatch, tmp_pa
     monkeypatch.setattr(run_pipeline, "_run_wsl_streaming",
                          lambda *a, **k: SimpleNamespace(stdout="", returncode=0))
     monkeypatch.setattr(run_pipeline, "read_vol_average_dat", lambda path: ([0], [0.0]))
+    # converge_flow_field reads its chunk monitor by LISTING the
+    # postProcessing legs - the directory is named after the run's start
+    # time, not necessarily "0" (see test_monitor_leg_naming).
+    monkeypatch.setattr(run_pipeline, "read_decay_curve", lambda *a, **k: ([0], [0.0]))
     monkeypatch.setattr(run_pipeline, "set_function_object_enabled", lambda *a, **k: None)
     monkeypatch.setattr(run_pipeline, "ensure_simple_fvsolution", lambda *a, **k: None)
     monkeypatch.setattr(run_pipeline, "write_fvoptions_file", lambda *a, **k: None)
@@ -696,6 +708,8 @@ def test_converge_flow_field_raises_flow_convergence_undecided_not_runtime_error
         return [0], [0.10 if read_calls["n"] % 2 else 0.20]
 
     monkeypatch.setattr(run_pipeline, "read_vol_average_dat", fake_read_vol_average)
+    monkeypatch.setattr(run_pipeline, "read_decay_curve",
+                        lambda *a, **k: fake_read_vol_average(None))
     # Local (non-WSL) file manipulation this test isn't exercising - only
     # the chunk-loop/verdict logic below matters here.
     monkeypatch.setattr(run_pipeline, "set_function_object_enabled", lambda *a, **k: None)
