@@ -1580,3 +1580,66 @@ keeping in view:
 Before this feature is used for exposure numbers in any new geometry, the
 direction needs to become a real modelling input (occupant orientation, or at
 minimum a documented worst/typical case) rather than an inherited default.
+
+## Flow convergence: what "converged enough" actually means (2026-09-01)
+
+The flow-convergence check accepted a field once the chunk-to-chunk change in
+volAverage(p) fell below tolerance. That test has two independent ways of
+firing on a field that has not converged, and both were caught on real runs:
+
+**Turning points.** `|x_n - x_(n-1)|` is smallest exactly where the slope
+crosses zero, which on an oscillating signal is a peak or trough. Patient ward
+v9 and v10 were each accepted off a single lucky chunk (1 of 15 and 1 of 7),
+landing on an extreme of their own series - v10 on its maximum, +24% off the
+series mean, against a median chunk-to-chunk change of 18%.
+
+**Slow drift.** Requiring 3 consecutive small changes fixes the first mode but
+not this one. A five-variant sweep on v9 (fan down / up / off, damped and not,
+16 chunks each) found the fan-free run producing three consecutive changes of
+0.38/0.31/0.28% while still climbing, then excursing 10.7% two chunks later -
+12.8% away from the value a streak would have frozen. A longer streak cannot
+help: a slower drift simply satisfies it.
+
+Acceptance is now judged on a window: **converged** when all of the last
+`oscillation_window` values lie within `rel_tol` of their own mean (bounding
+total movement, not each step), and **bounded oscillation** when the amplitude
+is not growing AND the window mean is stationary against the standard error of
+the means themselves. Both are needed for the second verdict: a symmetric
+divergence holds the mean still while the swing grows, and a bounded swing can
+still have a walking mean.
+
+### How much does the freeze point actually cost?
+
+Measured rather than argued. Three snapshots of the SAME bounded oscillation
+(6000 / 7000 / 8000 iterations, fan-down v9), injected into three otherwise
+byte-identical decay cases - same mesh, fluence, UV cellZones and fan, so the
+frozen flow phase was the only variable - each run 2000 s:
+
+| freeze point | reduction | lambda_total |
+|---|---|---|
+| 6000 it | 94.13% | 5.0837 /hr |
+| 7000 it | 93.84% | 5.0164 /hr |
+| 8000 it | 93.95% | 5.0322 /hr |
+
+Spread 0.0672 /hr = **1.33% of the mean**. lambda_vent is common to all three,
+so this is the eACH_uv spread exactly. Against this project's ~200%
+decay-vs-steady-state signal that is **150x smaller** - and it independently
+reproduces the earlier ~2% estimate from two snapshots 500 iterations apart.
+
+So "converged enough" has a defensible definition here: the window mean is
+stationary, and the residual freeze-point spread (~1.3%) is negligible against
+the effect being measured. Chasing 1% on volAverage(p) was chasing a quantity
+whose swing is 84% of the room's entire dynamic head (0.5*|U|^2) - i.e. asking
+the turbulence to stop.
+
+### Two levers tested and rejected
+
+Monitoring volAverage(|U|) instead of p is 6-9x better conditioned in all four
+fan cases but **3x worse** fan-free: that room moves 8x slower (0.020 vs 0.16
+m/s), so the same absolute wander is far larger in relative terms. Damping the
+fan's meanVelocityForce gain (relaxation 1.0 -> 0.5) helped fan-down (CV -28%)
+and hurt fan-up (+19.5%) - n=2, opposite signs, no demonstrated effect. Neither
+shipped. With the window tests in place the p-vs-|U| gap largely stops
+mattering anyway: stationarity fires at chunk 12 on p for all five variants and
+12-14 on |U|. The conditioning difference only ever mattered for the
+delta-based test that has now been removed.
