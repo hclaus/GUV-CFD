@@ -115,13 +115,6 @@ _FIELD_INFO = {
                                    "nominal."),
     "deltat-target-fraction": ("DeltaT scaling: target residence-time fraction",
                                 "How close to full steady-state the deltaT scaling targets."),
-    "flow-converged-chunks": ("Consecutive chunks to call it converged",
-                              "How many convergence-check chunks in a ROW must each stay within the "
-                              "flow convergence tolerance before the flow field is accepted. Do not "
-                              "set this to 1: a single small chunk-to-chunk change is smallest "
-                              "exactly at a turning point of an oscillation, so a one-chunk test "
-                              "fires at the peaks and troughs of a still-swinging field and calls "
-                              "it converged."),
     "oscillation-window": ("Oscillation-acceptance window (chunks)",
                             "How many recent flow-convergence chunks are compared to judge a bounded, "
                             "non-growing oscillation as 'good enough'."),

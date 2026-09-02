@@ -110,7 +110,7 @@ def _save_history(case_dir, history):
 
 
 def _oscillation_diagnostic(history, window, growth_tol, rel_tol, n_iterations, check_field,
-                             converged_chunks=3):
+                             ):
     """Best-effort analysis of whatever chunk history actually exists,
     regardless of whether there's enough of it for the formal bounded-
     oscillation check (_is_stable_oscillation) to reach a verdict - the
@@ -151,14 +151,18 @@ def _oscillation_diagnostic(history, window, growth_tol, rel_tol, n_iterations, 
     if len(values) >= 2 and values[-2]:
         last_rel_change = abs(values[-1] - values[-2]) / abs(values[-2])
 
-    # How much of a converged streak has actually accumulated. Far more
-    # informative than last_chunk_rel_change on its own, which is small at
-    # every turning point of an oscillation and so says nothing by itself.
-    converged_streak = 0
-    for i in range(len(values) - 1, 0, -1):
-        if not values[i - 1] or abs(values[i] - values[i - 1]) / abs(values[i - 1]) > rel_tol:
-            break
-        converged_streak += 1
+    # The two numbers acceptance is actually judged on, so a human deciding
+    # whether to continue sees the same evidence the automatic test used.
+    # last_chunk_rel_change is reported too but is the LEAST informative of
+    # the three on its own - it is small at every turning point of an
+    # oscillation and throughout any slow drift.
+    window_spread_pct = None
+    if chunks_available >= window:
+        w = values[-window:]
+        m = sum(w) / len(w)
+        if m:
+            window_spread_pct = max(abs(x - m) for x in w) / abs(m) * 100
+    drift_over_sem = stationarity_ratio(values, window)
 
     if insufficient_history:
         summary = (
@@ -189,8 +193,9 @@ def _oscillation_diagnostic(history, window, growth_tol, rel_tol, n_iterations, 
         "bounded": bounded,
         "trend": trend,
         "last_chunk_rel_change": last_rel_change,
-        "converged_streak": converged_streak,
-        "converged_chunks_required": converged_chunks,
+        "window_spread_pct": window_spread_pct,
+        "window_spread_target_pct": rel_tol * 100,
+        "drift_over_sem": drift_over_sem,
         "rel_tol": rel_tol,
         "oscillation_window": window,
         "oscillation_growth_tol": growth_tol,
@@ -199,6 +204,108 @@ def _oscillation_diagnostic(history, window, growth_tol, rel_tol, n_iterations, 
         "recent_values": values[-chunks_needed:] if chunks_available else [],
         "summary": summary,
     }
+
+
+def window_mean_settled(history, window, rel_tol):
+    """True when the last `window` chunk values ALL lie within rel_tol of
+    their own mean - i.e. the monitored quantity has genuinely flattened.
+
+    This is the fast "converged" path, and it replaces "N consecutive
+    chunk-to-chunk changes under rel_tol". The difference matters because a
+    consecutive-change test looks only at neighbours, so it is satisfied by
+    a signal that is steadily walking away (each step small, total drift
+    unbounded) and by a signal that has merely paused at a turning point.
+    Requiring every value in the window to sit inside one narrow band bounds
+    the TOTAL movement across the window at 2*rel_tol, which is what
+    "settled to this tolerance" actually means.
+
+    Checked against the real series that motivated it: the fan-free v9
+    variant gave three consecutive changes of 0.38/0.31/0.28% while still
+    climbing (and excursed 10.7% two chunks later); this test does not
+    accept it, because those values span more than rel_tol around their
+    mean once the whole window is considered. A synthetic steady drift of
+    +0.4%/chunk - accepted by a 3-chunk streak at chunk 4 - is never
+    accepted by this test at all.
+
+    Needs `window` chunks (not 2*window - this is a single-window test),
+    so it can still resolve an easy, genuinely-settling case quickly.
+    """
+    if len(history) < window or window < 1:
+        return False
+    w = list(history[-window:])
+    mean = sum(w) / window
+    if mean == 0:
+        return all(x == 0 for x in w)
+    return max(abs(x - mean) for x in w) / abs(mean) <= rel_tol
+
+
+def mean_is_stationary(history, window, k=2.0):
+    """True when the monitored quantity's WINDOW MEAN has stopped moving:
+    the drift between the last `window` chunks' mean and the `window` before
+    it is smaller than `k` times the combined standard error of those two
+    means.
+
+    This is the acceptance test, and it replaces "N consecutive chunk-to-chunk
+    changes under a fixed tolerance". That streak test has two independent
+    ways of firing on a field that is NOT converged, both observed on real
+    runs of this project:
+
+      1. TURNING POINTS. |x_n - x_(n-1)| is smallest exactly where the slope
+         crosses zero, which on an oscillating signal is a peak or trough.
+         patient ward v9 and v10 were both accepted off a single lucky chunk
+         (1 of 15 and 1 of 7), each landing on an extreme of its own series -
+         v10 on its maximum, +24% off the series mean.
+
+      2. SLOW DRIFT. A steadily rising signal produces small consecutive
+         changes without being settled at all. The fan-free v9 variant gave
+         three consecutive changes of 0.38/0.31/0.28% while climbing, then
+         excursed 10.7% two chunks later - 12.8% away from the value the
+         streak would have frozen. Demanding a LONGER streak cannot fix this;
+         a slower drift simply satisfies a longer streak.
+
+    Comparing means against their own standard error has neither failure
+    mode. A turning point does not move a window mean, and a real drift is
+    exactly what the test measures. It is also scale-free: no tolerance to
+    pick, and a noisier signal automatically has to supply more evidence,
+    because its SEM is larger.
+
+    k=2 is the conventional "difference is within noise" threshold (about a
+    95% two-sided interval for a difference of means). Needs 2*window chunks
+    before it can compare anything - the same evidence requirement
+    _is_stable_oscillation already had - and returns False until then.
+    """
+    if len(history) < 2 * window:
+        return False
+    older = list(history[-2 * window:-window])
+    newer = list(history[-window:])
+    m_old = sum(older) / window
+    m_new = sum(newer) / window
+    var_old = sum((x - m_old) ** 2 for x in older) / (window - 1)
+    var_new = sum((x - m_new) ** 2 for x in newer) / (window - 1)
+    sem = (var_old / window + var_new / window) ** 0.5
+    if sem == 0:
+        return m_old == m_new          # a genuinely constant signal
+    return abs(m_new - m_old) / sem < k
+
+
+def stationarity_ratio(history, window):
+    """drift/SEM for the latest two windows - the number mean_is_stationary
+    thresholds, exposed so logs and the undecided-diagnostic can report HOW
+    close a run is rather than just yes/no. None if there isn't enough
+    history, or if the signal is exactly constant.
+    """
+    if len(history) < 2 * window:
+        return None
+    older = list(history[-2 * window:-window])
+    newer = list(history[-window:])
+    m_old = sum(older) / window
+    m_new = sum(newer) / window
+    var_old = sum((x - m_old) ** 2 for x in older) / (window - 1)
+    var_new = sum((x - m_new) ** 2 for x in newer) / (window - 1)
+    sem = (var_old / window + var_new / window) ** 0.5
+    if sem == 0:
+        return None
+    return abs(m_new - m_old) / sem
 
 
 def _is_stable_oscillation(history, window, growth_tol):
@@ -226,7 +333,6 @@ def _is_stable_oscillation(history, window, growth_tol):
 def converge_flow_field(case_dir, n_iterations=500, fan_entry=None, log_fn=print,
                          max_iterations=20000, check_field="p", rel_tol=0.01, should_stop=None,
                          method="simple", oscillation_window=6, oscillation_growth_tol=1.5,
-                         converged_chunks=3,
                          solver_log_fn=None, resume=False, should_pause=None, skip_potential_flow=False,
                          n_procs=None, solve_semaphore=None):
     """Run simpleFoam to actually converge the flow field on this mesh,
@@ -265,21 +371,23 @@ def converge_flow_field(case_dir, n_iterations=500, fan_entry=None, log_fn=print
     instead this runs in n_iterations-sized chunks, and after each chunk
     compares the room's volume-averaged `check_field` (a representative
     scalar flow quantity - p by default) against the previous chunk's value;
-    once the relative change has stayed <= rel_tol for `converged_chunks`
-    CONSECUTIVE chunks, the flow field is accepted as converged. Capped at
-    max_iterations total to avoid a runaway on a case that never plateaus.
+    once all of the last `oscillation_window` chunk values lie within
+    rel_tol of their own mean, the flow field is accepted as converged (see
+    window_mean_settled). Capped at max_iterations total to avoid a runaway
+    on a case that never plateaus.
 
-    The consecutive requirement is the whole point of that test, not a
-    refinement of it. A single chunk-to-chunk change is small exactly where
-    the signal's slope passes through zero, which on an oscillating quantity
-    is a TURNING POINT - so a one-sample test fires preferentially at the
-    extremes of the cycle, and reports "converged" for a field that is still
-    swinging by tens of percent. Two real runs (patient ward v9 and V10) were
-    accepted this way off a single lucky chunk out of 15 and 7 respectively,
-    each landing on an extreme of its own series (V10 on its maximum, +24%
-    off the series mean; v9 second-lowest of 16, -18% off). A genuinely
-    settling flow produces a RUN of small changes; a turning point produces
-    exactly one.
+    Acceptance is deliberately judged on a WINDOW, never on the change
+    between two neighbouring chunks. Neighbour-to-neighbour tests have two
+    independent ways of firing on an unconverged field, both seen on real
+    runs here: at a TURNING POINT, where the slope crosses zero (patient
+    ward v9 and V10 were each accepted off one lucky chunk out of 15 and 7,
+    landing on an extreme of their own series - V10 on its maximum, +24% off
+    the series mean); and on a slow DRIFT, where every step is small but the
+    total movement is unbounded (the fan-free v9 variant gave three
+    consecutive changes of 0.38/0.31/0.28% while climbing, then excursed
+    10.7% two chunks later). Requiring a longer run of small changes fixes
+    neither: a slower drift satisfies a longer streak, and a turning point
+    is unaffected by how many chunks you demand around it.
 
     The bounded-oscillation check below is also applied inside the chunk
     loop, not only after the budget is exhausted: a genuinely turbulent flow
@@ -474,18 +582,9 @@ def converge_flow_field(case_dir, n_iterations=500, fan_entry=None, log_fn=print
         _save_history(case_dir, history)
     converged = False
     accepted_oscillation = False
-    # Consecutive chunks whose change stayed within rel_tol. A settling flow
-    # produces a RUN of small changes; an oscillating one produces exactly one
-    # (at each turning point, where the chunk-to-chunk slope passes through
-    # zero) - which is why a single small change is not evidence of anything.
-    # Recomputed from persisted history on a resume, so a continuation isn't
-    # forced to re-earn a streak it had already accumulated.
-    streak = 0
-    _vals = [h["value"] for h in history]
-    for _i in range(len(_vals) - 1, 0, -1):
-        if not _vals[_i - 1] or abs(_vals[_i] - _vals[_i - 1]) / abs(_vals[_i - 1]) > rel_tol:
-            break
-        streak += 1
+    # No per-chunk streak state to carry: acceptance is computed from the
+    # persisted history window every chunk, so a resumed run inherits its
+    # evidence automatically rather than having to re-earn it.
 
     try:
         while total_run < max_iterations:
@@ -569,31 +668,50 @@ def converge_flow_field(case_dir, n_iterations=500, fan_entry=None, log_fn=print
             _, vals = read_vol_average_dat(f"{case_dir}/postProcessing/volAverage1/0/volFieldValue.dat")
             cur_avg = vals[-1]
 
-            if prev_avg is not None and prev_avg != 0:
-                rel_change = abs(cur_avg - prev_avg) / abs(prev_avg)
-                streak = streak + 1 if rel_change <= rel_tol else 0
-                log_fn(f"  [{total_run} iterations total] volAverage({check_field}) = {cur_avg:.6g} "
-                       f"(change since last chunk: {rel_change * 100:.3f}%, target <={rel_tol * 100:.2g}%"
-                       f"{f'; {streak}/{converged_chunks} consecutive' if streak else ''})")
-                # ONE small change is not convergence - on an oscillating
-                # signal it is a turning point, so this test would otherwise
-                # fire preferentially at the extremes of the cycle rather than
-                # at a settled state. Demand a run of them.
-                if streak >= converged_chunks:
-                    converged = True
-            else:
-                log_fn(f"  [{total_run} iterations total] volAverage({check_field}) = {cur_avg:.6g} (first chunk)")
             prev_avg = cur_avg
             history.append({"iteration": total_run, "value": cur_avg})
             _save_history(case_dir, history)
+            values = [h["value"] for h in history]
+
+            # Acceptance is judged on the WINDOW, never on the change between
+            # two neighbouring chunks. A neighbour-to-neighbour test is
+            # satisfied both at a turning point (where the slope crosses zero)
+            # and by a steady drift (every step small, total movement
+            # unbounded) - both observed on real runs of this project, both
+            # freezing a field that had not settled. See window_mean_settled
+            # and mean_is_stationary for the two failures in detail.
+            settled = window_mean_settled(values, oscillation_window, rel_tol)
+            ratio = stationarity_ratio(values, oscillation_window)
+            spread = None
+            if len(values) >= oscillation_window:
+                w = values[-oscillation_window:]
+                m = sum(w) / len(w)
+                if m:
+                    spread = max(abs(x - m) for x in w) / abs(m) * 100
+            parts = [f"  [{total_run} iterations total] volAverage({check_field}) = {cur_avg:.6g}"]
+            if spread is not None:
+                parts.append(f"last {oscillation_window} chunks span "
+                             f"{spread:.2f}% of their mean (target <={rel_tol * 100:.2g}%)")
+            if ratio is not None:
+                parts.append(f"mean drift {ratio:.2f}x its own noise (stationary below 2)")
+            log_fn("; ".join(parts) if len(parts) > 1 else parts[0] + " (building history)")
+            if settled:
+                converged = True
 
             # A genuinely turbulent flow (fan jet on a wall) never produces a
             # run of small changes, so the streak test above would burn the
             # whole max_iterations budget before the post-loop check reached
             # the same verdict. Ask the same question here, as soon as there
             # is enough history to answer it.
+            # BOTH checks, because they catch different things: the mean can
+            # be perfectly stationary while the amplitude around it grows
+            # (a symmetric divergence), and the amplitude can be bounded
+            # while the mean walks. Only a bounded amplitude AND a stationary
+            # mean means "cycling through the same range about the same
+            # centre" - which is what genuine turbulent unsteadiness is.
             if not converged and _is_stable_oscillation(
-                    [h["value"] for h in history], oscillation_window, oscillation_growth_tol):
+                    values, oscillation_window, oscillation_growth_tol) and \
+                    mean_is_stationary(values, oscillation_window):
                 accepted_oscillation = True
 
             log_fn(f"  Copying fields from {latest}/ to 0/ (excluding T - that's our fresh UV-decay "
@@ -617,7 +735,7 @@ def converge_flow_field(case_dir, n_iterations=500, fan_entry=None, log_fn=print
             if not accepted_oscillation:
                 diagnostic = _oscillation_diagnostic(
                     history, oscillation_window, oscillation_growth_tol, rel_tol, n_iterations, check_field,
-                    converged_chunks=converged_chunks)
+                    )
                 raise FlowConvergenceUndecided(
                     f"Flow field did not converge within {total_run} iterations, and there's no clear "
                     f"verdict on whether it's a stable bounded oscillation either: {diagnostic['summary']}",
@@ -631,12 +749,15 @@ def converge_flow_field(case_dir, n_iterations=500, fan_entry=None, log_fn=print
 
     if converged:
         log_fn(f"Flow field converged after {total_run} iterations total "
-               f"(volAverage({check_field}) changed <={rel_tol * 100:.2g}% in each of the last "
-               f"{converged_chunks} consecutive chunks).")
+               f"(all of the last {oscillation_window} chunks' volAverage({check_field}) "
+               f"values lie within {rel_tol * 100:.2g}% of their own mean - the quantity has "
+               f"genuinely flattened, not merely paused between two chunks).")
     else:
         log_fn(f"Flow field did not fully converge within {total_run} iterations, but "
-               f"volAverage({check_field}) has settled into a bounded oscillation (not still "
-               f"growing or drifting) rather than genuinely diverging - accepting it as-is. "
+               f"volAverage({check_field}) has settled into a bounded oscillation: its "
+               f"amplitude is not growing AND its window mean is stationary (drift smaller "
+               f"than the standard error of the means themselves), rather than genuinely "
+               f"diverging - accepting it as-is. "
                f"This is expected for flows with a jet/fan impinging directly on a wall or "
                f"floor (real unsteady turbulence, not a numerical convergence problem); "
                f"verified empirically that the downstream T-decay/eACH_uv result is "
@@ -660,7 +781,7 @@ def converge_flow_field(case_dir, n_iterations=500, fan_entry=None, log_fn=print
 def continue_flow_convergence(case_dir, additional_iterations, n_iterations=500, fan_entry=None,
                                log_fn=print, should_stop=None, method="simple", rel_tol=0.01,
                                oscillation_window=6, oscillation_growth_tol=1.5, solver_log_fn=None,
-                               should_pause=None, converged_chunks=3):
+                               should_pause=None):
     """Resume a case directory whose flow convergence previously stopped
     without a verdict (a caller caught FlowConvergenceUndecided and the
     user chose "continue") - runs `additional_iterations` more on top of
@@ -685,13 +806,12 @@ def continue_flow_convergence(case_dir, additional_iterations, n_iterations=500,
         max_iterations=already_run + additional_iterations, rel_tol=rel_tol, should_stop=should_stop,
         method=method, oscillation_window=oscillation_window, oscillation_growth_tol=oscillation_growth_tol,
         solver_log_fn=solver_log_fn, resume=True, should_pause=should_pause,
-        converged_chunks=converged_chunks,
     )
 
 
 def case_awaiting_flow_decision(case_dir, oscillation_window=6, oscillation_growth_tol=1.5,
                                  rel_tol=0.01, n_iterations=500, check_field="p",
-                                 converged_chunks=3):
+                                 ):
     """Whether `case_dir` has flow-convergence chunk history on disk but
     never reached a resolved verdict (converged, accepted, or an explicit
     user override via resume_case_setup) - lets a resume be offered even
@@ -720,7 +840,7 @@ def case_awaiting_flow_decision(case_dir, oscillation_window=6, oscillation_grow
         return None
     diagnostic = _oscillation_diagnostic(
         history, oscillation_window, oscillation_growth_tol, rel_tol, n_iterations, check_field,
-        converged_chunks=converged_chunks)
+        )
     return {"diagnostic": diagnostic, "total_iterations": history[-1]["iteration"]}
 
 
@@ -968,7 +1088,7 @@ def setup_case(guv_path, case_dir, template_case_dir=None, cell_size=0.1, Z=2.0,
                outlet2_wall=None, outlet2_center=None, outlet2_size=None,
                converge_flow=True, simple_foam_iterations=500, flow_convergence_method="simple",
                flow_rel_tol=0.01, flow_max_iterations=20000, n_procs=None,
-               oscillation_window=6, oscillation_growth_tol=1.5, converged_chunks=3,
+               oscillation_window=6, oscillation_growth_tol=1.5,
                ach_delivery_tol=0.10,
                momentum_relaxation=None, scalar_relaxation=None, adaptive_t_relaxation=False,
                scalar_transport_ncorr=None, scalar_transport_tolerance=None,
@@ -1336,7 +1456,6 @@ def setup_case(guv_path, case_dir, template_case_dir=None, cell_size=0.1, Z=2.0,
             log_fn=log_fn, should_stop=should_stop, method=flow_convergence_method,
             rel_tol=flow_rel_tol, max_iterations=flow_max_iterations,
             oscillation_window=oscillation_window, oscillation_growth_tol=oscillation_growth_tol,
-            converged_chunks=converged_chunks,
             solver_log_fn=solver_log_fn, should_pause=should_pause, skip_potential_flow=sealed,
             n_procs=n_procs, solve_semaphore=solve_semaphore)
         summary["flow_converged"] = flow_converged
@@ -1497,7 +1616,6 @@ def resume_case_setup(case_dir, guv_path, decision, ach, Z, nbins=25, source_fie
                        cell_size=0.1, additional_iterations=None,
                        simple_foam_iterations=500, flow_convergence_method="simple",
                        flow_rel_tol=0.01, oscillation_window=6, oscillation_growth_tol=1.5,
-                       converged_chunks=3,
                        ach_delivery_tol=0.10,
                        pimple_end_time=120, pimple_write_interval=10, pimple_delta_t=0.5, max_co=None,
                        fan_speed=None, fan_direction=(0, 0, -1), mechanical_ach_only=False,
@@ -1570,7 +1688,6 @@ def resume_case_setup(case_dir, guv_path, decision, ach, Z, nbins=25, source_fie
             case_dir, additional_iterations, n_iterations=simple_foam_iterations, fan_entry=fan_entry,
             log_fn=log_fn, should_stop=should_stop, method=flow_convergence_method, rel_tol=flow_rel_tol,
             oscillation_window=oscillation_window, oscillation_growth_tol=oscillation_growth_tol,
-            converged_chunks=converged_chunks,
             solver_log_fn=solver_log_fn, should_pause=should_pause)
         summary["flow_converged"] = flow_converged
     else:

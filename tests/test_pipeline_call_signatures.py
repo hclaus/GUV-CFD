@@ -75,13 +75,25 @@ def test_every_keyword_argument_is_accepted(module_name):
         assert checked > 0, f"no {TARGETS} calls found in {module_name}"
 
 
-def test_the_specific_regression_converged_chunks():
-    """setup_case and resume_case_setup must forward the knob, not just
-    tolerate it - a wrapper that swallows it silently would restore the
-    one-sample convergence bug it exists to prevent."""
+def test_no_call_site_still_passes_the_removed_converged_chunks():
+    """converged_chunks was the streak criterion's knob. The streak test was
+    replaced by the window-based one (see test_flow_convergence_criterion),
+    so the parameter is gone - a leftover caller would now raise the very
+    TypeError this module exists to prevent."""
     import guvcfd.run_pipeline as rp
-    src = inspect.getsource(rp)
-    for wrapper in ("setup_case", "resume_case_setup"):
-        assert "converged_chunks" in inspect.signature(getattr(rp, wrapper)).parameters
-    # forwarded to both underlying implementations
-    assert src.count("converged_chunks=converged_chunks") >= 2
+    import guvcfd.qtapp.run_state as rs
+    for mod in (rp, rs):
+        assert "converged_chunks" not in inspect.getsource(mod),             f"{mod.__name__} still references the removed converged_chunks"
+    for fn in (rp.setup_case, rp.resume_case_setup, rp.converge_flow_field,
+               rp.continue_flow_convergence):
+        assert "converged_chunks" not in inspect.signature(fn).parameters
+
+
+def test_the_acceptance_helpers_are_importable_and_wired():
+    """The two window tests acceptance now depends on must exist and be used
+    inside converge_flow_field - not merely defined."""
+    import guvcfd.run_pipeline as rp
+    src = inspect.getsource(rp.converge_flow_field)
+    for name in ("window_mean_settled", "mean_is_stationary", "_is_stable_oscillation"):
+        assert callable(getattr(rp, name)), name
+        assert name in src, f"{name} is defined but not used by converge_flow_field"

@@ -131,11 +131,6 @@ ADVANCED_SETTINGS_DEFAULTS = {
     "deltat-scaling-enabled": True,
     "deltat-effective-fraction": 0.7,  # measured ACH/eACH_uv usually runs below nominal - conservative derating
     "deltat-target-fraction": 0.995,  # matches _settling_iterations' own default - ~5.3 residence times
-    # Consecutive chunks that must each stay within flow-rel-tol before the
-    # flow field counts as converged. 1 = the old one-sample test, which fires
-    # at turning points of an oscillation and so falsely "converges" a field
-    # that is still swinging (see converge_flow_field's docstring).
-    "flow-converged-chunks": 3,
     "oscillation-window": 6,        # chunks - run_pipeline._is_stable_oscillation
     "oscillation-growth-tol": 1.5,  # ratio - run_pipeline._is_stable_oscillation
     "ach-delivery-tol": 10.0,   # % - run_pipeline.check_ach_delivery
@@ -249,7 +244,7 @@ PROJECT_OPENFOAM_SETTINGS_KEYS = (
     "scalar-transport-ncorr", "scalar-transport-tolerance",
     "t-infinity-early-stop-enabled", "t-infinity-rel-tol",
     "phase1-require-stable-extrapolation", "phase-chunk-size", "phase-write-interval",
-    "oscillation-window", "oscillation-growth-tol", "flow-converged-chunks",
+    "oscillation-window", "oscillation-growth-tol",
     "ach-delivery-tol", "mass-balance-tol",
     "phase1-t-initial", "phase1-extrapolation-streak",
     "phase1-settling-safety-multiplier", "phase1-max-iterations-ceiling",

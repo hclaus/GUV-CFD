@@ -908,7 +908,6 @@ def _run_decay(guv_path, case_dir, room, settings):
         cell_size=adv["mesh-cell-size"], nbins=adv["uv-zone-bins"],
         flow_rel_tol=adv["flow-rel-tol"] / 100.0, flow_max_iterations=adv["flow-max-iterations"],
         oscillation_window=adv["oscillation-window"], oscillation_growth_tol=adv["oscillation-growth-tol"],
-        converged_chunks=adv["flow-converged-chunks"],
         ach_delivery_tol=adv["ach-delivery-tol"] / 100.0,
         momentum_relaxation=adv["momentum-relaxation"], scalar_relaxation=adv["scalar-relaxation"],
         adaptive_t_relaxation=adv["adaptive-t-relaxation"],
@@ -1339,7 +1338,6 @@ def _run_steady_state(guv_path, case_dir, room, settings):
         cell_size=adv["mesh-cell-size"], nbins=adv["uv-zone-bins"],
         flow_rel_tol=adv["flow-rel-tol"] / 100.0, flow_max_iterations=adv["flow-max-iterations"],
         oscillation_window=adv["oscillation-window"], oscillation_growth_tol=adv["oscillation-growth-tol"],
-        converged_chunks=adv["flow-converged-chunks"],
         ach_delivery_tol=adv["ach-delivery-tol"] / 100.0,
         momentum_relaxation=adv["momentum-relaxation"], scalar_relaxation=adv["scalar-relaxation"],
         adaptive_t_relaxation=adv["adaptive-t-relaxation"],
@@ -1640,7 +1638,6 @@ def _resume_pipeline_thread(action, additional_iterations):
             cell_size=adv["mesh-cell-size"], additional_iterations=additional_iterations,
             flow_rel_tol=adv["flow-rel-tol"] / 100.0,
             oscillation_window=adv["oscillation-window"], oscillation_growth_tol=adv["oscillation-growth-tol"],
-        converged_chunks=adv["flow-converged-chunks"],
             ach_delivery_tol=adv["ach-delivery-tol"] / 100.0,
             pimple_end_time=settings.get("pimple-end-time", 120),
             pimple_write_interval=settings.get("pimple-write-interval", 10),
@@ -2568,17 +2565,6 @@ settings_modal = dbc.Modal(
                     "downstream results (T_ss, eACH_uv) are insensitive to exactly which point in "
                     "the oscillation the field gets accepted at.",
                     className="small text-muted mb-2",
-                ),
-                _settings_field(
-                    "settings-flow-converged-chunks", "Consecutive chunks to call it converged",
-                    "How many convergence-check chunks in a ROW must each stay within the flow "
-                    "convergence tolerance before the flow field is accepted as converged. Do not "
-                    "set this to 1: a single small chunk-to-chunk change is smallest exactly at a "
-                    "turning point of an oscillation, so a one-chunk test fires preferentially at "
-                    "the peaks and troughs of a still-swinging field and reports it as converged. "
-                    "A genuinely settling flow produces a run of small changes; a turning point "
-                    "produces exactly one.",
-                    "chunks", _adv_defaults["flow-converged-chunks"],
                 ),
                 _settings_field(
                     "settings-oscillation-window", "Oscillation check window",
@@ -3773,7 +3759,6 @@ def _open_help_modal(*_clicks):
 
 _SETTINGS_FIELD_IDS = [
     "settings-flow-rel-tol", "settings-flow-max-iterations",
-    "settings-flow-converged-chunks",
     "settings-oscillation-window", "settings-oscillation-growth-tol", "settings-ach-delivery-tol",
     "settings-plateau-rel-tol", "settings-mass-balance-tol",
     "settings-momentum-relaxation", "settings-scalar-relaxation", "settings-adaptive-t-relaxation",
@@ -3798,7 +3783,6 @@ _SETTINGS_FIELD_IDS = [
 # app_settings.py storage key (see ADVANCED_SETTINGS_DEFAULTS).
 _SETTINGS_FIELD_KEYS = [
     "flow-rel-tol", "flow-max-iterations",
-    "flow-converged-chunks",
     "oscillation-window", "oscillation-growth-tol", "ach-delivery-tol",
     "plateau-rel-tol", "mass-balance-tol",
     "momentum-relaxation", "scalar-relaxation", "adaptive-t-relaxation",
@@ -4901,7 +4885,7 @@ def _start_run(n_clicks, *values):
     pending = case_awaiting_flow_decision(
         case_dir, oscillation_window=adv["oscillation-window"],
         oscillation_growth_tol=adv["oscillation-growth-tol"],
-        converged_chunks=adv["flow-converged-chunks"], rel_tol=adv["flow-rel-tol"] / 100.0)
+        rel_tol=adv["flow-rel-tol"] / 100.0)
     if pending:
         _run_log(f"Found a paused flow convergence in {case_dir} from an earlier session "
                  f"({pending['total_iterations']} iterations so far) - awaiting your decision "
@@ -5312,7 +5296,7 @@ def _start_scenario_sweep(n_clicks, z_text, ach_text, *values):
     pending = case_awaiting_flow_decision(
         case_dir, oscillation_window=adv["oscillation-window"],
         oscillation_growth_tol=adv["oscillation-growth-tol"],
-        converged_chunks=adv["flow-converged-chunks"], rel_tol=adv["flow-rel-tol"] / 100.0)
+        rel_tol=adv["flow-rel-tol"] / 100.0)
     if pending:
         _run_log(f"Found a paused flow convergence in {case_dir} from an earlier session "
                  f"({pending['total_iterations']} iterations so far) - awaiting your decision "
