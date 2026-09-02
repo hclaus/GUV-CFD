@@ -266,7 +266,7 @@ def test_scenario_progress_table_handles_decay_mode_result():
         (6.0, 3.0): {
             "status": "done",
             "detail": {
-                "eACH_uv_effective_corrected": 34.7,
+                "eACH_uv_actual": 34.7,
                 "ventilation_ach_measured": 4.2,
                 "eACH_uv_well_mixed": 72.3,
             },

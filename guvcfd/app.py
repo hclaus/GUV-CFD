@@ -30,7 +30,7 @@ from .case_io import (
 )
 from .decay_analysis import (write_results_summary, mechanical_mixing_efficiency_pct,
                               spatial_coefficient_of_variation, read_vol_average_dat,
-                              run_decay_to_target, read_decay_curve)
+                              run_decay_to_target, read_decay_curve, migrate_result_keys)
 from .monitoring import splice_live_vol_average_if_needed
 from .contaminant_source import (breathing_inlet_direction, breathing_inlet_velocity,
                                   breathing_inlet_velocity_constraint, resolve_source_size)
@@ -1199,7 +1199,7 @@ def _finish_decay(case_dir, room, settings, summary):
         spatial_cov = None
 
     if sealed:
-        control_results = {"total_ach_effective": 0.0}
+        control_results = {"total_ach_actual": 0.0}
     elif mech_ach_only:
         control_results = None  # no separate control run - this run's own curve IS the measurement
     else:
@@ -1218,7 +1218,7 @@ def _finish_decay(case_dir, room, settings, summary):
 
     if mech_ach_only:
         _run_log("Writing results summary (mechanical ACH only - no separate control run to "
-                 "correct against; total_ach_effective is this run's own measured rate)...")
+                 "correct against; total_ach_actual is this run's own measured rate)...")
         results = write_results_summary(
             case_dir, f"{case_dir}/results.json", settings["ach"], 0.0,
             extra={
@@ -1239,8 +1239,8 @@ def _finish_decay(case_dir, room, settings, summary):
                 "flow_converged": summary.get("flow_converged"), "ach_delivery": summary.get("ach_delivery"),
                 "spatial_cov_final": spatial_cov,
             },
-            measured_ventilation_ach=control_results["total_ach_effective"],
-            measured_ventilation_ach_ci95=control_results.get("total_ach_effective_ci95"),
+            measured_ventilation_ach=control_results["total_ach_actual"],
+            measured_ventilation_ach_ci95=control_results.get("total_ach_actual_ci95"),
             measured_ventilation_ach_se_per_s=control_results.get("fit_se_per_s"),
             measured_ventilation_fit_dof=(control_results["fit_n"] - 2) if control_results.get("fit_n") else None,
         )
@@ -1257,11 +1257,11 @@ def _finish_decay(case_dir, room, settings, summary):
             json.dump(results, f, indent=2)
 
     _complete_all_steps()
-    _run_log(f"Done. eACH_uv effective={results['eACH_uv_effective']:.4g} /hr "
+    _run_log(f"Done. eACH_uv effective={results['eACH_uv_assuming_well_mixed']:.4g} /hr "
              f"(well-mixed={results['eACH_uv_well_mixed']:.4g} /hr)")
-    if "mixing_efficiency_corrected" in results:
+    if "mixing_efficiency_actual" in results:
         _run_log(f"  Corrected mixing efficiency (measured ventilation baseline): "
-                 f"{results['mixing_efficiency_corrected'] * 100:.1f}% "
+                 f"{results['mixing_efficiency_actual'] * 100:.1f}% "
                  f"(vs {results['mixing_efficiency'] * 100:.1f}% using nominal ACH)")
 
 
@@ -1525,7 +1525,7 @@ def _record_run_timing(case_dir, started_at, elapsed_seconds):
     if not Path(results_path).exists():
         return
     with open(results_path) as f:
-        results = json.load(f)
+        results = migrate_result_keys(json.load(f))  # pre-2026-09-02 results.json files use the old key names
     results["run_started_at"] = started_at.isoformat()
     results["run_elapsed_seconds"] = elapsed_seconds
     with open(results_path, "w") as f:
@@ -1568,7 +1568,7 @@ def _write_single_run_summary_csv(case_dir):
     """
     try:
         with open(f"{case_dir}/results.json") as f:
-            detail = json.load(f)
+            detail = migrate_result_keys(json.load(f))  # pre-2026-09-02 results.json files use the old key names
     except (FileNotFoundError, json.JSONDecodeError):
         return
     metrics = combo_summary_metrics(detail)
@@ -2375,7 +2375,7 @@ def _empty_analysis_figure():
 def _monitoring_summary_rows(monitoring):
     """Extra Analysis-tab rows for monitoring locations, if any were
     computed. Handles both decay's shape
-    ({name: {t_seconds, volAverage_T, eACH_uv_effective?}}) and
+    ({name: {t_seconds, volAverage_T, eACH_uv_assuming_well_mixed?}}) and
     steady-state's shape ({name: {phase1: {...}, phase2: {...}}}).
     """
     if not monitoring:
@@ -2398,8 +2398,8 @@ def _monitoring_summary_rows(monitoring):
         else:
             T_final = data["volAverage_T"][-1] if data["volAverage_T"] else None
             value = f"final volAverage(T)={T_final:.4g}" if T_final is not None else "n/a"
-            if data.get("eACH_uv_effective") is not None:
-                value += f", eACH_uv={data['eACH_uv_effective']:.4g}/hr"
+            if data.get("eACH_uv_assuming_well_mixed") is not None:
+                value += f", eACH_uv={data['eACH_uv_assuming_well_mixed']:.4g}/hr"
         rows.append((f"  {name}", value))
     return rows
 
@@ -2475,8 +2475,8 @@ def _decay_summary(result):
     rows += [
         ("Ventilation ACH (nominal)", f"{result['ventilation_ach']:.3g} /hr"),
         ("eACH_uv, well-mixed (idealized: Z x E_avg)", f"{result['eACH_uv_well_mixed']:.4g} /hr"),
-        ("eACH_uv, CFD-fit (nominal ventilation ACH)", f"{result['eACH_uv_effective']:.4g} /hr"),
-        ("Total ACH, effective", f"{result.get('total_ach_effective', 0):.3g} /hr"),
+        ("eACH_uv, CFD-fit (nominal ventilation ACH)", f"{result['eACH_uv_assuming_well_mixed']:.4g} /hr"),
+        ("Total ACH, effective", f"{result.get('total_ach_actual', 0):.3g} /hr"),
     ]
     if result.get("mixing_efficiency") is not None:
         rows.append(("Measured UV eff. %", f"{result['mixing_efficiency'] * 100:.1f}%"))
@@ -2484,9 +2484,9 @@ def _decay_summary(result):
         rows.append(("Ventilation ACH (measured, UV-off control)",
                       f"{result['ventilation_ach_measured']:.4g} /hr"))
         rows.append(("eACH_uv, CFD-fit (measured ventilation ACH)",
-                      f"{result['eACH_uv_effective_corrected']:.4g} /hr"))
+                      f"{result['eACH_uv_actual']:.4g} /hr"))
         rows.append(("Measured UV eff. % (using measured ventilation ACH)",
-                      f"{result['mixing_efficiency_corrected'] * 100:.1f}%"))
+                      f"{result['mixing_efficiency_actual'] * 100:.1f}%"))
     if result.get("mechanical_mixing_efficiency_pct") is not None:
         rows.append(("Mechanical mixing eff. %", f"{result['mechanical_mixing_efficiency_pct']:.1f}%"))
     if result.get("spatial_cov_final") is not None:
@@ -3582,7 +3582,7 @@ def _load_results(n_clicks, case_dir_field):
         return dash.no_update, dash.no_update, dash.no_update
     try:
         with open(path) as f:
-            data = json.load(f)
+            data = migrate_result_keys(json.load(f))  # pre-2026-09-02 files use the old key names
     except Exception as e:
         return dash.no_update, f"Failed to load: {e}", dash.no_update
     name = path.replace("\\", "/").rsplit("/", 1)[-1]
@@ -5590,7 +5590,7 @@ def _single_run_progress_table():
     if status == "done" and _run_state.get("case_dir"):
         try:
             with open(f"{_run_state['case_dir']}/results.json") as f:
-                metrics = combo_summary_metrics(json.load(f))
+                metrics = combo_summary_metrics(migrate_result_keys(json.load(f)))  # pre-2026-09-02 files use the old key names
         except Exception:
             pass
 
@@ -5915,7 +5915,7 @@ def _poll_run(n_intervals):
     if status == "done" and _run_state.get("case_dir"):
         try:
             with open(f"{_run_state['case_dir']}/results.json") as f:
-                results_data = json.load(f)
+                results_data = migrate_result_keys(json.load(f))  # pre-2026-09-02 files use the old key names
             results_case_dir = _run_state["case_dir"]
         except Exception:
             results_data = dash.no_update

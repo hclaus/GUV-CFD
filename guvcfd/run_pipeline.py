@@ -406,7 +406,7 @@ def converge_flow_field(case_dir, n_iterations=500, fan_entry=None, log_fn=print
     chunks before that, the field is accepted as-is. This was verified
     empirically (not just assumed): two flow-field snapshots frozen 500
     iterations apart during exactly this kind of bounded oscillation
-    produced eACH_uv_effective within ~2% of each other, so which point in
+    produced eACH_uv_assuming_well_mixed within ~2% of each other, so which point in
     the cycle the field gets frozen at doesn't meaningfully affect the
     downstream scalar-decay result.
 

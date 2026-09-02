@@ -16,7 +16,7 @@ def test_continue_decay_delegates_to_scenario_runs_with_its_own_callbacks(monkey
         captured.update(case_dir=case_dir, end_time=end_time, write_interval=write_interval,
                          log_fn=log_fn, should_stop=should_stop, should_pause=should_pause,
                          solver_log_fn=solver_log_fn)
-        return {"eACH_uv_effective": 1.0, "eACH_uv_well_mixed": 5.0}
+        return {"eACH_uv_assuming_well_mixed": 1.0, "eACH_uv_well_mixed": 5.0}
 
     monkeypatch.setattr(guvcfd_app.scenario_runs, "continue_decay", fake_continue_decay)
     completed = []
@@ -31,4 +31,4 @@ def test_continue_decay_delegates_to_scenario_runs_with_its_own_callbacks(monkey
     assert captured["should_pause"] is guvcfd_app._should_pause
     assert captured["solver_log_fn"] is guvcfd_app._track_solver_time
     assert completed == [1]
-    assert results == {"eACH_uv_effective": 1.0, "eACH_uv_well_mixed": 5.0}
+    assert results == {"eACH_uv_assuming_well_mixed": 1.0, "eACH_uv_well_mixed": 5.0}

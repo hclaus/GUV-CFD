@@ -15,7 +15,7 @@ from lxml import etree
 from guv_calcs import Project
 
 from .contaminant_source import compute_source_strength
-from .decay_analysis import windowed_stats_detrended, mechanical_mixing_efficiency_pct as _mech_mixing_eff_pct
+from .decay_analysis import windowed_stats_detrended, mechanical_mixing_efficiency_pct as _mech_mixing_eff_pct, migrate_result_keys
 from .monitoring_points import mixing_uniformity_note, point_reduction_basis
 from .result_figures import decay_figure, steady_state_figure
 from .system_info import get_system_info
@@ -208,10 +208,10 @@ def combo_summary_metrics(detail):
         uv_efficiency_pct = (est_each_per_hr / well_mixed * 100
                               if est_each_per_hr is not None and well_mixed else None)
     else:
-        est_each_per_hr = detail.get("eACH_uv_effective_corrected", detail.get("eACH_uv_effective"))
+        est_each_per_hr = detail.get("eACH_uv_actual", detail.get("eACH_uv_assuming_well_mixed"))
         total_reduction_pct = (_decay_reduction_ratio(est_each_per_hr, ach_t_measured_per_hr) * 100
                                 if est_each_per_hr is not None and ach_t_measured_per_hr is not None else None)
-        mixing_eff = detail.get("mixing_efficiency_corrected", detail.get("mixing_efficiency"))
+        mixing_eff = detail.get("mixing_efficiency_actual", detail.get("mixing_efficiency"))
         uv_efficiency_pct = mixing_eff * 100 if mixing_eff is not None else None
 
     mechanical_mixing_pct = detail.get("mechanical_mixing_efficiency_pct")
@@ -303,8 +303,8 @@ def _decay_results_table_cell_values(results, settings):
     if ach_eff is not None and ach_air_measured:
         values[(8, 1)] = f"{ach_eff / ach_air_measured * 100:.1f}%"
 
-    eACH_eff = results.get("eACH_uv_effective_corrected", results.get("eACH_uv_effective"))
-    eACH_eff_ci = results.get("eACH_uv_effective_corrected_ci95", results.get("eACH_uv_effective_ci95"))
+    eACH_eff = results.get("eACH_uv_actual", results.get("eACH_uv_assuming_well_mixed"))
+    eACH_eff_ci = results.get("eACH_uv_actual_ci95", results.get("eACH_uv_assuming_well_mixed_ci95"))
     if eACH_eff is not None:
         values[(9, 1)] = f"{eACH_eff:.4g} /hr{_ci_suffix(eACH_eff_ci)}"
 
@@ -375,7 +375,7 @@ def _fill_decay_monitoring_table(table, results):
     room-average row (_decay_reduction_ratio), combining the room's own
     measured ACHeff (no separate per-point UV-off control curve is
     computed - see compute_monitoring_results) with that point's own
-    eACH_uv_effective (nominal-ACH-corrected, the only per-point
+    eACH_uv_assuming_well_mixed (nominal-ACH-corrected, the only per-point
     measurement available) - a reasonable approximation, slightly less
     rigorous than the room-average version above which benefits from the
     real measured-ACH correction. The T_point/T_avg ratio and detrended CV
@@ -390,9 +390,9 @@ def _fill_decay_monitoring_table(table, results):
     for row in table.rows:
         label = row.cells[0].text
         match = next((data for name, data in monitoring.items() if name.lower() in label.lower()), None)
-        if match is None or match.get("eACH_uv_effective") is None:
+        if match is None or match.get("eACH_uv_assuming_well_mixed") is None:
             continue
-        reduction = _decay_reduction_ratio(match["eACH_uv_effective"], ach_eff)
+        reduction = _decay_reduction_ratio(match["eACH_uv_assuming_well_mixed"], ach_eff)
         if reduction is None:
             continue
         text = f"{reduction * 100:.1f}%"
@@ -699,7 +699,7 @@ def _relocate_after(doc, after_element, before_element):
 
 def _monitoring_rows(monitoring):
     """Row list for monitoring locations, if any were computed. Handles both
-    decay's shape ({name: {t_seconds, volAverage_T, eACH_uv_effective?}})
+    decay's shape ({name: {t_seconds, volAverage_T, eACH_uv_assuming_well_mixed?}})
     and steady-state's shape ({name: {phase1: {...}, phase2: {...}}}).
     """
     if not monitoring:
@@ -722,8 +722,8 @@ def _monitoring_rows(monitoring):
         else:
             T_final = data["volAverage_T"][-1] if data["volAverage_T"] else None
             value = f"final volAverage(T)={T_final:.4g}" if T_final is not None else "n/a"
-            if data.get("eACH_uv_effective") is not None:
-                value += f", eACH_uv={data['eACH_uv_effective']:.4g}/hr"
+            if data.get("eACH_uv_assuming_well_mixed") is not None:
+                value += f", eACH_uv={data['eACH_uv_assuming_well_mixed']:.4g}/hr"
         rows.append((name, value))
     return rows
 
@@ -823,7 +823,10 @@ def generate_report_docx(case_dir, out_path):
     with open(settings_path) as f:
         settings = json.load(f)
     with open(results_path) as f:
-        results = json.load(f)
+        # migrate_result_keys: results.json files written before the
+        # 2026-09-02 rename use eACH_uv_effective/_corrected. Reports must
+        # keep opening them.
+        results = migrate_result_keys(json.load(f))
 
     guv_path = settings.get("guv_path")
     if not guv_path:

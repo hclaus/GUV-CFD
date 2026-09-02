@@ -1782,7 +1782,7 @@ def run_steady_state_scenario(case_dir, room_x, room_y, room_z, ach, Z, nbins=25
     log_fn(f"Reduction: {reduction_pct:.1f}%, eACH_uv (steady-state method) = {eACH_uv:.4g} /hr")
 
     if control_results_future is not None:
-        measured_ventilation_ach = control_results_future.result().get("total_ach_effective")
+        measured_ventilation_ach = control_results_future.result().get("total_ach_actual")
 
     if measured_ventilation_ach is not None:
         # Preferred: a real UV-off control run measured the ventilation

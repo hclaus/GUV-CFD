@@ -151,10 +151,10 @@ def finish_ventilation_only_control(control_dir, ach, log_fn=print):
     prepare_ventilation_only_control's own splice_live_vol_average_if_needed
     call - no separate postProcess pass needed here anymore). Returns the
     results dict (ventilation_ach set, eACH_uv_well_mixed=0.0) - its
-    total_ach_effective is the actual measured ventilation air-change rate.
+    total_ach_actual is the actual measured ventilation air-change rate.
     """
     log_fn("Writing the control run's results.json...")
     results = write_results_summary(control_dir, f"{control_dir}/results.json", ach, 0.0)
     log_fn(f"UV-off control done: measured ventilation ACH = "
-           f"{results['total_ach_effective']:.4g} /hr (nominal was {ach:.4g} /hr).")
+           f"{results['total_ach_actual']:.4g} /hr (nominal was {ach:.4g} /hr).")
     return results

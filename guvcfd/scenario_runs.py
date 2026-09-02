@@ -49,7 +49,7 @@ from .contaminant_source import (breathing_inlet_direction, breathing_inlet_velo
                                   breathing_inlet_velocity_constraint, resolve_source_size,
                                   write_fvoptions_file,
                                   write_source_topo_set_dict)
-from .decay_analysis import write_results_summary, mechanical_mixing_efficiency_pct, spatial_coefficient_of_variation
+from .decay_analysis import write_results_summary, mechanical_mixing_efficiency_pct, spatial_coefficient_of_variation, migrate_result_keys
 from .fan import fan_fvoptions_entry, write_fan_topo_set_dict, fan_entry_from_settings
 from .fluence import compute_fluence_at_points, compute_inactivation_rate, compute_well_mixed_eACH
 from .initial_fields import compute_inlet_velocities, resolve_case_inlet_velocities
@@ -1371,8 +1371,8 @@ def _run_decay_scenario(case_dir, room, settings, z, ach, adv, z_summary, log_fn
             "spatial_cov_final": spatial_cov,
             "adaptive_scalar_relaxation": z_summary.get("adaptive_scalar_relaxation"),
         },
-        measured_ventilation_ach=control_results["total_ach_effective"],
-        measured_ventilation_ach_ci95=control_results.get("total_ach_effective_ci95"),
+        measured_ventilation_ach=control_results["total_ach_actual"],
+        measured_ventilation_ach_ci95=control_results.get("total_ach_actual_ci95"),
         measured_ventilation_ach_se_per_s=control_results.get("fit_se_per_s"),
         measured_ventilation_fit_dof=(control_results["fit_n"] - 2) if control_results.get("fit_n") else None,
     )
@@ -1484,8 +1484,8 @@ def _monitoring_summary_columns(detail):
                     columns[f"{name}_reduction_pct"] = reduction_pct
                 except Exception:
                     pass
-        elif point.get("eACH_uv_effective") is not None:
-            columns[f"{name}_eACH_uv"] = point["eACH_uv_effective"]
+        elif point.get("eACH_uv_assuming_well_mixed") is not None:
+            columns[f"{name}_eACH_uv"] = point["eACH_uv_assuming_well_mixed"]
     return columns
 
 
@@ -1540,7 +1540,8 @@ def write_sweep_summary_csv(project_dir, project_name):
         subdir = combo.get("subdir") or _subdir_name(z, ach)
         report_relative = f"{project_name}_{subdir}_report.json"
         try:
-            detail = json.loads(_read_case_file(project_dir, report_relative))
+            detail = migrate_result_keys(
+                json.loads(_read_case_file(project_dir, report_relative)))  # pre-2026-09-02 files use the old key names
         except (json.JSONDecodeError, OSError, RuntimeError):
             # Missing (failed/skipped/not-yet-reached combo), unreadable, or
             # malformed - read via _read_case_file (not a plain Windows-side
@@ -1620,7 +1621,7 @@ def _skip_if_combo_already_done(case_dir, subdir, combo_log_fn, trim_fn, on_comb
                      f"read ({e}) - re-running from scratch.")
         return False
     try:
-        result = json.loads(content)
+        result = migrate_result_keys(json.loads(content))  # pre-2026-09-02 results.json files use the old key names
         trimmed = trim_fn(result)
     except Exception as e:
         combo_log_fn(f"  {subdir} has a results.json from an earlier attempt, but it couldn't be "
@@ -1757,7 +1758,7 @@ def continue_decay(case_dir, end_time, write_interval, log_fn=print, should_stop
             f"here first before continuing it."
         )
     with open(results_path) as f:
-        prior = json.load(f)
+        prior = migrate_result_keys(json.load(f))  # pre-2026-09-02 results.json files use the old key names
 
     case_dir_wsl = wsl_path(case_dir)
     log_fn(f"Resuming from the latest existing time directory, extending to {end_time}s "
@@ -1813,7 +1814,7 @@ def continue_decay(case_dir, end_time, write_interval, log_fn=print, should_stop
         measured_ventilation_ach=prior.get("ventilation_ach_measured"),
         measured_ventilation_ach_ci95=prior.get("ventilation_ach_measured_ci95"),
     )
-    log_fn(f"Done. eACH_uv effective={results['eACH_uv_effective']:.4g} /hr "
+    log_fn(f"Done. eACH_uv effective={results['eACH_uv_assuming_well_mixed']:.4g} /hr "
            f"(well-mixed={results['eACH_uv_well_mixed']:.4g} /hr)")
     return results
 
@@ -1981,7 +1982,7 @@ def run_decay_sweep(guv_path, settings_path, project_dir, room, settings, adv,
                 ctx["control_results_future"].result()
                 control_dir_content = _read_case_file(ctx["control_dir"], "results.json")
                 write_case_file(case_dir, "results.json", control_dir_content)
-                result = json.loads(control_dir_content)
+                result = migrate_result_keys(json.loads(control_dir_content))  # pre-2026-09-02 files use the old key names
                 uv_fingerprint = None  # no UV/lamp physics involved at all in this mode
             else:
                 z_summary = _apply_z(case_dir, z, adv["uv-zone-bins"], ctx["fan_kw"], combo_log_fn,
@@ -2008,7 +2009,7 @@ def run_decay_sweep(guv_path, settings_path, project_dir, room, settings, adv,
             report_relative = f"{project_name}_{subdir}_report.json"
             report_path = f"{project_dir}/{report_relative}"
             write_case_file(project_dir, report_relative, json.dumps(trimmed, indent=2))
-            combo_log_fn(f"  Done. eACH_uv effective={result['eACH_uv_effective']:.4g} /hr "
+            combo_log_fn(f"  Done. eACH_uv effective={result['eACH_uv_assuming_well_mixed']:.4g} /hr "
                          f"(well-mixed={result['eACH_uv_well_mixed']:.4g} /hr)")
             _update_combo_status_safe(project_dir, project_name, z, ach, status="done",
                                        finished_at=now_iso(), uv_fingerprint=uv_fingerprint,
@@ -2057,7 +2058,7 @@ def run_decay_sweep(guv_path, settings_path, project_dir, room, settings, adv,
             _prefixed_log_fn(log_fn, f"ACH={ach}")(
                 "Skipping the UV-off control run - sealed room, ventilation-only decay "
                 "rate is exactly 0 by construction.")
-            control_future = _completed_future({"total_ach_effective": 0.0})
+            control_future = _completed_future({"total_ach_actual": 0.0})
         else:
             control_future = pool.submit(_prepare_control, flow_ctx)
         zs = [z for z, a in combos if a == ach]

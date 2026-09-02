@@ -20,9 +20,9 @@ def test_nominal_baseline_matches_uncorrected_behavior():
     lambda_total = 0.005  # /s, e.g. ventilation(3/hr) + UV(~15/hr) combined
     t, T = _synthetic_decay(lambda_total)
     fit = compute_effective_eACH(t, T, ventilation_ach=3.0)
-    assert math.isclose(fit["lambda_total_effective_per_s"], lambda_total, rel_tol=1e-6)
+    assert math.isclose(fit["lambda_total_per_s"], lambda_total, rel_tol=1e-6)
     expected_eACH = (lambda_total - 3.0 / 3600.0) * 3600.0
-    assert math.isclose(fit["eACH_uv_effective"], expected_eACH, rel_tol=1e-6)
+    assert math.isclose(fit["eACH_uv_assuming_well_mixed"], expected_eACH, rel_tol=1e-6)
 
 
 def test_measured_ventilation_baseline_overrides_nominal():
@@ -33,10 +33,10 @@ def test_measured_ventilation_baseline_overrides_nominal():
     fit = compute_effective_eACH(
         t, T, ventilation_ach=3.0, ventilation_lambda_per_s=measured_lambda)
     expected_eACH = (lambda_total - measured_lambda) * 3600.0
-    assert math.isclose(fit["eACH_uv_effective"], expected_eACH, rel_tol=1e-6)
+    assert math.isclose(fit["eACH_uv_assuming_well_mixed"], expected_eACH, rel_tol=1e-6)
     # Using the smaller measured baseline attributes MORE of the decay to UV.
     fit_nominal = compute_effective_eACH(t, T, ventilation_ach=3.0)
-    assert fit["eACH_uv_effective"] > fit_nominal["eACH_uv_effective"]
+    assert fit["eACH_uv_assuming_well_mixed"] > fit_nominal["eACH_uv_assuming_well_mixed"]
 
 
 def test_fit_effective_decay_rate_ci_widens_with_noise():
@@ -53,7 +53,7 @@ def test_fit_effective_decay_rate_ci_widens_with_noise():
     fit = compute_effective_eACH(t, T_noisy, ventilation_ach=3.0)
     assert fit["ci95_eACH_per_hr"] is not None
     lo, hi = fit["ci95_eACH_per_hr"]
-    assert lo < fit["eACH_uv_effective"] < hi
+    assert lo < fit["eACH_uv_assuming_well_mixed"] < hi
     assert (hi - lo) > 0.01  # a real, non-degenerate width, not a near-zero point
 
 
@@ -101,7 +101,7 @@ def test_compute_effective_eACH_propagates_ventilation_baseline_uncertainty():
     lo_prop, hi_prop = fit_propagated["ci95_eACH_per_hr"]
     assert (hi_prop - lo_prop) > (hi_exact - lo_exact)
     # Point estimate itself is unaffected - only the interval widens.
-    assert math.isclose(fit_exact_baseline["eACH_uv_effective"], fit_propagated["eACH_uv_effective"])
+    assert math.isclose(fit_exact_baseline["eACH_uv_assuming_well_mixed"], fit_propagated["eACH_uv_assuming_well_mixed"])
 
 
 def test_write_results_summary_adds_corrected_fields_only_when_measured_given(tmp_path):
@@ -116,15 +116,15 @@ def test_write_results_summary_adds_corrected_fields_only_when_measured_given(tm
 
     out_path = tmp_path / "results.json"
     result_no_control = write_results_summary(str(case_dir), str(out_path), 3.0, 15.0)
-    assert "eACH_uv_effective_corrected" not in result_no_control
-    assert "mixing_efficiency_corrected" not in result_no_control
+    assert "eACH_uv_actual" not in result_no_control
+    assert "mixing_efficiency_actual" not in result_no_control
 
     result_with_control = write_results_summary(
         str(case_dir), str(out_path), 3.0, 15.0, measured_ventilation_ach=2.67)
     assert result_with_control["ventilation_ach_measured"] == 2.67
-    assert "eACH_uv_effective_corrected" in result_with_control
-    assert "mixing_efficiency_corrected" in result_with_control
-    assert result_with_control["eACH_uv_effective_corrected"] > result_with_control["eACH_uv_effective"]
+    assert "eACH_uv_actual" in result_with_control
+    assert "mixing_efficiency_actual" in result_with_control
+    assert result_with_control["eACH_uv_actual"] > result_with_control["eACH_uv_assuming_well_mixed"]
 
     with open(out_path) as f:
         saved = json.load(f)

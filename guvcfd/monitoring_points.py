@@ -142,7 +142,7 @@ def compute_monitoring_results(case_dir, points, cell_size=0.1,
     volAverage(T) curve from the time-directory data already on disk (the
     main simulation must already have run). Returns
     {name: {"t_seconds": [...], "volAverage_T": [...],
-            "eACH_uv_effective": float}} - the eACH_uv_effective key is only
+            "eACH_uv_assuming_well_mixed": float}} - the eACH_uv_assuming_well_mixed key is only
     present when fit_decay=True and ventilation_ach is given (meaningful for
     a decay-mode curve; not for a steady-state build-up curve, which isn't a
     decay and would fit garbage).
@@ -179,10 +179,10 @@ def compute_monitoring_results(case_dir, points, cell_size=0.1,
         entry = {"t_seconds": t.tolist(), "volAverage_T": T.tolist()}
         if fit_decay and ventilation_ach is not None and len(t) > 2:
             fit = compute_effective_eACH(t, T, ventilation_ach)
-            entry["eACH_uv_effective"] = fit["eACH_uv_effective"]
-            entry["eACH_uv_effective_ci95"] = fit["ci95_eACH_per_hr"]
+            entry["eACH_uv_assuming_well_mixed"] = fit["eACH_uv_assuming_well_mixed"]
+            entry["eACH_uv_assuming_well_mixed_ci95"] = fit["ci95_eACH_per_hr"]
         results[p["name"]] = entry
-        suffix = f", eACH_uv={entry['eACH_uv_effective']:.4g}/hr" if "eACH_uv_effective" in entry else ""
+        suffix = f", eACH_uv={entry['eACH_uv_assuming_well_mixed']:.4g}/hr" if "eACH_uv_assuming_well_mixed" in entry else ""
         log_fn(f"  {p['name']}: {len(t)} points, final volAverage(T)={T[-1]:.4g}{suffix}")
     return results
 

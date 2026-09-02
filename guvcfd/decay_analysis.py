@@ -18,6 +18,40 @@ from .wsl_utils import (wsl_path as _wsl_path, read_wsl_text as _read_wsl_text,
                          write_case_file as _write_case_file, run_wsl as _run_wsl)
 
 
+# Result keys renamed 2026-09-02. "effective" was actively misleading: it
+# named the value computed against the NOMINAL ventilation rate, i.e. the one
+# that assumes perfect mixing - which in a badly mixed room goes NEGATIVE and
+# reads as "UV made things worse" when it really means "ventilation never did
+# the work that was assumed". The measured-baseline value, previously
+# "_corrected", is the one that is actually effective, so it is now "_actual".
+LEGACY_RESULT_KEYS = {
+    "eACH_uv_effective": "eACH_uv_assuming_well_mixed",
+    "eACH_uv_effective_ci95": "eACH_uv_assuming_well_mixed_ci95",
+    "eACH_uv_effective_corrected": "eACH_uv_actual",
+    "eACH_uv_effective_corrected_ci95": "eACH_uv_actual_ci95",
+    "lambda_total_effective_per_s": "lambda_total_per_s",
+    "total_ach_effective": "total_ach_actual",
+    "total_ach_effective_ci95": "total_ach_actual_ci95",
+    "mixing_efficiency_corrected": "mixing_efficiency_actual",
+}
+
+
+def migrate_result_keys(result):
+    """Add the current key names to a results dict that may use the old ones.
+
+    Every results.json written before 2026-09-02 uses the old names, and the
+    reports/dashboards must keep opening them. Only fills in a new key when it
+    is absent, so a current file is untouched; the old keys are left in place
+    so anything still reading them (a user's own CSV/script) keeps working.
+    """
+    if not isinstance(result, dict):
+        return result
+    for old, new in LEGACY_RESULT_KEYS.items():
+        if old in result and new not in result:
+            result[new] = result[old]
+    return result
+
+
 def read_vol_average_dat(path):
     """Parse postProcessing/volAverage1/<time>/volFieldValue.dat.
 
@@ -306,7 +340,7 @@ def compute_effective_eACH(t, T, ventilation_ach, ventilation_lambda_per_s=None,
     ventilation_ach/3600 exactly. Real ventilation doesn't always achieve its
     nominal ACH either (the same imperfect-mixing effect this function
     already isolates for UV) - using the measured baseline removes that
-    small bias from eACH_uv_effective. Defaults to the nominal ACH when not
+    small bias from eACH_uv_assuming_well_mixed. Defaults to the nominal ACH when not
     given (the original, uncorrected behavior).
 
     ventilation_lambda_se_per_s/ventilation_lambda_dof: if the measured
@@ -315,7 +349,7 @@ def compute_effective_eACH(t, T, ventilation_ach, ventilation_lambda_per_s=None,
     standard error and degrees of freedom here combines it IN QUADRATURE
     with this fit's own uncertainty (assuming independence - reasonable,
     since the two curves come from separate CFD runs) to give a properly
-    propagated CI on eACH_uv_effective, instead of treating the
+    propagated CI on eACH_uv_assuming_well_mixed, instead of treating the
     ventilation baseline as an exact constant. The combined interval uses
     the SMALLER of the two fits' degrees of freedom (a standard,
     conservative simplification of the exact Welch-Satterthwaite
@@ -324,13 +358,13 @@ def compute_effective_eACH(t, T, ventilation_ach, ventilation_lambda_per_s=None,
     exact, same as before (a CI that's too narrow if it actually came from
     its own noisy fit).
 
-    Returns a dict {eACH_uv_effective, lambda_total_effective_per_s,
+    Returns a dict {eACH_uv_assuming_well_mixed, lambda_total_per_s,
     intercept, se_per_s, ci95_eACH_per_hr, n}.
     """
     fit = fit_effective_decay_rate(t, T)
-    lambda_total_effective = fit["lambda_per_s"]
+    lambda_total = fit["lambda_per_s"]
     lambda_vent = ventilation_lambda_per_s if ventilation_lambda_per_s is not None else ventilation_ach / 3600.0
-    eACH_uv_effective = (lambda_total_effective - lambda_vent) * 3600.0
+    eACH_uv_assuming_well_mixed = (lambda_total - lambda_vent) * 3600.0
 
     ci95_eACH_per_hr = None
     if ventilation_lambda_se_per_s is not None and fit["se_per_s"] is not None:
@@ -340,14 +374,14 @@ def compute_effective_eACH(t, T, ventilation_ach, ventilation_lambda_per_s=None,
             dof = min(dof, ventilation_lambda_dof)
         if dof > 0:
             margin = stats.t.ppf(0.975, dof) * se_combined * 3600.0
-            ci95_eACH_per_hr = (eACH_uv_effective - margin, eACH_uv_effective + margin)
+            ci95_eACH_per_hr = (eACH_uv_assuming_well_mixed - margin, eACH_uv_assuming_well_mixed + margin)
     elif fit["ci95_per_s"] is not None:
         lo, hi = fit["ci95_per_s"]
         ci95_eACH_per_hr = ((lo - lambda_vent) * 3600.0, (hi - lambda_vent) * 3600.0)
 
     return {
-        "eACH_uv_effective": eACH_uv_effective,
-        "lambda_total_effective_per_s": lambda_total_effective,
+        "eACH_uv_assuming_well_mixed": eACH_uv_assuming_well_mixed,
+        "lambda_total_per_s": lambda_total,
         "intercept": fit["intercept"],
         "se_per_s": fit["se_per_s"],
         "ci95_eACH_per_hr": ci95_eACH_per_hr,
@@ -660,19 +694,19 @@ def write_results_summary(case_dir, out_path, ventilation_ach, well_mixed_eACH_m
     measured_ventilation_ach: the *actual* ventilation-only air-change rate
     from a UV-off control run (ventilation_control.py), if one was run
     alongside this case. When given, also writes corrected
-    eACH_uv_effective_corrected/mixing_efficiency_corrected fields that
+    eACH_uv_actual/mixing_efficiency_actual fields that
     subtract this measured baseline instead of the nominal ventilation_ach -
     see compute_effective_eACH's docstring for why that's more accurate.
 
     measured_ventilation_ach_ci95: that control run's OWN 95% CI on its
-    fitted rate (its "total_ach_effective_ci95"), passed through here
+    fitted rate (its "total_ach_actual_ci95"), passed through here
     purely for display next to "ventilation_ach_measured".
 
     measured_ventilation_ach_se_per_s/measured_ventilation_fit_dof: that
     same control run's own fit standard error [1/s] and degrees of freedom
     (its "fit_se_per_s"/"fit_n"-1) - when given, PROPERLY combined in
     quadrature with this run's own fit uncertainty to give
-    eACH_uv_effective_corrected_ci95 a rigorous, non-underestimated width
+    eACH_uv_actual_ci95 a rigorous, non-underestimated width
     (see compute_effective_eACH's docstring) instead of treating the
     measured baseline as an exact constant.
     """
@@ -688,28 +722,28 @@ def write_results_summary(case_dir, out_path, ventilation_ach, well_mixed_eACH_m
     except (OSError, RuntimeError):
         t, T = read_vol_average_dat(f"{case_dir}/{vol_average_dat}")
     fit = compute_effective_eACH(t, T, ventilation_ach)
-    eACH_eff = fit["eACH_uv_effective"]
-    lambda_eff = fit["lambda_total_effective_per_s"]
+    eACH_eff = fit["eACH_uv_assuming_well_mixed"]
+    lambda_eff = fit["lambda_total_per_s"]
 
-    # total_ach_effective = ventilation_ach + eACH_eff - ventilation_ach is
+    # total_ach_actual = ventilation_ach + eACH_eff - ventilation_ach is
     # an exact constant here, so its CI is just eACH_eff's own CI shifted
     # by the same amount (see compute_effective_eACH's docstring on why
     # this doesn't widen the interval).
-    total_ach_effective_ci95 = None
+    total_ach_actual_ci95 = None
     if fit["ci95_eACH_per_hr"] is not None:
         lo, hi = fit["ci95_eACH_per_hr"]
-        total_ach_effective_ci95 = (ventilation_ach + lo, ventilation_ach + hi)
+        total_ach_actual_ci95 = (ventilation_ach + lo, ventilation_ach + hi)
 
     summary = {
         "ventilation_ach": ventilation_ach,
         "eACH_uv_well_mixed": well_mixed_eACH_mean,
-        "eACH_uv_effective": eACH_eff,
-        "eACH_uv_effective_ci95": fit["ci95_eACH_per_hr"],
+        "eACH_uv_assuming_well_mixed": eACH_eff,
+        "eACH_uv_assuming_well_mixed_ci95": fit["ci95_eACH_per_hr"],
         "mixing_efficiency": eACH_eff / well_mixed_eACH_mean if well_mixed_eACH_mean else None,
         "total_ach_well_mixed": ventilation_ach + well_mixed_eACH_mean,
-        "total_ach_effective": ventilation_ach + eACH_eff,
-        "total_ach_effective_ci95": total_ach_effective_ci95,
-        "lambda_total_effective_per_s": lambda_eff,
+        "total_ach_actual": ventilation_ach + eACH_eff,
+        "total_ach_actual_ci95": total_ach_actual_ci95,
+        "lambda_total_per_s": lambda_eff,
         "fit_intercept": fit["intercept"],
         "fit_n": fit["n"],
         "fit_se_per_s": fit["se_per_s"],
@@ -726,12 +760,12 @@ def write_results_summary(case_dir, out_path, ventilation_ach, well_mixed_eACH_m
             t, T, ventilation_ach, ventilation_lambda_per_s=measured_ventilation_ach / 3600.0,
             ventilation_lambda_se_per_s=measured_ventilation_ach_se_per_s,
             ventilation_lambda_dof=measured_ventilation_fit_dof)
-        eACH_eff_corrected = fit_corrected["eACH_uv_effective"]
+        eACH_eff_corrected = fit_corrected["eACH_uv_assuming_well_mixed"]
         summary["ventilation_ach_measured"] = measured_ventilation_ach
         summary["ventilation_ach_measured_ci95"] = measured_ventilation_ach_ci95
-        summary["eACH_uv_effective_corrected"] = eACH_eff_corrected
-        summary["eACH_uv_effective_corrected_ci95"] = fit_corrected["ci95_eACH_per_hr"]
-        summary["mixing_efficiency_corrected"] = (
+        summary["eACH_uv_actual"] = eACH_eff_corrected
+        summary["eACH_uv_actual_ci95"] = fit_corrected["ci95_eACH_per_hr"]
+        summary["mixing_efficiency_actual"] = (
             eACH_eff_corrected / well_mixed_eACH_mean if well_mixed_eACH_mean else None)
 
     if extra:

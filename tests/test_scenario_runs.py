@@ -201,7 +201,7 @@ def test_run_sweep_creates_expected_subfolders_and_reports(tmp_path, monkeypatch
     build_calls = []
     monkeypatch.setattr(sr, "_build_flow_base", lambda *a, **k: build_calls.append(a[4]))
     monkeypatch.setattr(sr, "_run_shared_phase1", lambda *a, **k: None)
-    monkeypatch.setattr(sr, "_run_shared_control", lambda *a, **k: {"total_ach_effective": 3.0})
+    monkeypatch.setattr(sr, "_run_shared_control", lambda *a, **k: {"total_ach_actual": 3.0})
     monkeypatch.setattr(sr, "write_source_topo_set_dict", lambda *a, **k: None)
     monkeypatch.setattr(sr, "_copy_base_case", lambda base, target, log_fn: __import__("os").makedirs(target, exist_ok=True))
     monkeypatch.setattr(sr, "_apply_z", lambda case_dir, z, nbins, fan_kwargs, log_fn, **kw:
@@ -266,7 +266,7 @@ def test_run_sweep_passes_adaptive_t_relaxation_flag_to_apply_z_per_combo(tmp_pa
 
     monkeypatch.setattr(sr, "_build_flow_base", lambda *a, **k: None)
     monkeypatch.setattr(sr, "_run_shared_phase1", lambda *a, **k: None)
-    monkeypatch.setattr(sr, "_run_shared_control", lambda *a, **k: {"total_ach_effective": 3.0})
+    monkeypatch.setattr(sr, "_run_shared_control", lambda *a, **k: {"total_ach_actual": 3.0})
     monkeypatch.setattr(sr, "write_source_topo_set_dict", lambda *a, **k: None)
     monkeypatch.setattr(sr, "_copy_base_case", lambda base, target, log_fn: __import__("os").makedirs(target, exist_ok=True))
     monkeypatch.setattr(sr, "compute_uv_fingerprint", lambda *a, **k: "fake-uv-fp")
@@ -304,7 +304,7 @@ def test_run_decay_sweep_records_error_status_in_project_status(tmp_path, monkey
     project_dir = tmp_path / "proj"
     project_dir.mkdir()
     monkeypatch.setattr(sr, "_build_flow_base", lambda *a, **k: None)
-    monkeypatch.setattr(sr, "_run_shared_control", lambda *a, **k: {"total_ach_effective": 3.0})
+    monkeypatch.setattr(sr, "_run_shared_control", lambda *a, **k: {"total_ach_actual": 3.0})
     monkeypatch.setattr(sr, "_copy_base_case", lambda base, target, log_fn: __import__("os").makedirs(target, exist_ok=True))
     monkeypatch.setattr(sr, "run_wsl_or_raise", lambda *a, **k: None)
 
@@ -344,7 +344,7 @@ def test_run_sweep_captures_build_flow_base_return_value_as_base_summary(tmp_pat
     fake_base_summary = {"flow_converged": True, "ach_delivery": {"measured_ach": 5.9}, "n_lamps": 4}
     monkeypatch.setattr(sr, "_build_flow_base", lambda *a, **k: fake_base_summary)
     monkeypatch.setattr(sr, "_run_shared_phase1", lambda *a, **k: None)
-    monkeypatch.setattr(sr, "_run_shared_control", lambda *a, **k: {"total_ach_effective": 3.0})
+    monkeypatch.setattr(sr, "_run_shared_control", lambda *a, **k: {"total_ach_actual": 3.0})
     monkeypatch.setattr(sr, "write_source_topo_set_dict", lambda *a, **k: None)
     monkeypatch.setattr(sr, "_copy_base_case", lambda base, target, log_fn: __import__("os").makedirs(target, exist_ok=True))
     monkeypatch.setattr(sr, "_apply_z", lambda case_dir, z, nbins, fan_kwargs, log_fn, **kw:
@@ -404,7 +404,7 @@ def test_run_sweep_passes_base_summary_to_run_shared_control(tmp_path, monkeypat
                                    solver_log_fn, base_summary, status_fn=None, should_pause=None, sealed=False,
                                    solve_semaphore=None):
         captured["base_summary"] = base_summary
-        return {"total_ach_effective": 3.0}
+        return {"total_ach_actual": 3.0}
     monkeypatch.setattr(sr, "_run_shared_control", strict_run_shared_control)
 
     monkeypatch.setattr(sr, "write_source_topo_set_dict", lambda *a, **k: None)
@@ -439,7 +439,7 @@ def test_run_sweep_keeps_shared_dirs_when_setting_enabled(tmp_path, monkeypatch)
 
     monkeypatch.setattr(sr, "_build_flow_base", lambda *a, **k: None)
     monkeypatch.setattr(sr, "_run_shared_phase1", lambda *a, **k: None)
-    monkeypatch.setattr(sr, "_run_shared_control", lambda *a, **k: {"total_ach_effective": 3.0})
+    monkeypatch.setattr(sr, "_run_shared_control", lambda *a, **k: {"total_ach_actual": 3.0})
     monkeypatch.setattr(sr, "write_source_topo_set_dict", lambda *a, **k: None)
     monkeypatch.setattr(sr, "_copy_base_case", lambda base, target, log_fn: __import__("os").makedirs(target, exist_ok=True))
     monkeypatch.setattr(sr, "_apply_z", lambda case_dir, z, nbins, fan_kwargs, log_fn, **kw:
@@ -478,12 +478,12 @@ def test_run_decay_sweep_keeps_shared_dirs_when_setting_enabled(tmp_path, monkey
     project_dir.mkdir()
 
     monkeypatch.setattr(sr, "_build_flow_base", lambda *a, **k: None)
-    monkeypatch.setattr(sr, "_run_shared_control", lambda *a, **k: {"total_ach_effective": 3.0})
+    monkeypatch.setattr(sr, "_run_shared_control", lambda *a, **k: {"total_ach_actual": 3.0})
     monkeypatch.setattr(sr, "_copy_base_case", lambda base, target, log_fn: __import__("os").makedirs(target, exist_ok=True))
     monkeypatch.setattr(sr, "_apply_z", lambda case_dir, z, nbins, fan_kwargs, log_fn, **kw:
                          {"fluence_mean": 1.0, "eACH_uv_well_mixed_mean": 0.0})
     monkeypatch.setattr(sr, "_run_decay_scenario", lambda *a, **k: {
-        "reduction_pct": 1.0, "eACH_uv_effective": 1.0, "eACH_uv_well_mixed": 1.0, "phase1": {}, "phase2": {}})
+        "reduction_pct": 1.0, "eACH_uv_assuming_well_mixed": 1.0, "eACH_uv_well_mixed": 1.0, "phase1": {}, "phase2": {}})
 
     removed = []
     monkeypatch.setattr(sr, "run_wsl_or_raise", lambda cmd, *a, **k: removed.append(cmd))
@@ -688,14 +688,14 @@ def test_run_decay_sweep_seeds_flow_base_from_existing_done_combo(tmp_path, monk
     monkeypatch.setattr(sr, "_seed_ach_base_if_no_scratch_survives",
                          lambda *a, **k: seed_calls.append(a))
     monkeypatch.setattr(sr, "_build_flow_base", lambda *a, **k: {"flow_converged": True})
-    monkeypatch.setattr(sr, "_run_shared_control", lambda *a, **k: {"total_ach_effective": 3.0})
+    monkeypatch.setattr(sr, "_run_shared_control", lambda *a, **k: {"total_ach_actual": 3.0})
     monkeypatch.setattr(sr, "_copy_base_case",
                          lambda base, target, log_fn: __import__("os").makedirs(target, exist_ok=True))
     monkeypatch.setattr(sr, "_apply_z", lambda case_dir, z, nbins, fan_kwargs, log_fn, **kw:
                          {"fluence_mean": 1.0, "eACH_uv_well_mixed_mean": 0.0})
     monkeypatch.setattr(sr, "compute_uv_fingerprint", lambda *a, **k: "fake-uv-fp")
     monkeypatch.setattr(sr, "_run_decay_scenario", lambda *a, **k: {
-        "reduction_pct": 1.0, "eACH_uv_effective": 1.0, "eACH_uv_well_mixed": 1.0, "phase1": {}, "phase2": {}})
+        "reduction_pct": 1.0, "eACH_uv_assuming_well_mixed": 1.0, "eACH_uv_well_mixed": 1.0, "phase1": {}, "phase2": {}})
     monkeypatch.setattr(sr, "run_wsl_or_raise", lambda *a, **k: None)
     adv = {"adaptive-t-relaxation": False, "scalar-relaxation": 0.7, "uv-zone-bins": 25, "mesh-cell-size": 0.1,
            "keep-shared-scratch-dirs": True}
@@ -734,7 +734,7 @@ def test_run_decay_sweep_second_launch_reuses_matching_flow_and_control(tmp_path
     def fake_run_shared_control(base_dir, control_dir, ach, *a, **k):
         control_calls.append(ach)
         __import__("os").makedirs(control_dir, exist_ok=True)
-        return {"total_ach_effective": 3.0}
+        return {"total_ach_actual": 3.0}
 
     monkeypatch.setattr(sr, "_build_flow_base", fake_build_flow_base)
     monkeypatch.setattr(sr, "_run_shared_control", fake_run_shared_control)
@@ -744,7 +744,7 @@ def test_run_decay_sweep_second_launch_reuses_matching_flow_and_control(tmp_path
                          {"fluence_mean": 1.0, "eACH_uv_well_mixed_mean": 0.0})
     monkeypatch.setattr(sr, "compute_uv_fingerprint", lambda *a, **k: "fake-uv-fp")
     monkeypatch.setattr(sr, "_run_decay_scenario", lambda *a, **k: {
-        "reduction_pct": 1.0, "eACH_uv_effective": 1.0, "eACH_uv_well_mixed": 1.0, "phase1": {}, "phase2": {}})
+        "reduction_pct": 1.0, "eACH_uv_assuming_well_mixed": 1.0, "eACH_uv_well_mixed": 1.0, "phase1": {}, "phase2": {}})
     monkeypatch.setattr(sr, "run_wsl_or_raise", lambda cmd, *a, **k: None)
 
     room = type("Room", (), {"x": 4.0, "y": 5.0, "z": 2.7})()
@@ -786,7 +786,7 @@ def test_run_decay_sweep_different_guv_at_same_z_ach_gets_its_own_folder(tmp_pat
 
     def fake_run_shared_control(base_dir, control_dir, ach, *a, **k):
         __import__("os").makedirs(control_dir, exist_ok=True)
-        return {"total_ach_effective": 3.0}
+        return {"total_ach_actual": 3.0}
 
     monkeypatch.setattr(sr, "_build_flow_base", fake_build_flow_base)
     monkeypatch.setattr(sr, "_run_shared_control", fake_run_shared_control)
@@ -797,7 +797,7 @@ def test_run_decay_sweep_different_guv_at_same_z_ach_gets_its_own_folder(tmp_pat
     monkeypatch.setattr(sr, "compute_uv_fingerprint", lambda *a, **k: "fake-uv-fp")
     decay_calls = []
     monkeypatch.setattr(sr, "_run_decay_scenario", lambda *a, **k: decay_calls.append(1) or {
-        "reduction_pct": 1.0, "eACH_uv_effective": 1.0, "eACH_uv_well_mixed": 1.0, "phase1": {}, "phase2": {}})
+        "reduction_pct": 1.0, "eACH_uv_assuming_well_mixed": 1.0, "eACH_uv_well_mixed": 1.0, "phase1": {}, "phase2": {}})
     monkeypatch.setattr(sr, "run_wsl_or_raise", lambda cmd, *a, **k: None)
 
     room = type("Room", (), {"x": 4.0, "y": 5.0, "z": 2.7})()
@@ -861,7 +861,7 @@ def test_switching_a_steady_state_project_to_decay_mode_gets_its_own_folder_and_
     def fake_run_shared_control(base_dir, control_dir, ach, *a, **k):
         control_calls.append(ach)
         __import__("os").makedirs(control_dir, exist_ok=True)
-        return {"total_ach_effective": 3.0}
+        return {"total_ach_actual": 3.0}
 
     monkeypatch.setattr(sr, "_build_flow_base", fake_build_flow_base)
     monkeypatch.setattr(sr, "_run_shared_phase1", lambda *a, **k: None)
@@ -878,7 +878,7 @@ def test_switching_a_steady_state_project_to_decay_mode_gets_its_own_folder_and_
         "phase2": {"T_ss": 0.1, "live": {"t": [1]}}})
     decay_calls = []
     monkeypatch.setattr(sr, "_run_decay_scenario", lambda *a, **k: decay_calls.append(1) or {
-        "reduction_pct": 1.0, "eACH_uv_effective": 1.0, "eACH_uv_well_mixed": 1.0, "phase1": {}, "phase2": {}})
+        "reduction_pct": 1.0, "eACH_uv_assuming_well_mixed": 1.0, "eACH_uv_well_mixed": 1.0, "phase1": {}, "phase2": {}})
 
     room = type("Room", (), {"x": 4.0, "y": 5.0, "z": 2.7})()
     # Every FLOW_FINGERPRINT_FIELDS key populated explicitly (see
@@ -966,7 +966,7 @@ def test_run_decay_sweep_rebuilds_when_flow_settings_change_between_launches(tmp
     def fake_run_shared_control(base_dir, control_dir, ach, *a, **k):
         control_calls.append(ach)
         __import__("os").makedirs(control_dir, exist_ok=True)
-        return {"total_ach_effective": 3.0}
+        return {"total_ach_actual": 3.0}
 
     removed = []
     monkeypatch.setattr(sr, "_build_flow_base", fake_build_flow_base)
@@ -977,7 +977,7 @@ def test_run_decay_sweep_rebuilds_when_flow_settings_change_between_launches(tmp
                          {"fluence_mean": 1.0, "eACH_uv_well_mixed_mean": 0.0})
     monkeypatch.setattr(sr, "compute_uv_fingerprint", lambda *a, **k: "fake-uv-fp")
     monkeypatch.setattr(sr, "_run_decay_scenario", lambda *a, **k: {
-        "reduction_pct": 1.0, "eACH_uv_effective": 1.0, "eACH_uv_well_mixed": 1.0, "phase1": {}, "phase2": {}})
+        "reduction_pct": 1.0, "eACH_uv_assuming_well_mixed": 1.0, "eACH_uv_well_mixed": 1.0, "phase1": {}, "phase2": {}})
     monkeypatch.setattr(sr, "run_wsl_or_raise", lambda cmd, *a, **k: removed.append(cmd))
 
     room = type("Room", (), {"x": 4.0, "y": 5.0, "z": 2.7})()
@@ -1012,7 +1012,7 @@ def test_run_decay_sweep_mechanical_ach_only_skips_apply_z_and_reuses_control_re
 
     monkeypatch.setattr(sr, "_build_flow_base", lambda *a, **k: {"flow_converged": True})
 
-    control_result = {"eACH_uv_effective": 0.0, "eACH_uv_well_mixed": 0.0, "total_ach_effective": 3.2}
+    control_result = {"eACH_uv_assuming_well_mixed": 0.0, "eACH_uv_well_mixed": 0.0, "total_ach_actual": 3.2}
 
     def fake_run_shared_control(base_dir, control_dir, ach, *a, **k):
         __import__("os").makedirs(control_dir, exist_ok=True)
@@ -1172,7 +1172,7 @@ def test_run_sweep_skips_a_combo_that_already_has_results_json(tmp_path, monkeyp
 
     monkeypatch.setattr(sr, "_build_flow_base", lambda *a, **k: None)
     monkeypatch.setattr(sr, "_run_shared_phase1", lambda *a, **k: None)
-    monkeypatch.setattr(sr, "_run_shared_control", lambda *a, **k: {"total_ach_effective": 3.0})
+    monkeypatch.setattr(sr, "_run_shared_control", lambda *a, **k: {"total_ach_actual": 3.0})
     monkeypatch.setattr(sr, "write_source_topo_set_dict", lambda *a, **k: None)
     copy_calls = []
     monkeypatch.setattr(sr, "_copy_base_case",
@@ -1227,7 +1227,7 @@ def test_run_sweep_skips_failed_combo_and_continues(tmp_path, monkeypatch):
     project_dir.mkdir()
     monkeypatch.setattr(sr, "_build_flow_base", lambda *a, **k: None)
     monkeypatch.setattr(sr, "_run_shared_phase1", lambda *a, **k: None)
-    monkeypatch.setattr(sr, "_run_shared_control", lambda *a, **k: {"total_ach_effective": 3.0})
+    monkeypatch.setattr(sr, "_run_shared_control", lambda *a, **k: {"total_ach_actual": 3.0})
     monkeypatch.setattr(sr, "write_source_topo_set_dict", lambda *a, **k: None)
     monkeypatch.setattr(sr, "_copy_base_case", lambda base, target, log_fn: __import__("os").makedirs(target, exist_ok=True))
     monkeypatch.setattr(sr, "run_wsl_or_raise", lambda *a, **k: None)
@@ -1291,12 +1291,12 @@ def test_run_scenario_threads_control_results_into_measured_ventilation_ach(monk
     sr._run_scenario("case_dir", room, settings, z=6.0, ach=3.0, adv=adv,
                       z_summary={"eACH_uv_well_mixed_mean": 0.0, "fluence_mean": 1.0}, log_fn=lambda m: None,
                       should_stop=None, solver_log_fn=None,
-                      control_results_future=sr._completed_future({"total_ach_effective": 2.46}))
+                      control_results_future=sr._completed_future({"total_ach_actual": 2.46}))
 
     # The future itself is handed through, not resolved by _run_scenario -
     # see run_steady_state_scenario's own control_results_future docstring
     # for why (must resolve only after its own simpleFoam call, not before).
-    assert calls[-1]["control_results_future"].result()["total_ach_effective"] == 2.46
+    assert calls[-1]["control_results_future"].result()["total_ach_actual"] == 2.46
 
 
 def test_run_scenario_deltat_scaling_uses_configured_iterations_not_settling_inflation(monkeypatch):
@@ -1728,7 +1728,7 @@ def test_run_sweep_different_guv_at_same_z_ach_produces_genuinely_different_resu
         return {"flow_converged": True, "inlet_velocity": 1.0, "inlet2_velocity": None, "n_lamps": 4}
 
     monkeypatch.setattr(sr, "_build_flow_base", fake_build_flow_base)
-    monkeypatch.setattr(sr, "_run_shared_control", lambda *a, **k: {"total_ach_effective": 3.0})
+    monkeypatch.setattr(sr, "_run_shared_control", lambda *a, **k: {"total_ach_actual": 3.0})
     monkeypatch.setattr(sr, "write_source_topo_set_dict", lambda *a, **k: None)
     monkeypatch.setattr(sr, "_copy_base_case",
                          lambda base, target, log_fn: __import__("os").makedirs(target, exist_ok=True))
@@ -1796,7 +1796,7 @@ def test_run_sweep_recarves_source_zone_after_apply_z_wipes_it(tmp_path, monkeyp
     project_dir.mkdir()
     monkeypatch.setattr(sr, "_build_flow_base", lambda *a, **k: None)
     monkeypatch.setattr(sr, "_run_shared_phase1", lambda *a, **k: None)
-    monkeypatch.setattr(sr, "_run_shared_control", lambda *a, **k: {"total_ach_effective": 3.0})
+    monkeypatch.setattr(sr, "_run_shared_control", lambda *a, **k: {"total_ach_actual": 3.0})
     monkeypatch.setattr(sr, "_copy_base_case", lambda base, target, log_fn: __import__("os").makedirs(target, exist_ok=True))
     monkeypatch.setattr(sr, "_apply_z", lambda case_dir, z, nbins, fan_kwargs, log_fn, **kw:
                          {"fluence_mean": 1.0, "eACH_uv_well_mixed_mean": 0.0})
@@ -1838,7 +1838,7 @@ def test_run_sweep_stop_between_combinations_raises_stopped_by_user(tmp_path, mo
     project_dir.mkdir()
     monkeypatch.setattr(sr, "_build_flow_base", lambda *a, **k: None)
     monkeypatch.setattr(sr, "_run_shared_phase1", lambda *a, **k: None)
-    monkeypatch.setattr(sr, "_run_shared_control", lambda *a, **k: {"total_ach_effective": 3.0})
+    monkeypatch.setattr(sr, "_run_shared_control", lambda *a, **k: {"total_ach_actual": 3.0})
     monkeypatch.setattr(sr, "run_wsl_or_raise", lambda *a, **k: None)
 
     calls = {"n": 0}
@@ -1881,13 +1881,13 @@ def test_run_decay_scenario_rebuilds_fvoptions_from_this_combos_own_kuv(tmp_path
     monkeypatch.setattr(sr, "run_wsl_streaming", lambda *a, **k: type("R", (), {"returncode": 0, "stdout": ""})())
     monkeypatch.setattr(sr, "run_wsl_or_raise", lambda *a, **k: None)
     monkeypatch.setattr(sr, "write_results_summary", lambda *a, **k: {
-        "eACH_uv_effective": 10.0, "eACH_uv_well_mixed": 20.0,
+        "eACH_uv_assuming_well_mixed": 10.0, "eACH_uv_well_mixed": 20.0,
     })
 
     written = {}
     monkeypatch.setattr(sr, "write_fvoptions_file", lambda cd, entries: written.__setitem__(cd, entries))
 
-    control_results = {"total_ach_effective": 3.0, "total_ach_effective_ci95": None,
+    control_results = {"total_ach_actual": 3.0, "total_ach_actual_ci95": None,
                         "fit_se_per_s": None, "fit_n": None}
     room = type("Room", (), {"x": 4.0, "y": 5.0, "z": 2.7})()
     settings = {"fan-enable": False, "inlet2-enable": False, "outlet2-enable": False,
@@ -1940,7 +1940,7 @@ def test_run_decay_scenario_releases_solve_semaphore_before_waiting_on_control(t
     monkeypatch.setattr(sr, "run_wsl_streaming",
                          lambda *a, **k: type("R", (), {"returncode": 0, "stdout": ""})())
     monkeypatch.setattr(sr, "write_results_summary", lambda *a, **k: {
-        "eACH_uv_effective": 10.0, "eACH_uv_well_mixed": 20.0,
+        "eACH_uv_assuming_well_mixed": 10.0, "eACH_uv_well_mixed": 20.0,
     })
 
     solve_semaphore = threading.Semaphore(1)
@@ -1980,11 +1980,11 @@ def test_run_decay_scenario_releases_solve_semaphore_before_waiting_on_control(t
         assert acquired, "solve_semaphore was still held while merely waiting on control_results_future"
         solve_semaphore.release()
     finally:
-        control_future.set_result({"total_ach_effective": 3.0, "total_ach_effective_ci95": None,
+        control_future.set_result({"total_ach_actual": 3.0, "total_ach_actual_ci95": None,
                                     "fit_se_per_s": None, "fit_n": None})
         t.join(timeout=5)
     assert not t.is_alive()
-    assert result_holder["result"]["eACH_uv_effective"] == 10.0
+    assert result_holder["result"]["eACH_uv_assuming_well_mixed"] == 10.0
 
 
 def test_run_decay_scenario_status_fn_gets_time_lines_and_clears_on_finish(tmp_path, monkeypatch):
@@ -2003,7 +2003,7 @@ def test_run_decay_scenario_status_fn_gets_time_lines_and_clears_on_finish(tmp_p
     monkeypatch.setattr(sr, "splice_live_vol_average_if_needed", lambda *a, **k: None)
     monkeypatch.setattr(sr, "run_wsl_or_raise", lambda *a, **k: None)
     monkeypatch.setattr(sr, "write_results_summary", lambda *a, **k: {
-        "eACH_uv_effective": 10.0, "eACH_uv_well_mixed": 20.0,
+        "eACH_uv_assuming_well_mixed": 10.0, "eACH_uv_well_mixed": 20.0,
     })
 
     def fake_run_wsl_streaming(cmd, cwd, on_line=None, **k):
@@ -2012,7 +2012,7 @@ def test_run_decay_scenario_status_fn_gets_time_lines_and_clears_on_finish(tmp_p
     monkeypatch.setattr(sr, "run_wsl_streaming", fake_run_wsl_streaming)
 
     status_calls = []
-    control_results = {"total_ach_effective": 3.0, "total_ach_effective_ci95": None,
+    control_results = {"total_ach_actual": 3.0, "total_ach_actual_ci95": None,
                         "fit_se_per_s": None, "fit_n": None}
     room = type("Room", (), {"x": 4.0, "y": 5.0, "z": 2.7})()
     settings = {"fan-enable": False, "inlet2-enable": False, "outlet2-enable": False,
@@ -2041,7 +2041,7 @@ def test_run_decay_scenario_status_fn_gets_time_lines_and_clears_on_finish(tmp_p
 
 def test_run_shared_control_status_fn_gets_time_lines_and_clears_on_finish(tmp_path, monkeypatch):
     monkeypatch.setattr(sr, "prepare_ventilation_only_control", lambda *a, **k: None)
-    monkeypatch.setattr(sr, "finish_ventilation_only_control", lambda *a, **k: {"total_ach_effective": 3.0})
+    monkeypatch.setattr(sr, "finish_ventilation_only_control", lambda *a, **k: {"total_ach_actual": 3.0})
 
     def fake_run_wsl_streaming(cmd, cwd, on_line=None, **k):
         on_line("Time = 5")
@@ -2081,7 +2081,7 @@ def test_run_decay_scenario_uses_configured_write_interval_not_duration_over_100
     monkeypatch.setattr(sr, "run_wsl_streaming", lambda *a, **k: type("R", (), {"returncode": 0, "stdout": ""})())
     monkeypatch.setattr(sr, "run_wsl_or_raise", lambda *a, **k: None)
     monkeypatch.setattr(sr, "write_results_summary", lambda *a, **k: {
-        "eACH_uv_effective": 10.0, "eACH_uv_well_mixed": 20.0,
+        "eACH_uv_assuming_well_mixed": 10.0, "eACH_uv_well_mixed": 20.0,
     })
 
     control_time_calls = []
@@ -2089,7 +2089,7 @@ def test_run_decay_scenario_uses_configured_write_interval_not_duration_over_100
                          delta_t=None, max_co=None: control_time_calls.append(("main", write_interval)))
     monkeypatch.setattr(sr, "splice_live_vol_average_if_needed", lambda *a, **k: None)
 
-    control_results = {"total_ach_effective": 3.0, "total_ach_effective_ci95": None,
+    control_results = {"total_ach_actual": 3.0, "total_ach_actual_ci95": None,
                         "fit_se_per_s": None, "fit_n": None}
     room = type("Room", (), {"x": 4.0, "y": 5.0, "z": 2.7})()
     settings = {"fan-enable": False, "inlet2-enable": False, "outlet2-enable": False,
@@ -2118,7 +2118,7 @@ def test_run_shared_control_uses_configured_write_interval(tmp_path, monkeypatch
                          end_time, write_interval, **k:
                          prepare_calls.append(("control", write_interval)))
     monkeypatch.setattr(sr, "run_wsl_streaming", lambda *a, **k: type("R", (), {"returncode": 0, "stdout": ""})())
-    monkeypatch.setattr(sr, "finish_ventilation_only_control", lambda *a, **k: {"total_ach_effective": 3.0})
+    monkeypatch.setattr(sr, "finish_ventilation_only_control", lambda *a, **k: {"total_ach_actual": 3.0})
 
     room = type("Room", (), {"x": 4.0, "y": 5.0, "z": 2.7})()
     settings = {"inlet2-enable": False, "outlet2-enable": False,
@@ -2141,9 +2141,9 @@ def test_run_shared_control_uses_configured_write_interval(tmp_path, monkeypatch
 # pools, with priority between stages falling out of submission order) ---
 
 def test_completed_future_resolves_immediately_to_the_given_value():
-    future = sr._completed_future({"total_ach_effective": 0.0})
+    future = sr._completed_future({"total_ach_actual": 0.0})
     assert future.done()
-    assert future.result() == {"total_ach_effective": 0.0}
+    assert future.result() == {"total_ach_actual": 0.0}
 
 
 def test_run_ach_pool_runs_every_ach_and_is_unbounded(monkeypatch):
@@ -2286,7 +2286,7 @@ def test_write_sweep_summary_csv_blank_convergence_quality_for_decay_rows(tmp_pa
     project_name = "myproj"
     from guvcfd.project_status import update_combo_status
     update_combo_status(project_dir, project_name, z=6.0, ach=3.0, sim_type="decay", status="done")
-    report = {"eACH_uv_effective": 12.0, "eACH_uv_well_mixed": 15.0}
+    report = {"eACH_uv_assuming_well_mixed": 12.0, "eACH_uv_well_mixed": 15.0}
     with open(f"{project_dir}/{project_name}_Z6_ACH3_report.json", "w") as f:
         json.dump(report, f)
 
@@ -2346,7 +2346,7 @@ def test_write_sweep_summary_csv_includes_a_row_per_mode_at_the_same_z_ach(tmp_p
     with open(f"{project_dir}/{project_name}_Z6_ACH3_report.json", "w") as f:
         json.dump({"reduction_pct_corrected": 80.0, "eACH_uv_steady_state_corrected": 10.0}, f)
     with open(f"{project_dir}/{project_name}_Z6_ACH3_decay_report.json", "w") as f:
-        json.dump({"eACH_uv_effective": 12.0}, f)
+        json.dump({"eACH_uv_assuming_well_mixed": 12.0}, f)
 
     csv_path = sr.write_sweep_summary_csv(project_dir, project_name)
     with open(csv_path, newline="") as f:
@@ -2402,8 +2402,8 @@ def test_monitoring_summary_columns_steady_state_reduction_pct():
 
 def test_monitoring_summary_columns_decay_each_uv():
     detail = {
-        "eACH_uv_effective": 5.0,
-        "monitoring": {"Point 1": {"eACH_uv_effective": 4.2}},
+        "eACH_uv_assuming_well_mixed": 5.0,
+        "monitoring": {"Point 1": {"eACH_uv_assuming_well_mixed": 4.2}},
     }
     columns = sr._monitoring_summary_columns(detail)
     assert columns == {"Point 1_eACH_uv": 4.2}
@@ -2471,7 +2471,7 @@ def test_continue_decay_reads_back_via_the_post_hoc_path_it_wrote(tmp_path, monk
     def fake_write_results_summary(case_dir_, out_path, ventilation_ach, well_mixed_eACH_mean,
                                     vol_average_dat=None, **kwargs):
         captured["vol_average_dat"] = vol_average_dat
-        return {"eACH_uv_effective": 1.0, "eACH_uv_well_mixed": well_mixed_eACH_mean}
+        return {"eACH_uv_assuming_well_mixed": 1.0, "eACH_uv_well_mixed": well_mixed_eACH_mean}
 
     monkeypatch.setattr(sr, "write_results_summary", fake_write_results_summary)
 
@@ -2555,7 +2555,7 @@ def test_run_sweep_runs_phase1_and_control_concurrently(tmp_path, monkeypatch):
             time.sleep(0.15)
             with lock:
                 intervals[name] = (start, time.time())
-            return {"total_ach_effective": 3.0} if name == "control" else None
+            return {"total_ach_actual": 3.0} if name == "control" else None
         return recorder
 
     monkeypatch.setattr(sr, "_run_shared_phase1", make_recorder("phase1"))
@@ -2593,14 +2593,14 @@ def test_run_decay_sweep_runs_control_and_z_decay_concurrently(tmp_path, monkeyp
         time.sleep(0.15)
         with lock:
             intervals["control"] = (start, time.time())
-        return {"total_ach_effective": 3.0}
+        return {"total_ach_actual": 3.0}
 
     def fake_decay_scenario(*a, **k):
         start = time.time()
         time.sleep(0.15)
         with lock:
             intervals["decay_z6"] = (start, time.time())
-        return {"reduction_pct": 1.0, "eACH_uv_effective": 1.0, "eACH_uv_well_mixed": 1.0,
+        return {"reduction_pct": 1.0, "eACH_uv_assuming_well_mixed": 1.0, "eACH_uv_well_mixed": 1.0,
                 "phase1": {}, "phase2": {}}
 
     monkeypatch.setattr(sr, "_run_shared_control", fake_control)
@@ -2664,7 +2664,7 @@ def test_run_sweep_never_exceeds_max_concurrent_solves(tmp_path, monkeypatch):
 
     monkeypatch.setattr(sr, "_build_flow_base", track())
     monkeypatch.setattr(sr, "_run_shared_phase1", track())
-    monkeypatch.setattr(sr, "_run_shared_control", track(lambda *a, **k: {"total_ach_effective": 3.0}))
+    monkeypatch.setattr(sr, "_run_shared_control", track(lambda *a, **k: {"total_ach_actual": 3.0}))
     monkeypatch.setattr(sr, "_run_scenario", track(lambda *a, **k: {
         "reduction_pct": 90.0, "eACH_uv_steady_state": 50.0, "phase1": {"T_ss": 1.0, "live": {"t": [1]}},
         "phase2": {"T_ss": 0.1, "live": {"t": [1]}}}))
@@ -2717,7 +2717,7 @@ def test_run_sweep_max_concurrent_solves_overridable_via_adv(tmp_path, monkeypat
 
     monkeypatch.setattr(sr, "_build_flow_base", track())
     monkeypatch.setattr(sr, "_run_shared_phase1", track())
-    monkeypatch.setattr(sr, "_run_shared_control", track(lambda *a, **k: {"total_ach_effective": 3.0}))
+    monkeypatch.setattr(sr, "_run_shared_control", track(lambda *a, **k: {"total_ach_actual": 3.0}))
     monkeypatch.setattr(sr, "_run_scenario", track(lambda *a, **k: {
         "reduction_pct": 90.0, "eACH_uv_steady_state": 50.0, "phase1": {"T_ss": 1.0, "live": {"t": [1]}},
         "phase2": {"T_ss": 0.1, "live": {"t": [1]}}}))

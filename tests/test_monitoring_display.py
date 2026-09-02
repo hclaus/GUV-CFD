@@ -41,7 +41,7 @@ def test_gather_falls_back_to_default_name_if_blank():
 
 def test_decay_style_summary_rows():
     monitoring = {
-        "Patient": {"t_seconds": [0, 10], "volAverage_T": [1.0, 0.5], "eACH_uv_effective": 12.3},
+        "Patient": {"t_seconds": [0, 10], "volAverage_T": [1.0, 0.5], "eACH_uv_assuming_well_mixed": 12.3},
     }
     rows = _monitoring_summary_rows(monitoring)
     assert rows[0] == ("Monitoring locations", "")
@@ -72,7 +72,7 @@ def test_empty_monitoring_gives_no_rows():
 
 
 def test_report_monitoring_rows_decay_style():
-    monitoring = {"Patient": {"t_seconds": [0, 10], "volAverage_T": [1.0, 0.5], "eACH_uv_effective": 12.3}}
+    monitoring = {"Patient": {"t_seconds": [0, 10], "volAverage_T": [1.0, 0.5], "eACH_uv_assuming_well_mixed": 12.3}}
     rows = _monitoring_rows(monitoring)
     assert rows == [("Patient", "final volAverage(T)=0.5, eACH_uv=12.3/hr")]
 

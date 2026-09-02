@@ -239,12 +239,12 @@ def test_find_reusable_ach_base_none_when_nothing_recorded(tmp_path):
 def test_find_reusable_ach_base_returns_record_on_matching_fingerprint(tmp_path):
     base_dir, control_dir = _make_base_dirs(tmp_path)
     ps.update_ach_base_status(str(tmp_path), "myproj", 3.0, "fp1", base_dir, control_dir,
-                               {"total_ach_effective": 3.0})
+                               {"total_ach_actual": 3.0})
 
     record = ps.find_reusable_ach_base(str(tmp_path), "myproj", 3.0, "fp1")
     assert record is not None
     assert record["base_dir"] == base_dir and record["control_dir"] == control_dir
-    assert record["control_results"] == {"total_ach_effective": 3.0}
+    assert record["control_results"] == {"total_ach_actual": 3.0}
 
 
 def test_find_reusable_ach_base_none_on_fingerprint_mismatch(tmp_path):

@@ -11,6 +11,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt
 
 from ..case_io import read_cell_centers
+from ..decay_analysis import migrate_result_keys
 from ..paraview_launch import launch_paraview
 from ..report import generate_report_docx
 from . import helpers
@@ -20,13 +21,13 @@ _METRIC_ROWS = [
     ("ventilation_ach", "Ventilation ACH (nominal)"),
     ("ventilation_ach_measured", "Ventilation ACH (measured)"),
     ("eACH_uv_well_mixed", "eACH_uv, well-mixed (idealized ceiling)"),
-    ("eACH_uv_effective", "eACH_uv, CFD-fit (nominal baseline)"),
-    ("eACH_uv_effective_corrected", "eACH_uv, CFD-fit (measured baseline)"),
+    ("eACH_uv_assuming_well_mixed", "eACH_uv, CFD-fit (nominal baseline)"),
+    ("eACH_uv_actual", "eACH_uv, CFD-fit (measured baseline)"),
     ("mixing_efficiency", "Mixing efficiency"),
-    ("mixing_efficiency_corrected", "Mixing efficiency (measured baseline)"),
+    ("mixing_efficiency_actual", "Mixing efficiency (measured baseline)"),
     ("mechanical_mixing_efficiency_pct", "Mechanical mixing efficiency (%)"),
     ("spatial_cov_final", "Spatial coefficient of variation"),
-    ("total_ach_effective", "Total ACH, effective"),
+    ("total_ach_actual", "Total ACH, effective"),
     ("reduction_pct", "Steady-state reduction (%)"),
     ("eACH_uv_steady_state", "eACH_uv, steady-state (nominal)"),
     ("eACH_uv_steady_state_corrected", "eACH_uv, steady-state (measured)"),
@@ -40,11 +41,11 @@ _METRIC_ROWS = [
 # some are already 0-100 percentages needing just "%" appended
 # (mechanical_mixing_efficiency_pct, reduction_pct); the rest are rates
 # that get a "/hr" unit suffix, matching Dash's own row text.
-_PERCENT_FRACTION_FIELDS = {"mixing_efficiency", "mixing_efficiency_corrected", "spatial_cov_final"}
+_PERCENT_FRACTION_FIELDS = {"mixing_efficiency", "mixing_efficiency_actual", "spatial_cov_final"}
 _ALREADY_PERCENT_FIELDS = {"mechanical_mixing_efficiency_pct", "reduction_pct"}
 _RATE_FIELDS = {
     "ventilation_ach", "ventilation_ach_measured", "eACH_uv_well_mixed",
-    "eACH_uv_effective", "eACH_uv_effective_corrected", "total_ach_effective",
+    "eACH_uv_assuming_well_mixed", "eACH_uv_actual", "total_ach_actual",
     "eACH_uv_steady_state", "eACH_uv_steady_state_corrected",
 }
 
@@ -118,7 +119,8 @@ class AnalysisTab(QWidget):
             QMessageBox.warning(self, "No results", f"{results_path} not found.")
             return
         with open(results_path) as f:
-            results = json.load(f)
+            # Older results.json files use the pre-2026-09-02 key names.
+            results = migrate_result_keys(json.load(f))
         self.case_dir = case_dir
         self.results = results
         self.export_btn.setEnabled(True)

@@ -17,8 +17,8 @@ def _all_text(components):
 
 
 _DECAY_RESULT = {
-    "ventilation_ach": 3.0, "eACH_uv_well_mixed": 10.27, "eACH_uv_effective": 8.97,
-    "mixing_efficiency": 0.873, "total_ach_effective": 11.97,
+    "ventilation_ach": 3.0, "eACH_uv_well_mixed": 10.27, "eACH_uv_assuming_well_mixed": 8.97,
+    "mixing_efficiency": 0.873, "total_ach_actual": 11.97,
     "decay_curve": {"t_seconds": [0, 10], "volAverage_T": [1.0, 0.9]},
     "fluence_mean": 5.678,
 }
@@ -43,8 +43,8 @@ def test_decay_summary_labels_state_what_each_eACH_is():
 def test_decay_summary_corrected_row_names_the_correction():
     result = dict(_DECAY_RESULT)
     result["ventilation_ach_measured"] = 2.8
-    result["eACH_uv_effective_corrected"] = 9.5
-    result["mixing_efficiency_corrected"] = 0.9
+    result["eACH_uv_actual"] = 9.5
+    result["mixing_efficiency_actual"] = 0.9
     text = _all_text(_decay_summary(result))
     assert "eACH_uv, CFD-fit (measured ventilation ACH)" in text
     assert "9.5" in text

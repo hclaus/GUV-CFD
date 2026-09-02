@@ -631,7 +631,7 @@ def _finish_decay(state, case_dir, room, settings, summary):
 
     if mech_ach_only:
         state.log_fn("Writing results summary (mechanical ACH only - no separate control run to "
-                     "correct against; total_ach_effective is this run's own measured rate)...")
+                     "correct against; total_ach_actual is this run's own measured rate)...")
         results = write_results_summary(
             case_dir, f"{case_dir}/results.json", settings["ach"], 0.0,
             extra={
@@ -642,7 +642,7 @@ def _finish_decay(state, case_dir, room, settings, summary):
         )
     else:
         if sealed:
-            control_results = {"total_ach_effective": 0.0}
+            control_results = {"total_ach_actual": 0.0}
         else:
             state.log_fn("=== Post-processing UV-off control ===")
             control_results = finish_ventilation_only_control(control_dir, settings["ach"], log_fn=state.log_fn)
@@ -655,8 +655,8 @@ def _finish_decay(state, case_dir, room, settings, summary):
                 "flow_converged": summary.get("flow_converged"), "ach_delivery": summary.get("ach_delivery"),
                 "spatial_cov_final": spatial_cov,
             },
-            measured_ventilation_ach=control_results["total_ach_effective"],
-            measured_ventilation_ach_ci95=control_results.get("total_ach_effective_ci95"),
+            measured_ventilation_ach=control_results["total_ach_actual"],
+            measured_ventilation_ach_ci95=control_results.get("total_ach_actual_ci95"),
             measured_ventilation_ach_se_per_s=control_results.get("fit_se_per_s"),
             measured_ventilation_fit_dof=(control_results["fit_n"] - 2) if control_results.get("fit_n") else None,
         )
@@ -669,7 +669,7 @@ def _finish_decay(state, case_dir, room, settings, summary):
             json.dump(results, f, indent=2)
 
     state.results = results
-    state.log_fn(f"Done. eACH_uv effective={results['eACH_uv_effective']:.4g} /hr "
+    state.log_fn(f"Done. eACH_uv effective={results['eACH_uv_assuming_well_mixed']:.4g} /hr "
                  f"(well-mixed={results['eACH_uv_well_mixed']:.4g} /hr)")
 
 

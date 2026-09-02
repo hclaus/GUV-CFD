@@ -68,7 +68,7 @@ _STEADY_STATE_RESULTS = {
 def test_steady_state_report_does_not_crash_on_decay_only_fields(tmp_path):
     # Regression test: steady-state results.json has a totally different
     # schema (phase1/phase2/reduction_pct/eACH_uv_steady_state) than decay's
-    # (ventilation_ach/eACH_uv_effective/decay_curve) - generate_report_docx
+    # (ventilation_ach/eACH_uv_assuming_well_mixed/decay_curve) - generate_report_docx
     # must dispatch on scenario type instead of assuming decay's fields.
     case_dir = str(tmp_path)
     (tmp_path / "run_settings.json").write_text(json.dumps(_REAL_SETTINGS))
@@ -136,8 +136,8 @@ def test_decay_report_shows_fluence_mean(tmp_path):
     case_dir = str(tmp_path)
     (tmp_path / "run_settings.json").write_text(json.dumps(_REAL_SETTINGS))
     decay_results = {
-        "ventilation_ach": 3.0, "eACH_uv_well_mixed": 10.27, "eACH_uv_effective": 8.97,
-        "mixing_efficiency": 0.873, "total_ach_effective": 11.97,
+        "ventilation_ach": 3.0, "eACH_uv_well_mixed": 10.27, "eACH_uv_assuming_well_mixed": 8.97,
+        "mixing_efficiency": 0.873, "total_ach_actual": 11.97,
         "decay_curve": {"t_seconds": [0, 10], "volAverage_T": [1.0, 0.9]},
         "fluence_mean": 5.678,
     }
@@ -639,8 +639,8 @@ def test_decay_report_embeds_decay_curve_picture(tmp_path):
     case_dir = str(tmp_path)
     (tmp_path / "run_settings.json").write_text(json.dumps(_REAL_SETTINGS))
     decay_results = {
-        "ventilation_ach": 3.0, "eACH_uv_well_mixed": 10.27, "eACH_uv_effective": 8.97,
-        "mixing_efficiency": 0.873, "total_ach_effective": 11.97,
+        "ventilation_ach": 3.0, "eACH_uv_well_mixed": 10.27, "eACH_uv_assuming_well_mixed": 8.97,
+        "mixing_efficiency": 0.873, "total_ach_actual": 11.97,
         "decay_curve": {"t_seconds": [0, 10], "volAverage_T": [1.0, 0.9]},
         "fluence_mean": 5.678,
     }
@@ -700,8 +700,8 @@ def test_trust_status_rows_reported_in_generated_docx(tmp_path):
     case_dir = str(tmp_path)
     (tmp_path / "run_settings.json").write_text(json.dumps(_REAL_SETTINGS))
     decay_results = {
-        "ventilation_ach": 3.0, "eACH_uv_well_mixed": 10.27, "eACH_uv_effective": 8.97,
-        "mixing_efficiency": 0.873, "total_ach_effective": 11.97,
+        "ventilation_ach": 3.0, "eACH_uv_well_mixed": 10.27, "eACH_uv_assuming_well_mixed": 8.97,
+        "mixing_efficiency": 0.873, "total_ach_actual": 11.97,
         "decay_curve": {"t_seconds": [0, 10], "volAverage_T": [1.0, 0.9]},
         "fluence_mean": 5.678,
         "flow_converged": False,
@@ -748,8 +748,8 @@ def test_combo_summary_metrics_decay_mode():
     # No "reduction_pct" key at all - is_steady_state must be False, using
     # the analytical _decay_reduction_ratio and decay's own mixing_efficiency.
     detail = {
-        "eACH_uv_effective_corrected": 8.97, "ventilation_ach_measured": 3.0,
-        "mixing_efficiency_corrected": 0.873,
+        "eACH_uv_actual": 8.97, "ventilation_ach_measured": 3.0,
+        "mixing_efficiency_actual": 0.873,
         "ach_delivery": {"measured_ach": 2.97, "ratio": 0.99},
     }
     metrics = combo_summary_metrics(detail)
