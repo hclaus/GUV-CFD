@@ -26,6 +26,19 @@ _WALL_LABEL_POSITIONS = {
 }
 
 
+def _num(value, default=0.0):
+    """A settings value as a float, tolerating None/blank/garbage - preview
+    code must never raise on a half-typed field."""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _breathing_velocity(settings):
+    return max(_num(settings.get("breathing-velocity"), 0.0), 0.0)
+
+
 class Preview3D(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -89,7 +102,12 @@ class Preview3D(QWidget):
             self._add_opening(room, settings, "outlet2", "Outlet 2", "#e74c3c", is_inlet=False)
         if settings.get("fan-enable"):
             self._add_fan(settings)
-        if settings.get("sim-type") == "steady_state":
+        # Draw the injection/source zone whenever it actually exists, not only
+        # in steady-state. Decay is the DEFAULT mode, and a decay run carves
+        # the same zone whenever the breathing velocity is non-zero (see
+        # scenario_runs._carve_breathing_inlet) - so gating on sim-type alone
+        # left it invisible in the mode most runs use.
+        if settings.get("sim-type") == "steady_state" or _breathing_velocity(settings) > 0:
             self._add_injection(settings)
         if settings.get("monitoring-enable"):
             self._add_monitoring_points(settings)
@@ -167,9 +185,39 @@ class Preview3D(QWidget):
             center = (settings["inject-x-input"], settings["inject-y-input"], settings["inject-z-input"])
         except (KeyError, TypeError):
             return
-        self.plotter.add_mesh(pv.Sphere(radius=0.06, center=center), color="#9b59b6")
+        # Sized from the real zone setting rather than a fixed radius, and
+        # drawn as a cube like the monitoring points, so its actual extent is
+        # visible instead of a dot that reads as "nothing is there".
+        cells = settings.get("source-zone-cells") or 1
+        try:
+            size = max(float(cells), 1.0) * 0.1     # preview-only cell-size approximation
+        except (TypeError, ValueError):
+            size = 0.1
+        box = pv.Cube(center=center, x_length=size, y_length=size, z_length=size)
+        self.plotter.add_mesh(box, color="#9b59b6", opacity=0.55)
+        self.plotter.add_mesh(pv.Cube(center=center, x_length=size, y_length=size, z_length=size),
+                               style="wireframe", color="#6c3483", line_width=2)
+
+        # The jet direction is a real setting now, and pointing it the wrong
+        # way changed T_ss by 4.5x - so show it rather than leave the user to
+        # infer it from three numbers in a form.
+        v = _breathing_velocity(settings)
+        label = "Injection"
+        if v > 0:
+            d = (_num(settings.get("breathing-dir-x"), 0.0),
+                 _num(settings.get("breathing-dir-y"), 0.0),
+                 _num(settings.get("breathing-dir-z"), 1.0))
+            mag = (d[0] ** 2 + d[1] ** 2 + d[2] ** 2) ** 0.5
+            if mag > 0:
+                arrow_len = max(size * 3.0, 0.35)
+                self.plotter.add_mesh(
+                    pv.Arrow(start=center, direction=d, scale=arrow_len,
+                             tip_length=0.3, tip_radius=0.11, shaft_radius=0.035),
+                    color="#9b59b6")
+            label = f"Injection  {v:g} m/s"
         self.plotter.add_point_labels(
-            [center], ["Injection"], point_size=0, font_size=12, text_color="#9b59b6",
+            [(center[0], center[1], center[2] + size / 2 + 0.12)], [label],
+            point_size=0, font_size=12, text_color="#6c3483",
             shape=None, always_visible=True, show_points=False)
 
     def _add_monitoring_points(self, settings):
