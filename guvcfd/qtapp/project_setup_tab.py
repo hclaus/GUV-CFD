@@ -3,6 +3,7 @@ monitoring/simulation-type, and see a live 3D preview - the native
 equivalent of guvcfd.app's Project Setup tab."""
 import json
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 
 from guv_calcs import Project
@@ -75,6 +76,10 @@ class ProjectSetupTab(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        # Depth counter, not a bool, so nested suspensions unwind correctly
+        # (load_guvcfd_project suspends, then calls apply_settings which
+        # suspends again - the inner exit must not re-enable early).
+        self._preview_suspend_depth = 0
         self.room = None
         self.guv_path = None
         # The currently open/saved .guvcfd project file (None if this
@@ -301,8 +306,9 @@ class ProjectSetupTab(QWidget):
     def apply_settings(self, settings):
         """Inverse of gather_settings() - restores every field from a saved
         settings dict (a .guvcfd project file's contents, or run_settings.json)."""
-        for fid, value in settings.items():
-            self.set_value(fid, value)
+        with self._preview_suspended():
+            for fid, value in settings.items():
+                self.set_value(fid, value)
         if "case-dir" in settings and settings["case-dir"]:
             self.case_dir_edit.setText(settings["case-dir"])
         if settings.get("sim-type") == "steady_state":
@@ -641,7 +647,8 @@ class ProjectSetupTab(QWidget):
             return
         self.guv_path = path
         self.room = room
-        self._clamp_position_fields_to_room()
+        with self._preview_suspended():
+            self._clamp_position_fields_to_room()
         self.settings_path = None  # a bare .guv load starts a fresh, never-saved project
         self._openfoam_overrides = {}  # overrides are per-loaded-project, not carried over
         self.project_label.setText(self._project_label_text())
@@ -684,9 +691,14 @@ class ProjectSetupTab(QWidget):
         self.settings_path = path
         self._openfoam_overrides = {}  # overrides are per-loaded-project, not carried over
         self.project_label.setText(self._project_label_text())
-        self._clamp_position_fields_to_room()
-        self.apply_settings(settings)
-        self._clamp_position_fields_to_room()
+        # One scene rebuild for the whole restore, not one per restored field.
+        # setMaximum() in the clamp can itself emit valueChanged (when it caps
+        # an out-of-range value), so the clamps are inside the suspension too.
+        with self._preview_suspended():
+            self._clamp_position_fields_to_room()
+            self.apply_settings(settings)
+            self._clamp_position_fields_to_room()
+        self.refresh_preview()
         self._remember_project_path(path)
         self.project_loaded.emit()
 
@@ -716,7 +728,29 @@ class ProjectSetupTab(QWidget):
         self._remember_project_path(path)
         self.project_loaded.emit()
 
+    @contextmanager
+    def _preview_suspended(self):
+        """Coalesce the preview rebuilds triggered by a bulk field update.
+
+        Every field widget is wired to refresh_preview (see
+        _connect_preview_refresh), and refresh_preview does a FULL PyVista
+        scene rebuild - plotter.clear() then re-adding room box, floor, wall
+        labels, every lamp, every opening and the fan. Setting ~25 fields one
+        at a time while loading a .guvcfd therefore rebuilt the scene ~25
+        times, which is the visible 30-second flicker on open: the user
+        watches the scene get torn down and redrawn once per restored field.
+
+        Wrap the bulk update in this and refresh once at the end.
+        """
+        self._preview_suspend_depth += 1
+        try:
+            yield
+        finally:
+            self._preview_suspend_depth -= 1
+
     def refresh_preview(self):
+        if self._preview_suspend_depth:
+            return          # a bulk update is in progress; it refreshes once at the end
         try:
             self.preview.update_scene(self.room, self.gather_settings())
         except Exception as e:
