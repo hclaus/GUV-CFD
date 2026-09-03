@@ -11,7 +11,7 @@ from PySide6.QtCore import QSettings, Qt, Signal
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFileDialog, QFormLayout, QGroupBox,
     QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPushButton, QScrollArea, QSpinBox, QSplitter, QTabWidget,
-    QVBoxLayout, QWidget,
+    QPlainTextEdit, QVBoxLayout, QWidget,
 )
 
 from ..app_settings import capture_openfoam_settings, load_advanced_settings, PROJECT_OPENFOAM_SETTINGS_KEYS
@@ -80,6 +80,9 @@ class ProjectSetupTab(QWidget):
         # (load_guvcfd_project suspends, then calls apply_settings which
         # suspends again - the inner exit must not re-enable early).
         self._preview_suspend_depth = 0
+        # monitor index -> the widget holding that point's input rows,
+        # hidden entirely while the point is disabled
+        self._monitor_field_blocks = {}
         self.room = None
         self.guv_path = None
         # The currently open/saved .guvcfd project file (None if this
@@ -134,6 +137,7 @@ class ProjectSetupTab(QWidget):
 
         self._build_project_group()
         self._build_case_dir_group()
+        self._build_notes_group()
         # Simulation type/timing/budget fields exist (registered in
         # self.fields, so gather_settings()/apply_settings() see them) but
         # are NOT part of this tab's visible layout - they live in the
@@ -199,6 +203,8 @@ class ProjectSetupTab(QWidget):
             return w.isChecked()
         if isinstance(w, QLineEdit):
             return w.text()
+        if isinstance(w, QPlainTextEdit):
+            return w.toPlainText()
         return None
 
     def set_value(self, field_id, value):
@@ -223,6 +229,8 @@ class ProjectSetupTab(QWidget):
             w.setChecked(bool(value))
         elif isinstance(w, QLineEdit):
             w.setText(str(value))
+        elif isinstance(w, QPlainTextEdit):
+            w.setPlainText(str(value))
 
     def gather_settings(self):
         settings = {fid: self.get_value(fid) for fid in self.fields}
@@ -309,6 +317,7 @@ class ProjectSetupTab(QWidget):
         with self._preview_suspended():
             for fid, value in settings.items():
                 self.set_value(fid, value)
+        self._sync_monitor_visibility()
         if "case-dir" in settings and settings["case-dir"]:
             self.case_dir_edit.setText(settings["case-dir"])
         if settings.get("sim-type") == "steady_state":
@@ -334,12 +343,61 @@ class ProjectSetupTab(QWidget):
         btn = QPushButton("Load .guv file...")
         btn.setToolTip("Start a new project from a raw .guv room/lamp design file (no saved "
                         "inlet/outlet/fan settings - use File > Open Project for those).")
+        # Deliberately prominent: this is the entry point to the whole tab and
+        # was easy to miss as a flat default-sized button.
+        f = btn.font()
+        f.setBold(True)
+        f.setPointSizeF(f.pointSizeF() * 1.15)
+        btn.setFont(f)
+        btn.setMinimumHeight(38)
+        btn.setCursor(Qt.PointingHandCursor)
+        btn.setStyleSheet(
+            "QPushButton {"
+            "  padding: 6px 18px;"
+            "  border: 1px solid #7a7a7a;"
+            "  border-radius: 5px;"
+            "  background: qlineargradient(x1:0, y1:0, x2:0, y2:1,"
+            "                              stop:0 #fdfdfd, stop:1 #d8d8d8);"
+            "}"
+            "QPushButton:hover { background: qlineargradient(x1:0, y1:0, x2:0, y2:1,"
+            "                              stop:0 #ffffff, stop:1 #e6e6e6); }"
+            "QPushButton:pressed {"
+            "  background: qlineargradient(x1:0, y1:0, x2:0, y2:1,"
+            "                              stop:0 #c8c8c8, stop:1 #e8e8e8);"
+            "  padding: 7px 17px 5px 19px;"      # 1px nudge = pressed-in feel
+            "}")
         btn.clicked.connect(self.load_project_dialog)
         row.addWidget(btn)
         self.project_label = QLabel("No project loaded")
         row.addWidget(self.project_label, 1)
         layout.addLayout(row)
         self.form_layout.addWidget(box)
+
+    def _build_notes_group(self):
+        box = QGroupBox("Notes")
+        box.setToolTip("Free-text notes saved with the project (.guvcfd). Prefilled with the "
+                        "room size when a room is first loaded; edit or replace as you like.")
+        layout = QVBoxLayout(box)
+        notes = self._register("notes", QPlainTextEdit())
+        notes.setPlaceholderText("Notes about this project - room, layout, what you are testing...")
+        # Three lines: enough for a real note without crowding the geometry
+        # fields below, and it scrolls if the text is longer.
+        notes.setFixedHeight(int(notes.fontMetrics().lineSpacing() * 3.5))
+        layout.addWidget(notes)
+        self.form_layout.addWidget(box)
+
+    def _default_notes_text(self):
+        """The room's dimensions - the default this field starts from."""
+        if self.room is None:
+            return ""
+        return f"Room {self.room.x:g} x {self.room.y:g} x {self.room.z:g} m"
+
+    def _prefill_notes_if_empty(self):
+        """Prefill with the room size, but never overwrite what the user (or a
+        saved project) already put there."""
+        w = self.fields.get("notes")
+        if w is not None and not w.toPlainText().strip():
+            w.setPlainText(self._default_notes_text())
 
     def _build_case_dir_group(self):
         box = QGroupBox("OpenFOAM Project Directory")
@@ -459,9 +517,13 @@ class ProjectSetupTab(QWidget):
     def _build_opening_group(self, prefix, label):
         box = QGroupBox(label)
         form = QFormLayout(box)
-        show = self._register(f"{prefix}-show", QCheckBox("Show in preview"))
-        show.setChecked(True)
-        form.addRow(show)
+        # No enable/show checkbox here. The primary inlet and outlet are
+        # mandatory - mass balance needs both, and nothing in the pipeline
+        # ever read the old per-prefix "show" flag; it only hid them from the
+        # 3D view, which made it read like a functional control that wasn't
+        # one. Everything genuinely optional (Inlet 2 / Outlet 2 / fan /
+        # monitoring) keeps its real "-enable" flag, and the preview follows
+        # that flag - so whatever is enabled is visible by default.
         wall = QComboBox()
         wall.addItems(WALLS)
         wall.setCurrentText("xMin" if prefix == "inlet" else "xMax")
@@ -577,9 +639,17 @@ class ProjectSetupTab(QWidget):
         enable = self._register("monitoring-enable", QCheckBox("Enable monitoring points"))
         layout.addWidget(enable)
         for i in (1, 2, 3):
-            form = QFormLayout()
             pt_enable = self._register(f"monitor{i}-enable", QCheckBox(f"Point {i} enabled"))
-            form.addRow(pt_enable)
+            layout.addWidget(pt_enable)
+            # The point's fields live in their own container widget so the
+            # whole block can be COLLAPSED (hidden, taking no vertical space)
+            # when the point is off - three disabled points' worth of empty
+            # Name/X/Y/Z/Cells rows is most of this group's height for
+            # nothing. setVisible on the container, not on each field, so the
+            # form layout actually reclaims the space.
+            fields = QWidget()
+            form = QFormLayout(fields)
+            form.setContentsMargins(16, 0, 0, 8)     # indent under its checkbox
             form.addRow("Name", self._register(f"monitor{i}-name", QLineEdit(f"Point {i}")))
             form.addRow("X (m)", self._register(f"monitor{i}-x-input", _dspin(0, 50, 0.05, 3, 2.0)))
             form.addRow("Y (m)", self._register(f"monitor{i}-y-input", _dspin(0, 50, 0.05, 3, 1.5)))
@@ -588,8 +658,24 @@ class ProjectSetupTab(QWidget):
             _add_row(form, "Cells per side", cells_field,
                       "Size (in mesh cells) of the small cube around this point that its "
                       "concentration reading is averaged over.")
-            layout.addLayout(form)
+            layout.addWidget(fields)
+            self._monitor_field_blocks[i] = fields
+            pt_enable.toggled.connect(fields.setVisible)
+            fields.setVisible(pt_enable.isChecked())
         self.form_layout.addWidget(box)
+
+    def _sync_monitor_visibility(self):
+        """Match each point's field block to its checkbox.
+
+        Needed after a bulk restore: set_value() calls setChecked(), which only
+        emits toggled when the value actually CHANGES - restoring an already-
+        matching value emits nothing, so the blocks would keep whatever
+        visibility they had.
+        """
+        for i, block in self._monitor_field_blocks.items():
+            w = self.fields.get(f"monitor{i}-enable")
+            if w is not None:
+                block.setVisible(w.isChecked())
 
     # -- last-used-directory / recent-projects memory (QSettings, persists
     # across sessions) --
@@ -649,6 +735,7 @@ class ProjectSetupTab(QWidget):
         self.room = room
         with self._preview_suspended():
             self._clamp_position_fields_to_room()
+        self._prefill_notes_if_empty()
         self.settings_path = None  # a bare .guv load starts a fresh, never-saved project
         self._openfoam_overrides = {}  # overrides are per-loaded-project, not carried over
         self.project_label.setText(self._project_label_text())
@@ -698,6 +785,8 @@ class ProjectSetupTab(QWidget):
             self._clamp_position_fields_to_room()
             self.apply_settings(settings)
             self._clamp_position_fields_to_room()
+        # after apply_settings, so a saved note is never overwritten
+        self._prefill_notes_if_empty()
         self.refresh_preview()
         self._remember_project_path(path)
         self.project_loaded.emit()

@@ -1720,10 +1720,39 @@ New `decay-scalar-relaxation` (default 1.0), separate from the steady-state
 a flow-only base that never sees decay setup). Steady-state Phase 2 keeps its
 calibrated low value untouched.
 
+### CORRECTION: the ventilation findings did NOT survive
+
+This section originally claimed the ventilation/fan results were unaffected,
+on the reasoning that those runs have no UV sink. **That was wrong.**
+Under-relaxation throttles the WHOLE T equation - the advection and diffusion
+that carry contaminant to the outlet, not only source terms - so a run with no
+sink is throttled just as hard. Re-measured with T=1.0:
+
+| | T relax 0.05 (wrong) | T relax 1.0 (correct) |
+|---|---|---|
+| fan ON  | 0.3529 /hr | **4.8180 /hr** |
+| fan OFF | 0.6374 /hr | **6.3267 /hr** |
+| fan effect | -44.6% | **-23.8%** |
+| fan OFF vs 5.98 /hr delivered | 10.7% | **105.8%** |
+| fan ON vs 5.98 /hr delivered | 5.9% | **80.6%** |
+
+So these are retracted: the 5.95% "mechanical mixing efficiency", the 9x
+flush-vs-mix ratio, and the severe-short-circuit reading. The room is close to
+well mixed, not short-circuited. The measured D_t / cell-Peclet numbers above
+are still correct as flow-field properties; the CONCLUSION drawn from them
+about contaminant transport was not, because the transport being observed was
+itself throttled.
+
+The fan's direction survives (it does reduce clearance) but the magnitude
+roughly halves, and the corrected absolute values finally reconcile with the
+literature. The inlet is high (z 2.17-2.57) and the outlet low (z 1.09-1.58),
+i.e. a DISPLACEMENT arrangement, which genuinely achieves air-change
+effectiveness above 100% - measured 105.8% with no fan. The fan mixes the room
+toward the well-mixed limit of ~100%, and mixing a displacement-ventilated
+room destroys that advantage. "Fans give well-mixed conditions" is true here;
+well-mixed is simply a downgrade from displacement.
+
 ### What this does NOT change
 
-The ventilation findings hold - those runs have no UV sink. The fan still
-reduces ventilation clearance by 44.6% (0.3529 vs 0.6374 /hr, exhaust drawing
-air at 6.31% vs 10.46% of room concentration), and the room still mixes slowly.
-Those numbers were measured on decay curves whose only sink is ventilation, so
-T relaxation barely affects them.
+The UV finding itself - its magnitude, TFinal not being a fix, mesh adequacy
+(+2.4%) and the binning being sound (99.68%) - all stand.

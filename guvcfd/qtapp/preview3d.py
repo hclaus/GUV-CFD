@@ -76,10 +76,13 @@ class Preview3D(QWidget):
             if aim != pos:
                 self.plotter.add_lines(np.array([pos, aim]), color="goldenrod", width=2)
 
-        if settings.get("inlet-show", True):
-            self._add_opening(room, settings, "inlet", "Inlet", "#2ecc71", is_inlet=True)
-        if settings.get("outlet-show", True):
-            self._add_opening(room, settings, "outlet", "Outlet", "#e74c3c", is_inlet=False)
+        # Primary inlet/outlet are mandatory, so always drawn - the old
+        # "-show" flag was preview-only and has been removed from the tab.
+        # An older .guvcfd may still carry inlet-show/outlet-show; it is
+        # ignored rather than honoured, so the two openings that always
+        # exist in the mesh are always visible.
+        self._add_opening(room, settings, "inlet", "Inlet", "#2ecc71", is_inlet=True)
+        self._add_opening(room, settings, "outlet", "Outlet", "#e74c3c", is_inlet=False)
         if settings.get("inlet2-enable"):
             self._add_opening(room, settings, "inlet2", "Inlet 2", "#2ecc71", is_inlet=True)
         if settings.get("outlet2-enable"):
