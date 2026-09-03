@@ -1643,3 +1643,87 @@ shipped. With the window tests in place the p-vs-|U| gap largely stops
 mattering anyway: stationarity fires at chunk 12 on p for all five variants and
 12-14 on |U|. The conditioning difference only ever mattered for the
 delta-based test that has now been removed.
+
+## Decay-mode UV was understated ~15x by T under-relaxation (2026-09-02)
+
+The headline: **every decay-mode eACH_uv produced with `scalar-relaxation`
+well below 1 is far too low.** On patient ward 4B1 v9 the reported
+eACH_uv_actual was 4.73 /hr; the correct value is ~70 /hr.
+
+### How it was found
+
+v9 reported 6.5% of its own well-mixed UV potential. Three explanations were
+tested and all failed, which is what forced the real one out:
+
+**Not the binning.** `bin_decay_rates` groups the continuous per-cell kUV into
+25 cellZones because `scalarSemiImplicitSource` takes one coefficient per
+zone. Measured: the zones carry 99.68% of the field's total kill capacity
+(0.79133 vs 0.79383 m3/s). This independently reproduces the user's earlier
+finding that doubling the bin count changed nothing.
+
+**Not the mesh.** Halving the cell size (0.1 m / 39,936 cells -> 0.05 m /
+313,344 cells, MPI) moved the UV-attributable decay rate from 4.74 to
+4.85 /hr, **+2.4%**, and `nut` agreed to 11% on a like-for-like (no-fan)
+comparison. The 6.6% / 6.7% shortfall reproduced on both meshes.
+
+**Not transport.** This was the author's own wrong hypothesis, corrected by
+the user. The UV is NOT concentrated in the upper room: the lower 38.5% of the
+room carries 17.7% of the kill and the top 15.4% carries 34.5% - a spread of
+only ~5x. Cells with kUV>0.5/s are 0.1% of the volume and 5.6% of the kill,
+so the "hot spots are transport-starved" argument was about a negligible
+fraction. With kUV that uniform, mixing barely matters.
+
+### The physical impossibility that gave it away
+
+Every one of the 39,936 cells has a UV sink; the weakest applied value is
+0.002985/s = **10.75 /hr**. A room with a sink everywhere cannot decay slower
+than its weakest cell, and ventilation only adds to that. The observed decay
+was **5.09 /hr** - below the floor. No mixing or mesh argument can produce
+that; the sink simply was not reaching the solution.
+
+Per-cell confirmation: at t=5000-5100 s every cell decayed at the same rate,
+0.00137/s, against a local kUV median of 0.0137/s - **a uniform factor of 10**.
+
+### Cause
+
+`fvSolution` carried `T 0.05` in `relaxationFactors.equations`.
+Under-relaxation is a STEADY-state convergence device; in a transient run the
+ddt term already provides that stability. Relaxing T there stabilises nothing
+- it stops each timestep reaching the implicit solution, so the UV sink is
+applied at a fraction of its strength on every step, cumulatively.
+
+The value came from the Phase 2 steady-state calibration
+(`compute_adaptive_scalar_relaxation`), which genuinely needs it to avoid
+diverging at high Z. It was being applied to decay runs as well.
+
+### The A/B test (same mesh, flow and UV sources; 400 s; relaxation only)
+
+```
+T 0.05 (as shipped)   ->  4.80 /hr    T 0.9913 -> 0.58157  (41.3% removed)
+T 1.0                 -> 70.74 /hr    T 0.8990 -> 0.00041  ( 100% removed)
+well-mixed prediction -> 72.17 /hr
+```
+
+Unrelaxed lands within **2%** of the prediction. 14.7x error, all of it lost
+UV performance.
+
+**`TFinal 1` is NOT a fix.** `scalarTransport` is a function object outside the
+PIMPLE outer loop, so `finalIteration` is never set for it and `TFinal` is
+never consulted. `T 0.05` with and without `TFinal 1` gave byte-identical
+curves (both 4.80 /hr, T 0.9913 -> 0.58157). Only the base value matters.
+
+### Fix
+
+New `decay-scalar-relaxation` (default 1.0), separate from the steady-state
+`scalar-relaxation`, applied in all three decay pipelines and in
+`prepare_ventilation_only_control` (the sweep's shared control is cloned from
+a flow-only base that never sees decay setup). Steady-state Phase 2 keeps its
+calibrated low value untouched.
+
+### What this does NOT change
+
+The ventilation findings hold - those runs have no UV sink. The fan still
+reduces ventilation clearance by 44.6% (0.3529 vs 0.6374 /hr, exhaust drawing
+air at 6.31% vs 10.46% of room concentration), and the room still mixes slowly.
+Those numbers were measured on decay curves whose only sink is ventilation, so
+T relaxation barely affects them.

@@ -51,6 +51,12 @@ _FIELD_INFO = {
     "scalar-relaxation": ("Contaminant (T) under-relaxation",
                            "Under-relaxation factor for the contaminant field. Ignored when "
                            "'Use adaptive T relaxation' below is on."),
+    "decay-scalar-relaxation": ("Contaminant (T) under-relaxation - decay mode",
+                                 "Under-relaxation for T in DECAY (transient) runs, separate "
+                                 "from the steady-state value above. Leave at 1.0 - in a "
+                                 "transient run the time term already provides stability, so "
+                                 "relaxing here only stops each timestep reaching the correct "
+                                 "solution and under-applies the UV sink (measured 14.7x)."),
     "adaptive-t-relaxation": ("Use adaptive T relaxation",
                                "It has been found that for high Z*fluencerate values, significantly "
                                "lower T-relaxation values are needed to prevent crashing. An adaptive "

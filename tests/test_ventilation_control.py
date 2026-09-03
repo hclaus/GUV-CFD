@@ -15,6 +15,11 @@ def test_staging_dir_is_unique_per_control_so_concurrent_clones_dont_race(monkey
     cmds = []
     monkeypatch.setattr(vc, "run_wsl_or_raise", lambda cmd, cwd, step: cmds.append(cmd))
     for name in ("restore_boundary_conditions", "write_fvoptions_file",
+                 # set_relaxation_factors edits system/fvSolution, which this
+                 # test's fake case dir does not have - it is exercising the
+                 # staging path only. That the decay relaxation IS applied is
+                 # covered by test_decay_scalar_relaxation.
+                 "set_relaxation_factors",
                  "set_function_object_enabled", "set_control_dict_start_from",
                  "set_control_dict_time", "splice_live_vol_average_if_needed"):
         monkeypatch.setattr(vc, name, lambda *a, **k: None)

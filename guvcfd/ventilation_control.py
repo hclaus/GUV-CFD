@@ -9,6 +9,7 @@ measured_ventilation_lambda_per_s parameter, which this feeds).
 from pathlib import Path
 
 from .decay_analysis import write_results_summary
+from .splice import set_relaxation_factors
 from .contaminant_source import write_fvoptions_file
 from .initial_fields import restore_boundary_conditions
 from .monitoring import splice_live_vol_average_if_needed
@@ -25,7 +26,8 @@ def prepare_ventilation_only_control(case_dir, control_dir, inlet_velocity, pimp
                                       pimple_write_interval, pimple_delta_t=0.5, max_co=None,
                                       inlet2_velocity=None, has_outlet2=False,
                                       sealed=False, log_fn=print, should_stop=None,
-                                      breathing_entry=None, fan_entry=None):
+                                      breathing_entry=None, fan_entry=None,
+                                      scalar_relaxation=1.0):
     """Clone case_dir's mesh/converged flow field into control_dir, remove
     every UV source, reset T fresh, and set its own transient-decay duration
     - everything needed before pimpleFoam can run. Split out from actually
@@ -126,6 +128,15 @@ def prepare_ventilation_only_control(case_dir, control_dir, inlet_velocity, pimp
     else:
         log_fn("Writing an empty constant/fvOptions (no UV source - ventilation only)...")
         write_fvoptions_file(control_dir, [])
+
+    # The control is ALWAYS a transient decay, so T must be solved
+    # essentially unrelaxed - the ddt term provides the stability that
+    # under-relaxation provides in a steady run. Set here rather than relying
+    # on the clone source: the sweep's shared control is cloned from a
+    # flow-only base that never went through the decay-mode setup. A relaxed
+    # T silently under-applies every sink; measured 14.7x on v9.
+    log_fn(f"Setting T under-relaxation to {scalar_relaxation} for this transient control...")
+    set_relaxation_factors(control_dir, scalar_factor=scalar_relaxation)
 
     log_fn("Ensuring scalarTransport1 is enabled...")
     set_function_object_enabled(control_dir, "scalarTransport1", True)

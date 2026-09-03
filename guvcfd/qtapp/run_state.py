@@ -61,7 +61,7 @@ from ..mesh_gen import opening_actual_area
 from ..monitoring import splice_live_vol_average_if_needed
 from ..monitoring_points import compute_monitoring_results
 from ..run_pipeline import case_awaiting_flow_decision, resume_case_setup, setup_case
-from ..splice import set_control_dict_start_from, set_control_dict_time
+from ..splice import set_control_dict_start_from, set_control_dict_time, set_relaxation_factors
 from ..steady_state_pipeline import (
     REFERENCE_TARGET_T_SS, clear_phase_resume_state, merge_project_deltat_settings, resolve_phase_delta_ts,
     run_steady_state_scenario,
@@ -577,6 +577,18 @@ def _finish_decay(state, case_dir, room, settings, summary):
         ensure_tclamp_decay_compiled(state.log_fn)
         splice_tclamp_decay_if_needed(case_dir, adv["t-clamp-decay-multiplier"] * REFERENCE_TARGET_T_SS)
 
+        # DECAY MODE: T must be solved essentially unrelaxed. In a transient run
+        # the ddt term supplies the stability that under-relaxation supplies in a
+        # steady one, so relaxing here stabilises nothing - it only stops each
+        # timestep reaching the implicit solution, applying the UV sink at a
+        # fraction of its strength every step. Measured on v9: T=0.05 gave
+        # 4.80 /hr against a 72.17 /hr well-mixed prediction; T=1.0 gave
+        # 70.74 /hr. The steady-state value is left untouched - Phase 2 needs it.
+        _decay_relax = adv.get("decay-scalar-relaxation", 1.0)
+        state.log_fn(f"Decay mode: setting T under-relaxation to {_decay_relax} "
+               f"(transient - the time term provides stability, not relaxation)...")
+        set_relaxation_factors(case_dir, scalar_factor=_decay_relax)
+
     if state.should_stop():
         raise StoppedByUser("Stopped before pimpleFoam.")
     if sealed:
@@ -595,6 +607,7 @@ def _finish_decay(state, case_dir, room, settings, summary):
             has_outlet2=bool(settings.get("outlet2-enable")),
             sealed=False, log_fn=state.log_fn, should_stop=state.should_stop,
             fan_entry=fan_entry_from_settings(settings),
+            scalar_relaxation=adv.get("decay-scalar-relaxation", 1.0),
         )
 
     state.log_fn(f"Running pimpleFoam: UV-on ({combined_end_time}s)"

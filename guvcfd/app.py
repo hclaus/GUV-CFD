@@ -53,7 +53,7 @@ from .run_pipeline import (
 from . import scenario_runs
 from .mesh_gen import opening_actual_area
 from .project_status import clear_ach_bases, load_project_status
-from .splice import set_control_dict_start_from, set_control_dict_time
+from .splice import set_control_dict_start_from, set_control_dict_time, set_relaxation_factors
 from .steady_state_pipeline import (
     run_steady_state_scenario, _read_phase1_checkpoint, _clear_phase1_checkpoint, Phase1ExtrapolationUndecided,
     resolve_phase_delta_ts, merge_project_deltat_settings, REFERENCE_TARGET_T_SS,
@@ -1130,6 +1130,18 @@ def _finish_decay(case_dir, room, settings, summary):
         ensure_tclamp_decay_compiled(_run_log)
         splice_tclamp_decay_if_needed(case_dir, adv["t-clamp-decay-multiplier"] * REFERENCE_TARGET_T_SS)
 
+        # DECAY MODE: T must be solved essentially unrelaxed. In a transient run
+        # the ddt term supplies the stability that under-relaxation supplies in a
+        # steady one, so relaxing here stabilises nothing - it only stops each
+        # timestep reaching the implicit solution, applying the UV sink at a
+        # fraction of its strength every step. Measured on v9: T=0.05 gave
+        # 4.80 /hr against a 72.17 /hr well-mixed prediction; T=1.0 gave
+        # 70.74 /hr. The steady-state value is left untouched - Phase 2 needs it.
+        _decay_relax = adv.get("decay-scalar-relaxation", 1.0)
+        _run_log(f"Decay mode: setting T under-relaxation to {_decay_relax} "
+               f"(transient - the time term provides stability, not relaxation)...")
+        set_relaxation_factors(case_dir, scalar_factor=_decay_relax)
+
     if _should_stop():
         raise StoppedByUser("Stopped before pimpleFoam.")
     if sealed:
@@ -1158,6 +1170,7 @@ def _finish_decay(case_dir, room, settings, summary):
             log_fn=_run_log, should_stop=_should_stop,
             breathing_entry=control_breathing_entry,
             fan_entry=fan_entry_from_settings(settings),
+            scalar_relaxation=adv.get("decay-scalar-relaxation", 1.0),
         )
         if control_breathing_entry is not None:
             scenario_runs._carve_breathing_inlet(control_dir, room, settings, adv, _run_log)
@@ -2666,6 +2679,11 @@ settings_modal = dbc.Modal(
                     "when adaptive T relaxation below is on.",
                     "", _adv_defaults["scalar-relaxation"],
                 ),
+                _settings_field(
+                    "settings-decay-scalar-relaxation", "Contaminant (T) relaxation - decay mode",
+                    "Under-relaxation for T in DECAY (transient) runs, kept separate from the steady-state value above. Leave at 1.0. Under-relaxation is a steady-state convergence device; in a transient run the time term already provides that stability, so relaxing here stabilises nothing - it only stops each timestep reaching the correct solution, so the UV sink is applied at a fraction of its strength every step. Measured: 0.05 understated eACH_uv by 14.7x.",
+                    "", _adv_defaults["decay-scalar-relaxation"],
+                ),
                 _settings_checkbox_field(
                     "settings-adaptive-t-relaxation", "Use adaptive T relaxation",
                     "It has been found that for high Z*fluencerate values, significantly lower "
@@ -3761,7 +3779,8 @@ _SETTINGS_FIELD_IDS = [
     "settings-flow-rel-tol", "settings-flow-max-iterations",
     "settings-oscillation-window", "settings-oscillation-growth-tol", "settings-ach-delivery-tol",
     "settings-plateau-rel-tol", "settings-mass-balance-tol",
-    "settings-momentum-relaxation", "settings-scalar-relaxation", "settings-adaptive-t-relaxation",
+    "settings-momentum-relaxation", "settings-scalar-relaxation",
+    "settings-decay-scalar-relaxation", "settings-adaptive-t-relaxation",
     "settings-t-clamp-decay-enabled", "settings-t-clamp-decay-multiplier",
     "settings-phase1-tmax-multiplier",
     "settings-scalar-transport-ncorr", "settings-scalar-transport-tolerance",
@@ -3785,7 +3804,8 @@ _SETTINGS_FIELD_KEYS = [
     "flow-rel-tol", "flow-max-iterations",
     "oscillation-window", "oscillation-growth-tol", "ach-delivery-tol",
     "plateau-rel-tol", "mass-balance-tol",
-    "momentum-relaxation", "scalar-relaxation", "adaptive-t-relaxation",
+    "momentum-relaxation", "scalar-relaxation", "decay-scalar-relaxation",
+    "adaptive-t-relaxation",
     "t-clamp-decay-enabled", "t-clamp-decay-multiplier", "phase1-tmax-multiplier",
     "scalar-transport-ncorr", "scalar-transport-tolerance",
     "t-infinity-early-stop-enabled", "phase1-require-stable-extrapolation",

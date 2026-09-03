@@ -33,6 +33,25 @@ ADVANCED_SETTINGS_DEFAULTS = {
     # carefully the iteration approaches it.
     "momentum-relaxation": 0.5,  # SIMPLE under-relaxation for U/(k|omega)
     "scalar-relaxation": 0.7,    # SIMPLE under-relaxation for T
+    # TRANSIENT (decay-mode) under-relaxation for T. Must be ~1: in a
+    # transient run the ddt term already provides the stability that
+    # under-relaxation provides in a steady one, so relaxing here does not
+    # stabilise anything - it just stops each timestep reaching the implicit
+    # solution, and the UV sink gets applied at a fraction of its strength
+    # EVERY step. Measured on patient ward 4B1 v9 (Z=7, kUV.max 3.03/s):
+    # T=0.05 decayed at 4.80 /hr, T=1.0 at 70.74 /hr against a 72.17 /hr
+    # well-mixed prediction - a 14.7x error, all of it lost UV performance.
+    #
+    # This is SEPARATE from scalar-relaxation above because the steady-state
+    # Phase 2 calibration genuinely needs a low value to avoid diverging at
+    # high Z (see splice.compute_adaptive_scalar_relaxation), and that value
+    # was being applied to decay runs too.
+    #
+    # A `TFinal` entry does NOT work as an alternative: scalarTransport is a
+    # function object outside the PIMPLE outer loop, so finalIteration is
+    # never set for it and TFinal is never consulted. Confirmed empirically -
+    # T 0.05 with and without TFinal 1 gave byte-identical results.
+    "decay-scalar-relaxation": 1.0,
     # Off by default (opt-in) - when on, scalar-relaxation above is ignored
     # and T's relaxation is instead computed per-case from its own
     # kUV.max (see splice.compute_adaptive_scalar_relaxation), fit against a
@@ -239,7 +258,8 @@ def save_advanced_settings(settings):
 PROJECT_OPENFOAM_SETTINGS_KEYS = (
     "flow-rel-tol", "flow-max-iterations", "plateau-rel-tol", "pimple-delta-t",
     "mesh-cell-size", "uv-zone-bins",
-    "momentum-relaxation", "scalar-relaxation", "adaptive-t-relaxation",
+    "momentum-relaxation", "scalar-relaxation", "decay-scalar-relaxation",
+    "adaptive-t-relaxation",
     "t-clamp-decay-enabled", "t-clamp-decay-multiplier", "phase1-tmax-multiplier",
     "scalar-transport-ncorr", "scalar-transport-tolerance",
     "t-infinity-early-stop-enabled", "t-infinity-rel-tol",

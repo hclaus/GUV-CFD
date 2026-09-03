@@ -1194,6 +1194,7 @@ def _run_shared_control(base_dir, control_dir, ach, room, settings, adv, log_fn,
         log_fn=log_fn, should_stop=should_stop,
         breathing_entry=breathing_entry,
         fan_entry=fan_entry_from_settings(settings),
+            scalar_relaxation=adv.get("decay-scalar-relaxation", 1.0),
     )
     if breathing_entry is not None:
         # The base this was cloned from is ventilation-only and has no
@@ -1313,6 +1314,18 @@ def _run_decay_scenario(case_dir, room, settings, z, ach, adv, z_summary, log_fn
         # source_zone_max_T (see tclamp_decay.py's module docstring).
         ensure_tclamp_decay_compiled(log_fn)
         splice_tclamp_decay_if_needed(case_dir, adv["t-clamp-decay-multiplier"] * REFERENCE_TARGET_T_SS)
+
+        # DECAY MODE: T must be solved essentially unrelaxed. In a transient run
+        # the ddt term supplies the stability that under-relaxation supplies in a
+        # steady one, so relaxing here stabilises nothing - it only stops each
+        # timestep reaching the implicit solution, applying the UV sink at a
+        # fraction of its strength every step. Measured on v9: T=0.05 gave
+        # 4.80 /hr against a 72.17 /hr well-mixed prediction; T=1.0 gave
+        # 70.74 /hr. The steady-state value is left untouched - Phase 2 needs it.
+        _decay_relax = adv.get("decay-scalar-relaxation", 1.0)
+        log_fn(f"Decay mode: setting T under-relaxation to {_decay_relax} "
+               f"(transient - the time term provides stability, not relaxation)...")
+        set_relaxation_factors(case_dir, scalar_factor=_decay_relax)
 
     if should_stop is not None and should_stop():
         raise StoppedByUser("Stopped before pimpleFoam.")
